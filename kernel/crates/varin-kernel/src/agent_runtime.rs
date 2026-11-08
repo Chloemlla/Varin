@@ -262,6 +262,7 @@ pub(crate) fn domain(error: varin_runtime::RuntimeError) -> KernelError {
         varin_runtime::RuntimeError::NotFound(message) => {
             KernelError::NotFound(message)
         }
+        varin_runtime::RuntimeError::IdentityUnavailable(message) => KernelError::IdentityUnavailable(message),
         varin_runtime::RuntimeError::Invalid(message) => KernelError::Protocol(message),
         other => KernelError::Storage(other.to_string()),
     }
@@ -679,6 +680,8 @@ pub(crate) fn spawn(
                                 | "runtime.messages.send"
                                 | "runtime.computer.event.accept"
                                 | "runtime.followup.register" | "runtime.followup.registration.prepare"
+                                | "runtime.followup.sourceRoute.remove" | "runtime.followup.sourceRoute.put" | "runtime.followup.sourceRoute.list"
+                                | "runtime.followup.arrangement.put" | "runtime.followup.arrangements.list" | "runtime.followup.events.receive" | "runtime.followup.eventSources.list" | "runtime.followup.eventSources.get" | "runtime.followup.eventSources.status" | "runtime.followup.backlog"
                                 | "runtime.calendar.sync"
                                 | "runtime.calendar.admit"
                                 | "runtime.calendar.prepare"
@@ -967,23 +970,12 @@ pub(crate) fn spawn(
                                 &cancellation,
                             );
                         }
-                        if matches!(
-                            method,
-                            "runtime.followup.register" | "runtime.followup.registration.prepare"
-                                | "runtime.followup.get"
-                                | "runtime.followup.occurrences"
-                                | "runtime.followup.occurrence"
-                                | "runtime.followup.metrics"
-                                | "runtime.followup.metric.observe"
-                                | "runtime.followup.research"
-                                | "runtime.followup.research.observe"
-                                | "runtime.followup.log.observe"
-                                | "runtime.followup.files"
-                                | "runtime.followup.registrations.pending"
-                                | "runtime.followup.registration.cancel"
-                                | "runtime.followup.file.observe"
-                                | "runtime.followup.file.release"
-                        ) {
+                        // The follow-up owner routes its whole namespace, including Bot arrangements
+                        // and plugin event delivery. Keep the synchronous list and control admission
+                        // below; a second method list here can silently strand new owner operations.
+                        if method.starts_with("runtime.followup.")
+                            && !matches!(method, "runtime.followup.list" | "runtime.followup.control")
+                        {
                             let runtime = runtime.clone();
                             let resources = resources.clone();
                             let method = method.to_owned();
@@ -2816,6 +2808,12 @@ fn dispatch(catalog: &mut Catalog, method: &str, params: Value) -> Result<Value,
         let p: varin_runtime::catalog::bot::BotGate = serde_json::from_value(params)?;
         catalog.publish_bot_gate(p).map_err(domain)?;
         return Ok(Value::Null);
+    }
+    if method == "runtime.bot.entry.resolve" {
+        let p: BotThreadCreateParams = serde_json::from_value(params)?;
+        return Ok(serde_json::to_value(
+            catalog.resolve_bot_entry(&p.thread_id, &p.branch_id, &p.bot_id).map_err(domain)?,
+        )?);
     }
     if method == "runtime.bot.thread.create" {
         let p: BotThreadCreateParams = serde_json::from_value(params)?;

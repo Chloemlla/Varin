@@ -1,3 +1,4 @@
+import { retainCalendarRunKey } from './calendar-run-key';
 import { CalendarTaskStatus } from './CalendarTaskStatus';
 import * as React from 'react';
 import { Button } from '@/components/ui/button';
@@ -18,7 +19,7 @@ import type { ProjectEntry, BotSummary } from '@varin/application-client';
 import { listBots, useBotNavigation } from '@/lib/bots';
 import { useWorkbenchProfileId } from '@/lib/workbench/profile-context';
 import { VARIN_WORKBENCH_BOT_PROFILE_ID } from '@varin/extension-contract';
-import { createScheduledTasksHttpAPI, getRuntimeEndpointGeneration, subscribeRuntimeEndpointWillChange, type ScheduledTask, type ThreadIdentity } from '@varin/application-client';
+import { createScheduledTasksHttpAPI, ScheduleRequestError, getRuntimeKey, getRuntimeEndpointGeneration, subscribeRuntimeEndpointWillChange, type ScheduledTask, type ThreadIdentity } from '@varin/application-client';
 import { useRuntimeAPIs } from '@/hooks/useRuntimeAPIs';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { ThreadConversation } from '@/components/thread/ThreadConversation';
@@ -51,7 +52,12 @@ export function ScheduledTasksDialog() {
   const [calendarEditorTask, setCalendarEditorTask] = React.useState<ScheduledTask | null>(null);
   const [calendarWork, setCalendarWork] = React.useState<ThreadIdentity | null>(null);
   const runKeys = React.useRef(new Map<string, string>());
-  React.useEffect(() => subscribeRuntimeEndpointWillChange(() => { runKeys.current.clear(); setCalendarWork(null); setCalendarEditorOpen(false); setCalendarEditorTask(null); }), []);
+  type RunReplacement = { projectId: string; taskId: string; taskName: string; key: string; host: number };
+  const [runReplacement, setRunReplacement] = React.useState<RunReplacement | null>(null);
+  const replacementRef = React.useRef<RunReplacement | null>(null);
+  const runContextGeneration = React.useRef(0);
+  const dismissRunReplacement = React.useCallback(() => { replacementRef.current = null; setRunReplacement(null); }, []);
+  React.useEffect(() => subscribeRuntimeEndpointWillChange(() => { replacementRef.current = null; setRunReplacement(null); setCalendarWork(null); setCalendarEditorOpen(false); setCalendarEditorTask(null); }), []);
   const open = useUIStore((state) => state.isScheduledTasksDialogOpen);
   const setOpen = useUIStore((state) => state.setScheduledTasksDialogOpen);
   const isMobile = useUIStore((state) => state.isMobile);
@@ -72,9 +78,17 @@ export function ScheduledTasksDialog() {
   const { currentTheme } = useThemeSystem();
 
   const [selectedProjectID, setSelectedProjectID] = React.useState<string>('');
+  React.useEffect(() => {
+    runContextGeneration.current += 1;
+    dismissRunReplacement();
+  }, [open, selectedProjectID, dismissRunReplacement]);
   const selectedManually = React.useRef(false);
   React.useEffect(() => { if (!open) selectedManually.current = false; }, [open]);
+  const arrangementFocus = useUIStore(state => state.scheduledTasksFocus);
   const [view, setView] = React.useState<'scheduled' | 'followups'>('scheduled');
+  const [visitedFollowups, setVisitedFollowups] = React.useState(false);
+  React.useEffect(() => { if (open && view === 'followups') setVisitedFollowups(true); }, [open, view]);
+  React.useEffect(() => { if (open && arrangementFocus) setView('followups'); }, [open, arrangementFocus]);
   const [query, setQuery] = React.useState('');
   const [filter, setFilter] = React.useState<'all' | 'enabled' | 'paused' | 'completed'>('all');
   const [createFollowUp, setCreateFollowUp] = React.useState(false);
@@ -273,28 +287,52 @@ export function ScheduledTasksDialog() {
     setCalendarEditorTask(task); setCalendarEditorOpen(true);
   }, []);
 
-  const handleRunNow = React.useCallback(async (task: ScheduledTask) => {
-    if (!selectedProjectID) {
-      return;
-    }
+  const runTask = React.useCallback(async (projectId: string, task: ScheduledTask) => {
     setMutatingTaskID(task.id);
+    const identity = JSON.stringify([getRuntimeKey(), projectId, task.id]);
+    // Freeze the admission generation only for a new user action. Refreshing a
+    // definition must never rewrite an uncertain earlier request.
+    const key = retainCalendarRunKey(runKeys.current, identity, task.calendar?.definition.manual_key_prefix, () => crypto.randomUUID());
+    const host = getRuntimeEndpointGeneration();
+    const context = runContextGeneration.current;
     try {
-      const identity = `${selectedProjectID}:${task.id}`;
-      const key = runKeys.current.get(identity) ?? crypto.randomUUID(); runKeys.current.set(identity, key);
-      const host = getRuntimeEndpointGeneration();
-      const receipt = await schedules.run(selectedProjectID, task.id, key);
+      const receipt = await schedules.run(projectId, task.id, key);
       if (host !== getRuntimeEndpointGeneration()) return;
       runKeys.current.delete(identity);
+      if (context !== runContextGeneration.current) return;
       setCalendarWork({ runtime: 'agent', threadId: receipt.occurrence.thread_id, branchId: receipt.occurrence.branch_id });
-      await reloadTasks(selectedProjectID, { silent: true });
+      await reloadTasks(projectId, { silent: true });
       toast.success(t('sessions.scheduledTasks.dialog.toast.started'));
-
     } catch (error) {
+      if (host !== getRuntimeEndpointGeneration() || context !== runContextGeneration.current) return;
+      if (error instanceof ScheduleRequestError && error.code === 'identity-unavailable') {
+        const replacement = { projectId, taskId: task.id, taskName: task.name, key, host };
+        replacementRef.current = replacement; setRunReplacement(replacement);
+      }
       toast.error(error instanceof Error ? error.message : t('sessions.scheduledTasks.dialog.toast.runFailed'));
     } finally {
       setMutatingTaskID(null);
     }
-  }, [selectedProjectID, reloadTasks, t]);
+  }, [reloadTasks, t]);
+  const handleRunNow = React.useCallback((task: ScheduledTask) => selectedProjectID ? runTask(selectedProjectID, task) : Promise.resolve(), [selectedProjectID, runTask]);
+  const confirmNewRun = React.useCallback(async () => {
+    const replacement = replacementRef.current;
+    if (!replacement) return;
+    setMutatingTaskID(replacement.taskId);
+    try {
+      const latest = (await schedules.list(replacement.projectId)).find(task => task.id === replacement.taskId);
+      if (replacementRef.current !== replacement || replacement.host !== getRuntimeEndpointGeneration()) return;
+      const identity = JSON.stringify([getRuntimeKey(), replacement.projectId, replacement.taskId]);
+      if (!latest || runKeys.current.get(identity) !== replacement.key) return;
+      // Only this explicit decision may discard an unresolved request. Read the
+      // latest admission generation before allocating the separate new request.
+      runKeys.current.delete(identity);
+      dismissRunReplacement();
+      await runTask(replacement.projectId, latest);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : t('sessions.scheduledTasks.dialog.toast.loadFailed'));
+    } finally { setMutatingTaskID(null); }
+  }, [dismissRunReplacement, runTask, t]);
 
   const projectSelector = (
     <div className="ml-auto min-w-0">
@@ -448,24 +486,24 @@ export function ScheduledTasksDialog() {
   );
 
   const sectionTabs = (
-    <div className="flex items-center gap-1" role="group" aria-label={t('tasksHub.title')}>
+    <div className="flex items-center gap-1" role="group" aria-label={t(botWorkbench ? 'arrangements.title' : 'tasksHub.title')}>
       <Button size="sm" variant={view === 'scheduled' ? 'secondary' : 'ghost'} aria-pressed={view === 'scheduled'} onClick={() => setView('scheduled')}><Icon name="calendar-schedule" className="mr-1.5 size-4" />{t('tasksHub.scheduled')}</Button>
-      <Button size="sm" variant={view === 'followups' ? 'secondary' : 'ghost'} aria-pressed={view === 'followups'} onClick={() => setView('followups')}><Icon name="timer" className="mr-1.5 size-4" />{t('tasksHub.followUps')}</Button>
+      <Button size="sm" variant={view === 'followups' ? 'secondary' : 'ghost'} aria-pressed={view === 'followups'} onClick={() => setView('followups')}><Icon name="timer" className="mr-1.5 size-4" />{t(botWorkbench ? 'arrangements.title' : 'tasksHub.followUps')}</Button>
     </div>
   );
 
   const createButton = <DropdownMenu>
     <DropdownMenuTrigger asChild><Button size="sm" className="shrink-0 gap-1 rounded-full px-3">{t('tasksHub.create')}<Icon name="arrow-down-s" className="size-3.5" /></Button></DropdownMenuTrigger>
     <DropdownMenuContent align="end">
-      <DropdownMenuItem disabled={projects.length === 0 || !threads} onSelect={() => { setCalendarEditorTask(null); setCalendarEditorOpen(true); }}>Agent calendar</DropdownMenuItem>
+      <DropdownMenuItem disabled={projects.length === 0 || !threads} onSelect={() => { setCalendarEditorTask(null); setCalendarEditorOpen(true); }}>{t('calendar.title')}</DropdownMenuItem>
       <DropdownMenuItem disabled={projects.length === 0} onSelect={openNewTaskEditor}><Icon name="calendar-schedule" className="mr-2 size-4" />{t('tasksHub.scheduled')}</DropdownMenuItem>
-      <DropdownMenuItem onSelect={() => { setView('followups'); setCreateFollowUp(true); }}><Icon name="timer" className="mr-2 size-4" />{t('tasksHub.followUps')}</DropdownMenuItem>
+      <DropdownMenuItem onSelect={() => { setView('followups'); setCreateFollowUp(true); }}><Icon name="timer" className="mr-2 size-4" />{t(botWorkbench ? 'arrangements.title' : 'tasksHub.followUps')}</DropdownMenuItem>
     </DropdownMenuContent>
   </DropdownMenu>;
 
   const tasksContent = <div className="space-y-6">
     <div className="flex items-start justify-between gap-4">
-      <div className="min-w-0 space-y-2"><h1 className="text-2xl font-semibold tracking-tight text-foreground">{t(view === 'scheduled' ? 'tasksHub.scheduled' : 'tasksHub.followUps')}</h1><p className="typography-meta text-muted-foreground">{t(view === 'scheduled' ? 'tasksHub.scheduledDescription' : 'tasksHub.followUpsDescription')}</p></div>
+      <div className="min-w-0 space-y-2"><h1 className="text-2xl font-semibold tracking-tight text-foreground">{t(view === 'scheduled' ? 'tasksHub.scheduled' : botWorkbench ? 'arrangements.title' : 'tasksHub.followUps')}</h1><p className="typography-meta text-muted-foreground">{t(view === 'scheduled' ? 'tasksHub.scheduledDescription' : botWorkbench ? 'arrangements.description' : 'tasksHub.followUpsDescription')}</p></div>
       {createButton}
     </div>
     {sectionTabs}
@@ -476,7 +514,8 @@ export function ScheduledTasksDialog() {
         {projectSelector}
       </div>
       {tasksList}
-    </div> : open ? <FollowUpTasksPanel createOpen={createFollowUp} onCreateOpenChange={setCreateFollowUp} /> : null}
+    </div> : null}
+    {open && (view === 'followups' || visitedFollowups) && <div hidden={view !== 'followups'}><FollowUpTasksPanel focus={arrangementFocus ?? undefined} createOpen={createFollowUp} onCreateOpenChange={setCreateFollowUp} /></div>}
   </div>;
 
   return (
@@ -484,13 +523,13 @@ export function ScheduledTasksDialog() {
       {isMobile ? (
         <MobileOverlayPanel
           open={open}
-          title={t('tasksHub.title')}
+          title={t(botWorkbench ? 'arrangements.title' : 'tasksHub.title')}
           onClose={() => setOpen(false)}
           contentMaxHeightClassName="max-h-[min(80vh,640px)]"
           renderHeader={(closeButton) => (
             <div className="flex flex-col gap-1 border-b border-border/40 px-3 py-2">
               <div className="flex items-center justify-between gap-2">
-                <h2 className="typography-ui-label font-semibold text-foreground">{t('tasksHub.title')}</h2>
+                <h2 className="typography-ui-label font-semibold text-foreground">{t(botWorkbench ? 'arrangements.title' : 'tasksHub.title')}</h2>
                 {closeButton}
               </div>
             </div>
@@ -505,8 +544,18 @@ export function ScheduledTasksDialog() {
         </div>
       ) : null}
 
+      <Dialog open={open && runReplacement !== null && runReplacement.projectId === selectedProjectID} onOpenChange={value => { if (!value) dismissRunReplacement(); }}><DialogContent>
+        <DialogTitle>{t('sessions.scheduledTasks.dialog.runReplacement.title')}</DialogTitle>
+        <p className="font-medium">{runReplacement?.taskName}</p>
+        <p>{t('sessions.scheduledTasks.dialog.runReplacement.warning')}</p>
+        <div className="flex justify-end gap-2">
+          <Button variant="outline" onClick={dismissRunReplacement}>{t('sessions.scheduledTasks.dialog.runReplacement.cancel')}</Button>
+          <Button disabled={mutatingTaskID !== null} onClick={() => void confirmNewRun()}>{t('sessions.scheduledTasks.dialog.runReplacement.confirm')}</Button>
+        </div>
+      </DialogContent></Dialog>
+
       <CalendarTaskEditorDialog open={calendarEditorOpen} projectId={selectedProjectID} task={calendarEditorTask} initialTarget={botEntries.find(bot => `bot:${bot.id}` === selectedProjectID)?.entry} onOpenChange={setCalendarEditorOpen} onSave={handleSaveTask} />
-      <Dialog open={calendarWork !== null} onOpenChange={value => { if (!value) setCalendarWork(null); }}><DialogContent className="h-[85vh] max-w-5xl overflow-hidden"><DialogTitle>Calendar work</DialogTitle>
+      <Dialog open={calendarWork !== null} onOpenChange={value => { if (!value) setCalendarWork(null); }}><DialogContent className="h-[85vh] max-w-5xl overflow-hidden"><DialogTitle>{t('calendar.work')}</DialogTitle>
         {calendarWork && threads && <ThreadConversation api={threads} identity={calendarWork} onBranchCreated={setCalendarWork} />}
       </DialogContent></Dialog>
       <ScheduledTaskLoopEditorDialog

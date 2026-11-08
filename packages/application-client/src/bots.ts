@@ -24,9 +24,10 @@ export interface BotSleepWork extends BotSleepProgress {
 /** A Bot entry is a stable native Thread and branch allocated with its profile. */
 export type BotEntry = ThreadIdentity;
 export type BotReadyEntry = ThreadIdentity;
+/** `entry` is the Catalog-resolved live session, which may differ from the profile's original entry. */
 export interface BotEntryResult { bot: BotSummary; entry: BotReadyEntry; model: BotModelSelection | null }
 export interface BotCreateInput { name?: string; instructions?: string; model?: BotModelSelection }
-export interface BotUpdateInput { expectedRevision?: number; name?: string; instructions?: string | null; model?: BotModelSelection | null; pinned?: boolean }
+export interface BotUpdateInput { expectedRevision?: number; name?: string; instructions?: string | null; model?: BotModelSelection | null; pinned?: boolean; appearance?: import('./bot-appearance.js').BotAppearance }
 
 export interface BotSleepMachine {
   machineId: string;
@@ -57,6 +58,8 @@ export interface BotActivity {
 export interface BotProfile {
   id: string;
   name: string;
+  /** Missing on existing profiles means the built-in figure, following the theme. */
+  appearance?: import('./bot-appearance.js').BotAppearance;
   /** Persona/collaboration guidance owned by the user-facing Bot record. */
   instructions: string | null;
   /** Preferred model; null follows the configured default. */
@@ -161,6 +164,8 @@ export interface BotMemoryMaintenance {
 
 /** Framework-neutral product boundary. All navigation uses the returned tagged identity. */
 export interface BotsAPI {
+  appearances: import('./bot-appearance.js').BotAppearancesAPI;
+  organization: import('./bot-organization.js').BotOrganizationAPI;
   selection: import("./chat-memory.js").ThreadMemoryAPI;
   list(signal?: AbortSignal): Promise<BotSummary[]>;
   get(botId: string, signal?: AbortSignal): Promise<BotSummary | null>;

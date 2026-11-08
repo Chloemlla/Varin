@@ -69,7 +69,16 @@ PR 与 main 的镜像验证由主 CI 按容器输入调用只读 reusable workfl
 基础镜像/公共容器配置改动再验证 toolbelt。不会向 GHCR 发布，手动 `ci.yml` 也只是完整资格检查。
 正式镜像发行由版本匹配的 release tag 进入 `Docker Images`；`Docker Commit Images` 则从 main 手动选择
 精确 main 历史 SHA，独立发布 `commit-<完整 SHA>`，不占版本号、不触发 Desktop/npm/完整 Release。
-两个通道都先做所选源码完整资格，再构建、启动并推广同一 digest；发布工具与产品源码分开固定。
+两个通道在确切源码准入后，并行运行完整资格检查与候选镜像构建；只有完整资格与两种镜像 smoke 都成功，
+才记录合格候选并推广同一 digest。发布工具与产品源码分开固定。构建用同一 BuildKit 分两阶段：先同时构建两种
+基础镜像，再按实测 digest 同时组装 standard/toolbelt，共享 Rust/Web 编译，不把普通 CI 的宿主二进制借给容器。
+发布的中间层缓存写入独立 `buildcache-v2` registry 引用，不占用 Actions 的 Rust/Bun 缓存空间；只读验证仅消费
+这些公开缓存，不写入发布缓存。Cargo 依赖以普通镜像层保存，源码或版本身份变化仍会重新构建真实 kernel。
+`container-check.yml` 提供独立手动入口，专项验证无需重复无关平台 CI；`ci.yml` 的 `container_benchmark` 仍可同时做完整资格检查。
+基准会在临时 loopback registry 记录双架构冷构建、同 builder 热构建，
+再删除 builder、建立全新 builder，并用一个只改 Rust 注释的本地 fixture commit 验证 registry 缓存恢复。
+它要求依赖 cook 全部命中、最终内核重新编译、镜像报告新的 source identity；三组计时均留作 artifact，不发布产品镜像。
+缓存命中只影响计算复用，不能代替资格、来源、产物身份或启动验证。
 main push 与按提交发布均不更新 `latest`。新命名采用 `varin` 标准环境与 `varin-toolbelt` 工具链环境；
 正式版本必须大于 0.9.38，独立 commit 标签允许源码版本仍为 0.9.38，旧精确版本/SHA 不重写。
 推广前核验 companion base 与匿名访问；commit 通道额外执行新 runner 上的匿名 amd64 pull，并保存可核验
@@ -139,10 +148,12 @@ Android native/toolchain 变更执行无签名 debug build，release 使用同�
 `Source quality` 始终创建，严格汇总本轮适用的 source、preflight、native、平台、production、
 container 和 Android 结果；失败、取消、缺失或意外 skip 都不能放行。轻量 production-lock
 前置直接调用构建 owner 的 `--check-lock`，不再先重跑 layout fixture；失败阻止 production/image 重复构建，同时不遮蔽独立源码与 native owner 的结果。
-Linux release kernel 一次构建，native 与 production 用现有回执核验输入/选项/摘要后消费；
+Linux release kernel 一次构建，Host/native、Rust workspace 与 production 分别用现有回执核验输入/选项/摘要后消费；
 Cargo release/debug 缓存分开；没有对应编译工作的任务不恢复 Rust 缓存。测试任务保留已成功编译的
 缓存，Windows 在 native 验收前保存，避免真实断言/teardown 失败导致下一轮再次冷编译；缓存不是测试成功证据。
-Rust 编译与执行分开，执行仍有原十分钟预算。
+Host/native 接线与 Rust workspace 是独立并行作业，各自保留依赖准备、FUSE 和真实 kernel 前置，失败互不遮蔽。
+同一 SHA 的重试可使用 GitHub 的失败作业重跑，保留已经通过的另一项；新提交仍按完整适用范围实际验证，
+不复用其他 SHA 的测试结果。Rust 编译与执行分开，执行仍有原十分钟预算。
 日常代码保留本地安全 patch 消费者回归；实时 Bun/Cargo advisory 查询由依赖改动、完整资格和发行承担。
 
 失败归属跟随检查而不是另建重试流程：preflight 由生产依赖/锁文件 owner 修复；portable 由失败的

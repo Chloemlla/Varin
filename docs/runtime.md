@@ -116,7 +116,18 @@ HTTP 状态码、错误代码或错误内容，首条命中生效，未命中时
 删除会话会隐藏 Thread 并请求空间回收。已受理的任务继续履行原来的执行和结算责任；Catalog
 等 Run 结束、实际执行者停止、模型请求结算后，清理该会话拥有的历史、请求和回执。其他会话
 分支仍引用的历史与关系记录继续保留，随后由 ContentStore 释放失去引用的正文和媒体。
-Thread、branch 的小型身份记录和删除回执保留，支持稳定身份与删除重试。Host 在启动、删除和
+Thread、branch 的小型身份、创建证据、Bot 直接绑定与删除回执保留，支持稳定身份与删除重试。
+创建证据只保存初始 branch、创建域及已知 Bot，不复制 principal；principal 始终由原 Thread 管理。
+正文回收不删除 fork 的小型创建输入。显式删除 Bot 同样保留不可再分配的身份，但清除标题、置顶、标题进度及历史 head；
+保留的 Bot 绑定不能绕过关闭或缺失的执行 gate。旧库已经回收的绑定不按名称、profile 或 ID 前缀还原，
+未知旧身份仍可枚举和清理，但不能被当作普通 Thread 获得执行权限。
+Bot 入口由 Catalog 原子核验原 principal／Bot／初始 branch 后选择可用的直接会话或创建新会话；
+Host 只重试同一解析请求，不在响应未知时换 UUID。返回旧创建回执不代表当前会话仍可发送。
+日程受理身份独立于可回收的 occurrence／input 正文；旧 key 返回原记录或明确的 identity-unavailable，绝不重新触发工作。
+87 → 88 升级为已有定义原子生成不可预测的手动 key 前缀。新的“立即运行”在首次分配 key 时固定前缀，
+刷新、同一 Host 重连或失败重试不改旧 key。回执已回收时，界面提示旧操作可能已执行，
+只有用户明确确认发起新操作才放弃旧 key；关闭或切换任务上下文不视为确认。旧客户端仍能读取已知回执；没有前缀且证据已丢的旧请求明确拒绝，
+新用户操作使用当前前缀仍可在原日程上受理。自动计划的 cursor 和已消费时段不回退。Host 在启动、删除和
 后续持久执行事件中推动回收；正在读取内容时沿原有读取保护延后执行。
 排空通知只在原执行者确实被移除并完成收尾时发出。对已排空 Run 的重复检查不建立执行屏障、
 不再次唤醒维护，避免删除维护在无新变化时循环创建材料访问授权。Storage 按 Run 的派生索引查询
@@ -131,7 +142,7 @@ Thread、branch 的小型身份记录和删除回执保留，支持稳定身份�
 [Catalog](../kernel/crates/varin-runtime/src/catalog.rs) 通过独占 owner 锁管理
 `conversation.sqlite`，使用 SQLite WAL/FULL 短事务。初次安装所有内部域在同一事务完成。
 已有数据先只读检查已知格式和结构，再由原 writer 自动升级到当前结构。升级步骤位于
-[catalog_upgrade.rs](../kernel/crates/varin-runtime/src/catalog_upgrade.rs)，覆盖格式 78 → 79 → 80 → 81 → 83 → 84 → 85 → 86 与独立格式 82 → 83 → 84 → 85 → 86；预检查严格区分已有 Zone2 捕获的 81 和已有派发索引但没有 Zone2 的 82。
+[catalog_upgrade.rs](../kernel/crates/varin-runtime/src/catalog_upgrade.rs)，覆盖格式 78 → 79 → 80 → 81 → 83 → 84 → 85 → 86 → 87 → 88 → 89 与独立格式 82 → 83 → 84 → 85 → 86 → 87 → 88 → 89；预检查严格区分已有 Zone2 捕获的 81 和已有派发索引但没有 Zone2 的 82。
 84 → 85 为消息、派发、历史及上下文保留增加 typed 附件关系；旧材料引用只由升级器转换一次，新发送不解析正文建立权限。附件字节仍由原 Storage／材料 owner 保管。
 85 → 86 允许明确 User 派发保留空工具来源，并增加原子任务报告身份；旧工具派发正文和回执保持不变，不回放执行效果。
 78 → 79 初始化外部 Agent 结构，79 → 80 初始化空用量账本及开始记账时间，不按缺少结算时间的旧回执伪造历史账单。
@@ -432,6 +443,73 @@ Host 按当前 paired 权限执行；Storage 在 callback dispatch 前提交 beg
 丢 ACK 时只观察，不重放日程修改；交付后的正文清理不删除调用指纹。
 见[日程准入](../packages/web/application-host/lib/kernel/managed-schedule-service.ts)与
 [原回执恢复](../kernel/crates/varin-kernel/src/schedule_reconciliation.rs)。
+
+### 长期事件安排与接收
+
+Catalog 的 `followups` 同时保存原工作的条件接续和显式 Bot 长期安排。后者可无 `source_run_id`，
+创建 Run 只是溯源，不是长期定义的生命期。旧条件等待不因创建者属于 Bot 而升级成持续监听。
+定义保存原 principal、Bot、实际目标、来源账号、处理意图与时机；接收和运行不依赖当前 UI 选择。
+
+插件来源身份包含 principal、扩展／来源、连接及真实账号；远端来源另固定 Host、受管连接与 endpoint identity。
+接收将正文／媒体写入 ContentStore，在短 Catalog 事务里发布引用、稳定事件身份、匹配与游标。
+只有该事务确认后才向来源确认。重复事件复用原记录；同对象的新修订保留为新事实。来源游标 CAS 防止在途旧读取覆盖新位置。
+重读不变状态、空轮询不生成永久事件正文。插件离线、账号替换和无法补拉的覆盖范围是独立来源状态，不等于没有变化。
+
+共享连接保存一份事件账本，各关注保留独立匹配位置。暂停者不影响其他使用者，恢复时仍可匹配共享账本中的未见变化。
+即时、固定窗口、Calendar 到期和被动方式共用 occurrence 与原 input queue。批次冻结实际事件集合、目标和输入来源；
+之后到达的内容留给下批，后续改目标或 sender 映射不改写已交付输入。多目标分别保存交付关系，正文共用。
+处理时机变更会沿原输入／external turn 的未消费撤回边界取消旧批次，再以事件原接收时间重新计算时机；
+已消费或已发送的批次不重排。显式现在处理同时提升未入队的被动批次和已排队输入，保留实际暂停状态。
+Calendar 的关联到期只选择事件批次，不再额外提交另一份相同日程提示；不执行的空批次记录为 `skipped`。
+暂停、提问、Goal 门控、Bot sleep 与原取消仍由原 ingress／activation 决定，不新增平行 writer。
+
+事件合并发生在实际输入消费边界，不把多条关注合成一个无法单独控制的队列身份。原生输入批次共享重复事件正文，
+各 input、occurrence、处理意图与消费回执分别保留。准备结果提交时重新核对各原输入及 hold；期间撤回任一输入，
+本次准备失效后按剩余输入重新构建。冷启动先登记的唤醒输入也参与第一次边界：在尚无 model step 时同步更新
+其历史展示和 worker 内存；已有请求的历史前缀不再改变。历史保存本次固定表示，原输入及 ContentStore 依赖保留原文，
+重启和重读不会因后来事件重新计算旧表示。`follow_up` occurrence 读取返回已准入批次的原始 `events`。
+
+插件可在完整状态快照上声明 `state: { key, sequence, value }`。同一关注内按原来源／账号、对象、发送者和 key 汇集，
+按来源 sequence 保留最新正文及 value 的变化过程；sequence 必须是可跨 JSON 传输的非负安全整数，补拉不改写顺序。
+相同序号存在多个不同事件时保留原文，不猜先后；未声明 state 的事件和明确映射的个人用户输入不作状态覆盖。
+不同筛选关注分别决定哪些状态属于本次交办，再在同一接收边界共用重复正文，不能借另一关注的新状态删掉本关注的依据。
+
+来源对象路由保存真实 Thread/branch 或 external conversation。同一 principal 下的原生与外部 Harness 普通任务可继续，不按 Bot 人为隔离任务池，
+但其他 Bot 的入口会话不成为隐式接收目标。个人聊天映射须由已认证用户显式指定 object 与 sender；模型建立普通任务映射不能提升用户身份。
+默认不按每个外部对象创建会话。显式 `firstContact: create_bot_session` 仅用于原生 Bot 接收：首次对象事件由原 identity owner 创建
+真实 Bot 会话，并与对象路由在同一事务提交。已有路由优先，重试复用同一映射；缺少 objectId 则保持原默认目标。
+原路由创建／移除事实防止已移除对象被下次事件自动重建；来源账号变化与首次 principal 认领分别保留其真实身份含义。
+外部目标显式保存 `externalConversationId`，原生 thread/branch 仅作为定义归属和回报位置，不伪造外部任务的原生锚点。
+批次与原 external turn 在同一 Catalog 事务受理；Host 唤醒现有 external owner，实际发送前再次检查暂停、Bot sleep 与配置身份。
+被动输入留在该外部会话原 turn 账本，随下一条真实输入处理；原 turn 已发送或结果未知时不自动重放。
+外部 Harness 在 Begin 固定本次可接收的被动输入及连续就绪安排，同一会话内共享正文并沿一次真实 turn 发送；
+不越过排队的普通用户消息。各安排仍关联自己的原 turn，通过 `consumedByTurnId` 跟踪实际执行，发送前再次核验全部关联。
+撤回领头安排会释放其他尚未发送意图，延期则解除整批绑定，重试按当前控制重新选择。相同 turn 的结果按实际回报目标汇集一次，
+并列出所有相关安排；不同回报目标各自收到结果。
+每次结果保留本次 turn 的报告身份，经原 Bot work ingress 回到交办位置，不覆盖早先 child dispatch 的完成回执。
+外部会话 principal 来自可信 UI 身份或真实 parent Thread，旧数据只沿既有一次性归属初始化迁移，不从会话 ID 或资源分支猜测。
+
+事件回显只有关联到同一来源对象和已确认的原处理 Operation 时才压下；不按「来自自己」一概忽略。
+跨 Host 的 operation ID 不是本地效果证明，不能用于误抑制另一主机上的合法变化。
+
+来源 Host 的 Catalog 保留远端 consumer 与未确认水位；目标 Host 经已有 authenticated managed connection 读取原事件，
+本地持久接受后才 ACK 原页。consumer 的 generation 区分已释放后重新关注，旧在途 ACK 不得推进新关注。
+断线重试沿原账号、订阅和接收游标；取消通过原 consumer 释放，不为了清理而重新连接插件或创建假本地会话。
+接收 worker 由 Host 生命周期和插件 generation 管理，Bot sleep 不停止共享监听；Host 退出可取消网络等待，重启恢复原 Catalog 状态。
+
+原文件使用独立 typed `files` 输入提交稳定 fileId、filename、mimeType 与真实字节，不能从插件传任意已存 attachment ref。
+ContentStore 保存字节并将依赖随事件和批次历史发布，原 AttachmentDelivery 决定哪个实际接收者可读取。
+Host 首次读取或准备执行路径时，把经 Catalog 验证的分页字节交给既有 Storage 附件 owner；文件 hash 是原字节 hash，不是清单地址。
+跨 Host 传输重新准入字节，不信任另一主机的附件引用。原收件人删除后，其他仍持有真实交付引用的收件人继续可读，最后引用结束后才回收。
+
+格式 88 → 89 增加长期定义、原事件／匹配、对象关联与跨 Host consumer 记录；旧 definition 保持 work 归属及原身份、
+证据、取消和已交付结果。GC 按实际 definition、匹配、输入与远端未确认水位保留正文，解除引用后释放媒体与材料，
+保留必要的紧凑去重身份，避免晚到重试重新执行。没有按天或按数量静默丢弃历史的策略。
+
+具体服务商的 webhook、历史补拉与发送工具仍由插件交付；平台接收合同不假定每个来源支持所有方式。
+主链路见 [事件 Catalog](../kernel/crates/varin-runtime/src/catalog_followup_events.rs)、
+[跨 Host 账本](../kernel/crates/varin-runtime/src/catalog_followup_event_transport.rs) 与
+[Host 接收](../packages/web/application-host/lib/extensions/event-sources.ts)。
 
 ## 上下文准备与压缩
 

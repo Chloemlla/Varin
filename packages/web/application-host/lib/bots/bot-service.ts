@@ -5,6 +5,9 @@ import { THINKING_LEVELS } from '@varin/protocol';
 import type { KernelClient, KernelScopedClient } from "../kernel/kernel-client.js";
 import type { BotExecutionGate, KernelRecordResult } from "../kernel/protocol.generated.js";
 import { HarnessServiceError } from "../harness/service-error.js";
+import { createBotOrganization } from './bot-organization.js';
+import { createBotAppearances } from './bot-appearances.js';
+import { parseBotAppearance } from '@varin/application-client';
 import type {
   BotActivity,
   BotCreateInput,
@@ -74,6 +77,8 @@ export interface BotServiceOptions {
   publishExecutionGate?(gate: BotExecutionGate): Promise<void>;
   onChange?(bot: BotSummary): void;
   onDeleted?(botId: string): void;
+  onOrganizationChange?(): void;
+  onAppearanceLibraryChange?(): void;
 }
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
@@ -108,6 +113,7 @@ const parseProfile = (record: KernelRecordResult): BotProfile | null => {
     return {
       id,
       name: raw.name,
+      ...(raw.appearance === undefined ? {} : { appearance: parseBotAppearance(raw.appearance) }),
       instructions: typeof raw.instructions === "string" ? raw.instructions : null,
       model: parseBotModelSelection(raw.model),
       coordinatorHostId: raw.coordinatorHostId,
@@ -144,6 +150,8 @@ const parseActivity = (value: unknown): BotActivity => {
 };
 
 export interface BotService {
+  appearances: ReturnType<typeof createBotAppearances>;
+  organization: import('@varin/application-client').BotOrganizationAPI;
   primary(): Promise<BotSummary>;
   list(): Promise<BotSummary[]>;
   get(botId: string): Promise<BotSummary | null>;
@@ -302,6 +310,9 @@ export function createBotService(options: BotServiceOptions): BotService {
     return record ? toSummary(record) : null;
   };
 
+  const appearances = createBotAppearances({ client: scoped, workspaceId: BOT_CATALOG_WORKSPACE_ID, bots: list,
+    ...(options.onAppearanceLibraryChange ? { changed: options.onAppearanceLibraryChange } : {}) });
+
   const create: BotService["create"] = async (input = {}) => {
     if ("runtime" in input) throw new HarnessServiceError("invalid-params", "Bot runtime selection is unsupported");
     if (input.model != null && !parseBotModelSelection(input.model)) throw new HarnessServiceError('invalid-params', 'Invalid Bot model or thinking level');
@@ -346,7 +357,12 @@ export function createBotService(options: BotServiceOptions): BotService {
       updates.model = patch.model;
     }
     if (patch.pinned !== undefined) updates.pinnedAt = patch.pinned ? (toSummary(existing)?.pinnedAt ?? new Date().toISOString()) : null;
-    const summary = await write(botId, "active", updates, existing.recordRevision);
+    if (patch.appearance !== undefined) {
+      try { updates.appearance = parseBotAppearance(patch.appearance); }
+      catch (error) { throw new HarnessServiceError('invalid-params', error instanceof Error ? error.message : 'Invalid Bot appearance'); }
+    }
+    const save = () => write(botId, "active", updates, existing.recordRevision);
+    const summary = updates.appearance?.kind === 'custom' ? await appearances.use(updates.appearance.assetId, save) : await save();
     if (patch.instructions !== undefined || patch.model !== undefined) {
       try { await options.agent.applyProfile?.(summary); }
       catch (error) { throw new BotProfileMutationError(summary, 'profile-propagation', error); }
@@ -600,6 +616,9 @@ export function createBotService(options: BotServiceOptions): BotService {
   });
 
   return {
+    appearances,
+    organization: createBotOrganization({ client: scoped, workspaceId: BOT_CATALOG_WORKSPACE_ID,
+      botIds: async () => (await list()).map(bot => bot.id), changed: options.onOrganizationChange }),
     primary: () => serialize('__primary__', async () => {
       const existing = (await list()).find(bot => !bot.archived && !bot.deletion);
       return existing ?? create({ name: 'Varin' });

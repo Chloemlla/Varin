@@ -1,6 +1,6 @@
 {
   "name": "@varin/electron",
-  "version": "0.9.39",
+  "version": "0.9.41",
   "license": "AGPL-3.0-only",
   "private": true,
   "description": "Varin desktop runtime",
@@ -18,7 +18,7 @@
     "puppeteer-core": "25.16.0"
   },
   "devDependencies": {
-    "electron": "^45.2.1",
+    "electron": "^45.2.3",
     "electron-builder": "^26.18.0",
     "node-abi": "^4.40.0"
   },

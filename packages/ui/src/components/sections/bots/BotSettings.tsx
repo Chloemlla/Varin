@@ -7,8 +7,9 @@ import { SettingsActionBar } from '@/components/sections/shared/SettingsActionBa
 import { Icon } from '@/components/icon/Icon';
 import { BotMemoryPreferences } from './BotMemoryPreferences';
 import { SettingsFieldRow, SettingsStackedField } from '@/components/sections/shared/SettingsSection';
-import { DropdownMenu, DropdownMenuContent, DropdownMenuRadioGroup, DropdownMenuRadioItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
-import { VarinLogo } from '@/components/ui/VarinLogo';
+import { DropdownMenu, DropdownMenuContent, DropdownMenuLabel, DropdownMenuRadioGroup, DropdownMenuRadioItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
+import { BotFigure } from '@/workbenches/bot/BotFigure';
+import { BotAppearanceSettings } from './BotAppearanceSettings';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
@@ -26,6 +27,8 @@ import { BotMenu, type BotMenuAction } from './BotMenu';
 import { BotDeleteDialog } from './BotDeleteDialog';
 import { BotActivityBanner } from './BotActivityBanner';
 import { subscribeVarinEvents } from '@/lib/varinEvents';
+import { useBotOrganization } from '@/workbenches/bot/useBotOrganization';
+import { BotOrganizationDialog, type BotOrganizationDialogState } from '@/workbenches/bot/BotOrganizationDialog';
 
 const BotMemoryPanel = React.lazy(() => import('./BotDetailsDialog').then((module) => ({ default: module.BotMemoryPanel })));
 
@@ -49,6 +52,8 @@ function BotSettingsForHost({ initialBotId, onDeleted, onDraftStateChange }: Bot
   React.useEffect(() => { if (target === 'knowledge.model') { setTab('memory'); setMemoryOpened(true); } }, [target]);
   const host = React.useSyncExternalStore(subscribeRuntimeEndpointChanged, getRuntimeEndpointGeneration, getRuntimeEndpointGeneration);
   const [bots, setBots] = React.useState<BotSummary[] | null>(null);
+  const organization = useBotOrganization(bots);
+  const [organizationDialog, setOrganizationDialog] = React.useState<BotOrganizationDialogState | null>(null);
   const [selectedId, setSelectedId] = React.useState<string | null>(initialBotId ?? null);
   const [work, setWork] = React.useState<BotWorkItem[] | null>(null);
   const [viewingDesktop, setViewingDesktop] = React.useState<ComputerDesktop | null>(null);
@@ -188,6 +193,8 @@ function BotSettingsForHost({ initialBotId, onDeleted, onDraftStateChange }: Bot
   };
 
   return <>
+    <BotOrganizationDialog value={organizationDialog} onClose={() => setOrganizationDialog(null)} organization={organization} />
+    {organization.error && !organizationDialog && <p role="alert" className="mb-4 typography-meta text-destructive">{organization.error} <button type="button" className="underline" onClick={() => { void organization.refresh(); }}>{t('common.retry')}</button></p>}
     {error ? <div role="alert" className="mb-5 rounded-lg border border-destructive/30 bg-destructive/5 p-3">
       <p className="typography-meta text-destructive">{error}</p>
       <Button variant="outline" size="sm" className="mt-2" onClick={() => { void refresh(); }}>{t('settings.harness.retry')}</Button>
@@ -195,9 +202,9 @@ function BotSettingsForHost({ initialBotId, onDeleted, onDraftStateChange }: Bot
     {!bots && !error ? <p role="status" className="typography-meta text-muted-foreground">{t('common.loading')}</p> : null}
     {bots ? <div className="@container min-w-0">
       <div className="mb-5 flex min-w-0 flex-wrap items-center justify-between gap-3">
-        {selected ? <BotMenu bot={selected} persistentActions disabled={busy !== null} onAction={value => action(selected, value)}>
+        {selected ? <BotMenu bot={selected} persistentActions disabled={busy !== null || organization.pending} onAction={value => action(selected, value)} onMove={organization.ready ? () => setOrganizationDialog({ kind: 'move', bot: selected }) : undefined}>
           <div className="flex min-w-0 items-center gap-3 py-1 pr-2">
-            <VarinLogo decorative width={24} height={24} className="shrink-0 text-muted-foreground" />
+            <BotFigure bot={selected} state="idle" size={28} still />
             <div className="min-w-0">
               {!initialBotId && bots.length > 1 ? <DropdownMenu>
                 <DropdownMenuTrigger asChild><Button type="button" variant="ghost" size="sm" disabled={busy !== null}
@@ -206,10 +213,13 @@ function BotSettingsForHost({ initialBotId, onDeleted, onDraftStateChange }: Bot
                 </Button></DropdownMenuTrigger>
                 <DropdownMenuContent align="start" className="min-w-56 max-w-[min(90vw,28rem)]">
                   <DropdownMenuRadioGroup value={selected.id} onValueChange={chooseBot}>
-                    {bots.map(bot => <DropdownMenuRadioItem key={bot.id} value={bot.id}>
+                    {organization.sections.filter(section => section.bots.length > 0).map(section => <React.Fragment key={section.group ? `group:${section.group.id}` : 'ungrouped'}>
+                      {organization.value.groups.length > 0 && <DropdownMenuLabel>{section.group?.name ?? t('bot.groups.ungrouped')}</DropdownMenuLabel>}
+                    {section.bots.map(bot => <DropdownMenuRadioItem key={bot.id} value={bot.id}>
+                      <BotFigure bot={bot} state="idle" size={22} still />
                       <span className="min-w-0 flex-1 truncate">{bot.name}</span>
                       <span className="ml-3 shrink-0 typography-micro text-muted-foreground">{botStatusLabel(bot)}</span>
-                    </DropdownMenuRadioItem>)}
+                    </DropdownMenuRadioItem>)}</React.Fragment>)}
                   </DropdownMenuRadioGroup>
                 </DropdownMenuContent>
               </DropdownMenu> : <p className="max-w-[min(50cqw,24rem)] truncate typography-settings-field-label">{selected.name}</p>}
@@ -218,6 +228,7 @@ function BotSettingsForHost({ initialBotId, onDeleted, onDraftStateChange }: Bot
           </div>
         </BotMenu> : <p className="typography-meta text-muted-foreground">{t('settings.bots.empty')}</p>}
         <div className="flex flex-wrap items-center gap-1">
+          {!initialBotId && <Button type="button" variant="ghost" size="sm" disabled={!organization.ready || organization.pending} onClick={() => setOrganizationDialog({ kind: 'create' })}><Icon name="folder-add" className="size-4" />{t('bot.groups.create')}</Button>}
           {selected ? <Button type="button" variant="ghost" size="sm" disabled={locked} onClick={() => { if (confirmDiscard()) void run('entry', () => openBotEntryFor(selected.id)); }}>
             <Icon name="chat-1" className="size-4" />{t('settings.bots.openEntry')}
           </Button> : null}
@@ -235,6 +246,7 @@ function BotSettingsForHost({ initialBotId, onDeleted, onDraftStateChange }: Bot
       <div id={`${panelId}-profile`} role="tabpanel" aria-label={t('bot.profile.title')} className="settings-tab-panel" hidden={tab !== 'profile'}>
       {selected ? <div className="space-y-6">
         {selected.deletion || !selected.archived ? <BotActivityBanner bot={selected} busy={busy !== null} onAction={(value) => action(selected, value)} /> : null}
+        <BotAppearanceSettings key={selected.id} bot={selected} disabled={locked} onChanged={saved => setBots(list => list?.map(item => item.id === saved.id ? saved : item) ?? null)} />
         <SettingsFieldRow label={t('settings.bots.name.label')}>
           <Input aria-label={t('settings.bots.name.label')} value={name} disabled={locked} onChange={(event) => setName(event.target.value)} />
         </SettingsFieldRow>

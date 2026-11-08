@@ -3,6 +3,9 @@ import type { ThreadMemoryDraft, ChatMemoryOwner, ChatMemoryReceipt } from './ch
 import type { BotActivityPage, MemorySourceExcerpt } from '@varin/protocol';
 import { runtimeFetch } from './transport/runtime-fetch.js';
 import { getRuntimeEndpointGeneration } from './transport/runtime-switch.js';
+import { parseBotOrganization } from './bot-organization.js';
+import { parseBotAppearance } from './bot-appearance.js';
+import { createBotAppearancesHttpAPI } from './bot-appearances-http.js';
 
 export class BotRequestError extends Error {
   constructor(readonly status: number, readonly code: string, message: string, readonly retryDisposition?: 'observe' | 'new_attempt' | 'none', readonly savedBot?: BotSummary) { super(message); this.name = 'BotRequestError'; }
@@ -29,6 +32,7 @@ export const decodeBot = (value: unknown): BotSummary => {
   if (bot.model !== null) { const model = record(bot.model); string(model.providerId); string(model.modelId); }
   if (bot.pinnedAt !== undefined && !nullableString(bot.pinnedAt)) invalid();
   if (bot.archiveRequested !== undefined && typeof bot.archiveRequested !== 'boolean') invalid();
+  if (bot.appearance !== undefined) parseBotAppearance(bot.appearance);
   if (bot.deletion !== undefined) { const deletion = record(bot.deletion); string(deletion.operationId); if (!nullableString(deletion.error)) invalid(); }
   if (bot.activity !== undefined) {
     const activity = record(bot.activity);
@@ -55,7 +59,8 @@ export const decodeBot = (value: unknown): BotSummary => {
 };
 export const decodeBotEntryResult = (value: unknown): BotEntryResult => {
   const result = record(value); const bot = decodeBot(result.bot); const target = entry(result.entry);
-  if (bot.entry.threadId !== target.threadId || bot.entry.branchId !== target.branchId) invalid();
+  // Catalog resolves a live session after the original entry is archived or deleted.
+  // The profile keeps that original identity; it is not the navigation target.
   if (result.model !== null) { const model = record(result.model); string(model.providerId); string(model.modelId); }
   return { bot, entry: target, model: result.model } as BotEntryResult;
 };
@@ -213,6 +218,11 @@ export function createBotsHttpAPI(): BotsAPI {
   };
   const path = (id: string) => `/api/harness/bots/${encodeURIComponent(id)}`;
   return {
+    appearances: createBotAppearancesHttpAPI(),
+    organization: {
+      read: async signal => parseBotOrganization(await request('/api/harness/bots/organization', 'GET', undefined, signal)),
+      update: async input => parseBotOrganization(await request('/api/harness/bots/organization', 'POST', input)),
+    },
     selection: {
       preview: async (input, signal) => {
         const result = await request('/api/bot-memory/preview', 'POST', input, signal);
@@ -234,7 +244,11 @@ export function createBotsHttpAPI(): BotsAPI {
     archive: async id => decodeBot((await request(`${path(id)}/archive`, 'POST')).bot),
     remove: async id => { const result = await request(path(id), 'DELETE'); return result.bot === null ? null : decodeBot(result.bot); },
     changeState: async (id, action) => decodeBot((await request(`${path(id)}/${action}`, 'POST')).bot),
-    entry: async (id, signal) => decodeBotEntryResult(await request(`${path(id)}/entry`, 'POST', undefined, signal)),
+    entry: async (id, signal) => {
+      const result = decodeBotEntryResult(await request(`${path(id)}/entry`, 'POST', undefined, signal));
+      if (result.bot.id !== id) invalid();
+      return result;
+    },
     work: async (id, signal) => array((await request(`${path(id)}/work`, 'GET', undefined, signal)).threads, decodeBotWork),
     activity: async (id, page = {}, signal) => {
       const query = new URLSearchParams();
