@@ -1,4 +1,4 @@
-import type { ThreadIdentity, ThreadsAPI } from "@varin/application-client";
+import type { ThreadIdentity, ThreadsAPI, ThreadQueuedExchange } from "@varin/application-client";
 import type {
   FamilyMember,
   MessageFeedEntry,
@@ -20,6 +20,7 @@ export type CollaborationFeedItem = {
   acceptedAtMs?: number;
 } & ({ kind: 'message'; message: MessageFeedEntry } | { kind: 'dispatch'; dispatch: MessageFeedDispatch } | { kind: 'report'; report: MessageFeedReport });
 export interface CollaborationFeedState {
+  exchanges: ThreadQueuedExchange[];
   rootThreadId: string;
   messages: MessageFeedEntry[];
   items: CollaborationFeedItem[];
@@ -30,6 +31,8 @@ export interface CollaborationFeedState {
   currentCursor?: string;
   historyCursor?: string;
   historyLoaded: boolean;
+  loadingMembers: boolean;
+  memberError?: string;
   error?: string;
 }
 const failureText = (error: unknown) =>
@@ -44,6 +47,7 @@ export class CollaborationFeed {
   private reports = new Map<string, MessageFeedReport>();
   private members = new Map<string, CollaborationMember>();
   private value: CollaborationFeedState = {
+    exchanges: [],
     rootThreadId: "",
     messages: [],
     items: [],
@@ -52,6 +56,7 @@ export class CollaborationFeed {
     loadingEarlier: false,
     before: null,
     historyLoaded: false,
+    loadingMembers: false,
   };
   private refreshing = false;
   private dirty = false;
@@ -61,6 +66,7 @@ export class CollaborationFeed {
   private eventCursor: number | null = null;
   private latest = 0;
   private changingMessages = new Set<string>();
+  private memberRequest?: Promise<void>;
   private observation?: Promise<void>;
   constructor(
     private api: ThreadsAPI,
@@ -198,7 +204,7 @@ export class CollaborationFeed {
   }
   private onEvent(event: RuntimeEvent) {
     if (
-      !/^(message\.|input\.|thread\.|child\.|run\.|execution\.committed|delivery\.)/.test(
+      !/^(message\.|input\.|thread\.|child\.|run\.|host_job\.|operation\.(code_exchange|terminal|cancel)|execution\.committed|delivery\.)/.test(
         event.kind,
       )
     )
@@ -216,6 +222,7 @@ export class CollaborationFeed {
     }
     void this.refresh(false);
   }
+  refreshMessage = (id: string) => { this.changingMessages.add(id); return this.refresh(false); };
   refresh = async (readNewMessages = true) => {
     this.feedDirty ||= readNewMessages;
     this.dirty = true;
@@ -249,6 +256,7 @@ export class CollaborationFeed {
           } while (after !== undefined);
         };
         await Promise.all([
+          this.api.collaboration?.queuedExchanges?.(this.identity, this.controller.signal).then(exchanges => this.publish({ exchanges })),
           readFeed ? feed() : undefined,
           refreshDirectory ? this.directory("current") : undefined,
           ...changedMembers.map((id) => this.resolveMember(id, true)),
@@ -315,18 +323,20 @@ export class CollaborationFeed {
       this.publish({ loadingEarlier: false });
     }
   };
-  loadMembers = async (scope: "current" | "history") => {
-    try {
-      await this.directory(
-        scope,
-        scope === "current"
-          ? this.value.currentCursor
-          : this.value.historyCursor,
-      );
-    } catch (error) {
-      if (!this.controller.signal.aborted)
-        this.publish({ error: failureText(error) });
-    }
+  loadMembers = (scope: "current" | "history"): Promise<void> => {
+    if (this.memberRequest) return this.memberRequest;
+    if (this.controller.signal.aborted) return Promise.resolve();
+    this.publish({ loadingMembers: true, memberError: undefined });
+    this.memberRequest = this.directory(
+      scope,
+      scope === "current" ? this.value.currentCursor : this.value.historyCursor,
+    ).catch(error => {
+      this.publish({ memberError: failureText(error) });
+    }).finally(() => {
+      this.memberRequest = undefined;
+      this.publish({ loadingMembers: false });
+    });
+    return this.memberRequest;
   };
   resolveMember = async (threadId: string, fresh = false) => {
     const existing = this.members.get(threadId);

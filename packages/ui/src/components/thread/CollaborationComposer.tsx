@@ -10,7 +10,6 @@ import {
   DropdownMenuTrigger,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuSeparator,
 } from '@/components/ui/dropdown-menu';
 import { EMPTY_THREAD_DRAFT, useThreadDraftStore, type ThreadDraft } from '@/stores/useThreadDraftStore';
 import { useI18n } from '@/lib/i18n';
@@ -19,6 +18,7 @@ import { prepareThreadFiles, removeDraftFile, selectThreadFiles } from '@/lib/ag
 import { composerFileSelections, removeComposerFile } from '@/components/chat/composer/submit/fileSelections';
 import { ComposerSelectedFiles } from './ComposerSelectedFiles';
 import { ThreadFileDrafts } from './ThreadAttachments';
+import { CollaborationMemberMenu } from './CollaborationMemberMenu';
 
 export type CollaborationTarget = ThreadIdentity;
 export function CollaborationComposer({
@@ -32,6 +32,8 @@ export function CollaborationComposer({
   onSent,
   loadMembers,
   moreMembers,
+  loadingMembers,
+  memberError,
 }: {
   api: ThreadsAPI;
   identity: ThreadIdentity;
@@ -43,11 +45,14 @@ export function CollaborationComposer({
   onSent(): void;
   loadMembers(): void;
   moreMembers: boolean;
+  loadingMembers?: boolean;
+  memberError?: string;
 }) {
   const { t } = useI18n();
   const draft = useThreadDraftStore((state) => state.drafts[draftKey] ?? EMPTY_THREAD_DRAFT);
   const patch = (value: Partial<ThreadDraft>) => useThreadDraftStore.getState().patch(draftKey, value);
   const collaboration = draft.collaboration;
+  const afterCurrent = collaboration?.afterCurrent ?? false;
   const targets = direct ? [direct] : (collaboration?.targets ?? (defaultTarget ? [defaultTarget] : []));
   const pending = collaboration?.attempts?.some((attempt) => !attempt.receipt) ?? false;
   const busy = collaboration?.sending ?? false;
@@ -57,7 +62,7 @@ export function CollaborationComposer({
     members.find((member) => member.threadId === id)?.agentId ||
     id;
   const editTargets = (next: CollaborationTarget[]) =>
-    patch({ collaboration: { targets: next, reply: collaboration?.reply } });
+    patch({ collaboration: { targets: next, reply: collaboration?.reply, afterCurrent } });
   const targetName = (target: CollaborationTarget) => {
     const branches = members.find((member) => member.threadId === target.threadId)?.detail?.branches ?? [];
     const ordinal = branches.findIndex((branch) => branch.branchId === target.branchId);
@@ -77,6 +82,12 @@ export function CollaborationComposer({
   };
   const selected = (target: CollaborationTarget) =>
     targets.some((current) => current.threadId === target.threadId && current.branchId === target.branchId);
+  const [recipientsOpen, setRecipientsOpen] = React.useState(false);
+  const recipients = members
+    .flatMap(member => (member.detail?.branches ?? []).map((branch, index) => ({ member, branch, index })))
+    .filter(({ member, branch }) => member.threadId !== identity.threadId || branch.branchId !== identity.branchId
+      || selected({ runtime: 'agent', threadId: member.threadId, branchId: branch.branchId }))
+    .sort((a, b) => Number(a.member.threadId === identity.threadId) - Number(b.member.threadId === identity.threadId));
   const send = async () => {
     const current = useThreadDraftStore.getState().drafts[draftKey] ?? draft;
     if (current.collaboration?.sending || !api.messages || (!current.text.trim() && !current.files?.length && !current.selectedAttachments?.length) || !targets.length) return;
@@ -99,6 +110,7 @@ export function CollaborationComposer({
         request: {
           key: crypto.randomUUID(),
           kind: 'request' as const,
+          afterCurrent,
           text: current.text,
           attachments,
           targetThreadId: target.threadId,
@@ -106,7 +118,7 @@ export function CollaborationComposer({
           ...(current.collaboration?.reply ? { replyTo: current.collaboration.reply.messageId } : {}),
         },
       }));
-    patch({ collaboration: { targets, reply: current.collaboration?.reply, attempts, sending: true } });
+    patch({ collaboration: { targets, reply: current.collaboration?.reply, afterCurrent, attempts, sending: true } });
     const results = await Promise.all(
       attempts.map(async (attempt) => {
         if ('receipt' in attempt && attempt.receipt) return attempt;
@@ -129,7 +141,7 @@ export function CollaborationComposer({
       const latest = useThreadDraftStore.getState().drafts[draftKey];
       patch({ text: latest?.text === current.text ? '' : latest?.text ?? '', files: latest?.files?.filter(file => !current.files?.some(selected => selected.id === file.id)), selectedAttachments: latest?.selectedAttachments?.filter(file => !current.selectedAttachments?.some(selected => selected.id === file.id)), collaboration: { targets } });
     } else
-      patch({ collaboration: { targets, reply: current.collaboration?.reply, attempts: results, sending: false } });
+      patch({ collaboration: { targets, reply: current.collaboration?.reply, afterCurrent, attempts: results, sending: false } });
     if (host === getRuntimeEndpointGeneration()) onSent();
   };
   const reply: MessageFeedEntry | undefined = collaboration?.reply;
@@ -168,7 +180,7 @@ export function CollaborationComposer({
           {direct ? (
             <span className="min-w-0 truncate text-foreground">{memberName(direct.threadId)}</span>
           ) : (
-            <DropdownMenu>
+            <DropdownMenu open={recipientsOpen} onOpenChange={setRecipientsOpen}>
               <DropdownMenuTrigger asChild>
                 <button
                   type="button"
@@ -182,9 +194,9 @@ export function CollaborationComposer({
                   <Icon name="arrow-down-s" className="size-3 shrink-0" />
                 </button>
               </DropdownMenuTrigger>
-              <DropdownMenuContent align="start" side="top" className="max-h-80 w-64 overflow-y-auto">
-                {members.flatMap((member) =>
-                  (member.detail?.branches ?? []).map((branch, index) => {
+              <CollaborationMemberMenu align="start" side="top" open={recipientsOpen} count={recipients.length}
+                more={moreMembers} loading={loadingMembers} error={memberError} loadMore={loadMembers}>
+                {recipients.map(({ member, branch, index }) => {
                     const target: CollaborationTarget = {
                       runtime: 'agent',
                       threadId: member.threadId,
@@ -214,17 +226,8 @@ export function CollaborationComposer({
                         {selected(target) && <Icon name="check" className="size-4" />}
                       </DropdownMenuItem>
                     );
-                  }),
-                )}
-                {moreMembers && (
-                  <>
-                    <DropdownMenuSeparator />
-                    <DropdownMenuItem closeOnClick={false} onClick={loadMembers}>
-                      {t('collaboration.moreMembers')}
-                    </DropdownMenuItem>
-                  </>
-                )}
-              </DropdownMenuContent>
+                  })}
+              </CollaborationMemberMenu>
             </DropdownMenu>
           )}
         </div>
@@ -268,6 +271,23 @@ export function CollaborationComposer({
               {t('chat.messages.newDraft')}
             </button>
           )}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button type="button" className="collaboration-send-timing" disabled={busy || retained}
+                aria-label={t('collaboration.queue.timing')} title={t(afterCurrent ? 'collaboration.queue.afterHint' : 'collaboration.queue.nowHint')}>
+                <Icon name={afterCurrent ? 'time' : 'arrow-up'} className="size-3.5" />
+                <span>{t(afterCurrent ? 'collaboration.queue.after' : 'collaboration.queue.now')}</span>
+                <Icon name="arrow-down-s" className="size-3" />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" side="top">
+              {[false, true].map(value => <DropdownMenuItem key={String(value)} onClick={() => patch({ collaboration: { ...collaboration, targets, afterCurrent: value } })}>
+                <Icon name={value ? 'time' : 'arrow-up'} className="size-4" />
+                <span>{t(value ? 'collaboration.queue.after' : 'collaboration.queue.now')}</span>
+                {afterCurrent === value && <Icon name="check" className="ml-auto size-4" />}
+              </DropdownMenuItem>)}
+            </DropdownMenuContent>
+          </DropdownMenu>
           <Button
             type="button"
             size="icon"
@@ -276,7 +296,7 @@ export function CollaborationComposer({
             onClick={() => void send()}
             aria-label={t(pending ? 'chat.messages.retry' : 'collaboration.send')}
           >
-            <Icon name={busy ? 'more' : 'arrow-up'} className="size-4" />
+            <Icon name={busy ? 'more' : afterCurrent ? 'time' : 'arrow-up'} className="size-4" />
           </Button>
         </div>
       </div>

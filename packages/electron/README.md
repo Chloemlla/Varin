@@ -14,6 +14,12 @@ Desktop starts the Varin web server in the same Electron main process. There is 
 
 The `main.ts` source imports `@varin/web/server/index.js` and calls `startWebUiServer()`; builds execute the generated `dist-bundle/main.mjs`. The Electron window then loads the UI from the local server in development, or from packaged `resources/web-dist` assets in packaged builds.
 
+Desktop LAN access and the optional UI password are independent preferences. Enabling LAN access
+binds the embedded Host on all interfaces, including when the password is empty; clearing a password
+does not disable network access. The settings page explains passwordless access before saving.
+Electron passes that explicit choice through `allowUnauthenticatedLan` for this Host startup,
+without changing the process-wide `VARIN_ALLOW_UNAUTHENTICATED_LAN` environment variable.
+
 The embedded Application Host starts the native Rust kernel from `resources/kernel`. Its Agent Catalog
 owns Thread/branch identity, history, queues and accepted execution. Storage, file/materialization,
 PTY/process and fixed-view compute remain Host services; they do not become a second Electron backend
@@ -77,12 +83,18 @@ extension broker must complete a real IPC handshake and clean shutdown before an
 Ordinary app/tray quit confirms background-work risk, then lets Electron close its windows and run
 `beforeunload` while the embedded Host is still available. `quit-lifecycle.ts` drains services at
 `will-quit`, after renderer clients have disconnected, and then exits. A page that blocks unloading
-cancels the pending quit; tray state and the Host remain available for another attempt. Update install
+cancels the pending quit; tray state and the Host remain available for another attempt. Computer
+controls and feedback are disposed with Host shutdown, not during the cancelable quit request;
+utility windows closed before an unload veto can be recreated by their next presentation update. Update install
 retains the updater's existing quit/install sequence.
 
 ## Desktop IPC contract
 
 All `desktop_*` commands, the preload bootstrap payload, desktop events, and shared DTOs (hosts, SSH, updates, capture, dialog) are typed in a single framework-neutral contract at `packages/application-client/src/desktop.ts`, exposed to the native bundle through the focused `@varin/application-client/desktop` subpath.
+
+Update checks return the native pending installer’s downloaded state. A repeated check keeps a
+completed download only for the same version and payload; renderer polling projects that state
+instead of retaining a downloaded flag for a different release.
 
 The contract exports:
 
@@ -217,9 +229,11 @@ Windows setup offers an optional WinFsp component page, selected by default when
 is detected and unselected when the installed component can be reused. `workspace-component.json` pins the
 unmodified official **WinFsp 2026 Beta5 (2.2.26286)** MSI, SHA-256 and license. The selected preview
 contains the upstream cached-write/concurrent-rename fixes; the installer names that preview explicitly.
-`prepare-workspace-component.mjs` prepares the verified build cache through the existing Windows
-before-pack hook. A matching or newer installed component is reused. User-selected installation asks
-Windows for permission and reports cancellation, failure or a required restart without blocking normal
+`prepare-workspace-component.mjs --assets-only` prepares the SHA-256-verified MSI and license with
+Node built-ins, so native workspace CI does not require npm dependencies. The default invocation
+also generates the NSIS includes and localized installer copy using the installed electron-builder
+through the existing Windows before-pack hook. A matching or newer installed component is reused.
+User-selected installation asks Windows for permission and reports cancellation, failure or a required restart without blocking normal
 Varin use. Silent updates do not install a system component, and uninstall leaves the shared component
 in place. The application ships its license and retains the required attribution in About and notices.
 

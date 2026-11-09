@@ -1,4 +1,5 @@
 import { uiSession } from '@/lib/interactive-ui/sessions';
+import * as imageAnnotations from '@/lib/images/annotations';
 import { addEditorContextAttachment, listEditorContextAttachments, resetEditorContextAttachments } from '@/lib/agent-editor/attachments';
 import { useInlineCommentDraftStore } from '@/stores/useInlineCommentDraftStore';
 import type { EditorContextAttachment } from '@/lib/agent-editor/types';
@@ -727,7 +728,7 @@ it.each(['file-backed', 'source-free'] as const)('keeps the original report, wai
   }));
   const cancelChild = vi.fn(async (_identity: ThreadIdentity, operationId: string) => ({ target: { kind: 'child' as const, operation_id: operationId }, cursor: 4, run_count: 1, child_count: 1, process_count: 1 }));
   const cancelTree = vi.fn(async () => ({ target: { kind: 'thread' as const, thread_id: identity.threadId }, cursor: 5, run_count: 2, child_count: 1, process_count: 1 }));
-  f.api.collaboration = { dispatchCatalog: vi.fn(), dispatch: vi.fn(), exchange: vi.fn(), integration: vi.fn(), continueChild: async () => { throw new Error('No continuation'); }, executions: async () => [], readExecutionReport: async () => { throw new Error('No report'); }, children: async () => [child], readReport, cancelWait: async () => { throw new Error('No wait'); }, cancelChild, cancelTree };
+  f.api.collaboration = { queuedExchanges: async () => [], controlExchange: vi.fn(), dispatchCatalog: vi.fn(), dispatch: vi.fn(), exchange: vi.fn(), integration: vi.fn(), continueChild: async () => { throw new Error('No continuation'); }, executions: async () => [], readExecutionReport: async () => { throw new Error('No report'); }, children: async () => [child], readReport, cancelWait: async () => { throw new Error('No wait'); }, cancelChild, cancelTree };
   await act(async () => { root.render(<ThreadConversation api={f.api} identity={identity} />); });
   await act(async () => {
     const details = container.querySelector<HTMLDetailsElement>('[aria-label="harness.threads.title"] details')!;
@@ -776,7 +777,7 @@ it('task menus reuse the selected Agent, retain uncertain send identity and rena
   const unused = async (): Promise<never> => { throw new Error('unused message read'); };
   const send = vi.fn<NonNullable<ThreadsAPI['messages']>['send']>().mockRejectedValueOnce(new Error('reply lost'))
     .mockResolvedValue({ messageId: 'accepted' } as Awaited<ReturnType<NonNullable<ThreadsAPI['messages']>['send']>>);
-  f.api.messages = { send, get: unused, list: unused, feed: unused };
+  f.api.messages = { control: unused, send, get: unused, list: unused, feed: unused };
   const child = { child_thread_id: 'child:chosen', child_branch_id: 'branch:chosen', operation_id: 'dispatch:chosen', agent_id: 'ABC12345' } as ChildTask;
   const changed = vi.fn(async () => {}), cancel = vi.fn(async () => {});
   const openMenu = async () => act(async () => {
@@ -1038,6 +1039,52 @@ it('opens a local draft and creates its canonical Thread only when the first mes
     expect(container.querySelector('[aria-label="Thread conversation"]')).not.toBeNull();
     expect(container.querySelector('[aria-label="Conversation runtime"]')).toBeNull();
   } finally { await act(async () => unbind?.()); }
+});
+
+it('observes first-send streaming and queues a follow-up while the sidebar catalog is still loading', async () => {
+  const f = fixture(); runtimeState.api = f.api;
+  const list = vi.fn(f.api.list); f.api.list = list;
+  const snapshot = vi.fn(f.api.snapshot); f.api.snapshot = snapshot;
+  let finishCatalog!: (threads: Awaited<ReturnType<ThreadsAPI['list']>>) => void;
+  const catalog = new Promise<Awaited<ReturnType<ThreadsAPI['list']>>>(resolve => { finishCatalog = resolve; });
+  let unbind: (() => void) | undefined;
+  try {
+    await act(async () => { unbind = bindThreadStore(f.api); });
+    await act(async () => { useThreadStore.getState().openDraft(); root.render(<ChatView />); });
+    expect(container.querySelector('[aria-label="Conversation draft"]')).not.toBeNull();
+    await edit('[aria-label="Registered model"]', JSON.stringify(['fixture-provider', 'fixture-model']), 'change');
+    await edit('[aria-label="Message thread"]', 'Start without waiting for the sidebar');
+    const draftKey = useThreadStore.getState().selectedDraftKey!;
+    list.mockImplementationOnce(() => catalog);
+    await submitForm(composerForm());
+    expect(useThreadStore.getState().catalogLoading).toBe(true);
+    expect(useThreadStore.getState().selectedIdentity).toEqual(identity);
+    expect(threadComposerKey(threadHostKey(), identity)).toBe(draftKey);
+    expect(container.querySelector('[aria-label="Conversation draft"]')).toBeNull();
+    expect(container.querySelector('[aria-label="Thread conversation"]')).not.toBeNull();
+    expect(snapshot).toHaveBeenCalled();
+    expect(f.submit).toHaveBeenCalledOnce();
+    expect(useThreadDraftStore.getState().drafts[draftKey].firstSend).toBeUndefined();
+    f.view.activeRun = initialSnapshot(true).activeRun;
+    f.view.thread.branches[0]!.active_run_id = 'ui-run';
+    f.view.thread.branches[0]!.latest_run = f.view.activeRun;
+    f.view.history = [{ id: 'sent', thread_id: identity.threadId, run_id: 'ui-run', parent: null,
+      source: 'user', provider: null, content: { text: 'Start without waiting for the sidebar' } }];
+    f.view.historyPage.head = 'sent'; f.view.thread.branches[0]!.head = 'sent';
+    await act(async () => f.emit({ cursor: 1, subject: 'ui-run', revision: 1, kind: 'run.accepted', data: {} }));
+    await act(async () => f.emit({ v: KERNEL_PROTOCOL_VERSION, kind: 'runtime-event', kernelEpoch: 'epoch', stream: 'progress', streamId: 'stream',
+      threadId: identity.threadId, branchId: identity.branchId, runId: 'ui-run', requestId: 'streaming-request', sequence: 1,
+      event: { kind: 'batch', events: [{ kind: 'provider', data: { kind: 'text_delta', item_id: 'answer', text: 'Visible before the sidebar finishes' } }] } }));
+    expect(container.textContent).toContain('Visible before the sidebar finishes');
+    await edit('[aria-label="Message thread"]', 'Follow up on the active run');
+    expect(button('Queue message').disabled).toBe(false);
+    await submitForm(composerForm());
+    expect(f.submit).toHaveBeenCalledOnce();
+    expect(f.enqueue).toHaveBeenCalledWith(expect.objectContaining({ ...identity, text: 'Follow up on the active run', mode: 'next_run' }));
+    expect(useThreadStore.getState().catalogLoading).toBe(true);
+  } finally {
+    await act(async () => { unbind?.(); finishCatalog([f.view.thread]); });
+  }
 });
 
 it('freezes editor and inline context on an unknown send and acknowledges only captured revisions', async () => {
@@ -2113,7 +2160,7 @@ it.each(['file-backed', 'source-free'] as const)('continues a completed %s child
     total_bytes: new TextEncoder().encode(reportBody).length, text: reportBody }));
   const cancelTree = vi.fn<NonNullable<ThreadsAPI['collaboration']>['cancelTree']>(async target => ({ target: { kind: 'thread', thread_id: target.threadId }, cursor: 15, run_count: 0, child_count: 1, process_count: 0 }));
   const unused = async (): Promise<never> => { throw new Error('unused collaboration control'); };
-  f.api.collaboration = { dispatchCatalog: vi.fn(), dispatch: vi.fn(), exchange: unused, integration: vi.fn(), continueChild, readExecutionReport, executions: async () => f.view.delegatedExecutions!, children: async () => [],
+  f.api.collaboration = { queuedExchanges: async () => [], controlExchange: unused, dispatchCatalog: vi.fn(), dispatch: vi.fn(), exchange: unused, integration: vi.fn(), continueChild, readExecutionReport, executions: async () => f.view.delegatedExecutions!, children: async () => [],
     readReport: unused, cancelChild: unused, cancelWait: unused, cancelTree };
   await act(async () => { root.render(<ThreadConversation api={f.api} identity={identity} />); });
   await openOverview('threads');
@@ -3083,6 +3130,81 @@ it('keeps stored images for a text edit, explicitly removes them with [], and re
   await act(async () => button('Keep original images').click());
   await submitForm(form());
   expect(editInput).toHaveBeenLastCalledWith('image-queue', 1, 'changed text');
+});
+
+const beginQueuedImageEdit = async () => {
+  await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="chat.queuedMessage.edit"]')!.click());
+  await edit('textarea[aria-label="chat.queuedMessage.edit"]', 'edited image message');
+  const picker = container.querySelector<HTMLInputElement>('[aria-label="Replace queued images"]')!;
+  await act(async () => {
+    Object.defineProperty(picker, 'files', { configurable: true, value: [new File([Uint8Array.of(1, 2, 3)], 'new.png', { type: 'image/png' })] });
+    picker.dispatchEvent(new window.Event('change', { bubbles: true }));
+    await new Promise(resolve => setTimeout(resolve, 0));
+  });
+  return container.querySelector('textarea[aria-label="chat.queuedMessage.edit"]')!.closest('form')!;
+};
+
+it.each(['unchanged', 'branch', 'host', 'host-roundtrip'] as const)('keeps queued image preparation on its original Host when selection is %s', async selection => {
+  const f = fixture(true);
+  f.view.inputs = [{ id: 'image-queue', thread_id: identity.threadId, branch_id: identity.branchId, run_id: 'ui-run',
+    mode: 'boundary', state: 'queued', revision: 1, content: { text: 'original text', attachments: [storedImage] }, cursor: 1 }];
+  const prepare = imageAnnotations.prepareAnnotatedImages;
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const exportImages = vi.spyOn(imageAnnotations, 'prepareAnnotatedImages').mockImplementationOnce(async images => {
+    await gate;
+    return prepare(images);
+  });
+  const dispatchedHosts: string[] = [];
+  const editInput = vi.fn<ThreadsAPI['editInput']>(async (id, revision, text) => {
+    dispatchedHosts.push(endpoint.hostKey);
+    return f.editInput(id, revision, text);
+  });
+  f.api.editInput = editInput;
+  await act(async () => root.render(<ThreadConversation api={f.api} identity={identity} />));
+  await submitForm(await beginQueuedImageEdit());
+  expect(exportImages).toHaveBeenCalledOnce();
+  expect(editInput).not.toHaveBeenCalled();
+  if (selection === 'branch') {
+    await act(async () => root.render(<ThreadConversation api={f.api} identity={{ ...identity, branchId: 'another-branch' }} />));
+  } else if (selection === 'host' || selection === 'host-roundtrip') {
+    await act(async () => { endpoint.generation++; endpoint.hostKey = 'host-b'; endpoint.listeners.forEach(listener => listener()); });
+    if (selection === 'host-roundtrip') {
+      await act(async () => { endpoint.generation++; endpoint.hostKey = 'host-a'; endpoint.listeners.forEach(listener => listener()); });
+    }
+    await edit('[aria-label="Message thread"]', 'new selection draft');
+  }
+  await act(async () => { release(); await gate; });
+  if (selection === 'host' || selection === 'host-roundtrip') {
+    expect(editInput).not.toHaveBeenCalled();
+    expect(f.view.inputs[0]).toMatchObject({ revision: 1, content: { text: 'original text' } });
+    expect(container.querySelector<HTMLTextAreaElement>('[aria-label="Message thread"]')!.value).toBe('new selection draft');
+    // The new selection stays usable. An explicit new Save belongs to its Host.
+    await submitForm(await beginQueuedImageEdit());
+    expect(dispatchedHosts).toEqual([endpoint.hostKey]);
+  } else {
+    expect(dispatchedHosts).toEqual(['host-a']);
+  }
+  expect(editInput).toHaveBeenCalledExactlyOnceWith('image-queue', 1, 'edited image message', [{ data: 'AQID', mimeType: 'image/png', reference: 1 }]);
+  expect(container.querySelector('textarea[aria-label="chat.queuedMessage.edit"]')).toBeNull();
+});
+
+it('retains the queued image edit after export failure and clears it only after a successful retry', async () => {
+  const f = fixture(true);
+  f.view.inputs = [{ id: 'image-queue', thread_id: identity.threadId, branch_id: identity.branchId, run_id: 'ui-run',
+    mode: 'boundary', state: 'queued', revision: 1, content: { text: 'original text', attachments: [storedImage] }, cursor: 1 }];
+  vi.spyOn(imageAnnotations, 'prepareAnnotatedImages').mockRejectedValueOnce(new Error('Image export failed'));
+  await act(async () => root.render(<ThreadConversation api={f.api} identity={identity} />));
+  const form = await beginQueuedImageEdit();
+  await submitForm(form);
+  expect(f.editInput).not.toHaveBeenCalled();
+  expect(container.textContent).toContain('Image export failed');
+  expect(form.querySelector('textarea')!.value).toBe('edited image message');
+  expect(form.querySelector('img')?.getAttribute('src')).toBe('data:image/png;base64,AQID');
+  await submitForm(form);
+  expect(f.editInput).toHaveBeenCalledExactlyOnceWith('image-queue', 1, 'edited image message', [{ data: 'AQID', mimeType: 'image/png', reference: 1 }]);
+  expect(container.querySelector('textarea[aria-label="chat.queuedMessage.edit"]')).toBeNull();
+  expect(container.textContent).not.toContain('Image export failed');
 });
 
 it('reads actual operation completion, result and external receipt images through their distinct original holders', async () => {
