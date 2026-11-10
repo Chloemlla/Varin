@@ -2,10 +2,11 @@ import { isDocumentAuthorityError } from './errors.js';
 import type { Express, Request, RequestHandler, Response } from 'express';
 
 interface DocumentAuthority {
+  textEncodings(): Promise<unknown>;
   setWorkspaceRetention?(request:unknown):Promise<unknown>;
   resolveWorkspace(input: unknown): Promise<unknown>;
   resolveResourceIdentity(resource: unknown, options?: unknown): Promise<unknown>;
-  read(resource: unknown): Promise<unknown>;
+  read(resource: unknown, options?: unknown): Promise<unknown>;
   write(request: unknown): Promise<unknown>;
   prepareWorkspaceEdit(request: unknown): Promise<unknown>;
   discardWorkspaceEdit(request: unknown): Promise<unknown>;
@@ -70,6 +71,10 @@ export const registerDocumentRoutes = (app: Express, {
   const requireAuth: RequestHandler = uiAuthController?.requireAuth
     ?? ((_req, _res, next) => next());
 
+  app.post(`${base}/encodings`, requireAuth, async (_req: Request, res: Response) => {
+    try { return res.json(await documents.textEncodings()); } catch (error) { return sendError(res, error); }
+  });
+
   app.post(`${base}/workspace/resolve`, requireAuth, async (req: Request, res: Response) => {
     try {
       return res.json(await documents.resolveWorkspace(readBody(req)));
@@ -85,7 +90,7 @@ export const registerDocumentRoutes = (app: Express, {
     try {
       const resource = readBody(req).resource;
       if (!resource) return res.status(400).json({ error: 'Resource is required', reason: 'failed' });
-      return res.json(await documents.read(resource));
+      return res.json(await documents.read(resource, readBody(req).options));
     } catch (error) {
       return sendError(res, error);
     }

@@ -1627,6 +1627,30 @@ export interface WorkspaceMutationToken {
   owner: WorkspaceMutationOwner;
 }
 
+/** File encoding capabilities supplied by the native file owner. */
+export interface VarinTextCodec {
+  encoding: string;
+  label: string;
+  read: boolean;
+  write: boolean;
+  bom: boolean;
+  defaultBom: boolean;
+  stateful: boolean;
+}
+/** Resolved disk representation bound to the original raw document revision. */
+export interface VarinTextFormat {
+  encoding: string;
+  bom: boolean;
+  lineEnding: 'lf' | 'crlf' | 'cr' | 'mixed' | 'none';
+  defaultLineEnding: 'lf' | 'crlf' | 'cr';
+  source: string;
+}
+export interface VarinDocumentReadOptions {
+  encoding?: string;
+  /** Explicit user reinterpretation, never an automatically detected preference. */
+  rememberEncoding?: boolean;
+}
+
 export type VarinDocumentReadResult =
   | {
       status: 'ready';
@@ -1636,6 +1660,7 @@ export type VarinDocumentReadResult =
       content: string;
       encoding: string;
       bom: boolean;
+      format?: VarinTextFormat;
       byteLength: number;
       modifiedAt?: string;
     }
@@ -1643,6 +1668,7 @@ export type VarinDocumentReadResult =
       status: 'missing';
       epoch: number;
       resource: VarinResourceReference;
+      format?: VarinTextFormat;
     }
   | {
       status: 'binary';
@@ -1661,6 +1687,13 @@ export type VarinDocumentReadResult =
       candidates?: string[];
     };
 
+/** Edits use UTF-16 offsets in the LF-normalized text at the original raw revision. */
+export interface VarinTextEdit {
+  start: number;
+  end: number;
+  text: string;
+}
+
 export interface VarinDocumentWriteRequest {
   token: WorkspaceMutationToken;
   resource: VarinResourceReference;
@@ -1668,11 +1701,20 @@ export interface VarinDocumentWriteRequest {
   encoding: string;
   bom: boolean;
   expectedRevision: string | null;
+  /** Interpretation returned by the read at expectedRevision; never re-resolve mutable settings. */
+  sourceFormat?: VarinTextFormat;
+  edits?: VarinTextEdit[];
+  lineEnding?: 'lf' | 'crlf' | 'cr' | 'mixed';
+  /** Set only for an explicit format conversion. Updated after the original write receipt. */
+  rememberEncoding?: boolean;
   operationId: string;
 }
 
+/** Durable save intent. Authentication/mutation tokens are supplied by the active connection. */
+export type VarinDocumentPendingSave = Omit<VarinDocumentWriteRequest, 'token'>;
+
 export type VarinDocumentWriteResult =
-  | { status: 'written'; revision: string; byteLength: number; modifiedAt?: string }
+  | { status: 'written'; revision: string; byteLength: number; encoding?: string; bom?: boolean; format?: VarinTextFormat; modifiedAt?: string }
   | { status: 'conflict'; current: Omit<VarinDocumentReadResult, 'content'> }
   | { status: 'stale-epoch'; currentEpoch: number };
 
@@ -1753,6 +1795,8 @@ export interface VarinDocumentRecoveryJournalSummary {
 
 export interface VarinDirtyBufferResource {
   baseRevision: string | null;
+  normalizeLineEndings?: boolean;
+  sourceFormat?: VarinTextFormat;
   /** Hash of the editor-normalized buffer text, not the serialized file bytes. */
   bufferHash?: string;
   documentInstanceId?: string;
@@ -1765,6 +1809,8 @@ export interface VarinDirtyBufferResource {
 
 export interface VarinDocumentSurfaceBinding {
   baseRevision: string | null;
+  baseFormat?: VarinTextFormat;
+  normalizeLineEndings?: boolean;
   bufferHash: string;
   documentInstanceId: string;
   encoding: string;
@@ -1779,6 +1825,9 @@ export interface VarinDocumentSurfaceOperationTarget extends VarinDocumentSurfac
   expectedAppliedRevision?: number;
   expectedAppliedHash?: string;
   restoreState?: {
+    baseFormat?: VarinTextFormat;
+    normalizeLineEndings?: boolean;
+    edits?: VarinTextEdit[];
     baseContent: string;
     baseRevision: string | null;
     encoding: string;
@@ -1807,6 +1856,7 @@ export interface VarinDocumentSurfaceOperationResourceResult {
   afterHash?: string;
   content?: string;
   baseContent?: string;
+  edits?: VarinTextEdit[];
   message?: string;
 }
 
@@ -1821,6 +1871,7 @@ export interface VarinDocumentSurfaceOperationCompletion {
 }
 
 export interface VarinAgentInputSnapshotResource extends VarinDirtyBufferResource {
+  edits?: VarinTextEdit[];
   content: string;
   encoding: string;
   bom: boolean;
@@ -1848,6 +1899,13 @@ export type VarinDocumentRecoveryReadResult =
       content: string;
       encoding: string;
       bom: boolean;
+      sourceFormat?: VarinTextFormat;
+      edits?: VarinTextEdit[];
+      pendingSave?: VarinDocumentPendingSave;
+      pendingEdits?: VarinTextEdit[];
+      pendingSaveReconciled?: boolean;
+      lineEnding?: 'lf' | 'crlf' | 'cr';
+      normalizeLineEndings?: boolean;
     }
   | { status: 'missing'; journalId: string }
   | { status: 'malformed'; journalId: string };
@@ -1860,6 +1918,12 @@ export interface VarinDocumentRecoveryWriteRequest {
   content: string;
   encoding: string;
   bom: boolean;
+  sourceFormat?: VarinTextFormat;
+  edits?: VarinTextEdit[];
+  pendingSave?: VarinDocumentPendingSave;
+  pendingEdits?: VarinTextEdit[];
+  lineEnding?: 'lf' | 'crlf' | 'cr';
+  normalizeLineEndings?: boolean;
   baseRevision: string | null;
   expectedRevision: number | null;
 }
@@ -1871,6 +1935,8 @@ export type VarinDocumentRecoveryWriteResult =
   | { status: 'stale-epoch'; currentEpoch: number };
 
 export interface DocumentsAPI extends DocumentsWorkspaceEditAPI {
+  /** Codecs supplied by the actual file owner, not by the renderer locale. */
+  textEncodings?(): Promise<VarinTextCodec[]>;
   setWorkspaceRetention?(request:{workspaceId:string;ownerId:string;retained:boolean}):Promise<{retained:boolean}>;
   ackDirtyStateBarrier?(request: {
     barrierId: string;
@@ -1897,7 +1963,7 @@ export interface DocumentsAPI extends DocumentsWorkspaceEditAPI {
   resolveResourceIdentity(resource: VarinResourceReference): Promise<VarinResourceIdentity>;
   /** Null proves the registered roots cannot intersect; candidate admission failures still reject. */
   resolveResourceIdentity(resource: VarinResourceReference, options: { withinWorkspaceId: string }): Promise<VarinResourceIdentity | null>;
-  read(resource: VarinResourceReference): Promise<VarinDocumentReadResult>;
+  read(resource: VarinResourceReference, options?: VarinDocumentReadOptions): Promise<VarinDocumentReadResult>;
   write(request: VarinDocumentWriteRequest): Promise<VarinDocumentWriteResult>;
   move(request: VarinDocumentMoveRequest): Promise<VarinDocumentMoveResult>;
   delete(request: VarinDocumentDeleteRequest): Promise<VarinDocumentDeleteResult>;
