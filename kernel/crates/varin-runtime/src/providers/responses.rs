@@ -43,7 +43,6 @@ fn response_parts(parts: Vec<ProviderPart<'_>>) -> Result<Vec<Value>, ExecutionE
                     &["image/png", "image/jpeg", "image/webp", "image/gif"],
                     FAMILY,
                 )?;
-                blocks.push(json!({"type":"input_text","text":media_label(media)}));
                 let mut block = json!({"type":"input_image"});
                 block["image_url"] = Value::String(inline_image(media));
                 blocks.push(block);
@@ -380,7 +379,11 @@ impl StreamState {
                                 output_tokens: usage["output_tokens"].as_u64(),
                                 cached_input_tokens: usage["input_tokens_details"]["cached_tokens"]
                                     .as_u64(),
-                                cache_write_tokens: None,
+                                // Newer Responses models bill cache writes separately. An
+                                // omitted/invalid count on older or compatible endpoints stays
+                                // unknown; it is not evidence that no cache write occurred.
+                                cache_write_tokens: usage["input_tokens_details"]["cache_write_tokens"]
+                                    .as_u64(),
                                 reasoning_tokens: usage["output_tokens_details"]
                                     ["reasoning_tokens"]
                                     .as_u64(),

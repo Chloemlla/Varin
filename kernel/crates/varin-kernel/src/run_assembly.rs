@@ -31,6 +31,8 @@ pub(crate) struct RunAssembly {
 #[cfg(test)]
 #[path = "child_policy_review.rs"]
 mod child_policy_review;
+#[path = "child_tool_bindings.rs"]
+mod child_tool_bindings;
 #[cfg(test)]
 #[path = "run_assembly_review.rs"]
 mod tests;
@@ -469,7 +471,13 @@ impl RunAssembly {
                 .ok_or_else(|| KernelError::Authorization("Child launch missing".into()))?
                 .selection
                 .tools;
-            declarations.retain(|declaration| admitted.contains(&declaration.schema));
+            declarations = child_tool_bindings::retain(declarations, admitted);
+        } else if let Some(launch) = &saved_launch {
+            // Admission owns the names. New rounds can refresh those declarations,
+            // but binding must not add capabilities omitted by the original selection.
+            declarations.retain(|declaration| {
+                launch.selection.tools.iter().any(|tool| tool.name == declaration.schema.name)
+            });
         }
         if !host_authority && !is_context_job { declarations.clear(); }
         if !host_authority && p.mcp_binding.is_some() { return Err(KernelError::Authorization("Member work cannot acquire Host MCP servers".into())); }

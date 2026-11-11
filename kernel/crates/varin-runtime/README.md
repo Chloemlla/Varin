@@ -21,6 +21,7 @@ This document is the local code map and maintenance boundary, not an implementat
 | Worker lifecycle, cancellation, policy actions, model/tool settlement | [execution.rs](src/execution.rs), [supervisor.rs](src/supervisor.rs) |
 | History/request commit, safe restoration, explicit navigation | [catalog_execution.rs](src/catalog_execution.rs), [catalog_recovery.rs](src/catalog_recovery.rs), [catalog_navigation.rs](src/catalog_navigation.rs) |
 | Fixed attachment descriptors, delivery relations and retention | [catalog_attachments.rs](src/catalog_attachments.rs) |
+| Stable typed model references, execution numbering and scoped public export | [catalog_model_references.rs](src/catalog_model_references.rs), [catalog_export.rs](src/catalog_export.rs) |
 | Immutable bodies, media, publication and collection | [content.rs](src/content.rs), [output.rs](src/output.rs), [content_collection.rs](src/content_collection.rs) |
 | Scope-local bindings, tools and context transforms | [composition](src/composition.rs) |
 | Resource conflict/capacity admission and nested calls | [resource_admission.rs](src/resource_admission.rs), [execution_capacity.rs](src/execution_capacity.rs), [nested_tools.rs](src/nested_tools.rs) |
@@ -44,8 +45,8 @@ representation. Do not add parallel old-format execution/read paths or a second 
 
 - One `runtime.owner` lock protects `conversation.sqlite`. WAL/FULL transactions commit facts and
   events together. Read-only preflight identifies supported generations and rejects unknown/newer or
-  malformed stores before writable recovery. Supported upgrades are 78 → 79 → 80 → 81 → 83 → 84 → 85 → 86 → 87 → 88 → 89
-  and standalone 82 → 83 → 84 → 85 → 86 → 87 → 88 → 89. The first two steps initialize external-agent records and the usage ledger;
+  malformed stores before writable recovery. Supported upgrades are 78 → 79 → 80 → 81 → 83 → 84 → 85 → 86 → 87 → 88 → 89 → 90 → 91 → 92 → 93 → 94
+  and standalone 82 → 83 → 84 → 85 → 86 → 87 → 88 → 89 → 90 → 91 → 92 → 93 → 94. The first two steps initialize external-agent records and the usage ledger;
   old receipts lack settlement attribution and are not backfilled. The 80 → 81 step creates Zone2
   capture tables; 81 → 83 indexes original history text ranges without copying bodies. Standalone 82
   already contains those indexes but no Zone2 tables, so 82 → 83 initializes only that missing domain.
@@ -55,6 +56,19 @@ representation. Do not add parallel old-format execution/read paths or a second 
   owner with Bot-owned arrangements, source receipts, per-arrangement matching watermarks, object routes
   and remote consumers. Existing work follow-ups retain their source Runs and original receipts;
   event delivery reuses native ingress or the real external turn ledger without synthetic Runs.
+  Format 90 adds pending/prepared extension admission only to new automatic roots. Existing launches
+  retain their exact semantics with no marker; the upgrade does not rewrite identities or receipts.
+  Format 91 restores missing Responses cache-write counts from retained raw ModelStep/planning receipts
+  and their matching existing ledger rows, preserving frozen pricing and settlement identity. Missing
+  evidence stays unknown; conversion never creates historical charges or replays execution effects.
+  Format 92 protects frozen quote relations in original input bodies from readers that cannot project
+  them. It does not rewrite historical bodies, resource identities or idempotency receipts.
+  Format 93 adds Catalog-local typed model references and execution numbering. Catalog 92
+  accepts either the quote-only layout with all seven index tables and both external item columns
+  absent, or the complete validated collaboration index. Existing spaces, references and allocation
+  high waters survive unchanged; partial or malformed layouts are rejected before writable recovery.
+  Format 94 protects the separate frozen source mappings in readable compaction recipes. Old recipes
+  keep their original source slicing, quotation and retention semantics without rewriting their bodies.
   Preflight for 82/83 scans User/Assistant reference metadata for index-object presence, not content
   bodies. This startup work scales with history records; typed index validation remains at use and
   malformed indexes never trigger request-time repair or a full-body fallback.
@@ -75,6 +89,16 @@ representation. Do not add parallel old-format execution/read paths or a second 
 - A model request pins its actual provider/tool/context bindings. Normal retirement permits retained
   exchanges to finish; revocation rejects/cancels them. Recovery uses the saved composition and
   artifact identities instead of silently applying current routing.
+  A new root round activated by Calendar, a message or a follow-up resolves its inherited builtin
+  names against the executable owner's current declarations before admission, just like a new user
+  round. It preserves Agent/source/principal/model ownership and marks extension admission Pending.
+  The original Host discovers the current enabled directory with ordinary new-request semantics;
+  unavailable individual tools are not inherited as mandatory requirements. The existing launch
+  transaction commits the complete resulting directory, including empty, as Prepared before binding
+  or execution. A kernel-only empty directory must use that same explicit preparation owner.
+  Prepared Runs, receipt retries, old launches and delegated continuations keep their exact bindings.
+  Exact restoration does not depend on optional current discovery. Later relevant Host changes retain
+  the ordinary closed-boundary tool-update path, without a new permanent capability ceiling.
 - Branch history has one writer. Background summary, memory and planning work uses separate admitted
   identities. A Wait releases active execution while retaining the dependency/continuation; cancelling
   observation does not cancel the observed Job or withdraw an independent follow-up definition.
@@ -133,9 +157,27 @@ worker retains only its latest compiled prefix under exact epoch/Run/branch/chec
 new steps hydrate the new suffix, while current memory/Goal/policy evidence is freshly projected.
 Navigation, changed checkpoints and worker exit discard the derived cache.
 
-The current-teammates projection is appended last and omitted when empty. It is temporary request data;
-only the exact request snapshot retains it. Delivery acknowledgements consume reports actually included in
-the organizer's completed model exchange. The same indexed lifecycle facts drive current/history UI pages.
+Collaboration messages and original reports append through the existing input/history owner. The engine
+never enumerates teammates at each model step. Report delivery is acknowledged by the actual receiving
+history transaction, not by parsing prompt text or observing a directory. Ordinary idle Agents are not
+started by passive reports; Bot continuation keeps its existing policy. Old delivery facts retain their meaning.
+
+[Model references](src/catalog_model_references.rs) persist small typed original-owner/selection mappings
+and per-Agent admission sequences. They contain no resource bytes and grant no access. Fixed file reads
+retain the original source/version/format; accepted controls retain their selected execution across retries.
+OutputBody keeps the original data and an optional stable model_data projection. Providers consume that
+projection without rewriting historical bodies or introducing another receipt authority.
+The shared provider composition includes non-null business data and ordered text/media once; empty
+objects, false and zero remain meaningful. Source types retain role/permission boundaries without printing
+internal provenance chains beside every result or image. Output previews address the frozen raw or
+model_data field before adapters receive their semantic view, so continuation reads select the same bytes.
+
+Follow-up preparation captures original operation/follow-up references under the publication guard,
+then hydrates result bodies off-lock. Process and Host Job data remain separate from their text/media;
+a final Job result supersedes only identical acceptance details from that same original Job. Event inputs
+show useful source/object/sender/time facts once. Identity, transport cursors, receipt epochs and scheduling
+controls remain in the original Catalog records. Existing consumption-boundary event sharing and ordered
+state replacement still use those original identities, never text similarity or image hashes.
 
 `RequestBody` is the only provider-body representation. Responses/Azure/Codex can retain independent
 item fragments and tool schemas; Codex also retains the exact ordered system-text join. Grouped
@@ -174,7 +216,15 @@ Numeric versions stay intact, conflicting encodings remain unmatched, and explic
 take precedence. The original provider request model is unchanged. Unmatched models use the o200k reference.
 No model-specific vocabularies or parallel encoding tables are bundled. Immutable request fragments cache counts; changed
 tokenizer bindings invalidate calibration/reuse identities. Summary input uses its own model tokenizer;
-retained material uses the frozen conversation tokenizer.
+retained material uses the frozen conversation tokenizer. New summary sources contain readable text and
+actual ordered media, with frozen source/part, retention-group and verified history-read relationships
+kept separately. UTF-8 ranges address that fixed text, not serialized conversation records; each
+fragment carries its prepared role, group cost and existing `summary_read` target. User quotes remain
+evidence while sharing their original message's retention group. The continuation estimate covers the
+complete original exchange's common provider view, including actions, arguments, statuses and all
+visible parts, without counting hidden receipts or auxiliary quotation headings. Original records,
+media owners and read permissions remain unchanged. Already-frozen recipes retain their earlier
+quotation bytes, ranges, group assignments and cost interpretation when reopened.
 Later input is appended after the frozen cut. Resource/personalization refresh preserves the selection;
 forking or navigation that discards the summary also discards its selection.
 Model nodes use [summary_tools.rs](src/summary_tools.rs) for read-only original history/output and related
@@ -206,3 +256,16 @@ Use [development guidance](../../../docs/development.md) and repository scripts 
 checks from the behavior changed; documentation-only consolidation does not require a runtime build.
 Keep unresolved external effects, platform limits and unexecuted acceptance explicit rather than
 substituting test counts for coverage.
+
+## Quoted user input
+
+Frozen quote objects and exact original UTF-16 occurrences live in the existing user-input
+ContentStore payload. `input_quotes.rs` validates object/range bindings and performs the single
+ordered native model projection. Selected text is not truncated; repeated occurrences deliver one
+copy per input. Source metadata stays in history, while quoted assistant/tool material retains
+external-data provenance. Images/files keep the existing media dependencies and attachment delivery
+edges. UI snapshots named by structured quote sources remain roots in the original retention graph.
+
+Raw receipt identity can omit prepared resource descriptors, but admission cannot. Queues, User
+messages, history forks and reopen consume the same immutable input. Message/plain-text edits retain
+selected objects and clear stale positions; they preserve original message routing and receipts.

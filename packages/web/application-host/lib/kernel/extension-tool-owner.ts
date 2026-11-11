@@ -1,3 +1,4 @@
+import { createHostModelReferences, resolveHostToolArguments, projectHostToolData } from './model-references.js';
 import type { OutputPart, IncomingMedia } from './protocol.generated.js';
 /** Ordinary installed services, selected and prepared by the existing routing/supervisor owner. */
 import { createHash, randomUUID } from 'node:crypto';
@@ -129,6 +130,8 @@ export interface ExtensionToolRun {
   source: LaunchIntent['selection']['source'];
   projectId?: string;
   fixed?: boolean;
+  /** Restore the committed initial directory, including an explicitly empty one. */
+  restoreExact?: boolean;
   workFocus?: WorkFocusId;
 }
 class ExtensionToolSourceError extends Error {
@@ -197,6 +200,8 @@ export async function retainExtensionTool(
     };
     if (required && !isDeepStrictEqual(binding, required))
       throw new HostBindingRestoreError('tool', 'binding_changed', required.providerKey);
+    const references = createHostModelReferences(kernel);
+    const referenceDeclaration = { trustedBuiltin: runtime.supervisor.isRetainedBuiltin?.(provider) === true, extensionId: binding.extensionId, serviceId: binding.serviceId, ...(descriptor.tool?.references ? { references: descriptor.tool.references } : {}) };
     const validateInput = compileToolJsonSchema(schema.schema),
       validateOutput = compileToolJsonSchema(schema.output_schema);
     const approved = new Map<string, { identity: string; policy: string; subjects: PermissionSubject[]; permissionSettingsRevision?: PermissionSettingsRevision; arguments: ReturnType<typeof parseVarinToolJson> }>();
@@ -221,10 +226,10 @@ export async function retainExtensionTool(
         throw new Error('extension_tool_binding_changed');
       pin.assertAvailable();
     };
-    const validate = (call: HostToolCall) => {
+    const validate = (call: HostToolCall, input: unknown = call.arguments) => {
       assertAvailable(call);
       let args: ReturnType<typeof parseVarinToolJson>;
-      try { args = parseVarinToolJson(call.arguments); }
+      try { args = parseVarinToolJson(input); }
       catch {
         throw new HostToolAdmissionError('extension_tool_input_schema_invalid', 'Tool arguments must be a valid JSON value.');
       }
@@ -234,8 +239,8 @@ export async function retainExtensionTool(
       }
       return args;
     };
-    const permissionSubjects = async (call: HostToolCall, signal: AbortSignal) => {
-      const args = object(call.arguments) ? call.arguments : { input: call.arguments };
+    const permissionSubjects = async (call: HostToolCall, signal: AbortSignal, resolved: unknown = call.arguments) => {
+      const args = object(resolved) ? resolved : { input: resolved };
       const declared = await options.permissionSubjects?.(call.name, args, signal);
       return { subjects: declared ?? [{ tool: call.name, arguments: args }], semantic: declared !== undefined };
     };
@@ -320,8 +325,8 @@ export async function retainExtensionTool(
       async authorize(call, signal) {
         const combined = AbortSignal.any([signal, pin.revocationSignal]);
         combined.throwIfAborted();
-        const args = validate(call), identity = canonical(call);
-        const { subjects, semantic } = await permissionSubjects(call, combined);
+        const args = validate(call, await resolveHostToolArguments(references, call, referenceDeclaration, combined)), identity = canonical(call);
+        const { subjects, semantic } = await permissionSubjects(call, combined, args);
         let current = await policy(call.runId);
         const decision = evaluatePermissionSubjects(subjects, current.value),
           previous = approved.get(call.operationId);
@@ -347,7 +352,7 @@ export async function retainExtensionTool(
               ...(descriptor.tool!.confirmation ? { confirmation: descriptor.tool!.confirmation } : {}),
             },
             combined,
-            { name: call.name, arguments: object(call.arguments) ? call.arguments : { input: call.arguments },
+            { name: call.name, arguments: object(args) ? args : { input: args },
               ...(semantic ? { subjects } : {}) },
           );
         combined.throwIfAborted();
@@ -371,7 +376,7 @@ export async function retainExtensionTool(
           const previous = approved.get(call.operationId);
           approved.delete(call.operationId);
           const current = await policy(call.runId);
-          const { subjects } = await permissionSubjects(call, combined);
+          const { subjects } = await permissionSubjects(call, combined, previous?.arguments);
           if (
             !previous ||
             previous.identity !== canonical(call) ||
@@ -381,7 +386,11 @@ export async function retainExtensionTool(
           )
             throw new Error('authorization changed');
           args = previous.arguments;
+          const settingsSurface = referenceDeclaration.trustedBuiltin && referenceDeclaration.serviceId.startsWith('varin.settings.')
+            ? await references.target(call.operationId,'host.settings.surface',call.arguments,combined) as ToolInvocationAuthority['settingsSurface'] | null : null;
           context = { ...await authority(call, combined, owner),
+            ...(settingsSurface ? {settingsSurface}:{}),
+            ...(!isDeepStrictEqual(args, call.arguments) ? { resolvedArguments: structuredClone(args) } : {}),
             ...(previous.permissionSettingsRevision ? { permissionSettingsRevision: previous.permissionSettingsRevision } : {}) };
           combined.throwIfAborted();
           assertAvailable(call);
@@ -390,11 +399,20 @@ export async function retainExtensionTool(
         }
         let domainReceipt: ToolExecutionReceipt | undefined;
         let parts: OutputPart<IncomingMedia>[] = [];
-        const completeDomain = (receipt: ToolExecutionReceipt): ToolExecutionReceipt => {
-          if (!parts.length) return receipt;
+        const completeDomain = async (receipt: ToolExecutionReceipt): Promise<ToolExecutionReceipt> => {
           const completion = receipt.completion;
-          if (completion.kind === 'not_dispatched') throw new Error('Undispatched invocation cannot publish output');
-          return { ...receipt, completion: { ...completion, content: { data: completion.content?.data ?? null, parts: [...(completion.content?.parts ?? []), ...parts] } } };
+          if (completion.kind === 'not_dispatched') { if (parts.length) throw new Error('Undispatched invocation cannot publish output'); return receipt; }
+          const content = { ...completion.content, data: completion.content?.data ?? null, parts: [...(completion.content?.parts ?? []), ...parts] };
+          // Only this trusted adapter creates model_data. Extension callback JSON
+          // remains ordinary data, even when it contains a property with that name.
+          try {
+            const model = await projectHostToolData(references, call, referenceDeclaration, content.model_data ?? content.data, context.source, context.resolvedArguments);
+            if (!isDeepStrictEqual(model, content.data)) content.model_data = model;
+          } catch {
+            // A failed presentation registration cannot erase confirmed effects or
+            // stop evidence. Original domain receipt remains authoritative.
+          }
+          return { ...receipt, completion: { ...completion, content } };
         };
         // Scope lifetime follows the actual pin callback, including cancellation/worker exit.
         try {
@@ -425,15 +443,15 @@ export async function retainExtensionTool(
               },
               executor_stopped: true,
             };
-          return {
+          return completeDomain({
             completion: {
               kind: 'result',
               outcome: 'succeeded',
               effect: descriptor.tool!.operation === 'read' ? 'none' : 'confirmed',
-              content: { data: output, parts },
+              content: { data: output, parts: [] },
             },
             executor_stopped: true,
-          };
+          });
         } catch {
           if (domainReceipt) return completeDomain(domainReceipt);
           // Broker transport keeps dispatched promises pending until actual response or process exit.
@@ -496,7 +514,10 @@ export function createExtensionTools(
   options: ExtensionToolOwnerOptions,
 ): ExtensionToolPreparer {
   return async (run, required, signal) => {
-    let preparedOptions = options.prepareConfiguration ? { ...options, configurationIdentity: await options.prepareConfiguration(run, required) } : options;
+    const emptyRestore = run.restoreExact && !required.length;
+    let preparedOptions = emptyRestore ? { ...options }
+      : options.prepareConfiguration ? { ...options, configurationIdentity: await options.prepareConfiguration(run, required) } : options;
+    if (emptyRestore) delete preparedOptions.configurationIdentity;
     try {
     const runtime = options.runtime,
       initial: ExtensionToolLease[] = [],
@@ -587,11 +608,11 @@ export function createExtensionTools(
       } catch (error) { selected.release(); throw error; }
       } finally { releasePreparation?.(); }
     };
-    const snapshot = await runtime.state();
+    const snapshot = emptyRestore ? undefined : await runtime.state();
     signal.throwIfAborted();
     if (
-      !snapshot.catalog.authoritative ||
-      (!required.length && !snapshot.routing.authoritative)
+      snapshot && (!snapshot.catalog.authoritative ||
+      (!required.length && !snapshot.routing.authoritative))
     )
       throw new Error('extension_tool_catalog_unavailable');
     try {
@@ -632,12 +653,12 @@ export function createExtensionTools(
           throw new HostBindingRestoreError('tool', 'implementation_unavailable', binding.providerKey, { cause });
         }
       }
-      if (!required.length && !run.fixed) await Promise.all([...services(snapshot).values()].map(async entry => {
+      if (!required.length && !run.fixed && !run.restoreExact) await Promise.all([...services(snapshot!).values()].map(async entry => {
         try {
           if (entry.declarations.every(descriptor => !enabled(descriptor))) return;
           // Prepare the first complete directory before the first model request.
           // Later changes still publish only at a closed request boundary.
-          initial.push(await prepare(entry.id, entry.version, snapshot.routing.document.revision));
+          initial.push(await prepare(entry.id, entry.version, snapshot!.routing.document.revision));
         } catch (error) {
           states.set(`${entry.id}@${entry.version}`, { serviceId: entry.id, version: entry.version,
             declarations: entry.declarations, status: 'unavailable',
@@ -668,7 +689,7 @@ export function createExtensionTools(
         tokens.set(
           slot,
           await tokenFor(
-            snapshot,
+            snapshot!,
             retained.binding.serviceId,
             retained.binding.serviceVersion,
           ),
@@ -676,13 +697,13 @@ export function createExtensionTools(
       states.set(slot, {
         serviceId: retained.binding.serviceId,
         version: retained.binding.serviceVersion,
-        declarations: services(snapshot).get(slot)?.declarations ?? [],
+        declarations: services(snapshot!).get(slot)?.declarations ?? [],
         status: 'ready',
         prepared: retained.binding,
       });
       delivered.set(slot, retained);
     }
-    let seenRevision = snapshot.revision;
+    let seenRevision = snapshot?.revision ?? 0;
     const refreshOnce = async () => {
       if (run.fixed) return;
       if (options.prepareConfiguration) {
@@ -690,7 +711,7 @@ export function createExtensionTools(
         if (closed || signal.aborted) { configurationIdentity.release?.(); return; }
         const previous = preparedOptions.configurationIdentity;
         preparedOptions = { ...options, configurationIdentity }; previous?.release?.();
-      }
+      } else if (emptyRestore) preparedOptions = options;
       const current = await runtime.state();
       if (
         closed ||

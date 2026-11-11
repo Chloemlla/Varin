@@ -77,6 +77,10 @@ consumer's actual registered read-tool name; this module does not invent a `read
   worktree admission can supply canonical context identities shadowed by the selected linked worktree.
   Ancestors marked `includeSkills` contribute their captured `.agents/skills` after source-local skill
   roots, inner-to-outer; admission marks only ancestors inside the original nearest-Git-root skill chain.
+- The resource editor uses Documents' private Host resource-access port for the configured data
+  directory and `HOME/.agents`. This remains available when a Docker deployment places its workspace
+  root elsewhere. Catalog selection, project trust and revision CAS still gate edits. These domains
+  do not expand the public Documents/Files boundary or grant access merely through a registered ID.
 - `AgentSettingsService` remains the only native settings writer. Resource files use their existing
   admitted document/file owner. Saving an asset does not mutate an existing snapshot. The consumer prepares and conditionally publishes a new candidate.
 
@@ -275,3 +279,7 @@ It covers selection, progressive metadata, frozen body reuse, source-relative ne
 and package rules, untrusted config exclusion, canonical bundle containment, same-pin relative links,
 cancellation independence, serializable snapshots and missing capture coverage. Its pinned fixture is
 not a real Rust IPC run, and no Host-wide or paid-model validation is implied.
+
+Model-visible skill discovery includes the resource read entry, name, description and origin. Version
+hashes remain with the captured directory and explicit activation owner; they are not extra model inputs.
+Ordinary reads use the frozen current directory, and historical activations retain their original version.

@@ -493,6 +493,7 @@ export type OutputMediaHolder = {kind:'history';itemId:string} | {kind:'input';i
 export type OperationResult = {kind:'control';value:unknown} | {kind:'output';output:OutputBody};
 
 export interface Attachment {
+  modelRef?: string;
   ref: string;
   filename: string;
   mimeType: string;
@@ -535,7 +536,7 @@ export interface KernelObjectView {
   readOnly: boolean;
 }
 
-export interface OutputBody<M = StoredMedia> { data: unknown; parts: OutputPart<M>[] }
+export interface OutputBody<M = StoredMedia> { data: unknown; model_data?: unknown; parts: OutputPart<M>[] }
 
 export type OutputPart<M = StoredMedia> = {kind:'text';text:string} | {kind:'media';media:M} | {kind:'attachment';attachment:Attachment};
 
@@ -979,6 +980,10 @@ export type MessageActivationHold = 'manual_pause' | 'question' | 'goal_blocked'
 export type MessageActivation = { state: 'passive' } | { state: 'pending'; executionId: string | null; holdReason: MessageActivationHold | null } | { state: 'bound'; runId: string; executionId: string | null; holdReason: MessageActivationHold | null } | { state: 'cancelled'; runId: string | null; executionId: string | null } | { state: 'failed'; executionId: string | null; code: string };
 
 export interface MessageSendParams {
+  contentReferences?: unknown[];
+  contentReferenceOccurrences?: unknown[];
+  attachmentImageReferences?: Record<string, number>;
+  imageReferences?: number[];
   sourceAgent?: string;
   name?: string;
   key: string;
@@ -1040,6 +1045,8 @@ export interface MessageSummary extends MessageReceipt {
 }
 
 export interface MessageView extends MessageSummary {
+  contentReferences?: unknown[];
+  contentReferenceOccurrences?: unknown[];
   text: string;
 }
 
@@ -1804,7 +1811,7 @@ export interface ThreadSummary {
   avatar?: string;
 }
 
-export type AgentRuntimeStreamEvent = {v: 84; kind: 'runtime-event'; kernelEpoch: string} & ({stream: 'durable'; cursor: number} | {stream: 'progress'; runId: string; threadId: string; branchId: string; requestId: string; streamId: string; sequence: number; event: unknown});
+export type AgentRuntimeStreamEvent = {v: 89; kind: 'runtime-event'; kernelEpoch: string} & ({stream: 'durable'; cursor: number} | {stream: 'progress'; runId: string; threadId: string; branchId: string; requestId: string; streamId: string; sequence: number; event: unknown});
 
 export type SourceMode = 'fixed_branch' | 'materialized' | 'live_root' | 'native_workspace';
 
@@ -1914,6 +1921,10 @@ export interface HostServiceComposition {
   schemaVersion: 1;
   root: string;
   nodes: HostCompositionNode[];
+}
+
+export interface ExtensionAdmission {
+  state: 'pending' | 'prepared';
 }
 
 export interface ExtensionToolBinding {
@@ -2143,6 +2154,7 @@ export interface LaunchSelection {
 }
 
 export interface LaunchIntent {
+  extension_admission?: ExtensionAdmission;
   principal_id?: string | null;
   driver_preparable: boolean;
   policy_preparable: boolean;
@@ -2309,7 +2321,7 @@ export type ContextCompactionPlan = {kind:'text';sourceCutHash:string;text:strin
 
 export interface ContextCompactionCandidate {producer:ContextCompactionProducer;plan:ContextCompactionPlan}
 
-export interface ContextCompactionSource {sourceId:string;item:{id:string;provenance:{kind:'external_data';source:string};content:{kind:'text';text:string}|{kind:'media';media:ResolvedMedia};opaque:null}}
+export interface ContextCompactionSource {sourceId:string;item:{id:string;provenance:{kind:'external_data';source:string};content:{kind:'text';text:string}|{kind:'media';media:ResolvedMedia};opaque:null};material?:{originalItemId:string;historyItemId:string|null;partIndex:number;heading:string;retention:{retainId:string;estimatedTokens:number;unmeasuredMedia:number;unmeasuredProviderItems:number}|null}}
 
 export type TokenizerBinding = {kind: 'encoding'; name: string} | {kind: 'file'; path: string; sha256: string}
 
@@ -3325,7 +3337,7 @@ export interface ChildSelectedProfile {
   model_selection_required?: boolean;
 }
 
-export type TreeCancelTarget = { kind: 'thread'; thread_id: string } | { kind: 'child'; operation_id: string };
+export type TreeCancelTarget = { kind: 'thread'; thread_id: string } | { kind: 'child'; operation_id: string } | { kind: 'execution'; execution_id: string } | { kind: 'run'; run_id: string };
 
 export interface TreeCancelParams {
   target: TreeCancelTarget;

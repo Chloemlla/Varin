@@ -722,6 +722,9 @@ fn catalog_88_upgrade_preserves_original_work_and_does_not_replay_an_occurrence(
     db.admit_followup_registration(p).unwrap();
     let before = db.followup_occurrences("legacy", None).unwrap().occurrences;
     let original = db.capture_followup("legacy").unwrap().load().unwrap();
+    let current_format: i64 = f.raw()
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
     // Build the released 88 representation, retaining the actual old work, queue and receipts.
     f.raw().execute_batch(include_str!("fixtures/catalog-pre-arrangements.sql")).unwrap();
     f.raw().pragma_update(None, "user_version", 88).unwrap();
@@ -739,7 +742,7 @@ fn catalog_88_upgrade_preserves_original_work_and_does_not_replay_an_occurrence(
         f.raw()
             .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        89
+        current_format
     );
 }
 
@@ -1466,4 +1469,27 @@ fn ordinary_target_tool_edits_its_existing_bot_arrangement_without_claiming_a_bo
     let restored = edit(&mut db, native);
     assert_eq!(restored.external_conversation_id, None);
     assert_eq!(restored.thread_id, "ordinary");
+}
+
+#[test]
+fn identical_event_text_from_distinct_identities_is_not_deduplicated() {
+    let f = Fixture::new(); let mut db = f.open(); setup(&mut db);
+    let run = start_event_run(&mut db);
+    arrange(&mut db, "watch", EventTiming::Immediate);
+    let mut first = incoming("message-a", None);
+    let mut second = incoming("message-b", None);
+    first.content = varin_runtime::output::OutputBody::text("same business text");
+    second.content = first.content.clone();
+    receive(&mut db, vec![first, second], None, Some("a")).unwrap();
+    deliver(&mut db);
+    let batch = consume_events(&mut db, &run.run_id);
+    let text = serde_json::to_string(&batch.items).unwrap();
+    assert_eq!(text.matches("same business text").count(), 2);
+    assert!(!text.contains("account-connection"));
+    assert!(!text.contains("registeredBy"));
+    assert!(text.contains("message-a") && text.contains("message-b"));
+    let varin_runtime::execution::Content::Output { output } = &batch.items[0].content else { panic!() };
+    assert_eq!(output.data["events"].as_array().unwrap().len(), 2);
+    assert_eq!(output.data["events"][0]["source"]["extensionId"], "mail");
+    assert_eq!(output.parts.iter().filter(|part| matches!(part, varin_runtime::output::OutputPart::Text { text } if text.starts_with("External event"))).count(), 2);
 }

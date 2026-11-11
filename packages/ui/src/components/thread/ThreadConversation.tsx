@@ -1,14 +1,16 @@
+import { prepareQuotedFiles } from '@/lib/agent-runtime/quoteAttachments';
 import { draftImageReferences } from '@/lib/images/references';
 import { flushUiSessions } from '@/lib/interactive-ui/sessions';
 import { registerUiSender } from '@/lib/interactive-ui/compose';
-import { projectContentReference } from '@/lib/agent-editor/projection';
+import { freezeDraftContentReferences, acknowledgeDraftMarkers, insertDraftMarker, restoreDraftReferences, draftAttachmentImageReferences } from '@/lib/agent-editor/contentReferences';
+import { DraftContentReferences } from './DraftContentReferences';
 import { useThreadComposerWorkflows } from './useThreadComposerWorkflows';
 import { useThreadComposerCommands } from './ThreadComposerCommands';
 import { composerFileSelections, composerHistoryAttachments, selectComposerFile, removeComposerFile } from '@/components/chat/composer/submit/fileSelections';
 import { ComposerSelectedFiles } from './ComposerSelectedFiles';
 import { composerInputReferences } from '@/components/chat/composer/submit/references';
 import { canRespondToQuestion } from './threadOperations';
-import { openThreadContext } from '@/lib/openThreadContext';
+import { useOpenThreadContext } from '@/lib/openThreadContext';
 import { toast } from '@/components/ui';
 import { ActiveEditorSuggestion } from '../conversation/ActiveEditorSuggestion';
 import { MessageHandoff } from '../conversation/messageHandoff';
@@ -57,6 +59,7 @@ import type { ImageAttachment } from '@varin/protocol';
 import { ImageAttachmentStrip } from '@/components/chat/composer/ImageAttachmentStrip';
 import { removeDraftImage, updateDraftImage } from '@/components/chat/composer/imageAttachments';
 import { prepareAnnotatedImages } from '@/lib/images/annotations';
+import { prepareDraftMarkerImages, hasDraftInlineImages, convertDraftMarkerImagesToFiles } from '@/lib/agent-runtime/draftImages';
 import { removeDraftFile, attachmentImageReferences, selectThreadFiles, prepareThreadFiles } from '@/lib/agent-runtime/fileAttachments';
 import { ThreadFileDrafts } from './ThreadAttachments';
 import { useI18n } from '@/lib/i18n';
@@ -69,6 +72,7 @@ import type { ThreadIdentity, ThreadModel, ThreadModelInfo, ThreadThinkingLevel,
 import { Button } from '@/components/ui/button';
 import { ThreadComposer } from './ThreadComposer';
 import { useThreadNextStep } from './useThreadNextStep';
+import { threadConfigurationModel, useThreadModelSelection } from './useThreadModelSelection';
 import { ThreadAgentControls } from './ThreadAgentControls';
 import { useThreadWorkFocus } from './useThreadWorkFocus';
 import { DraftPresetChips } from '@/components/chat/DraftPresetChips';
@@ -86,6 +90,8 @@ import { threadHistoryWindow } from '@/lib/agent-runtime/thread-history';
 import { ThreadInputQueue } from './ThreadQueuedInput';
 import { threadLiveActivity, type ThreadLiveActivity, type ThreadProgressActivity } from './threadLiveActivity';
 
+const EMPTY_MODELS: ThreadModelInfo[] = [];
+
 const resourceErrorMessages = new Map([
   ['resource-missing', 'This skill or resource is missing from the current snapshot. Refresh instructions and skills, then try again.'],
   ['resource-invalid', 'This skill or resource could not be prepared. Check the skill definition or command, then try again.'],
@@ -101,10 +107,11 @@ export function ThreadConversation({ api, identity, onBranchCreated, initialWork
   preferredModel?: ThreadModel | null; inheritWorkbenchModel?: boolean; readOnly?: boolean; api: ThreadsAPI; identity: ThreadIdentity; onBranchCreated?: (identity: ThreadIdentity) => void; initialWorkspacePath?: string }) {
   const botSurface = surface === 'bot';
   const { t } = useI18n();
+  const openThreadContext = useOpenThreadContext();
   const host = React.useSyncExternalStore(subscribeRuntimeEndpointChanged, getRuntimeEndpointGeneration, getRuntimeEndpointGeneration);
   const draftKey = threadComposerKey(threadHostKey(), identity);
   const viewScope = React.useMemo(() => ({ api, host, draftKey, readOnly }), [api, host, draftKey, readOnly]);
-  const referenceNavigation = React.useMemo<ReferenceNavigation>(() => ({ identity: { runtime: identity.runtime, threadId: identity.threadId, branchId: identity.branchId } }), [identity.runtime, identity.threadId, identity.branchId, host]);
+  const referenceNavigation = React.useMemo<ReferenceNavigation>(() => ({ identity: { runtime: identity.runtime, threadId: identity.threadId, branchId: identity.branchId } }), [identity.runtime, identity.threadId, identity.branchId]);
   const currentViewScope = React.useRef(viewScope);
   currentViewScope.current = viewScope;
   const [handoff] = React.useState(() => messageHandoff ?? new MessageHandoff());
@@ -131,14 +138,6 @@ export function ThreadConversation({ api, identity, onBranchCreated, initialWork
     return captured.length ? [{ key, drafts: captured }] : [];
   }), [inlineBuckets, draftKey]);
   const inlineDrafts = inlineContext.flatMap(bucket => bucket.drafts);
-  const providerId = draft.model?.providerId ?? '';
-  const modelId = draft.model?.modelId ?? '';
-  const thinkingLevel = draft.model?.thinkingLevel ?? 'off';
-  const temperature = draft.model?.temperature;
-  const patchModel = React.useCallback((patch: Partial<ThreadModel>) => useThreadDraftStore.getState().patch(draftKey, current => ({ model: { providerId: '', modelId: '', ...current.model, ...patch } })), [draftKey]);
-  const setProviderId = React.useCallback((providerId: string) => patchModel({ providerId }), [patchModel]);
-  const setModelId = React.useCallback((modelId: string) => patchModel({ modelId }), [patchModel]);
-  const setThinkingLevel = React.useCallback((thinkingLevel: ThreadThinkingLevel) => patchModel({ thinkingLevel }), [patchModel]);
   const pendingInput = React.useMemo(() => ({
     get current() { return useThreadDraftStore.getState().drafts[draftKey]?.pendingInput; },
     set current(pendingInput: ThreadPendingInput | undefined) { useThreadDraftStore.getState().patch(draftKey, { pendingInput }); },
@@ -165,30 +164,32 @@ export function ThreadConversation({ api, identity, onBranchCreated, initialWork
     setProgressActivity(current => !context ? null : current?.runId === context.runId && current.activity === context.activity ? current : { runId: context.runId, activity: context.activity });
   }, []);
   const messageInput = React.useRef<ComposerEditorHandle | null>(null);
-  const appliedModelPreference = React.useRef<string | undefined>(undefined);
-  const [models, setModels] = React.useState<ThreadModelInfo[]>([]);
+  const [modelCatalog, setModelCatalog] = React.useState<{ api: ThreadsAPI; host: number; models: ThreadModelInfo[] }>();
+  const modelsReady = modelCatalog?.api === api && modelCatalog.host === host;
+  const models = modelsReady ? modelCatalog.models : EMPTY_MODELS;
   // Capture the ordinary workbench/IDE selection when entering an unconfigured
   // Bot conversation. Do not turn another conversation's later edits into a binding.
   const workbenchModel = React.useMemo(() => {
-    if (!inheritWorkbenchModel) return null;
+    if (!inheritWorkbenchModel || host !== getRuntimeEndpointGeneration()) return null;
     const navigation = useThreadStore.getState();
     if (navigation.hostKey !== threadHostKey()) return null;
     const key = selectedComposerKey(navigation);
     if (!key || key === draftKey) return null;
     return useThreadDraftStore.getState().drafts[key]?.model ?? null;
-  }, [inheritWorkbenchModel, draftKey]);
+  }, [inheritWorkbenchModel, draftKey, host]);
   const inheritedModel = workbenchModel && models.some(model => model.providerId === workbenchModel.providerId && model.modelId === workbenchModel.modelId)
-    ? defaultConversationModel({ defaultProvider: workbenchModel.providerId, defaultModel: workbenchModel.modelId, defaultThinkingLevel: workbenchModel.thinkingLevel }, models) : null;
+    ? { ...defaultConversationModel({ defaultProvider: workbenchModel.providerId, defaultModel: workbenchModel.modelId, defaultThinkingLevel: workbenchModel.thinkingLevel }, models)!,
+      ...(workbenchModel.temperature === undefined ? {} : { temperature: workbenchModel.temperature }) } : null;
   const preferredModel = inheritedModel ?? configuredPreferredModel;
   const [modelError, setModelError] = React.useState<string>();
   const [defaultsVersion, refreshDefaults] = React.useReducer(version => version + 1, 0);
   React.useEffect(() => {
     let active = true; let request = 0;
-    setModels([]); setModelError(undefined);
+    setModelCatalog(undefined); setModelError(undefined);
     const refresh = () => {
       const current = ++request;
       void api.listModels().then(value => {
-        if (active && current === request) { setModels(value); setModelError(undefined); }
+        if (active && current === request) { setModelCatalog({ api, host, models: value }); setModelError(undefined); }
       }, () => { if (active && current === request) setModelError(t('settings.agents.modelsUnavailable')); });
     };
     refresh();
@@ -247,14 +248,14 @@ export function ThreadConversation({ api, identity, onBranchCreated, initialWork
   const branch = snapshot?.thread.branches.find(value => value.branch_id === identity.branchId);
   const run = snapshot?.activeRun ?? branch?.latest_run;
   const runFailure = snapshot?.runFailure?.runId === run?.id ? snapshot?.runFailure : null;
-  const samplingConfiguration = (snapshot?.modelSelection.active?.configuration ?? run?.configuration) as
-    { providerId?: string; model?: string; thinkingLevel?: ThreadThinkingLevel; catalogModelId?: string; modelOptions?: { temperature?: number } } | undefined;
-  const samplingModel: ThreadModel | undefined = samplingConfiguration?.providerId && samplingConfiguration.model ? {
-    providerId: samplingConfiguration.providerId, modelId: samplingConfiguration.catalogModelId ?? samplingConfiguration.model,
-    ...(samplingConfiguration.thinkingLevel === undefined ? {} : { thinkingLevel: samplingConfiguration.thinkingLevel }),
-    ...(samplingConfiguration.modelOptions?.temperature === undefined ? {} : { temperature: samplingConfiguration.modelOptions.temperature }),
-  } : undefined;
+  const samplingModel = threadConfigurationModel(snapshot?.modelSelection.active?.configuration ?? run?.configuration);
   const active = Boolean(branch?.active_run_id);
+  const delegated = Boolean(snapshot?.delegatedExecutions?.length);
+  const selectedModel = useThreadModelSelection({ draftKey, draft, ready: Boolean(snapshot), active, delegated,
+    runId: run?.id, runModel: threadConfigurationModel(snapshot?.modelSelection.desired?.configuration ?? snapshot?.modelSelection.active?.configuration ?? run?.configuration),
+    preferredModel, inheritWorkbenchModel, preferenceReady: !inheritWorkbenchModel || modelsReady, models });
+  const { providerId, modelId, temperature } = selectedModel;
+  const thinkingLevel = selectedModel.thinkingLevel ?? 'off';
   // A run that finishes in the conversation on screen taps once (§3.14); a failed one says so instead.
   const finishedRun = React.useRef<{ key: string; active: boolean } | null>(null);
   const runKey = `${identity.threadId}\0${identity.branchId}`;
@@ -266,7 +267,6 @@ export function ThreadConversation({ api, identity, onBranchCreated, initialWork
   }, [runKey, active, runFailure]);
   const computer = useComputerAutomation(identity, api.computer, branch?.active_run_id);
   const hasComputer = Boolean(computer.error || computer.state?.active || computer.state && computer.state.status !== 'enabled' || computer.state?.cleanups.length || computer.state?.leases.length || computer.state?.requests.length || computer.activities.length);
-  const delegated = Boolean(snapshot?.delegatedExecutions?.length);
   const preparingExecution = snapshot?.delegatedExecutions?.find(execution => execution.state === 'preparing' && !execution.cancel_requested);
   const preparingDelegation = Boolean(preparingExecution);
   const botSession = Boolean(snapshot?.thread.bot_id && !snapshot.thread.parent_thread_id);
@@ -282,27 +282,7 @@ export function ThreadConversation({ api, identity, onBranchCreated, initialWork
   const acceptsImages = active || delegated ? (run?.configuration as { acceptsImages?: boolean } | undefined)?.acceptsImages
     : models.find(model => model.providerId === providerId && model.modelId === modelId)?.acceptsImages;
   const projectedText = projectEditorContextAttachments(appendInlineComments(text, inlineDrafts), editorContext, { includeImages: acceptsImages === true });
-  const requestImages = React.useMemo(() => [...images, ...(acceptsImages === true ? editorContext.flatMap(item => item.reference?.image
-    ? [{ mimeType: item.reference.image.mimeType, data: item.reference.image.data }] : []) : [])], [images, acceptsImages, editorContext]);
-  React.useEffect(() => {
-    if (active || delegated || draft.firstSend) return;
-    const levels = models.find(model => model.providerId === providerId && model.modelId === modelId)?.thinkingLevels;
-    if (levels?.length && !levels.includes(thinkingLevel)) setThinkingLevel(levels[0]!);
-  }, [active, delegated, draft.firstSend, models, providerId, modelId, thinkingLevel, setThinkingLevel]);
-  React.useEffect(() => {
-    const config = (snapshot?.modelSelection.desired?.configuration ?? run?.configuration) as { providerId?: string; model?: string; thinkingLevel?: ThreadThinkingLevel; catalogModelId?: string } | undefined;
-    if (config?.providerId && config.model && (active || !providerId && preferredModel === undefined)) { setProviderId(config.providerId); setModelId(config.catalogModelId ?? config.model); setThinkingLevel(config.thinkingLevel ?? 'off'); }
-  }, [run?.configuration, snapshot?.modelSelection.desired, active, providerId, preferredModel, setProviderId, setModelId, setThinkingLevel]);
-  React.useEffect(() => {
-    if (!snapshot || preferredModel === undefined) return;
-    if (inheritWorkbenchModel && (!models.length || providerId || modelId)) return;
-    const key = JSON.stringify([host, identity.threadId, identity.branchId, preferredModel]);
-    if (appliedModelPreference.current === key) return;
-    appliedModelPreference.current = key;
-    // Active work consumes the original desired-selection owner. Idle drafts may follow a
-    // changed Bot profile even when their latest Run was cancelled; later renders preserve edits.
-    if (!active) { setProviderId(preferredModel?.providerId ?? ''); setModelId(preferredModel?.modelId ?? ''); setThinkingLevel(preferredModel?.thinkingLevel ?? 'off'); }
-  }, [snapshot, active, host, identity.threadId, identity.branchId, preferredModel, inheritWorkbenchModel, models.length, providerId, modelId, setProviderId, setModelId, setThinkingLevel]);
+  const requestImages = images;
   const needsDefaultModel = Boolean(snapshot && !run && preferredModel === undefined && !providerId && !modelId);
   React.useEffect(() => {
     if (!needsDefaultModel) return;
@@ -354,18 +334,17 @@ export function ThreadConversation({ api, identity, onBranchCreated, initialWork
     }
   };
   const insertImageReference = (number: number) => {
-    const token = t('chat.imageReference.token', { number });
-    if (messageInput.current) messageInput.current.insertText(token);
-    else useThreadDraftStore.getState().patch(draftKey, current => ({ text: current.text + token }));
+    const object = useThreadDraftStore.getState().drafts[draftKey]?.markerObjects?.find(object => object.kind === 'image' && object.number === number);
+    if (object) void insertDraftMarker(draftKey, object);
   };
   const addFiles = (files: File[]) => {
     if (!files.length || readOnly || pendingAction.current || pendingInput.current || useThreadDraftStore.getState().drafts[draftKey]?.firstSend) return;
-    selectThreadFiles(draftKey, files, insertImageReference);
+    selectThreadFiles(draftKey, files);
   };
   const selectModel = (provider: string, model: string, thinking: ThreadThinkingLevel) => {
     if (active && run) {
-      return act(()=>api.selectModel({...identity,runId:run.id,key:crypto.randomUUID(),model:{providerId:provider,modelId:model,thinkingLevel:thinking}}), false, true);
-    } else {setProviderId(provider);setModelId(model);setThinkingLevel(thinking);}
+      return act(()=>api.selectModel({...identity,runId:run.id,key:crypto.randomUUID(),model:{...selectedModel,providerId:provider,modelId:model,thinkingLevel:thinking}}), false, true);
+    } else useThreadDraftStore.getState().patch(draftKey, { model: { ...selectedModel, providerId: provider, modelId: model, thinkingLevel: thinking } });
   };
   const returnToLatest = () => {
     const store = useTimelineViewStore.getState();
@@ -373,8 +352,8 @@ export function ThreadConversation({ api, identity, onBranchCreated, initialWork
   };
   const recovery = useThreadRecovery({ api, identity, host, snapshot, disabled: readOnly || active || actionPending || Boolean(draft.pendingInput), onRecovered: async editor => {
     returnToLatest(); pendingInput.current = undefined; setPreparedSource(null);
-    if (editor.editorText !== undefined) setText(editor.editorText);
-    if (editor.editorImages !== undefined) setImages(editor.editorImages);
+    if (editor.editorText !== undefined) useThreadDraftStore.getState().patch(draftKey, restoreDraftReferences({ ...editor, identity }));
+    else if (editor.editorImages !== undefined) setImages(editor.editorImages);
     await projection.current?.refresh();
   } });
   const pending = actionPending || recovery.blocked || draft.firstSend?.status === 'sending';
@@ -412,12 +391,12 @@ export function ThreadConversation({ api, identity, onBranchCreated, initialWork
   const firstMessage = useFirstMessagePreview(draftKey, Boolean(snapshot?.historyPage.head), handoff);
   const memorySelection = getRegisteredRuntimeAPIs()?.bots?.selection;
   const referenceScope = JSON.stringify([host, draftKey, preparedSource?.source ?? launch?.selection.source ?? workspacePath]);
-  const submissionFingerprint = () => JSON.stringify([identity.threadId, identity.branchId, projectedText, draft.references, draft.selectedAttachments, requestImages, materials, draft.files?.map(file => file.id), providerId, modelId, thinkingLevel, preparedSource?.source, agent]);
+  const submissionFingerprint = () => JSON.stringify([identity.threadId, identity.branchId, projectedText, draft.references, draft.markerObjects, draft.selectedAttachments, requestImages, materials, draft.files?.map(file => file.id), providerId, modelId, thinkingLevel, preparedSource?.source, agent]);
   const sourceCannotBeApplied = active && Boolean(preparedSource) && !pendingInput.current;
   const sendBlocked = pending || (!draft.pendingInput && (!snapshot || preparingDelegation || preparingSource || sourceCannotBeApplied
-    || (images.length > 0 && acceptsImages === false)
+    || (hasDraftInlineImages(draft) && acceptsImages === false)
     || (!active && (delegated ? !api.collaboration || !run : !providerId || !modelId))));
-  const hasComposerInput = Boolean(text.trim() || images.length || materials.length || draft.files?.length || draft.selectedAttachments?.length || inlineDrafts.length || editorContext.length);
+  const hasComposerInput = Boolean(text.trim() || images.length || materials.length || draft.files?.length || draft.selectedAttachments?.length || inlineDrafts.length || editorContext.length || draft.markerObjects?.length);
   const sendDisabled = sendBlocked || (!draft.pendingInput && !hasComposerInput);
   // Trusted platform buttons use the native input owner without consuming the composer.
   // Registration follows the exact visible Host/branch; retained attempts live in its draft.
@@ -432,9 +411,7 @@ export function ThreadConversation({ api, identity, onBranchCreated, initialWork
       if (!snapshot || preparingDelegation || pending || (!active && (delegated ? !api.collaboration || !run : !providerId || !modelId))) {
         throw new Error(t('ui.content.sendUnavailable'));
       }
-      const body = { ...identity, key: crypto.randomUUID(), text: action.reference
-        ? projectContentReference(action.text, action.reference, acceptsImages === true) : action.text,
-        images: acceptsImages === true && action.reference?.image ? [{ ...action.reference.image }] : [] };
+      const body = { ...identity, key: crypto.randomUUID(), text: action.text, contentReferences: action.reference ? [{ ...action.reference, number: 1 }] : undefined };
       const original: ThreadPendingInput = { fingerprint, editorText: action.text, status: 'sending',
         ...(active ? { kind: 'enqueue', input: { ...body, mode: inputMode } }
           : delegated ? { kind: 'continue', input: { ...body, previousRunId: run!.id, expectedHead: branch?.head ?? null } }
@@ -480,7 +457,7 @@ export function ThreadConversation({ api, identity, onBranchCreated, initialWork
     if (section === 'context') { openThreadContext(identity, initialWorkspacePath, undefined, readOnly); return; }
     setFocusedOverview({ owner: contentOwner, section });
     disclosure(overviewKey, 'overview', true);
-  }, [identity, initialWorkspacePath, readOnly, contentOwner, disclosure, overviewKey]);
+  }, [identity, initialWorkspacePath, readOnly, contentOwner, disclosure, overviewKey, openThreadContext]);
   const treeNavigation = useConversationTreeStore(state => state.navigation[draftKey]);
   React.useEffect(() => () => {
     queueMicrotask(() => {
@@ -506,7 +483,7 @@ export function ThreadConversation({ api, identity, onBranchCreated, initialWork
   const localWorkspacePath = preparedSource?.source.resourceOwner.kind === 'local' ? preparedSource.path
     : launch?.selection.source?.resource_owner.kind === 'local' && launch.selection.source.mode === 'live_root' ? launch.selection.source.live_root?.canonicalRoot
     : !launch?.selection.source ? workspacePath : undefined;
-  const composerCommands = useThreadComposerCommands({ api, identity, snapshot, sourcePath: localWorkspacePath, act,
+  const composerCommands = useThreadComposerCommands({ api, identity, snapshot, sourcePath: localWorkspacePath, act, readOnly,
     disabled: pending || readOnly ? t('composer.menu.unavailable') : undefined, onHistory: () => openConversationTree(surface), onFork: head => forkFrom(head, true),
     refresh: async () => { await projection.current?.refresh(); }, onSources: () => showOverview('sources') });
   const workflows = useThreadComposerWorkflows({ api, identity, snapshot, draftKey, draftText: text, referenceScope: JSON.stringify([host, draftKey, launch?.selection.source ?? workspacePath]), onMemoryOpen: () => showOverview('memory'),
@@ -598,14 +575,14 @@ export function ThreadConversation({ api, identity, onBranchCreated, initialWork
     {!botSurface && snapshot && <ThreadWorkStrips key={`${host}:${identity.threadId}:${identity.branchId}`} api={api} identity={identity} goals={snapshot.goals} followups={snapshot.followups} pending={pending} act={act} onGoal={() => showOverview('goals')} onFollowups={() => showOverview('followups')} />}
     <div className="chat-input-column conversation-composer-queue">{snapshot && <ThreadInputQueue key={`${host}:${identity.threadId}:${identity.branchId}`}
       api={api} identity={identity} inputs={snapshot.inputs} pending={pending} reportDelivery={botSession}
-      onSave={async (input, text, images) => {
+      onSave={async (input, text, images, quotes) => {
         let saved = false;
         await act(async () => {
           const preparedImages = images === undefined ? undefined : await prepareAnnotatedImages(images);
           // Image export may outlive a Host switch. The API resolves its endpoint
           // at dispatch, so the original edit must not follow the new selection.
           if (host !== getRuntimeEndpointGeneration()) return;
-          await (preparedImages === undefined ? api.editInput(input.id, input.revision, text) : api.editInput(input.id, input.revision, text, preparedImages));
+          await api.editInput(input.id, input.revision, text, preparedImages, undefined, quotes);
           saved = true;
         });
         return saved;
@@ -620,8 +597,8 @@ export function ThreadConversation({ api, identity, onBranchCreated, initialWork
         try {
         const settings = useUIStore.getState();
         const request = draft.firstSend ?? { key: crypto.randomUUID(), status: 'sending' as const, editorText: text, text: projectedText,
-          images: requestImages, files: draft.files ?? [], selectedAttachments: draft.selectedAttachments, referenceScope, model: { providerId, modelId, thinkingLevel, ...(temperature === undefined ? {} : { temperature }) }, ...(!botSurface && !snapshot?.thread.bot_id && !delegated ? { agent } : {}), workspacePath,
-          sourceSelection: draft.sourceSelection, editorContext, inlineContext, ...composerInputReferences(text, draft.references, referenceScope),
+          images: requestImages, imageObjects: draft.markerObjects, files: draft.files ?? [], selectedAttachments: draft.selectedAttachments, referenceScope, model: { providerId, modelId, thinkingLevel, ...(temperature === undefined ? {} : { temperature }) }, ...(!botSurface && !snapshot?.thread.bot_id && !delegated ? { agent } : {}), workspacePath,
+          sourceSelection: draft.sourceSelection, attachmentImageReferences: draftAttachmentImageReferences(draft), editorContext, inlineContext, markerObjectIds: draft.markerObjects?.map(object => object.id), markerOccurrenceIds: draft.references?.filter(reference => reference.target.kind === 'quote' || reference.target.kind === 'image').map(reference => reference.id), ...freezeDraftContentReferences(draft), ...composerInputReferences(text, draft.references, referenceScope),
           ...(draft.goalArmed && text.trim() ? { goalObjective: text.trim(), ...(settings.sessionGoalDefaultBudgetEnabled ? { goalBudget: settings.sessionGoalDefaultBudget } : {}) } : {}) };
         tapHaptic();
         handoff.submit(request.key, draftKey, handoff.captureDraft());
@@ -652,18 +629,21 @@ export function ThreadConversation({ api, identity, onBranchCreated, initialWork
           const selections = composerFileSelections(draft.selectedAttachments, referenceScope);
           const files = draft.files ?? [];
           const retained = await prepareThreadFiles(api, identity, draftKey, files);
+          const preparedImages = await prepareDraftMarkerImages(draft, api);
           if (generation !== identityGeneration.current || host !== getRuntimeEndpointGeneration()) return;
           const key = crypto.randomUUID();
-          const attachments = { ...attachmentImageReferences(files, retained), ...(materials.length ? { materials: materials.map(({ snapshotId }) => ({ snapshotId })) } : {}),
+          const attachments = { attachmentImageReferences: { ...draftAttachmentImageReferences(draft), ...attachmentImageReferences(files, retained).attachmentImageReferences }, ...(materials.length ? { materials: materials.map(({ snapshotId }) => ({ snapshotId })) } : {}),
             ...(retained.length || selections.length ? { attachments: [...retained.map(({ ref }) => ({ ref })), ...selections] } : {}) };
-          const submit = { ...identity, key, text: projectedText, images: requestImages, ...composerInputReferences(text, draft.references, referenceScope), ...attachments, expectedHead: branch?.head ?? null, model: { providerId, modelId, thinkingLevel, ...(temperature === undefined ? {} : { temperature }) }, ...(!botSurface && !snapshot?.thread.bot_id && !delegated ? { agent } : {}), ...(sourceForInput ? { source: sourceForInput.source } : {}) };
-          const queued = { ...identity, key, text: projectedText, images: requestImages, ...composerInputReferences(text, draft.references, referenceScope), ...attachments, mode: requestedMode };
-          const continuation = { ...identity, key, text: projectedText, images: requestImages, ...composerInputReferences(text, draft.references, referenceScope), ...attachments, previousRunId: run?.id ?? '', expectedHead: branch?.head ?? null };
+          const quotedFiles = await prepareQuotedFiles({ ...freezeDraftContentReferences(draft), ...attachments }, identity, input => api.attachments.upload(identity, input), api, draft.markerObjects);
+          if (generation !== identityGeneration.current || host !== getRuntimeEndpointGeneration()) return;
+          const submit = { ...identity, key, text: projectedText, images: preparedImages, ...quotedFiles, ...composerInputReferences(text, draft.references, referenceScope), ...attachments, ...quotedFiles, expectedHead: branch?.head ?? null, model: { providerId, modelId, thinkingLevel, ...(temperature === undefined ? {} : { temperature }) }, ...(!botSurface && !snapshot?.thread.bot_id && !delegated ? { agent } : {}), ...(sourceForInput ? { source: sourceForInput.source } : {}) };
+          const queued = { ...identity, key, text: projectedText, images: preparedImages, ...quotedFiles, ...composerInputReferences(text, draft.references, referenceScope), ...attachments, ...quotedFiles, mode: requestedMode };
+          const continuation = { ...identity, key, text: projectedText, images: preparedImages, ...quotedFiles, ...composerInputReferences(text, draft.references, referenceScope), ...attachments, ...quotedFiles, previousRunId: run?.id ?? '', expectedHead: branch?.head ?? null };
           if (!active && delegated && (!api.collaboration || !run)) throw new Error('Child continuation is unavailable');
           const goalSettings = useUIStore.getState();
           const goal = !botSurface && draft.goalArmed && !active && !delegated && text.trim() ? { goalObjective: text.trim(),
             ...(goalSettings.sessionGoalDefaultBudgetEnabled ? { goalBudget: goalSettings.sessionGoalDefaultBudget } : {}) } : {};
-          pendingInput.current = { fingerprint, editorText: text, fileIds: files.map(file => file.id), selectedAttachmentIds: draft.selectedAttachments?.map(file => file.id), editorContext, inlineContext, preparedSource: sourceForInput, ...goal, status: 'sending', ...(active ? { kind: 'enqueue' as const, input: queued }
+          pendingInput.current = { fingerprint, editorText: text, editorImages: requestImages, markerObjectIds: draft.markerObjects?.map(object => object.id), markerOccurrenceIds: draft.references?.filter(reference => reference.target.kind === 'quote' || reference.target.kind === 'image').map(reference => reference.id), fileIds: files.map(file => file.id), selectedAttachmentIds: draft.selectedAttachments?.map(file => file.id), editorContext, inlineContext, preparedSource: sourceForInput, ...goal, status: 'sending', ...(active ? { kind: 'enqueue' as const, input: queued }
             : delegated ? { kind: 'continue' as const, input: continuation } : { kind: 'submit' as const, input: submit }) };
         }
         const original = pendingInput.current;
@@ -677,11 +657,8 @@ export function ThreadConversation({ api, identity, onBranchCreated, initialWork
           pendingInput: undefined, preparedSource: current.preparedSource === original.preparedSource ? null : current.preparedSource,
           ...(original.goalObjective ? { goalArmed: false } : {}),
           text: current.text === original.editorText ? '' : current.text,
-          ...(current.text === original.editorText ? { references: [] } : {}),
-          images: current.images.filter(image => !(original.input.images ?? []).includes(image)),
-          files: current.files?.filter(file => !original.fileIds?.includes(file.id)),
-          selectedAttachments: current.selectedAttachments?.filter(file => !original.selectedAttachmentIds?.includes(file.id)),
-          materials: current.materials.filter(material => !(original.input.materials ?? []).some(item => item.snapshotId === material.snapshotId)),
+          ...acknowledgeDraftMarkers(current, original.editorText, original.markerObjectIds, original.markerOccurrenceIds, { images: original.editorImages ?? original.input.images, fileIds: original.fileIds, selectedAttachmentIds: original.selectedAttachmentIds }),
+            materials: current.materials.filter(material => !(original.input.materials ?? []).some(item => item.snapshotId === material.snapshotId)),
         } : {});
         if (generation !== identityGeneration.current || host !== getRuntimeEndpointGeneration()) return;
         returnToLatest();
@@ -705,7 +682,12 @@ export function ThreadConversation({ api, identity, onBranchCreated, initialWork
       {modelError && <p role="alert" className="text-sm text-destructive">{modelError}</p>}
       {snapshot?.modelSelection.desired?.status === 'failed' && <p role="alert" className="text-sm text-destructive">{t('chat.model.preparationFailed', { reason: snapshot.modelSelection.desired.failure ?? '' })}</p>}
       {snapshot?.modelSelection.desired && snapshot.modelSelection.desired.id !== snapshot.modelSelection.active?.id && snapshot.modelSelection.desired.status !== 'failed' && <p role="status" className="text-sm text-muted-foreground">{t('chat.model.nextRequest')}</p>}
-      {images.length > 0 && acceptsImages === false && <p role="alert" className="text-sm text-destructive">{t('chat.model.imagesUnsupported')}</p>}
+      {hasDraftInlineImages(draft) && acceptsImages === false && <div className="space-y-1">
+        <p role="alert" className="text-sm text-destructive">{t('chat.model.imagesUnsupported')}</p>
+        <button type="button" className="text-sm text-primary underline" disabled={pending || Boolean(draft.pendingInput || draft.firstSend)}
+          onClick={() => { void convertDraftMarkerImagesToFiles(draftKey, host, api).catch(cause => setError(cause instanceof Error ? cause.message : String(cause))); }}>{t('chat.model.useImagesAsFiles')}</button>
+      </div>}
+      {acceptsImages === false && draft.files?.some(file => file.imageReference !== undefined) && <p role="status" className="text-sm text-muted-foreground">{t('chat.model.imagesAsFilesNotice')}</p>}
       <input ref={fileInput} type="file" accept="image/*" multiple hidden aria-label="Choose image attachments"
         onChange={event => { const files = [...(event.target.files ?? [])]; event.target.value = ''; void addFiles(files); }} />
       <input ref={pdfInput} type="file" multiple hidden aria-label={t('chat.attachments.choose')}
@@ -738,7 +720,7 @@ export function ThreadConversation({ api, identity, onBranchCreated, initialWork
         onWorkspace={botSurface ? undefined : () => showOverview('sources')} workspaceLabel={preparedSource ? formatDirectoryName(preparedSource.path) : launch?.selection.source?.live_root ? formatDirectoryName(launch.selection.source.live_root.canonicalRoot) : launch?.selection.source ? t('harness.overview.sources') : workspacePath ? formatDirectoryName(workspacePath) : t('thread.composer.chatOnly')}
         workspacePath={localWorkspacePath}
         skills={snapshot?.context.checkpoint?.resources?.snapshot.skills.map(skill => skill.name) ?? []}>
-        <div className="space-y-2 px-3 empty:hidden">{!botSurface && emptyWorkspacePath && <ActiveEditorSuggestion threadKey={draftKey} />}      <EditorContextAttachmentChips threadKey={draftKey} />
+        <div className="space-y-2 px-3 empty:hidden">{!botSurface && emptyWorkspacePath && <ActiveEditorSuggestion threadKey={draftKey} />}      <EditorContextAttachmentChips threadKey={draftKey} /><DraftContentReferences draftKey={draftKey} locked={pending || Boolean(draft.firstSend || draft.pendingInput)} />
       {inlineContext.length > 0 && <div className="flex flex-wrap gap-1" aria-label="Attached context">
         {inlineContext.flatMap(bucket => bucket.drafts.map(item => <Button key={item.id} type="button" size="sm" variant="outline"
           title={item.text || item.fileLabel} onClick={() => useInlineCommentDraftStore.getState().acknowledgeDrafts(bucket.key, [item])}>
@@ -747,9 +729,7 @@ export function ThreadConversation({ api, identity, onBranchCreated, initialWork
       </div>}
       <ImageAttachmentStrip key={draftKey} images={images} removeLabel={t('chat.fileAttachment.actions.removeImage')}
         onUpdate={pending || draft.pendingInput || draft.firstSend ? undefined : (index,image)=>updateDraftImage(draftKey,index,image)}
-        onReference={pending || draft.pendingInput || draft.firstSend ? undefined : number => {
-          messageInput.current?.insertText(t('chat.imageReference.token', { number })); messageInput.current?.focus();
-        }}
+        onReference={pending || draft.pendingInput || draft.firstSend ? undefined : insertImageReference}
         onRemove={pending || draft.pendingInput || draft.firstSend ? undefined : index => removeDraftImage(draftKey, index)} />
       <ThreadMaterialAttachments materials={materials} locked={pending || Boolean(draft.firstSend || draft.pendingInput)}
         onRemove={snapshotId => { if (!pendingAction.current && !pendingInput.current) setMaterials(current => current.filter(material => material.snapshotId !== snapshotId)); }} />

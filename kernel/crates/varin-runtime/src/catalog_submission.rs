@@ -2,6 +2,8 @@
 use super::*;
 
 pub struct SubmissionPreparation {
+    input_id: String,
+    model_attachments: Vec<super::attachments::Attachment>,
     existing: Option<(Value, Receipt)>,
     input_preparation: Option<resources::InputResourcePreparation>,
     expected_context_checkpoint: Option<String>,
@@ -51,6 +53,7 @@ pub(super) enum SubmissionOrigin {
     Summary { source_branch_id: String },
 }
 pub struct PreparedSubmission {
+    pub(super) extension_admission: Option<launches::ExtensionAdmission>,
     pub(super) attachments: Vec<super::attachments::Attachment>,
     pub(super) title: Option<String>,
     pub(super) input_id: String,
@@ -69,6 +72,8 @@ pub struct PreparedSubmission {
     pub(super) _publication: crate::content::ContentPublication,
 }
 pub(super) struct SubmissionBody {
+    pub input_id: Option<String>,
+    pub model_attachments: Option<Vec<super::attachments::Attachment>>,
     pub inherited_context: Option<crate::context_retention::RetainedContext>,
     pub input_preparation: Option<resources::InputResourcePreparation>,
     pub command: SubmitInput,
@@ -172,7 +177,13 @@ impl Catalog {
                     .then(|| personalization.as_ref().map(context::ContextScope::from))
                     .flatten()
             });
+        let publication=self.content.begin_publication();
+        let input_id=existing.as_ref().map(|(_,receipt): &(Value,Receipt)|receipt.input_id.clone()).unwrap_or_else(id);
+        let mut model_attachments=super::attachments::input_attachments(&command.input)?;
+        if existing.is_none() {self.project_attachments(&mut model_attachments,&input_id)?;}
         Ok(SubmissionPreparation {
+            input_id,
+            model_attachments,
             existing,
             input_preparation: None,
             expected_context_checkpoint: None,
@@ -185,7 +196,7 @@ impl Catalog {
             resources: None,
             epoch: self.epoch,
             content: self.content.clone(),
-            publication: self.content.begin_publication(),
+            publication,
             inherited_launch,
             current_tool_catalog: None,
         })
@@ -265,6 +276,7 @@ impl SubmissionPreparation {
                 .0
                 .clone();
             return Ok(PreparedSubmission {
+                extension_admission: None,
                 attachments: Vec::new(),
                 title: None,
                 input_id: receipt.input_id,
@@ -327,6 +339,8 @@ impl SubmissionPreparation {
             }
         } else { None };
         let mut prepared = PreparedSubmission::stage(SubmissionBody {
+            input_id: Some(self.input_id),
+            model_attachments: Some(self.model_attachments),
             inherited_context: None,
             input_preparation: self.input_preparation,
             command: self.command,
@@ -351,6 +365,8 @@ impl SubmissionPreparation {
 impl PreparedSubmission {
     pub(super) fn stage(body: SubmissionBody) -> Result<Self> {
         let SubmissionBody {
+            input_id: selected_input_id,
+            model_attachments,
             inherited_context,
             input_preparation,
             command,
@@ -369,7 +385,7 @@ impl PreparedSubmission {
         let input_id = match &origin {
             SubmissionOrigin::Ingress { input, .. } => input.id.clone(),
             SubmissionOrigin::Child { operation_id, .. } => format!("child-input:{operation_id}"),
-            _ => id(),
+            _ => selected_input_id.unwrap_or_else(id),
         };
         if resources.is_some() && initial.is_none() {
             return Err(RuntimeError::Invalid(
@@ -530,7 +546,7 @@ impl PreparedSubmission {
             })
             .transpose()?
             .flatten();
-        let input_material = match input_material {
+        let mut input_material = match input_material {
             Some(value) => value,
             None if matches!(
                 origin,
@@ -546,6 +562,9 @@ impl PreparedSubmission {
             }
             None => command.input.clone(),
         };
+        if let Some(files)=&model_attachments {
+            if !files.is_empty() {input_material["fileAttachments"]=serde_json::to_value(files)?;}
+        }
         let history = match &origin {
             SubmissionOrigin::Ingress { history, .. } => history.clone(),
             SubmissionOrigin::Child { user: true, .. } => content.save_user_history(&input_id, &input_material)?,
@@ -595,7 +614,8 @@ impl PreparedSubmission {
             .map(|selection| launch_content::LaunchSelectionMetadata::stage(&content, selection))
             .transpose()?;
         Ok(Self {
-            attachments: super::attachments::input_attachments(&command.input)?,
+            extension_admission: None,
+            attachments: model_attachments.unwrap_or(super::attachments::input_attachments(&command.input)?),
             title: threads::input_title(&command.input),
             input_id,
             run_id,

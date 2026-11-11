@@ -5,6 +5,7 @@ use super::*;
 use crate::execution::{Content, ConversationItem, Provenance};
 
 pub struct ProcessWaitPreparation {
+    model_reference: Option<String>,
     epoch: u64,
     run: Run,
     wait: Wait,
@@ -70,14 +71,32 @@ impl ProcessWaitPreparation {
                 "output":{"processId":process.id,"reader":"process_read",
                     "available":data.and_then(|data|data.get("outputAvailable")).and_then(Value::as_bool)}})
         };
-        let text = if wait.cancelled {
-            "The observation wait was cancelled. This did not stop the observed job.".into()
+        let reference=self.model_reference.as_deref().ok_or_else(||RuntimeError::Invalid("Process observation projection missing".into()))?;
+        let mut projected=json!({"operationRef":reference,"outcome":process.outcome,"effect":process.effect,
+            "observationCancelled":wait.cancelled,
+            "executorStopped":process.external_receipt.as_ref().map(|receipt|receipt.executor_stopped)});
+        if process.managed_process.is_some() {
+            projected["processId"]=json!(reference);
+            for key in ["exitCode","signal","stopApplied","treeConfirmed"] {projected[key]=result[key].clone();}
+            projected["output"]=json!({"available":data.and_then(|data|data.get("outputAvailable")).and_then(Value::as_bool),
+                "read":{"tool":"process_read","arguments":{"processId":reference}}});
         } else {
-            format!(
-                "Job lifecycle data, not a user instruction or permission. This reports the original executor's observed outcome; an indeterminate outcome is not proof of success or termination. Output remains in the original domain owner and may be read separately when authorized.\n{}",
-                serde_json::to_string(&result)?
-            )
-        };
+            projected["jobId"]=json!(reference);
+            if let Some(job)=&process.host_job {projected["domain"]=json!(job.binding.domain);}
+            // Respect an explicit owner projection, otherwise retain the actual business data.
+            // Its arbitrary JSON keys are not execution metadata to guess or remove.
+            if let Some(model)=receipt.as_ref().map(|body|body.model_data()).filter(|data|!data.is_null()) {projected["receipt"]=model.clone();}
+            if let Some(fact)=&self.mcp_result {
+                projected["availability"]=json!(fact.task.availability);
+                projected["resultReady"]=json!(fact.task.result_ready);
+                projected["executorStopped"]=json!(fact.executor_stopped);
+            }
+        }
+        let text = if wait.cancelled {
+            "The observation wait was cancelled. This did not stop the observed job."
+        } else {
+            "Job result observation."
+        }.to_owned();
         let item: ConversationItem = ConversationItem {
             resource_activation: None,
             id: item_id.clone(),
@@ -87,21 +106,13 @@ impl ProcessWaitPreparation {
                     |cursor| format!("process-terminal:{cursor}"),
                 ),
             },
-            content: if let Some(receipt) = receipt {
-                Content::Output {
-                    output: crate::output::OutputBody {
-                        data: result,
-                        // The wrapped data can address its original parts by index. Append
-                        // our lifecycle explanation without shifting any owned output part.
-                        parts: receipt
-                            .parts
-                            .into_iter()
-                            .chain(std::iter::once(crate::output::OutputPart::Text { text }))
-                            .collect(),
-                    },
-                }
-            } else {
-                Content::Text { text }
+            content: Content::Output {
+                output: crate::output::OutputBody {
+                    model_data: Some(projected),
+                    data: result,
+                    parts: receipt.map(|body|body.parts).unwrap_or_default().into_iter()
+                        .chain(std::iter::once(crate::output::OutputPart::Text{text})).collect(),
+                },
             },
             opaque: None,
         };
@@ -226,7 +237,9 @@ impl Catalog {
                     )
                 })
             };
+            let model_reference=if visible.is_none() {Some(self.operation_model_reference(&process.id,&run.id)?)} else {None};
             preparations.push(ProcessWaitPreparation {
+                model_reference,
                 epoch: self.epoch,
                 expected_head: self.head(&run.branch_id)?,
                 run,

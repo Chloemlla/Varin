@@ -991,11 +991,19 @@ impl<M> ToolCompletion<M> {
     /// Project only an original failure state. Successful opaque tool data is never
     /// reclassified because it happens to contain a property named `error`.
     pub fn error(&self) -> Option<ExecutionError> {
+        self.error_with_projection(false)
+    }
+    /// Model rendering respects the owner's fixed projection; the durable error accessor
+    /// above continues reading the exact original completion data.
+    pub(crate) fn model_error(&self) -> Option<ExecutionError> {
+        self.error_with_projection(true)
+    }
+    fn error_with_projection(&self, model: bool) -> Option<ExecutionError> {
         match self {
             Self::NotDispatched { reason, error } if reason != "cancelled" => Some(error.clone()
                 .unwrap_or_else(||ExecutionError::new("tool_not_dispatched", reason))),
             Self::Result { outcome: Outcome::Failed | Outcome::Indeterminate, content, .. } => {
-                let data=&content.data;
+                let data=if model {content.model_data()} else {&content.data};
                 let structured=data.get("error").filter(|value|value.is_object());
                 let code=structured.and_then(|value|value.get("code")).or_else(||data.get("code")).and_then(Value::as_str).unwrap_or("tool_failed");
                 let message=structured.and_then(|value|value.get("message")).or_else(||data.get("message")).or_else(||data.get("reason")).and_then(Value::as_str)
@@ -1125,6 +1133,9 @@ pub fn bind_tool_executor<T: ToolExecutor + ?Sized>(executor: Arc<T>, call: &Too
     Box::new(ExecutorCall { executor, call: call.clone(), context: context.clone() })
 }
 impl<T: ToolExecutor + ?Sized> PreparedToolCall for ExecutorCall<T> {
+    fn requires_operation(&self) -> bool {
+        self.executor.requires_operation(&self.context, &self.call)
+    }
     fn receipt_persisted(&self, context: &ToolExecutionContext) {
         self.executor.receipt_persisted(context, &self.call);
     }
@@ -1255,6 +1266,9 @@ pub trait ToolExecutor: Send + Sync + 'static {
     ) -> Result<Option<crate::execution_capacity::AdmissionControlGuard>, ExecutionError> {
         Ok(None)
     }
+
+    /// Domain reads which publish durable consumption provenance retain their original invocation.
+    fn requires_operation(&self, _: &FrozenToolContext, _: &ToolCall) -> bool { false }
 
     /// Trusted implementation opt-in, never inferred from untrusted MCP annotations.
     fn supports_policy_read(&self, _: &FrozenToolContext, _: &ToolCall, _: &ToolContract) -> bool {
@@ -1469,7 +1483,6 @@ pub trait Persistence: Send + Sync + 'static {
     ) -> Result<Option<crate::catalog::goals::GoalContext>, ExecutionError> {
         Ok(None)
     }
-    fn teammate_context(&self, _run: &str, _epoch: u64) -> Result<Option<ConversationItem>, ExecutionError> { Ok(None) }
     fn goal_boundary(
         &self,
         _run: &str,
@@ -2650,7 +2663,6 @@ impl<
                         .persistence
                         .goal_context(&input.run_id, input.owner_generation)?;
                     binding.goal = goal.as_ref().map(|g| g.binding.clone());
-                    let teammates = self.persistence.teammate_context(&input.run_id,input.owner_generation)?;
                     // Current binding instructions belong to the fixed request context, after
                     // the existing system prefix and before growing history. Keep Goal's original
                     // provenance (and provider user role); neither these items nor their placement
@@ -2670,7 +2682,6 @@ impl<
                         let prefix = request_history.iter().take_while(|item| item.provenance.is_system()).count();
                         request_history.splice(prefix..prefix,
                             binding_context.iter().cloned().chain(goal.as_ref().and_then(|g| g.item.clone()).map(Arc::new)));
-                        request_history.extend(teammates.iter().cloned().map(Arc::new));
                         request_history
                     };
                     let request_history = project_request(&history, Some(&mut history_projection_reuse));

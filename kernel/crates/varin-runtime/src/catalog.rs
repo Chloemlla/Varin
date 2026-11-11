@@ -53,7 +53,7 @@ pub enum RuntimeError {
     },
 }
 type Result<T> = std::result::Result<T, RuntimeError>;
-pub(crate) const FORMAT: i64 = 89;
+pub(crate) const FORMAT: i64 = 94;
 fn sql_number(value: u64) -> Result<i64> {
     i64::try_from(value).map_err(|_| RuntimeError::Invalid("integer exceeds catalog range".into()))
 }
@@ -146,6 +146,8 @@ fn inspect_catalog_format(db: &Connection) -> Result<i64> {
 
 fn check_catalog_schema(db: &Connection, version: i64) -> Result<()> {
     threads::check_format(db)?;
+    if version >= 93 { model_references::check_format(db)?; }
+    else if version == 92 { model_references::check_optional_format(db)?; }
     if version >= 87 { principals::check_format(db)?; }
     else { principals::check_legacy_format(db)?; }
     db.prepare("SELECT id,thread_id,parent,run_id,body FROM history")?;
@@ -239,6 +241,7 @@ fn initialize_metadata(
         context_observations::initialize(&tx)?;
         driver::initialize(&tx)?;
         attachments::initialize(&tx)?;
+        model_references::initialize(&tx)?;
     }
     titles::initialize(&tx)?;
     let epoch = tx.query_row(
@@ -254,6 +257,7 @@ fn initialize_metadata(
 /// across model, extension or tool execution is forbidden: all methods are bounded local transactions.
 /// Its database is separate from the replaceable system-kernel cache and is never recreated on error.
 pub struct Catalog {
+    ingress_tool_catalog: Option<activation::IngressToolCatalog>,
     db: Connection,
     content: crate::content::ContentStore,
     resource_admission: std::sync::Arc<crate::resource_admission::ResourceAdmission>,
@@ -309,6 +313,7 @@ impl Catalog {
         }
         let epoch = initialize_metadata(&mut db, if version == 0 { 0 } else { FORMAT }, &content)?;
         let mut this = Self {
+            ingress_tool_catalog: None,
             db,
             content,
             resource_admission,
@@ -587,6 +592,13 @@ impl Catalog {
             "INSERT INTO runs(id,branch_id,body,context_checkpoint_id) VALUES(?1,?2,?3,(SELECT checkpoint_id FROM active_contexts WHERE branch_id=?2))",
             params![run_id, command.branch_id, encode(&run)?],
         )?;
+        match origin {
+            submissions::SubmissionOrigin::Child { operation_id, .. } => model_references::bind_delegated_run(tx, operation_id, &run.id)?,
+            submissions::SubmissionOrigin::ChildContinuation { execution_id, .. } => model_references::bind_delegated_run(tx, execution_id, &run.id)?,
+            submissions::SubmissionOrigin::Ingress { execution_id: Some(execution_id), .. } => model_references::bind_delegated_run(tx, execution_id, &run.id)?,
+            submissions::SubmissionOrigin::Summary { .. } => {},
+            _ => model_references::admit_native(tx, &run)?,
+        }
         tx.execute(
             "UPDATE branches SET head=?2,active_run=?3 WHERE id=?1",
             params![command.branch_id, input_id, run_id],
@@ -608,6 +620,7 @@ impl Catalog {
                 launches::validate_environment_source(&tx, &run.thread_id, source)?;
             }
             let intent = launch_content::LaunchMetadata {
+                extension_admission: prepared.extension_admission.clone(),
                 dispatch_context_ref: None,
                 policy_generation: 0,
                 policy_target: policy_switch::PolicyTargetMetadata::Default,
@@ -1838,6 +1851,11 @@ mod observe;
 pub mod usage;
 #[path = "catalog_usage_ledger.rs"]
 pub mod usage_ledger;
+#[path = "catalog_model_references.rs"]
+pub mod model_references;
+#[path = "catalog_export.rs"]
+pub mod export;
+
 #[path = "catalog_threads.rs"]
 pub mod threads;
 #[path = "catalog_identity.rs"]
@@ -2103,3 +2121,7 @@ pub mod attachments;
 #[cfg(test)]
 #[path = "catalog_read_performance_tests.rs"]
 mod read_performance_tests;
+
+#[cfg(test)]
+#[path = "catalog_quote_tests.rs"]
+mod quote_tests;
