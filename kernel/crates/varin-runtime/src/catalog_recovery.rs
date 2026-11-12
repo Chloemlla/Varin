@@ -155,7 +155,6 @@ impl ExecutionPreparation {
 
 struct ModelRecoveryPreparation {
     active_model: Option<super::models::RunModelSelection>,
-    active_tool_composition: Option<Value>,
     step: ModelStep,
     output: Value,
     calls: Vec<ToolCall>,
@@ -278,6 +277,27 @@ fn reconciled_terminal_stop(op: &Operation) -> bool {
         })
 }
 
+/// Cancelling a foreground Result can end its observation without certifying that the
+/// original Host callback stopped. Keep its unknown Operation and resource occupancy
+/// available for the original owner's late receipt. Jobs, subscriptions and processes
+/// have independent lifetimes and cannot use this caller-only cancellation boundary.
+pub(super) fn cancellable_result_observation(op: &Operation) -> Result<bool> {
+    if op.phase != OperationPhase::Terminal
+        || op.outcome != Some(Outcome::Indeterminate)
+        || !matches!(op.effect, Effect::None | Effect::Unknown)
+        || !matches!(op.execution_owner, Some(ExecutorOwner::External { .. }))
+        || op.host_job.is_some()
+        || op.managed_process.is_some()
+        || op.mcp_resource_subscription.is_some()
+        || op.intent.get("kind").and_then(Value::as_str) != Some("tool")
+    {
+        return Ok(false);
+    }
+    let intent = super::tool_content::ToolIntent::from_operation(op)?;
+    Ok(intent.contract().completion == CompletionKind::Result
+        && intent.contract().lifetime == Lifetime::Run)
+}
+
 impl RecoveryPreparation {
     pub(crate) fn identity(&self) -> PreparationIdentity {
         PreparationIdentity {
@@ -303,6 +323,15 @@ impl RecoveryPreparation {
             .and_then(|agent| agent.tools.as_deref());
         let request_tools = crate::tool_disclosure::request_tools(
             &self.execution.binding.tools, self.goal.is_some(), allowed_tools);
+        if let Some(launch) = &self.launch {
+            let current: Vec<ToolSchema> = serde_json::from_value(
+                self.execution.content.load(&launch.selection.tools_ref)?)?;
+            if current != self.execution.binding.tools
+                || launch.selection.tool_schema_generation != self.execution.binding.tool_schema_generation
+            {
+                return Err(RuntimeError::Conflict("execution tools differ from the current launch directory".into()));
+            }
+        }
         let recovery = match &self.kind {
             RecoveryKind::None | RecoveryKind::Policy => None,
             RecoveryKind::Undispatched { step, checkpoint } => {
@@ -490,6 +519,7 @@ impl RecoveryPreparation {
                     &self.execution.run.id,
                     step.clone(),
                     policy,
+                    self.execution.run.cancel_requested,
                 )?;
                 drop(snapshot_read);
                 let snapshot: RequestSnapshot =
@@ -530,20 +560,7 @@ impl RecoveryPreparation {
                     })
                     .transpose()?
                     .unwrap_or(false);
-                let tools_changed = snapshot.view.binding.tools != request_tools
-                    || snapshot.view.binding.tool_schema_generation
-                        != binding.tool_schema_generation;
-                let activated_tools = match &model.active_tool_composition {
-                    Some(reference) => {
-                        let selected: super::tools::ToolComposition =
-                            serde_json::from_value(self.execution.content.load(reference)?)?;
-                        selected.generation == binding.tool_schema_generation
-                            && selected.tools == binding.tools
-                    }
-                    None => false,
-                };
-                if (tools_changed && (model.committed != model.calls.len() || !activated_tools))
-                    || (model_changed && (model.committed != model.calls.len() || !activated_model))
+                if model_changed && (model.committed != model.calls.len() || !activated_model)
                 {
                     return Err(RuntimeError::Conflict(
                         "completed exchange belongs to another frozen launch binding".into(),
@@ -785,13 +802,15 @@ impl Catalog {
             let (call, receipt) = row?;
             let key = format!("{request}:tool:{call}");
             if let Some(op) = optional_record::<Operation>(&self.db, "operations", &key)? {
+                let cancelled_observation = cancellable_result_observation(&op)?;
                 if !op.handed_off
                     && (op.effect == Effect::Unknown || op.outcome == Some(Outcome::Indeterminate))
                     && !reconciled_terminal_stop(&op)
+                    && !cancelled_observation
                 {
-                    // Caller completion can be durable before physical stop. Only the original
-                    // executor's stop fact, never a receipt/empty occupancy alone, releases this
-                    // cancelled foreground exchange for recovery.
+                    // Independent jobs/processes still need their original stop fact. A
+                    // foreground Result may only close its caller observation above; neither
+                    // path treats an empty occupancy record as physical stop evidence.
                     let owner = serde_json::to_value(&op.execution_owner)?;
                     let stopped: bool = self.db.query_row(
                         "SELECT EXISTS(SELECT 1 FROM events WHERE subject=?1 AND kind='operation.invocation_executor_stopped' AND json_extract(data,'$.operationEpoch')=?2 AND json_extract(data,'$.executionOwner.kind') IS ?3 AND json_extract(data,'$.executionOwner.identity') IS ?4 AND json_extract(data,'$.executionOwner.epoch') IS ?5)",
@@ -807,7 +826,7 @@ impl Catalog {
                 }
                 if op.phase != OperationPhase::Terminal
                     || ((op.effect == Effect::Unknown || op.outcome == Some(Outcome::Indeterminate))
-                        && !reconciled_terminal_stop(&op))
+                        && !reconciled_terminal_stop(&op) && !cancelled_observation)
                 {
                     return Ok(None);
                 }
@@ -1186,6 +1205,7 @@ impl Catalog {
         run_id: &str,
         step: ModelStep,
         policy: &PolicyIdentity,
+        cancelling: bool,
     ) -> Result<ModelRecoveryPreparation> {
         let request_id = &step.id;
         let output: Option<String> = database
@@ -1285,10 +1305,12 @@ impl Catalog {
                 }
                 // A stopped original executor can truthfully leave its business effect unknown.
                 // That durable receipt closes the call without making it replayable or successful.
-                // Recovery's synthetic Unknown alone is insufficient, as is empty occupancy.
+                // Ordinary recovery cannot resume an unresolved effect. Explicit foreground
+                // cancellation may close only its observation and keeps the original occupancy.
                 if ((op.effect == Effect::Unknown
                     || op.outcome == Some(Outcome::Indeterminate))
-                    && !reconciled_terminal_stop(&op))
+                    && !reconciled_terminal_stop(&op)
+                    && !(cancelling && cancellable_result_observation(&op)?))
                     || (op.phase != OperationPhase::Terminal && op.effect != Effect::None)
                 {
                     return Err(RuntimeError::Conflict(
@@ -1350,8 +1372,6 @@ impl Catalog {
             None
         };
         Ok(ModelRecoveryPreparation {
-            active_tool_composition: database.query_row("SELECT json_extract(data,'$.composition') FROM events WHERE subject=?1 AND kind='run.tools_activated' ORDER BY cursor DESC LIMIT 1",
-                [run_id],|row|row.get::<_,String>(0)).optional()?.map(|value|serde_json::from_str(&value)).transpose()?,
             active_model: {
                 let id: Option<String> = database.query_row("SELECT id FROM model_selections WHERE run_id=?1 AND active=1",[run_id],|row|row.get(0)).optional()?;
                 id.map(|id|record(database,"model_selections",&id)).transpose()?

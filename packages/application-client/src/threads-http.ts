@@ -7,6 +7,7 @@ export class ThreadRequestError extends Error {
   constructor(readonly status: number, readonly code: string, readonly admission?: 'not_started', readonly detail?: string) {
     super(code === 'extension-host-unavailable' ? 'The local extension process is unavailable. Restart Varin; if it persists, reinstall the application.'
       : code === 'thread-input-rejected' ? 'This message was not accepted. You can edit it and try again.'
+      : code === 'thread-conflict' ? 'The conversation state changed while this request was in progress (409).'
       : code === 'model-images-unsupported' ? 'The selected model does not accept images. Choose an image-capable model or remove the images.'
       : code === 'http-body-too-large' ? 'The message exceeds this server’s request size limit. Reduce its attachments or adjust the server limit.'
       : (code === 'workspace_backend_unavailable' || code.startsWith('resource-')) && detail ? detail : threadSourceFailureMessage(code) ?? `Thread request failed (${status})`);
@@ -190,7 +191,7 @@ export function createThreadsHttpAPI(): ThreadsAPI {
     deleteBranch: input => post('branch/delete', input),
     listModels: () => post('models', {}),
     selectModel: input => post('model/select',input),
-    create: key => post('create', { key }), fork: input => post('fork', input), submit: input => post('submit', withClientTime(input)), enqueue: input => post('enqueue', withClientTime(input)),
+    create: (key, options) => post('create', { key, ...options }), fork: input => post('fork', input), submit: input => post('submit', withClientTime(input)), enqueue: input => post('enqueue', withClientTime(input)),
     prepareNavigation: input => post('navigation/prepare', input),
     recoverySource: input => post('recovery/source', input),
     navigate: input => post('navigate', input),

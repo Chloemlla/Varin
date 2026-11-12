@@ -357,19 +357,16 @@ export class AgentRuntimeClient {
     // ContextJobs own a frozen tool-free plan, including pure text runs. Current
     // extension routing cannot add capabilities or block their original recovery.
     if (launch?.selection.policy.name === 'context_compaction') return [];
+    const child = await this.childExecutionForRun(runId, signal);
     const saved = launch?.selection.extension_bindings ?? [];
-    const required = pending ? [] : saved;
+    const required = child ? saved : [];
     if (!this.prepareExtensionOwner) {
-      if (saved.length)
+      if (required.length)
         throw new Error(
           'Saved extension tools require their original Host owner',
         );
-      if (pending) await this.kernel.agentRuntimeRequest(
-        'runtime.launch.extensions.prepare', { runId, bindings: [] }, signal,
-      );
       return [];
     }
-    const child = await this.childExecutionForRun(runId, signal);
     if (child && !required.length) return [];
     const admittedScope = await this.kernel.agentRuntimeRequest<
       RunContextScope | null,
@@ -378,8 +375,7 @@ export class AgentRuntimeClient {
     const projectId = admittedScope?.projectId;
     const scope = await this.prepareExtensionOwner(
       { runId, threadId: run.thread_id, branchId: run.branch_id, source: launch?.selection.source ?? null,
-        workFocus: launch?.selection.agent?.workFocus ?? 'general', ...(projectId ? { projectId } : {}), ...(child ? { fixed: true } : {}),
-        ...(launch?.extension_admission?.state === 'prepared' ? { restoreExact: true } : {}) },
+        workFocus: launch?.selection.agent?.workFocus ?? 'general', ...(projectId ? { projectId } : {}), ...(child ? { fixed: true } : {}) },
       required,
       AbortSignal.any([signal, state.controller.signal]),
     );
@@ -401,7 +397,9 @@ export class AgentRuntimeClient {
           live,
         );
       }
-      if (initial.length || pending)
+      // Root assembly commits the complete current directory with the launch.
+      // Only delegated capabilities need the separate original-selection admission.
+      if (child && initial.length)
         await this.kernel.agentRuntimeRequest(
           'runtime.launch.extensions.prepare',
           { runId, bindings: initial.map((e) => e.binding) },
@@ -1030,11 +1028,11 @@ export class AgentRuntimeClient {
   markThreadRead(input: import('./protocol.generated.js').ThreadReadPositionParams, signal?: AbortSignal): Promise<ThreadSummary> {
     return this.kernel.agentRuntimeRequest('runtime.thread.read', input, signal);
   }
-  botScope(botId: string, signal?: AbortSignal, historyOnly = false): Promise<import('./protocol.generated.js').BotScopeView> {
-    return this.kernel.agentRuntimeRequest('runtime.bot.scope.inspect', { botId, historyOnly }, signal);
+  botScope(botId: string, signal?: AbortSignal, historyOnly = false, principalId?: string | null): Promise<import('./protocol.generated.js').BotScopeView> {
+    return this.kernel.agentRuntimeRequest('runtime.bot.scope.inspect', { botId, historyOnly, ...(principalId === undefined ? {} : { principalId }) }, signal);
   }
-  botMatters(botId: string, signal?: AbortSignal): Promise<import('./protocol.generated.js').BotMatter[]> {
-    return this.kernel.agentRuntimeRequest('runtime.bot.matters.list', { botId }, signal);
+  botMatters(botId: string, signal?: AbortSignal, principalId?: string | null): Promise<import('./protocol.generated.js').BotMatter[]> {
+    return this.kernel.agentRuntimeRequest('runtime.bot.matters.list', { botId, ...(principalId === undefined ? {} : { principalId }) }, signal);
   }
   pendingBotWork(signal?: AbortSignal): Promise<import('./protocol.generated.js').ColdBotWork[]> {
     return this.kernel.agentRuntimeRequest('runtime.bot.work.pending', {}, signal);
@@ -1042,14 +1040,14 @@ export class AgentRuntimeClient {
   admitBotWork(input: import('./protocol.generated.js').BotWorkAdmitParams, signal?: AbortSignal): Promise<InputSubmitReceipt> {
     return this.kernel.agentRuntimeRequest('runtime.bot.work.admit', input, signal);
   }
-  updateBotMatter(input: import('./protocol.generated.js').BotMatterUpdate, signal?: AbortSignal): Promise<import('./protocol.generated.js').BotMatter> {
-    return this.kernel.agentRuntimeRequest('runtime.bot.matters.update', input, signal);
+  updateBotMatter(input: import('./protocol.generated.js').BotMatterUpdate, signal?: AbortSignal, principalId?: string | null): Promise<import('./protocol.generated.js').BotMatter> {
+    return this.kernel.agentRuntimeRequest('runtime.bot.matters.update', { ...input, ...(principalId === undefined ? {} : { principalId }) }, signal);
   }
-  createBotThread(botId: string, threadId: string, branchId: string, signal?: AbortSignal): Promise<{threadId:string;branchId:string}> {
-    return this.kernel.agentRuntimeRequest('runtime.bot.thread.create', {botId,threadId,branchId}, signal);
+  createBotThread(botId: string, threadId: string, branchId: string, signal?: AbortSignal, organization?: import('@varin/application-client').ConversationOrganizationPlacement, principalId?: string | null, creationDefaults?: import('@varin/application-client').ConversationCreationDefaults): Promise<{threadId:string;branchId:string}> {
+    return this.kernel.agentRuntimeRequest('runtime.bot.thread.create', {botId,threadId,branchId, ...(organization === undefined ? {} : {organization}), ...(principalId === undefined ? {} : {principalId}), ...(creationDefaults === undefined ? {} : {creationDefaults})}, signal);
   }
-  resolveBotEntry(botId: string, threadId: string, branchId: string, signal?: AbortSignal): Promise<{threadId:string;branchId:string}> {
-    return this.kernel.agentRuntimeRequest('runtime.bot.entry.resolve', {botId,threadId,branchId}, signal);
+  resolveBotEntry(botId: string, threadId: string, branchId: string, signal?: AbortSignal, principalId?: string | null): Promise<{threadId:string;branchId:string}> {
+    return this.kernel.agentRuntimeRequest('runtime.bot.entry.resolve', {botId,threadId,branchId, ...(principalId === undefined ? {} : {principalId})}, signal);
   }
   botHistory(input: import('./protocol.generated.js').BotHistoryReadParams, signal?: AbortSignal): Promise<HistoryItem> {
     return this.kernel.agentRuntimeRequest('runtime.bot.history.read', input, signal);
@@ -1058,15 +1056,35 @@ export class AgentRuntimeClient {
   botActivity(input: import('./protocol.generated.js').BotActivityParams, signal?: AbortSignal): Promise<import('./protocol.generated.js').BotActivityPage> {
     return this.kernel.agentRuntimeRequest('runtime.bot.activity.read', input, signal);
   }
+  organizationCreationDefaults(threadId: string, signal?: AbortSignal): Promise<import('@varin/application-client').ConversationCreationDefaults|null> {
+    return this.kernel.agentRuntimeRequest('runtime.organization.creationDefaults', { threadId }, signal);
+  }
+  organizationReceipt(principalId: string | null, command: import('@varin/application-client').ConversationOrganizationCommand, signal?: AbortSignal): Promise<import('@varin/application-client').ConversationOrganizationReceipt|null> {
+    return this.kernel.agentRuntimeRequest('runtime.organization.receipt', { principalId, command }, signal);
+  }
+  organizationEntry(principalId: string | null, conversation: import('@varin/application-client').ConversationOrganizationRef, signal?: AbortSignal): Promise<import('@varin/application-client').ConversationOrganizationEntry> {
+    return this.kernel.agentRuntimeRequest('runtime.organization.entry', { principalId, conversation }, signal);
+  }
+  organizationRead(principalId: string | null, query: import('@varin/application-client').ConversationOrganizationQuery & { projectNames?: Record<string, string> }, signal?: AbortSignal): Promise<import('@varin/application-client').ConversationOrganizationSnapshot> {
+    return this.kernel.agentRuntimeRequest('runtime.organization.read', { principalId, query }, signal);
+  }
+  organizationCommand(principalId: string | null, command: import('@varin/application-client').ConversationOrganizationCommand, signal?: AbortSignal): Promise<import('@varin/application-client').ConversationOrganizationReceipt> {
+    return this.kernel.agentRuntimeRequest('runtime.organization.command', { principalId, command }, signal);
+  }
+  organizationInitialize(principalId: string | null, initial: import('./protocol.generated.js').OrganizationInitialization, signal?: AbortSignal): Promise<import('@varin/application-client').ConversationOrganizationReceipt> {
+    return this.kernel.agentRuntimeRequest('runtime.organization.initialize', { principalId, initial }, signal);
+  }
   createThread(
     threadId: string,
     branchId: string,
     signal?: AbortSignal,
     principalId?: string | null,
+    organization?: import('@varin/application-client').ConversationOrganizationPlacement,
+    creationDefaults?: import('@varin/application-client').ConversationCreationDefaults,
   ): Promise<{ threadId: string; branchId: string }> {
     return this.kernel.agentRuntimeRequest(
       'runtime.thread.create',
-      { threadId, branchId, ...(principalId !== undefined ? { principalId } : {}) },
+      { threadId, branchId, ...(principalId !== undefined ? { principalId } : {}), ...(organization === undefined ? {} : { organization }), ...(creationDefaults === undefined ? {} : { creationDefaults }) },
       signal,
     );
   }
@@ -1153,6 +1171,9 @@ export class AgentRuntimeClient {
   refreshResources(input: ResourceRefreshParams, signal?: AbortSignal): Promise<ContextCheckpoint> {
     return this.kernel.agentRuntimeRequest('runtime.resources.refresh', input, signal);
   }
+  organizationInvocation(input: {runId:string;origin:ResourceSnapshotParams['origin'];callId:string;operationId:string},signal?:AbortSignal):Promise<Run> {
+    return this.kernel.agentRuntimeRequest('runtime.organization.invocation',input,signal);
+  }
   resourceSnapshot(input: ResourceSnapshotParams, signal?: AbortSignal): Promise<ContextResources> {
     return this.kernel.agentRuntimeRequest('runtime.resources.snapshot', input, signal);
   }
@@ -1226,6 +1247,9 @@ export class AgentRuntimeClient {
       { runId },
       signal,
     );
+  }
+  inheritedInputReceipt(input: InputSubmitParams, signal?: AbortSignal): Promise<InputSubmitReceipt | null> {
+    return this.kernel.agentRuntimeRequest('runtime.input.inheritedReceipt', input, signal);
   }
   inputReceipt(input: InputSubmitParams, signal?: AbortSignal): Promise<InputSubmitReceipt | null> {
     return this.kernel.agentRuntimeRequest('runtime.input.receipt', input, signal);
@@ -1993,7 +2017,7 @@ export class AgentRuntimeClient {
           'runtime.run.start',
           {
             runId,
-            ...(extensionBindings.length ? { extensionBindings } : {}),
+            extensionBindings,
             ...(policyBinding ? { policyBinding } : {}),
             ...(driverBinding ? { driverBinding } : {}),
             ...(mcpBinding ? { mcpBinding } : {}),
@@ -2046,7 +2070,7 @@ export class AgentRuntimeClient {
           'runtime.run.start',
           {
             runId,
-            ...(extensionBindings.length ? { extensionBindings } : {}),
+            extensionBindings,
             credentialScope,
             ...(policyBinding ? { policyBinding } : {}),
             ...(driverBinding ? { driverBinding } : {}),

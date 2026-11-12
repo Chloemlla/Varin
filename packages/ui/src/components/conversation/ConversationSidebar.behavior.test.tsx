@@ -279,7 +279,7 @@ it('saves a parent title on blur without changing its child', async () => {
   expect(titleButton('Child task')).toBeDefined();
 });
 
-it('lists the work a Bot delegated with a Bot mark, but not the Bot’s own conversations', async () => {
+it('omits direct Bot conversations while keeping delegated work visible', async () => {
   await act(async () => {
     useThreadStore.setState(store => ({ threads: [...store.threads,
       { ...summary('bot-session', 'Bot conversation', null), bot_id: 'varin' },

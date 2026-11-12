@@ -130,8 +130,6 @@ export interface ExtensionToolRun {
   source: LaunchIntent['selection']['source'];
   projectId?: string;
   fixed?: boolean;
-  /** Restore the committed initial directory, including an explicitly empty one. */
-  restoreExact?: boolean;
   workFocus?: WorkFocusId;
 }
 class ExtensionToolSourceError extends Error {
@@ -514,10 +512,8 @@ export function createExtensionTools(
   options: ExtensionToolOwnerOptions,
 ): ExtensionToolPreparer {
   return async (run, required, signal) => {
-    const emptyRestore = run.restoreExact && !required.length;
-    let preparedOptions = emptyRestore ? { ...options }
-      : options.prepareConfiguration ? { ...options, configurationIdentity: await options.prepareConfiguration(run, required) } : options;
-    if (emptyRestore) delete preparedOptions.configurationIdentity;
+    let preparedOptions = options.prepareConfiguration
+      ? { ...options, configurationIdentity: await options.prepareConfiguration(run, required) } : options;
     try {
     const runtime = options.runtime,
       initial: ExtensionToolLease[] = [],
@@ -608,11 +604,11 @@ export function createExtensionTools(
       } catch (error) { selected.release(); throw error; }
       } finally { releasePreparation?.(); }
     };
-    const snapshot = emptyRestore ? undefined : await runtime.state();
+    const snapshot = await runtime.state();
     signal.throwIfAborted();
     if (
-      snapshot && (!snapshot.catalog.authoritative ||
-      (!required.length && !snapshot.routing.authoritative))
+      !snapshot.catalog.authoritative ||
+      (!required.length && !snapshot.routing.authoritative)
     )
       throw new Error('extension_tool_catalog_unavailable');
     try {
@@ -653,7 +649,7 @@ export function createExtensionTools(
           throw new HostBindingRestoreError('tool', 'implementation_unavailable', binding.providerKey, { cause });
         }
       }
-      if (!required.length && !run.fixed && !run.restoreExact) await Promise.all([...services(snapshot!).values()].map(async entry => {
+      if (!required.length && !run.fixed) await Promise.all([...services(snapshot).values()].map(async entry => {
         try {
           if (entry.declarations.every(descriptor => !enabled(descriptor))) return;
           // Prepare the first complete directory before the first model request.
@@ -711,7 +707,7 @@ export function createExtensionTools(
         if (closed || signal.aborted) { configurationIdentity.release?.(); return; }
         const previous = preparedOptions.configurationIdentity;
         preparedOptions = { ...options, configurationIdentity }; previous?.release?.();
-      } else if (emptyRestore) preparedOptions = options;
+      }
       const current = await runtime.state();
       if (
         closed ||
@@ -778,7 +774,14 @@ export function createExtensionTools(
       refreshPending = true;
       return refreshing ??= (async () => {
         while (refreshPending && !closed) { refreshPending = false; await refreshOnce(); }
-      })().finally(() => { refreshing = undefined; });
+      })().finally(() => {
+        refreshing = undefined;
+        // A newer configuration/catalog notification can arrive while the old
+        // snapshot read is rejecting (or after its last loop check). Its pending
+        // read belongs to that notification, not to the failed snapshot. Drain
+        // it after releasing the old flight; never retry without a new event.
+        if (refreshPending && !closed) void refresh().catch(() => undefined);
+      });
     };
     let unsubscribe: () => void;
     try {

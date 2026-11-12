@@ -53,7 +53,7 @@ pub enum RuntimeError {
     },
 }
 type Result<T> = std::result::Result<T, RuntimeError>;
-pub(crate) const FORMAT: i64 = 94;
+pub(crate) const FORMAT: i64 = 97;
 fn sql_number(value: u64) -> Result<i64> {
     i64::try_from(value).map_err(|_| RuntimeError::Invalid("integer exceeds catalog range".into()))
 }
@@ -146,6 +146,7 @@ fn inspect_catalog_format(db: &Connection) -> Result<i64> {
 
 fn check_catalog_schema(db: &Connection, version: i64) -> Result<()> {
     threads::check_format(db)?;
+    if version >= 95 { organization::check_format(db,version)?; } else { organization::check_legacy_format(db)?; }
     if version >= 93 { model_references::check_format(db)?; }
     else if version == 92 { model_references::check_optional_format(db)?; }
     if version >= 87 { principals::check_format(db)?; }
@@ -242,6 +243,7 @@ fn initialize_metadata(
         driver::initialize(&tx)?;
         attachments::initialize(&tx)?;
         model_references::initialize(&tx)?;
+        organization::initialize(&tx)?;
     }
     titles::initialize(&tx)?;
     let epoch = tx.query_row(
@@ -257,7 +259,6 @@ fn initialize_metadata(
 /// across model, extension or tool execution is forbidden: all methods are bounded local transactions.
 /// Its database is separate from the replaceable system-kernel cache and is never recreated on error.
 pub struct Catalog {
-    ingress_tool_catalog: Option<activation::IngressToolCatalog>,
     db: Connection,
     content: crate::content::ContentStore,
     resource_admission: std::sync::Arc<crate::resource_admission::ResourceAdmission>,
@@ -313,7 +314,6 @@ impl Catalog {
         }
         let epoch = initialize_metadata(&mut db, if version == 0 { 0 } else { FORMAT }, &content)?;
         let mut this = Self {
-            ingress_tool_catalog: None,
             db,
             content,
             resource_admission,
@@ -365,14 +365,8 @@ impl Catalog {
     pub fn create_thread_with_principal(&mut self, thread_id: &str, branch_id: &str, principal: Option<&str>) -> Result<()> {
         self.create_thread_owned(thread_id, branch_id, None, principal)
     }
-    fn create_thread_with_bot(&mut self, thread_id: &str, branch_id: &str, bot_id: Option<&str>) -> Result<()> {
-        self.create_thread_owned(thread_id, branch_id, bot_id, None)
-    }
     fn create_thread_owned(&mut self, thread_id: &str, branch_id: &str, bot_id: Option<&str>, principal: Option<&str>) -> Result<()> {
-        let tx = self.db.transaction()?;
-        identity::create_public(&tx, thread_id, branch_id, bot_id, principal, self.epoch)?;
-        tx.commit()?;
-        Ok(())
+        self.create_thread_owned_with_placement(thread_id, branch_id, bot_id, principal, None)
     }
     pub fn head(&self, branch: &str) -> Result<Option<String>> {
         Ok(self
@@ -1474,10 +1468,34 @@ impl Catalog {
         Ok(result)
     }
     fn recover(&mut self) -> Result<()> {
-        let interrupted_read: bool = self.db.query_row(&format!("SELECT EXISTS(SELECT 1 FROM operations WHERE json_extract(body,'$.phase')='running' AND json_extract(body,'$.effect')='none' AND coalesce(json_extract(body,'$.intent.kind'),'') NOT IN ({}))", policy_body::ACTION_KINDS), [], |row|row.get(0))?;
+        let interrupted_body = json!({"reason":"executor interrupted"});
+        // Older recovery code stored this exact raw body for an interrupted kernel
+        // Result (including tool_invoke). Repair only its known content identity; arbitrary
+        // tool output and original caller receipts must never be rewritten on reopen.
+        let legacy_interrupted_result = crate::content::ContentStore::reference(&interrupted_body)?;
+        let interrupted_read: bool = self.db.query_row(&format!("SELECT EXISTS(SELECT 1 FROM operations WHERE
+            (json_extract(body,'$.phase')='running' AND json_extract(body,'$.effect')='none'
+             AND coalesce(json_extract(body,'$.intent.kind'),'') NOT IN ({}))
+            OR (json_extract(body,'$.execution_owner.kind')='kernel' AND json_extract(body,'$.phase')='terminal'
+             AND json_extract(body,'$.outcome')='failed' AND json_extract(body,'$.effect')='none'
+             AND json_extract(body,'$.result.reference.content_object')=?1))", policy_body::ACTION_KINDS),
+            [legacy_interrupted_result["content_object"].as_str()], |row| row.get(0))?;
         let interrupted_result = interrupted_read
-            .then(|| self.content.save(&json!({"reason":"executor interrupted"})))
+            .then(|| self.content.save_output(&interrupted_body.into()))
             .transpose()?;
+        // Older Catalogs retained an interrupted Host Result's owner but no result body.
+        // Preserve that uncertainty while giving explicit cancellation a truthful caller
+        // completion to pair. This is not an executor-stop receipt or a replay admission.
+        let interrupted_observation: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE json_extract(body,'$.execution_owner.kind')='external'
+             AND json_extract(body,'$.phase') IN ('running','terminal')
+             AND json_extract(body,'$.result') IS NULL
+             AND json_extract(body,'$.intent.contract.completion')='result'
+             AND json_extract(body,'$.intent.contract.lifetime')='run')", [], |row| row.get(0))?;
+        let interrupted_observation_result = interrupted_observation.then(|| self.content.save_output(&json!({
+            "error":"tool_result_unavailable",
+            "message":"The original call was interrupted before its result was recorded. Its executor has not been confirmed stopped; no retry was started."
+        }).into())).transpose()?;
         let tx = self.db.transaction()?;
         policy_switch::interrupt_candidates(&tx)?;
         tx.execute("UPDATE resumptions SET claimed=0 WHERE acknowledged=0", [])?;
@@ -1716,6 +1734,32 @@ impl Catalog {
                     "operation.recovered",
                     serde_json::to_value(&op)?,
                 )?;
+            }
+            if op.execution_owner == Some(ExecutorOwner::Kernel)
+                && op.phase == OperationPhase::Terminal && op.outcome == Some(Outcome::Failed)
+                && op.effect == Effect::None && op.call_completion.is_none()
+                && op.intent.get("kind").and_then(Value::as_str) == Some("tool")
+                && tool_content::ToolIntent::from_operation(&op)?.contract().completion == crate::execution::CompletionKind::Result
+                && matches!(&op.result, Some(OperationResultMetadata::Content { reference }) if reference == &legacy_interrupted_result)
+            {
+                op.result = Some(OperationResultMetadata::Content {
+                    reference: interrupted_result.as_ref().ok_or_else(|| {
+                        RuntimeError::Invalid("interrupted kernel result was not prepared".into())
+                    })?.clone(),
+                });
+                op.revision += 1;
+                put(&tx, "operations", &op.id, &op)?;
+                event(&tx, &op.id, op.revision, "operation.interrupted_result_repaired", Value::Null)?;
+            }
+            if op.result.is_none() && recovery::cancellable_result_observation(&op)? {
+                op.result = Some(OperationResultMetadata::Content {
+                    reference: interrupted_observation_result.as_ref().ok_or_else(|| {
+                        RuntimeError::Invalid("interrupted tool observation was not prepared".into())
+                    })?.clone(),
+                });
+                op.revision += 1;
+                put(&tx, "operations", &op.id, &op)?;
+                event(&tx, &op.id, op.revision, "operation.observation_interrupted", Value::Null)?;
             }
         }
         tx.commit()?;
@@ -2125,3 +2169,6 @@ mod read_performance_tests;
 #[cfg(test)]
 #[path = "catalog_quote_tests.rs"]
 mod quote_tests;
+
+#[path = "catalog_organization.rs"]
+pub mod organization;

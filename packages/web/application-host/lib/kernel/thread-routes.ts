@@ -1,3 +1,4 @@
+import { parseConversationOrganizationPlacement } from '@varin/application-client';
 import { currentRequestPrincipal } from './request-principal.js';
 import { parseAttachmentSelections, THINKING_LEVELS, isWorkFocusId } from '@varin/protocol';
 import { parseThreadObjectReferences } from './thread-object-input.js';
@@ -144,7 +145,7 @@ export function registerThreadRoutes(app: Express, adapter: ThreadAdapter, requi
     'source/draft-files': ['source', 'query', 'type', 'limit', 'cursor'],
     'source/list': ['runtime', 'threadId', 'branchId'],
     'source/resolve': ['runtime', 'threadId', 'branchId', 'resourceOwner', 'path'],
-    'source/prepare': ['resourceOwner', 'runtime', 'threadId', 'branchId', 'key', 'workspaceId', 'mode', 'content', 'captureScopes'],
+    'source/prepare': ['selection', 'resourceOwner', 'runtime', 'threadId', 'branchId', 'key', 'workspaceId', 'mode', 'content', 'captureScopes'],
     'context/compact': ['runtime', 'threadId', 'branchId', 'key', 'throughId', 'expectedRevision', 'model'],
     'context/history': ['runtime', 'threadId', 'branchId', 'runId', 'headId', 'beforeId'],
     'history/file': ['runtime', 'threadId', 'branchId', 'itemId', 'path'],
@@ -207,7 +208,7 @@ export function registerThreadRoutes(app: Express, adapter: ThreadAdapter, requi
     update: ['runtime', 'threadId', 'key', 'expectedRevision', 'title', 'pinned', 'archived'],
     delete: ['runtime', 'threadId', 'key', 'expectedRevision'],
     read: ['runtime', 'threadId', 'key', 'throughCursor'],
-    attention: [], create: ['key'], list: ['query', 'archived'], models: [], submit: ['runtime', 'threadId', 'branchId', 'key', 'text', 'images', 'attachmentImageReferences', 'materials', 'attachments', 'expectedHead', 'model', 'source', 'agent', 'clientTime', 'skills', 'references', 'contentReferences', 'contentReferenceOccurrences'],
+    attention: [], create: ['key', 'organization'], list: ['query', 'archived'], models: [], submit: ['runtime', 'threadId', 'branchId', 'key', 'text', 'images', 'attachmentImageReferences', 'materials', 'attachments', 'expectedHead', 'model', 'source', 'agent', 'clientTime', 'skills', 'references', 'contentReferences', 'contentReferenceOccurrences'],
     usage: ['runtime', 'threadId', 'branchId'],
     'context/inspect': ['runtime', 'threadId', 'branchId', 'headId'],
     snapshot: ['runtime', 'threadId', 'branchId'], 'history/page': ['runtime', 'threadId', 'branchId', 'headId', 'beforeId', 'limit'],
@@ -261,6 +262,8 @@ export function registerThreadRoutes(app: Express, adapter: ThreadAdapter, requi
         const admission = error instanceof ThreadPreAdmissionError ? { admission: 'not_started' as const } : {};
         if (sourceCode) { response.status(sourceCode === 'source_authority_denied' ? 403 : sourceCode === 'source_registration_missing' ? 404 : 409).json({ code: sourceCode, error: threadSourceFailureMessage(sourceCode), ...admission }); return; }
         const conflict = reason instanceof PlanConflict || reason instanceof KernelClientError && reason.code === 'operation-error' && reason.message.startsWith('operation error: conflict:');
+        if (conflict) console.warn('[Threads] Request state conflict', { method,
+          admission: error instanceof ThreadPreAdmissionError ? 'not_started' : 'unknown' });
         if (error instanceof ComputerError) { response.status(error.computerCode === 'computer-work-not-found' ? 404 : error.computerCode === 'computer-execution-stale' ? 409 : error.computerCode === 'computer-request-invalid' ? 400 : 503).json({ code: error.computerCode, error: error.message }); return; }
         const suppliedCode = conflict ? 'thread-conflict' : error instanceof HarnessServiceError ? error.harnessCode
           : error && typeof error === 'object' && 'code' in error && typeof error.code === 'string' ? error.code : 'thread-request-failed';
@@ -591,7 +594,7 @@ export function registerThreadRoutes(app: Express, adapter: ThreadAdapter, requi
   });
   post('delete', body => adapter.delete({ ...catalogIdentity(body), key: text(body.key), expectedRevision: revision(body.expectedRevision) }));
   post('read', body => adapter.markRead({ ...catalogIdentity(body), key: text(body.key), throughCursor: revision(body.throughCursor) }));
-  post('create', body => adapter.create(text(body.key)));
+  post('create', body => adapter.create(text(body.key), body.organization === undefined ? undefined : { organization: parseConversationOrganizationPlacement(body.organization) }));
   post('recovery/source', (body, signal) => adapter.recoverySource({ ...identity(body), entryId: text(body.entryId) }, signal));
   post('navigation/prepare', (body, signal) => adapter.prepareNavigation({ ...identity(body), entryId: text(body.entryId) }, signal));
   post('tree', (body, signal) => adapter.conversationTree(identity(body), signal));
@@ -605,7 +608,7 @@ export function registerThreadRoutes(app: Express, adapter: ThreadAdapter, requi
   post('source/prepare', (body, signal) => {
     if (body.mode !== 'fixed_branch' && body.mode !== 'materialized' && body.mode !== 'live_root'&&body.mode!=='native_workspace') throw new Error('Invalid source mode');
     return adapter.prepareSource(normalizeThreadSourcePreparation({ ...identity(body), resourceOwner: parseSourceResourceOwner(body.resourceOwner), key: text(body.key), workspaceId: text(body.workspaceId), mode: body.mode,
-      content: body.content, captureScopes: body.captureScopes } as import('@varin/application-client').ThreadPrepareSource), signal);
+      content: body.content, captureScopes: body.captureScopes, ...(body.selection !== undefined ? { selection: body.selection } : {}) } as import('@varin/application-client').ThreadPrepareSource), signal);
   });
   post('context/compact', (body, signal) => {
     return adapter.compact({ ...identity(body), key: text(body.key), throughId: text(body.throughId), expectedRevision: revision(body.expectedRevision),
@@ -633,7 +636,7 @@ export function registerThreadRoutes(app: Express, adapter: ThreadAdapter, requi
         if (Object.keys(agent).some(key => !['profileId', 'workFocus'].includes(key)) || !isWorkFocusId(agent.workFocus)) throw new Error('Invalid Agent selection');
         input.agent = { profileId: agent.profileId === null ? null : text(agent.profileId), workFocus: agent.workFocus };
       }
-      if (body.source !== undefined) input.source = threadSource(body.source);
+      if (body.source !== undefined) input.source = body.source === null ? null : threadSource(body.source);
       return input;
     });
     return adapter.submit(input);

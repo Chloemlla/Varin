@@ -136,6 +136,73 @@ inputs; file bytes do not enter JSON model input. Preparation failures retain th
 uncertain sends keep exact accepted-intent keys. Typed file actions stay visible outside collapsed
 message text and use their enclosing conversation's binary reader. Unknown formats remain downloadable.
 
+## Shared conversation organization
+
+`useConversationOrganizationStore` holds the current Host's Catalog navigation projection and one
+cursor observation. It reads the root's first page; opening a container, selecting a Bot scope, or
+searching adds a shared query page. Continuations are explicit, and refresh preserves only the window
+already loaded. Navigation uses `pageNodes: true`: `items` is the mixed container/native/external
+page membership; `containers` includes only its container metadata and necessary ancestor context.
+Ancestors do not consume page slots. Stable IDs merge loaded pages, and refresh restores the loaded
+`items` window even when every item is an empty category. New branches remain closed until opened.
+Search, Bot views and destination browsing use their own query membership, not incidental global
+cache coverage. The observation cursor is independent of newer query reads, so loading a picker
+cannot suppress a durable change to an older visible page. A failed page retains its last good
+projection and reports the failure instead of an empty directory. Full descendant reads happen
+when a person explicitly selects that action's scope.
+
+`ConversationOrganizationTree` is shared by the workbench, IDE picker, archive and Bot navigator.
+The workbench assembles the full sidebar, the IDE uses its compact picker, and the Bot navigator
+retains its assistant identity list with an explicit entry into shared conversations/work.
+The Bot navigator toolbar contracts button widths with the available space, then wraps
+controls when their minimum widths no longer fit; labels and icons retain their font and graphic sizes.
+`OrganizationRow` preserves the original avatar, attention, extension-decoration and highlight contracts.
+Active conversation highlighting uses one persistent sliding pill and the settings navigation's spring;
+row backgrounds remain responsible for multi-selection rather than taking over after each slide.
+Recent rows reserve one trailing slot for the timestamp and more button. One fades out before the other fades in on
+hover, keyboard focus or an open menu; only the button itself gains a quiet hover/open background.
+Recent reads use `kind: 'conversations', sort: 'recent', conversationTree: {}` to page root tasks across
+categories. The Catalog uses descendant activity for each family's recent order. Expanding a task reads
+`conversationTree: { parent }` with its own sibling pagination and `hasChildren` hints. Display ancestry
+comes from dispatch provenance even after an explicit category move; unavailable parents leave visible
+tasks at the root. Task branches start collapsed and reuse the Host/view's persisted expansion choices.
+Only opened branches start reads; cached descendants stay mounted while folding. Search retains matching
+ancestry without overwriting those choices. Recent pages never collect cached category pages. Destination browsing uses
+`kind: 'containers'`, so conversation rows do not consume its page slots. Optional activity timestamps
+participate only in recent-page continuations; normal directory cursors remain independent of activity.
+Workbench and IDE queries set `excludeBotConversations` before pagination, including search, archive
+and expanded child scopes. This excludes direct Bot chats only; delegated work from any source remains
+visible. Bot conversation creation stays in the Bot navigator, without an additional all-conversations entry.
+
+Container identity, mixed order and effective placement come from the Catalog; container-first display,
+pin segments, local collapse, focus and project sorting do not rewrite them. Reorder drop lines respect
+the visible type/pin segments, while moving into a location remains independent of display sorting.
+The current selection and its descendant locations are excluded from drop targets; release-time
+validation also ignores self/descendant drops and an unchanged location before reading or committing.
+`useOrganizationNavigation` stores view/focus/expansion in the existing persisted display preferences,
+scoped by stable Host identity and shell view. Inherited tasks remain under their real parent; an explicit
+move gives them one independent navigation row. Typed native/external keys prevent ID collisions.
+Moves retain the original row until acceptance, preserve ambiguous acceptance keys, and derive undo
+from the original receipt. Undo is a new atomic restore with the receipt's object revisions, real
+sibling anchors and inheritance intent, so it cannot overwrite another client's subsequent move.
+Undo reads a bounded metadata page for each affected parent, including an old location no longer
+present in a Recent page; these reads do not replace the receipt's original object revisions or anchors.
+Before moving, only the selected source parents' complete sibling pages are read; Catalog's scoped
+cursor and the captured parent/object revisions protect the original undo anchors without conflicting
+on unrelated branches. The move dialog has one paged/searchable directory picker with breadcrumbs;
+same-name targets use readable paths and ordinals while retaining stable internal identities.
+It never assumes every category was loaded. `OrganizationGroupDialog` retains its closing contents
+and protects composition keys. Unknown admissions expose original-key result checking outside the
+editor; partial metadata results retain names, translated outcomes and only unresolved retries.
+
+`ConversationOrigin` reads the same original provenance for normal, flat, search, archive and work
+detail views. Bot profiles are read together and their assets reuse the existing figure cache;
+missing/unreadable Bot profiles remain explicit rather than being replaced by a same-named Bot.
+The Bot shell retains the shared `ThreadDraftConversation`, fixed placement/source and first-send
+handoff, then opens the actual accepted Bot identity. Selecting another session hides only the draft
+view, not its input or assets. Native and external delegated work open in the Bot's existing side
+workspace; explicit full-workbench navigation remains separate.
+
 ## Motion
 
 The product uses four springs and two tweens from `lib/motion/tokens.ts`:
@@ -712,3 +779,10 @@ behind advanced management. Business/account state belongs to each plugin's conf
 View filters and scroll are persisted per Host; changing Host unmounts its pending confirmation and fences
 late results. Source management, explicit source installation and archive file upload remain independently
 available when discovery is unavailable.
+
+External draft agent choices follow the draft's source resource owner. Opening the agent selector
+or restoring an external draft reads that source Host's saved settings, not program discovery;
+remote failures never fall back to the coordinating Host's same-ID configuration or capability cache.
+Model/options drafts are scoped by source owner and configuration. Source changes retain the original
+preparation key and source until the prior binding's cleanup is confirmed; a lost cleanup response is
+not successful cancellation. Accepted external conversations retain the existing conversation owner.
