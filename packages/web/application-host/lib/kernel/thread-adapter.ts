@@ -1,3 +1,4 @@
+import { calendarPreparationError, type CalendarPreparationStage } from '../scheduled-tasks/preparation-error.js';
 import { prepareQuoteSelections } from './thread-quotes.js';
 import { parseContentReferenceInput, type ContentReferenceInput } from '@varin/application-client';
 import { currentRequestPrincipal, assertPrincipalOwnership } from './request-principal.js';
@@ -26,7 +27,7 @@ import { createThreadObjectInputPreparer, parseThreadObjectReferences } from './
 import type { ThreadObjectReference, ThreadDraftSkillOptions, ThreadSkillSelection, ThreadSkillCatalog, ThreadMaterialAttachment } from '@varin/application-client';
 import { createHash } from 'node:crypto';
 import type { ThreadIdentity, ThreadModel, ThreadModelInfo, ThreadSubmit, ThreadSource, ThreadSnapshot, ThreadHistoryPage, ThreadCompact, ThreadContextState, ThreadPrepareSource, ThreadPreparedSource, ThreadResourceRefresh, ThreadChildContinuation, ThreadSourcesAPI } from '@varin/application-client';
-import type { InputMode, InitialContext, InputSubmitParams, InputEnqueueParams, InputResourcePreparation, ContextResources, PreparedExplicitSkill, ModelSessionConfiguration, CredentialScope, AgentRuntimeStreamEvent, PolicyResumeReceipt } from './protocol.generated.js';
+import type { InputMode, InitialContext, InputSubmitParams, InputEnqueueParams, InputResourcePreparation, ContextResources, PreparedExplicitSkill, ModelSessionConfiguration, CredentialScope, PolicyResumeReceipt } from './protocol.generated.js';
 import type { ExistingHostCredentialOwner } from './credential-owner.js';
 import { isAbortError, waitWithSignal } from '../cancellation.js';
 import { modelCredentialBindingIdentity, waitForModelBinding } from './model-binding-lifetime.js';
@@ -35,11 +36,12 @@ import type { ContextPreparer } from './thread-context.js';
 import { parseThreadSkills, type ThreadSkillInputPreparer } from './thread-skill-input.js';
 import { resourceThreadSource } from './thread-context.js';
 import { parseExplicitSkillCommand } from '../agent-resources/activation.js';
-import { KernelRequestError } from './kernel-error.js';
+import { KernelClientError, KernelRequestError } from './kernel-error.js';
 import { ResourceScopeError } from './thread-resource-scope.js';
 import { HistoryRunUsageReader, historyModelRequestId } from './history-run-usage.js';
 import { HistoryRunNavigationReader } from './history-run-navigation.js';
-import { ThreadContextReader } from './thread-context-inspection.js';
+import { threadEventHub } from './event-hub.js';
+import { ownershipResolver } from './ownership-resolver.js';
 
 export interface ThreadModelAuthority {
   listModels?(): Promise<ThreadModelInfo[]>;
@@ -998,47 +1000,62 @@ export class ThreadAdapter {
   /** Cold calendar work is prepared by the same source/model/context owners as User submission.
    * Catalog supplies the occurrence identity and original instruction; this cannot forge User input. */
   async prepareCalendarWork(preparation: import('./protocol.generated.js').CalendarPreparation, projectPath: string, signal: AbortSignal) {
-    const { occurrence, definition } = preparation;
-    if (definition.target.kind !== 'new_work') throw new Error('Calendar work is not a cold submission');
-    const identity: ThreadIdentity = { runtime: 'agent', threadId: occurrence.thread_id, branchId: occurrence.branch_id };
-    await this.requireIdentity(identity);
-    signal.throwIfAborted();
-    // Only an explicit project source resolves the coordinator's project path. A
-    // workspace selection retains its registered Host and namespace even offline.
-    const selected = definition.target.source;
-    const location = selected.kind === 'workspace' ? selected
-      : await this.resolveSource(identity, { resourceOwner: { kind: 'local' }, path: projectPath }, signal);
-    signal.throwIfAborted();
-    const { source } = await this.prepareSource({ ...identity, key: occurrence.id, resourceOwner: location.resourceOwner,
-      workspaceId: location.workspaceId, mode: definition.target.sourceMode, content: { mode: 'saved-files' }, captureScopes: [] }, signal);
-    signal.throwIfAborted();
-    await this.admitSource(source, identity, undefined, signal);
-    signal.throwIfAborted();
-    const model = await waitForModelBinding(this.models.resolveModel(definition.target.model as ThreadModel), model => model.credentialOwner.release(), signal);
+    let stage: CalendarPreparationStage = 'identity';
     try {
-      if (!this.prepareContext) throw new Error('Calendar context preparation is unavailable');
-      // The calendar definition is the admitted project scope, independently of
-      // where its files execute. The resource owner still prepares the actual view.
-      const initialContext = await this.prepareContext(identity, source, {
-        mode: 'agent', threadRole: 'main', projectId: definition.project_id,
-      }, signal);
-      const skill = await this.skillInput(identity, initialContext.resources, preparation.instruction, signal);
-      const childDispatch = this.prepareChildProfiles ? await this.prepareChildProfiles({ modelOwner: model.credentialOwner, parent: {
-        configuration: model.configuration, credential_scope: await model.credentialOwner.scope(),
-      } }, signal) : undefined;
+      const { occurrence, definition } = preparation;
+      if (definition.target.kind !== 'new_work') throw new Error('Calendar work is not a cold submission');
+      const identity: ThreadIdentity = { runtime: 'agent', threadId: occurrence.thread_id, branchId: occurrence.branch_id };
+      await this.requireIdentity(identity);
       signal.throwIfAborted();
-      const receipt = await this.runtime.admitCalendar({ occurrenceId: occurrence.id, expectedRevision: occurrence.revision,
-        ownerEpoch: preparation.owner_epoch, configuration: model.configuration, initialContext,
-        ...(skill ? { inputPreparation: { expectedContextCheckpoint: null, skill } } : {}),
-        launch: { inheritSource: false, source: { resourceOwner: source.resourceOwner, workspaceId: source.workspaceId, executionWorkspaceId: source.executionWorkspaceId,
-          ...(source.mode==='native_workspace'&&source.nativeScope?{nativeScope:source.nativeScope}:{}),branchId: source.branchId ?? null, revision: source.revision ?? null, mode: source.mode, liveRoot: source.liveRoot ?? null, ...(source.environmentRunId ? { environmentRunId: source.environmentRunId } : {}) },
-          enabledTools: source.tools, credentialScope: await model.credentialOwner.scope(), ...(childDispatch ? { childDispatch } : {}) },
-      }, signal);
-      // Admission transfers ownership to the Run. Retiring this preparation must not
-      // cancel its newly admitted launch; withRunPreparation owns actual Run/epoch stop.
-      if (receipt.run_id) void this.continueLaunch(receipt.run_id, { credentialOwner: model.credentialOwner }).catch(() => undefined);
-      return receipt;
-    } finally { model.credentialOwner.release(); }
+      // Only an explicit project source resolves the coordinator's project path. A
+      // workspace selection retains its registered Host and namespace even offline.
+      stage = 'source_resolution';
+      const selected = definition.target.source;
+      const location = selected.kind === 'workspace' ? selected
+        : await this.resolveSource(identity, { resourceOwner: { kind: 'local' }, path: projectPath }, signal);
+      signal.throwIfAborted();
+      stage = 'source_preparation';
+      const { source, sourcePreparation } = await this.prepareSource({ ...identity, key: occurrence.id, resourceOwner: location.resourceOwner,
+        workspaceId: location.workspaceId, mode: definition.target.sourceMode, content: { mode: 'saved-files' }, captureScopes: [] }, signal);
+      signal.throwIfAborted();
+      stage = 'source_admission';
+      await this.admitSource(source, identity, undefined, signal);
+      signal.throwIfAborted();
+      stage = 'model';
+      const model = await waitForModelBinding(this.models.resolveModel(definition.target.model as ThreadModel), model => model.credentialOwner.release(), signal);
+      try {
+        stage = 'context';
+        if (!this.prepareContext) throw new Error('Calendar context preparation is unavailable');
+        // The calendar definition is the admitted project scope, independently of
+        // where its files execute. The resource owner still prepares the actual view.
+        const initialContext = await this.prepareContext(identity, source, {
+          mode: 'agent', threadRole: 'main', projectId: definition.project_id,
+        }, signal);
+        stage = 'skills';
+        const skill = await this.skillInput(identity, initialContext.resources, preparation.instruction, signal);
+        stage = 'child_profiles';
+        const childDispatch = this.prepareChildProfiles ? await this.prepareChildProfiles({ modelOwner: model.credentialOwner, parent: {
+          configuration: model.configuration, credential_scope: await model.credentialOwner.scope(),
+        } }, signal) : undefined;
+        signal.throwIfAborted();
+        stage = 'admission';
+        const receipt = await this.runtime.admitCalendar({ occurrenceId: occurrence.id, expectedRevision: occurrence.revision,
+          ownerEpoch: preparation.owner_epoch, configuration: model.configuration, initialContext,
+          ...(sourcePreparation ? { sourcePreparation } : {}),
+          ...(skill ? { inputPreparation: { expectedContextCheckpoint: null, skill } } : {}),
+          launch: { inheritSource: false, source: { resourceOwner: source.resourceOwner, workspaceId: source.workspaceId, executionWorkspaceId: source.executionWorkspaceId,
+            ...(source.mode==='native_workspace'&&source.nativeScope?{nativeScope:source.nativeScope}:{}),branchId: source.branchId ?? null, revision: source.revision ?? null, mode: source.mode, liveRoot: source.liveRoot ?? null, ...(source.environmentRunId ? { environmentRunId: source.environmentRunId } : {}) },
+            enabledTools: source.tools, credentialScope: await model.credentialOwner.scope(), ...(childDispatch ? { childDispatch } : {}) },
+        }, signal);
+        // Admission transfers ownership to the Run. Retiring this preparation must not
+        // cancel its newly admitted launch; withRunPreparation owns actual Run/epoch stop.
+        if (receipt.run_id) void this.continueLaunch(receipt.run_id, { credentialOwner: model.credentialOwner }).catch(() => undefined);
+        return receipt;
+      } finally { model.credentialOwner.release(); }
+    } catch (error) {
+      if (signal.aborted || error instanceof KernelClientError && error.code === 'activation-held') throw error;
+      throw calendarPreparationError(error, stage);
+    }
   }
 
   async submit(input: ThreadSubmit) {
@@ -1427,17 +1444,10 @@ export class ThreadAdapter {
   }
 
   private historyUsageReader?: HistoryRunUsageReader;
-  private contextReader?: ThreadContextReader;
   async contextInspection(identity: ThreadIdentity, cursor: { headId: string | null }, signal?: AbortSignal) {
-    await this.requireIdentity(identity);
-    const [inspection, checkpoint] = await Promise.all([
-      (this.contextReader ??= new ThreadContextReader(this.runtime)).read(identity.branchId, cursor.headId, signal),
-      this.runtime.context(identity.branchId, signal),
-    ]);
-    // Publication replaces the prompt without appending fake conversation messages.
-    const requestCheckpoint = inspection.contextRequest?.context?.checkpointId;
-    if (requestCheckpoint !== undefined && requestCheckpoint !== (checkpoint?.id ?? null)) inspection.contextRequest = null;
-    return { ...inspection, checkpointId: checkpoint?.id ?? null };
+    this.assertIdentity(identity);
+    for (const owner of await ownershipResolver(this.runtime).owners({ threads: [identity.threadId] })) assertPrincipalOwnership(owner);
+    return this.runtime.contextInspection(identity.threadId, identity.branchId, cursor.headId, signal);
   }
 
   private async readHistoryPage(branchId: string, cursor?: { headId: string; beforeId?: string; limit?: number }, signal?: AbortSignal): Promise<ThreadHistoryPage> {
@@ -1457,90 +1467,30 @@ export class ThreadAdapter {
     }) };
   }
 
-  async snapshot(identity: ThreadIdentity, signal?: AbortSignal): Promise<ThreadSnapshot> {
+  async snapshot(identity: ThreadIdentity, signal?: AbortSignal, options: { afterHeadId?: string } = {}): Promise<ThreadSnapshot> {
     signal?.throwIfAborted();
-    const { eventCursor } = await this.runtime.status(signal);
-    const thread = await this.requireIdentity(identity, signal);
-    const branch = thread.branches.find(branch => branch.branch_id === identity.branchId)!;
-    const [page, inputs, activeOperations, context, followups, goals, childState, delegatedExecutions] = await Promise.all([
-      this.readHistoryPage(identity.branchId, branch.head ? { headId: branch.head } : undefined, signal),
-      this.runtime.inputs(identity.branchId, signal), this.runtime.activeOperations(identity.threadId, identity.branchId, signal), this.context(identity, signal),
-      // The identity/principal check above covers this read only. Keep public
-      // endpoints independently admitted; do not cache authorization across requests.
-      this.runtime.followups(identity.threadId, signal).then(items => items.filter(item => item.thread_id === identity.threadId && item.branch_id === identity.branchId)),
-      this.runtime.goals(identity.threadId, signal).then(items => items.filter(item => item.thread_id === identity.threadId && item.branch_id === identity.branchId)),
-      this.currentChildren(identity, signal),
-      this.readChildExecutions(identity, undefined, signal),
-    ]);
+    this.assertIdentity(identity);
+    const snapshot = await this.runtime.threadView({ threadId: identity.threadId, branchId: identity.branchId,
+      historyLimit: 20, ...options }, signal);
+    assertPrincipalOwnership(snapshot.thread.principal_id);
+    const branch = snapshot.thread.branches.find(branch => branch.branch_id === identity.branchId)!;
     if (branch.latest_run && this.readContextPolicy) {
-      try { context.policy = await this.readContextPolicy(branch.latest_run, signal); }
-      catch (error) { signal?.throwIfAborted(); context.policyError = error instanceof Error ? error.message : String(error); }
+      try { snapshot.context.policy = await this.readContextPolicy(branch.latest_run, signal); }
+      catch (error) { signal?.throwIfAborted(); snapshot.context.policyError = error instanceof Error ? error.message : String(error); }
     }
-    const childActivity: NonNullable<ThreadSnapshot['childActivity']> = {};
-    const latestExecutions = new Map(childState.executions.map(execution => [execution.child_operation_id, execution]));
-    await Promise.all([...latestExecutions.values()].filter(execution => execution.state === 'ready' && execution.receipt).map(async execution => {
-      const runId = execution.receipt!.run_id;
-      const [run, launch] = await Promise.all([this.runtime.run(runId, signal), this.runtime.launch(runId, signal)]);
-      childActivity[execution.execution_id] = launch?.preparation_failure ? { state: 'preparation_failed', reason: launch.preparation_failure_detail ?? launch.preparation_failure }
-        : run.waiting_on?.startsWith('preparation:') ? { state: 'preparing' }
-          : ['completed', 'failed', 'cancelled'].includes(run.state) ? { state: 'settling' }
-            : run.state === 'waiting' && launch?.pause ? { state: 'waiting' } : { state: 'running' };
-    }));
-    const history = page.items;
-    if (history.some(item => item.thread_id !== identity.threadId) || inputs.some(item => item.thread_id !== identity.threadId)) {
-      throw new Error('Branch does not belong to the selected thread');
-    }
-    const operationIds = new Set<string>();
-    const observerIds = new Set<string>();
-    const effectful = (effect: unknown) => ['dispatched', 'partial', 'confirmed', 'unknown'].includes(String(effect));
-    for (const item of history) {
-      const conversation = item.content as {
-        provenance?: { kind?: string; reference?: { action_id?: string; node_id?: string } };
-        content?: { kind?: string; output?: { data?: { operationId?: unknown } };
-          result?: { request_id?: string; call_id?: string; completion?: { kind?: string; operation_id?: string; effect?: string } } };
-      };
-      const result = conversation?.content?.kind === 'tool_result' ? conversation.content.result : undefined;
-      const completion = result?.completion;
-      if (completion?.kind === 'job_accepted' && typeof completion.operation_id === 'string') operationIds.add(completion.operation_id);
-      if (completion?.kind === 'result' && effectful(completion.effect)
-        && typeof result?.request_id === 'string' && typeof result.call_id === 'string') {
-        const original = `${result.request_id}:tool:${result.call_id}`;
-        operationIds.add(original); observerIds.add(original);
-      }
-      if (conversation.provenance?.kind === 'policy_tool_data' && conversation.content?.kind === 'output') {
-        const reference = conversation.provenance.reference;
-        if (typeof reference?.action_id === 'string' && typeof reference.node_id === 'string') {
-          const original = `${reference.action_id}:node:${reference.node_id}`;
-          if (conversation.content.output?.data?.operationId === original) {
-            operationIds.add(original); observerIds.add(original);
-          }
-        }
-      }
-    }
-    const operations = new Map(activeOperations.map(operation => [operation.id, operation]));
-    const visible = await Promise.all([...operationIds].filter(id => !operations.has(id)).map(async id => {
-      // Read-only policy evidence may have no durable Operation. Only a real missing row is optional.
-      const operation = observerIds.has(id) ? await this.runtime.findOperation(id, signal) : await this.runtime.operation(id, signal);
-      if (!operation || observerIds.has(id) && (!operation.mcp_resource_subscription || !effectful(operation.effect))) return null;
-      const run = await this.requireRun(operation.run_id, signal);
-      // Forked history retains the original receipt, not control over the source branch's job.
-      return run.thread_id === identity.threadId && run.branch_id === identity.branchId ? operation : null;
-    }));
-    for (const operation of visible) if (operation) operations.set(operation.id, operation);
-    const latest = branch.latest_run;
-    const activeRun = branch.active_run_id ? await this.runtime.run(branch.active_run_id, signal) : null;
-    const shownRun = activeRun ?? latest;
-    const [runFailure, launch, modelSelection, recovery] = await Promise.all([
-      shownRun?.state === 'failed' ? this.runtime.runFailure(shownRun.id, signal) : null,
-      shownRun ? this.runtime.launch(shownRun.id, signal) : null,
-      shownRun ? this.runtime.modelSelections(shownRun.id, signal) : {desired:null,active:null},
-      this.recoveryReader?.(identity, signal),
+    const shownRun = snapshot.activeRun ?? branch.latest_run;
+    if (snapshot.policySelection && shownRun) snapshot.policySelection.preparation = this.runtime.policyPreparation(shownRun.id);
+    const [creationDefaults, recovery] = await Promise.all([
+      this.creationDefaults?.(identity, signal), this.recoveryReader?.(identity, signal),
     ]);
-    const policySelection = shownRun && launch ? await this.runtime.inspectPolicy(shownRun.id, signal) : null;
     signal?.throwIfAborted();
-    return { identity, ...(this.creationDefaults ? { creationDefaults: await this.creationDefaults(identity, signal) } : {}), ...(recovery ? { recovery } : {}), eventCursor, thread, activeRun, runFailure, history, historyPage: { head: page.head, previous: page.previous }, inputs,
-      operations: [...operations.values()], followups, goals, launch, modelSelection, policySelection, context,
-      children: childState.children, childExecutions: childState.executions, childDirectory:childState.directory,childActivity, delegatedExecutions };
+    return { ...snapshot, identity, ...(creationDefaults ? { creationDefaults } : {}), ...(recovery ? { recovery } : {}) };
+  }
+
+  async inspectMany(threadIds: string[], signal?: AbortSignal) {
+    const threads = await this.runtime.inspectThreads(threadIds, signal);
+    for (const thread of threads) assertPrincipalOwnership(thread.principal_id);
+    return threads;
   }
 
   private async recordLaunchFailure(runId: string, error: unknown): Promise<void> {
@@ -1699,51 +1649,13 @@ export class ThreadAdapter {
     }), options.signal, () => { if (!started) release?.(); });
   }
 
-  /** Listener registration precedes replay. Notifications only wake the durable cursor reader. */
-  observe(cursor: number, emit: (event: unknown) => boolean, fail: (error: unknown) => void): () => void {
-    const observerPrincipal = currentRequestPrincipal();
-    // Immutable Catalog ownership is checked once per observed Thread for this reader.
-    const progressAccess = new Map<string, Promise<boolean>>();
-    let closed = false;
-    let reading = false;
-    let dirty = false;
-    const replay = async () => {
-      dirty = true;
-      if (reading || closed) return;
-      reading = true;
-      try {
-        while (!closed && dirty) {
-          dirty = false;
-          let events;
-          do {
-            events = await this.runtime.events(cursor, 256, undefined, observerPrincipal);
-            for (const event of events) {
-              if (closed) return;
-              if (!emit(event)) { close(); return; }
-              cursor = event.cursor;
-            }
-          } while (!closed && events.length === 256);
-        }
-      } catch (error) { close(); fail(error); }
-      finally { reading = false; }
-    };
-    const remove = this.runtime.onEvent((event: AgentRuntimeStreamEvent) => {
-      if (event.stream === 'durable') void replay();
-      else if (!closed) {
-        if (observerPrincipal === undefined) { try { if (!emit(event)) close(); } catch (error) { close(); fail(error); } }
-        else {
-          let access = progressAccess.get(event.threadId);
-          if (!access) {
-            access = this.runtime.thread(event.threadId).then(thread => thread.principal_id === observerPrincipal || thread.principal_id === null);
-            progressAccess.set(event.threadId, access);
-          }
-          void access.then(allowed => { if (!closed && allowed && !emit(event)) close(); }).catch(error => { close(); fail(error); });
-        }
-      }
-    });
-    const removeExit = this.runtime.onExit(error => { close(); fail(error); });
-    const close = () => { closed = true; progressAccess.clear(); remove(); removeExit(); };
-    void replay();
-    return close;
+  /** All HTTP and multiplexed WebSocket observations share the Host event owner. */
+  observe(cursor: number, emit: (event: unknown) => boolean, fail: (error: unknown) => void,
+    options: { threadIds?: readonly string[]; observationId?: string } = {}): () => void {
+    return threadEventHub(this.runtime).subscribe(cursor, currentRequestPrincipal(), emit, fail, options.threadIds, options.observationId);
   }
+  updateObservationInterests(observationId: string, threadIds: readonly string[] | null): void {
+    threadEventHub(this.runtime).updateInterests(observationId, currentRequestPrincipal(), threadIds);
+  }
+
 }
