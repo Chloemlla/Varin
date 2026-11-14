@@ -35,7 +35,9 @@ See [Computer admission and feedback](../web/application-host/lib/computer/DOCUM
 | `ping` | liveness probe |
 | `capabilities` | honest driver capability table (see `ComputerCapabilities` in `packages/protocol/src/harness-computer.ts`) |
 | `list_apps` | running top-level apps on this desktop |
-| `get_app_state` | snapshot: window bounds, UIA/AT-SPI tree lines + element records, optional screenshot |
+| `get_app_state` | snapshot: window bounds, structured UIA/AX/AT-SPI element records and display lines, optional screenshot |
+| `query_elements` | Native lookup by target or scope, explicit properties or matching controls; returns native completeness separately from the returned page |
+| `set_checked`, `set_expanded`, `select`, `scroll_into_view` | Target-state operations; unsupported patterns remain unavailable; report direct readback if available |
 | `click`, `perform_secondary_action`, `scroll`, `drag`, `type_text`, `press_key`, `set_value` | actions; return dispatch acceptance, optionally a fresh tree or screenshot |
 | `release_input` | release the synthetic buttons/keys this driver pressed, rather than every desktop modifier |
 | `capture_frame` / `inject_input` | viewer frames and human input; successful down/move/up requests preserve a gesture across frame requests until explicit release, cancellation, failure or EOF |
@@ -70,12 +72,14 @@ those pixels to window units using PNG dimensions and the recorded bounds;
 native helpers reject changed geometry before input. Windows also compares DPI
 and checks point ownership for screen-copy captures. This does not establish
 unchanged UI content: observe again when the next step depends on the previous
-action's result. A tree-only read retains the latest raster, while element
-indexes must use the newest tree for that window. Live viewer frames never
+action's result. A tree-only read retains the latest raster, while semantic indexes remain bound to their own retained native identity and window. Live viewer frames never
 replace either Agent observation.
 
-Windows relocates by runtime identity first, then a unique AutomationId/type,
-then a unique name/type. Ambiguous matches do not choose the first control.
+Semantic capabilities are per driver/session and per element. A scoped observation does not
+substitute a full-window capture when the driver lacks a region path. The Host samples through
+short reads unless the driver supports relevant events. Native element IDs stay on the owner
+side and are not selectors for an arbitrary window. Older providers can still report tree
+or coordinate input without advertising native query or state actions.
 Text entry searches only the selected window's subtree; another window in the
 same process holding global focus cannot redirect the bound application's text.
 `rejected:true` means preflight proved no input was sent; other failed native
@@ -240,6 +244,17 @@ port selects a caller-provided endpoint. Existing installed browsers and their
 profiles are retained. `components.json` is the recipe used by both preparation
 and additional software installation. The general guest also requests dev/docs;
 failed optional groups remain visible in the persisted software status.
+
+The browser resource adapter reuses this same driver route and desktop control
+assignment, queue, cancellation lifetime and evidence journal. It hashes the
+actual CDP browser endpoint for instance identity and uses real target IDs;
+coordinate input rechecks the observed frame/loader/URL at the provider before
+sending input. Structured reads expose AX text and PNG screenshots, but do not
+invent actionable element references. This bridge declares only its implemented
+new-tab, navigation, evaluation, coordinate click and focused typing operations;
+file transfers, element-ref actions and independent per-tab execution are not
+provided by this Linux adapter. Existing desktop application tools remain
+available while these capabilities differ.
 
 Software installation results are separate from desktop and bridge readiness.
 The Host imports bootstrap results and reports the packages for each component.

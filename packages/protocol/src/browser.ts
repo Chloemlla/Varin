@@ -1,6 +1,63 @@
+export type BrowserConnectionState = 'disconnected' | 'connecting' | 'online' | 'interrupted' | 'ended';
+export type BrowserResourceCapability = 'tabs' | 'open' | 'read' | 'screenshot' | 'act' | 'upload' | 'download' | 'activate';
+export interface BrowserProviderStatus {
+  instanceId?: string;
+  state: BrowserConnectionState;
+  capabilities: BrowserResourceCapability[];
+  operations?: string[];
+}
+export interface BrowserResource extends BrowserProviderStatus {
+  browserId: string;
+  label: string;
+  deviceName: string;
+  source?: 'embedded' | 'cdp' | 'connector' | 'desktop';
+}
+
+/** Connection settings belong to the Host that reaches the browser, not the UI device. */
+export interface BrowserConnection {
+  id: string;
+  label: string;
+  endpoint: string;
+  scratchDirectory?: string;
+  headers?: Record<string, string>;
+}
+export interface BrowserSettings {
+  connections: BrowserConnection[];
+  defaultBrowserId: string | null;
+}
+export interface BrowserSettingsSnapshot extends BrowserSettings { revision: string }
+export interface BrowserSettingsDevice { id: string; label: string }
+export interface BrowserManagementSnapshot {
+  settings: BrowserSettingsSnapshot;
+  resources: BrowserResource[];
+  viewBrowserIds?: Record<string, string>;
+}
+export interface BrowserTaskSelection {
+  preferredBrowserId: string | null;
+  binding?: BrowserResourceBinding;
+}
+export interface BrowserResourceBinding {
+  browserId: string;
+  instanceId: string;
+  pageId?: string;
+}
+export interface BrowserUseScope {
+  threadId?: string;
+  runId?: string;
+  operationId?: string;
+  signal?: AbortSignal;
+}
+export interface BrowserPageUsage {
+  controller: 'human' | 'agent';
+  activeThreadId?: string;
+  waitingThreadIds: string[];
+}
+
 /** Browser identity is independent of the window currently presenting a page. */
 export interface BrowserPage {
   browserId: string;
+  instanceId?: string;
+  generation?: number;
   pageId: string;
   title: string;
   url: string;
@@ -81,6 +138,7 @@ export interface BrowserActionResult {
   downloads?: BrowserDownload[];
 }
 export type BrowserEvent =
+  | { kind: 'connection'; browserId: string; instanceId?: string; state: BrowserConnectionState }
   | { kind: 'page'; page: BrowserPage }
   | { kind: 'closed'; pageId: string }
   | { kind: 'download'; download: BrowserDownload }
@@ -110,6 +168,13 @@ export interface BrowserRenderResult {
 /** Trusted embedding port. Files are transferred by the Host's original resource owner. */
 export interface BrowserOwner {
   readonly browserId: string;
+  resource?(): Promise<BrowserProviderStatus>;
+  forScope?(scope: BrowserUseScope, binding: BrowserResourceBinding): BrowserOwner;
+  pageUsage?(pageId: string): Promise<BrowserPageUsage>;
+  controlPage?(pageId: string, action: 'takeover' | 'resume' | 'activate'): Promise<BrowserPageUsage>;
+  pausePage?(pageId: string, paused: boolean): Promise<void>;
+  activate?(pageId: string): Promise<void>;
+  dispose?(): Promise<void>;
   renderPage?(request: BrowserRenderRequest): Promise<BrowserRenderResult>;
   list(): Promise<BrowserPage[]>;
   open(input: { url: string; pageId?: string; retained?: boolean }, scope: { threadId?: string; signal?: AbortSignal }): Promise<BrowserPage>;

@@ -59,6 +59,30 @@ describe('typed Host model references', () => {
     const observation = await seed('observation','host.browser',{pageId:'original-page',observationId:'original-image'});
     await expect(resolveHostToolArguments(refs,call('browser_act',{pageId:'other-page',observationId:observation,action:'click',point:{x:1,y:2}}),declaration('browser'))).rejects.toThrow('different pageId');
   });
+  it('pins resource, instance and page through observations without leaking raw binding IDs', async () => {
+    const {refs} = port();
+    const binding = {browserId:'remote:office:chrome',instanceId:'original-instance',pageId:'target-1'};
+    const raw = {binding,page:{...binding,title:'Signed-in page',url:'https://example.test/'},observationId:'native-observation'};
+    const projected = await projectHostToolData(refs,call('browser_read',{}),declaration('browser'),raw) as typeof raw;
+    expect(projected.binding).toBeUndefined(); expect(projected.page.browserId).toBeUndefined(); expect(projected.page.instanceId).toBeUndefined();
+    expect(raw.binding).toEqual(binding);
+    expect(await resolveHostToolArguments(refs,call('browser_act',{pageId:projected.observationId,action:'click',point:{x:1,y:2}}),declaration('browser')))
+      .toEqual({...binding,observationId:'native-observation',action:'click',point:{x:1,y:2}});
+    expect(await resolveHostToolArguments(refs,call('browser_read',{pageId:projected.page.pageId},'next-read'),declaration('browser'))).toEqual(binding);
+    for (const conflicting of [{browserId:'other-resource'}, {instanceId:'replacement-instance'}]) {
+      await expect(resolveHostToolArguments(refs,call('browser_act',{pageId:projected.page.pageId,...conflicting,action:'reload'},JSON.stringify(conflicting)),declaration('browser')))
+        .rejects.toThrow(`different ${Object.keys(conflicting)[0]}`);
+    }
+  });
+  it('keeps tab and download references on the resource returned by the route, not the owner-local ID', async () => {
+    const {refs} = port();
+    const binding = {browserId:'remote-browser',instanceId:'remote-instance'};
+    const raw = {binding,browserId:'owner-local',pages:[{browserId:'owner-local',pageId:'target-1'}],downloads:[{downloadId:'download',pageId:'target-1'}]};
+    const projected = await projectHostToolData(refs,call('browser_tabs',{}),declaration('browser'),raw) as typeof raw;
+    expect(projected.pages[0]!.pageId).toEqual(projected.downloads[0]!.pageId);
+    expect(await resolveHostToolArguments(refs,call('browser_files',{pageId:projected.downloads[0]!.pageId,action:'downloads'}),declaration('browser')))
+      .toEqual({...binding,pageId:'target-1',action:'downloads'});
+  });
   it('binds Computer input to the observed app/window and control epoch', async () => {
     const {refs} = port();
     const raw = {observation:{id:'native-observation',desktopId:'original-desktop',machineId:'machine',automationEpoch:'original-epoch',app:{pid:12,name:'Editor'},windowHandle:21,nativeTarget:'private-target',treeLines:['1 Button'],elements:[]}};
@@ -66,6 +90,25 @@ describe('typed Host model references', () => {
     expect(output.observation.nativeTarget).toBeUndefined(); expect(raw.observation.nativeTarget).toBe('private-target');
     const resolved = await resolveHostToolArguments(refs,call('computer_act',{action:{kind:'click',observationId:output.observation.id,elementIndex:1}}),declaration('computer'));
     expect(resolved).toEqual({desktopId:'original-desktop',automationEpoch:'original-epoch',action:{kind:'click',observationId:'native-observation',app:'12',window:21,elementIndex:1}});
+  });
+  it('projects await evidence as a reusable scoped reference without exposing driver identity', async () => {
+    const {refs} = port();
+    const raw = {status:'satisfied',last:{complete:true,observation:{
+      id:'native-match',desktopId:'original-desktop',machineId:'machine',automationEpoch:'epoch',
+      app:{pid:12,name:'Editor'},windowHandle:21,treeLines:['duplicate presentation'],
+      elements:[{index:12,parentIndex:5,role:'checkbox',checked:'mixed',nativeElementId:'private',path:[1,2],name:'Autosave'}],
+    }}};
+    const output = await projectHostToolData(refs,call('computer_await',{}),declaration('computer'),raw) as typeof raw;
+    const observation = output.last.observation;
+    expect(observation.id).toMatch(/^obs:/);
+    expect(observation.elements).toEqual([{index:12,parentIndex:5,role:'checkbox',checked:'mixed',name:'Autosave'}]);
+    expect(observation.treeLines).toBeUndefined();
+    expect(raw.last.observation.elements[0]?.nativeElementId).toBe('private');
+    const params = {within:{observationId:observation.id,elementIndex:12},match:{name:'Save'}};
+    expect(await resolveHostToolArguments(refs,call('computer_query',params,'query'),declaration('computer')))
+      .toEqual({desktopId:'original-desktop',within:{observationId:'native-match',elementIndex:12},match:{name:'Save'}});
+    await expect(resolveHostToolArguments(refs,call('computer_query',{...params,desktopId:'other'},'conflict'),declaration('computer')))
+      .rejects.toThrow('different desktopId');
   });
   it('uses the same native managed-process target shape for script environments', async () => {
     const {refs} = port();

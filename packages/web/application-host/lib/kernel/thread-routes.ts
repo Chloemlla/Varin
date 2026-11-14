@@ -24,7 +24,7 @@ import { HarnessServiceError } from '../harness/service-error.js';
 import { KernelClientError } from './kernel-client.js';
 import { ThreadAdapter, ThreadPreAdmissionError } from './thread-adapter.js';
 import { WorkspaceBackendUnavailableError } from './native-workspaces.js';
-import { listThreadSourceRoutes, putThreadSourceRoute, removeThreadSourceRoute, putThreadArrangement, controlThreadBacklog, listThreadFollowupJobs, pendingThreadFollowupRegistrations, cancelThreadFollowupRegistration, controlThreadFollowup, getThreadFollowup, getThreadFollowupOccurrence, listThreadFollowupOccurrences, listThreadFollowups, registerThreadFollowup } from './thread-followups.js';
+import { listThreadSourceRoutes, putThreadSourceRoute, removeThreadSourceRoute, putThreadArrangement, controlThreadBacklog, listThreadFollowupJobs, pendingThreadFollowupRegistrations, cancelThreadFollowupRegistration, updateThreadFollowup, controlThreadFollowup, getThreadFollowup, getThreadFollowupOccurrence, listThreadFollowupOccurrences, listThreadFollowups, registerThreadFollowup } from './thread-followups.js';
 import { controlThreadGoal, listThreadGoals, startThreadGoal, updateThreadGoal } from './thread-goals.js';
 
 const object = (value: unknown): Record<string, unknown> => {
@@ -239,6 +239,7 @@ export function registerThreadRoutes(app: Express, adapter: ThreadAdapter, requi
     'followup/occurrences': ['runtime', 'threadId', 'branchId', 'followupId', 'after'],
     'followup/get': ['runtime', 'threadId', 'branchId', 'followupId'],
     'followup/list': ['runtime', 'threadId', 'branchId'],
+    'followup/update': ['runtime', 'threadId', 'branchId', 'followupId', 'expectedRevision', 'instruction', 'atMs', 'fileCondition'],
     'followup/control': ['runtime', 'threadId', 'branchId', 'followupId', 'expectedRevision', 'action'],
     'goal/start': ['runtime', 'threadId', 'branchId', 'key', 'runId', 'objective', 'budget'],
     'goal/update': ['runtime', 'threadId', 'branchId', 'goalId', 'expectedRevision', 'objective', 'budget'],
@@ -604,6 +605,10 @@ export function registerThreadRoutes(app: Express, adapter: ThreadAdapter, requi
     body.after === undefined ? undefined : revision(body.after), signal));
   post('followup/get', 'read', (body, signal) => getThreadFollowup(adapter, identity(body), text(body.followupId), signal));
   post('followup/list', 'read', (body, signal) => listThreadFollowups(adapter, identity(body), signal));
+  post('followup/update', 'write', (body, signal) => {
+    if (body.fileCondition !== undefined && !['exists','changed','ready'].includes(String(body.fileCondition))) throw new Error('Invalid file condition');
+    return updateThreadFollowup(adapter, { ...identity(body), followupId:text(body.followupId),expectedRevision:revision(body.expectedRevision),instruction:text(body.instruction),...(body.atMs === undefined ? {} : {atMs:revision(body.atMs)}),...(body.fileCondition === undefined ? {} : {fileCondition:body.fileCondition as 'exists'|'changed'|'ready'}) },signal);
+  });
   post('followup/control', 'write', (body, signal) => {
     if (body.action !== 'pause' && body.action !== 'resume' && body.action !== 'cancel') throw new Error('Invalid follow-up control');
     return controlThreadFollowup(adapter, { ...identity(body), followupId: text(body.followupId),

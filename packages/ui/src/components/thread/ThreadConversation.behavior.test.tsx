@@ -137,7 +137,7 @@ vi.mock('./ThreadComposer', () => ({ ThreadComposer: (props: React.ComponentProp
   {props.value === '/' && <CommandAutocomplete api={props.api} identity={props.identity} source={props.source} searchQuery="" onClose={() => props.onChange('')}
     onCommandSelect={command => props.onChange(`/${command.name} `)} />}
 </div> }));
-vi.mock('@/components/chat/DraftPresetChips', () => ({ DraftPresetChips: () => null }));
+vi.mock('@/components/chat/DraftPresetChips', () => ({ DraftPresetChips: ({ onSubmit }: React.ComponentProps<typeof import('@/components/chat/DraftPresetChips').DraftPresetChips>) => <button type="button" onClick={() => onSubmit?.({ ref: { type: 'command', name: 'schedule-task' }, submitText: '/schedule-task' } as Parameters<NonNullable<typeof onSubmit>>[0])}>Schedule starter</button> }));
 vi.mock('@/components/ui/VarinLogo', () => ({ VarinLogo: () => null }));
 vi.mock('@/components/ui/input', () => ({ Input: ({ onChange, ...props }: React.InputHTMLAttributes<HTMLInputElement>) => <input {...props} onInput={onChange as React.FormEventHandler<HTMLInputElement>} /> }));
 vi.mock('@/components/ui/textarea', () => ({ Textarea: ({ onChange, ...props }: React.TextareaHTMLAttributes<HTMLTextAreaElement>) => <textarea {...props} onInput={onChange as React.FormEventHandler<HTMLTextAreaElement>} /> }));
@@ -219,7 +219,7 @@ function fixture(active = false) {
   });
   const listeners = new Set<Parameters<ThreadsAPI['observe']>[1]>();
   const unused = async (): Promise<never> => { throw new Error('unused fixture API'); };
-  const api: ThreadsAPI = { inspectMany: async ids => ids.includes(view.thread.thread_id) ? [view.thread] : [], conversationTree: unused, treePreview: unused, attachments: { upload: vi.fn(async (_identity, request) => ({ ref: 'attachment:retained-original', filename: request.filename, mimeType: request.mimeType, byteLength: request.data.size })), read: vi.fn(async () => new Blob(['original'])) }, attention: unused, historyRuns: async (_identity, { headId }) => ({ head: headId, runs: [] }), historyRunPreview: async () => '', historyUsage: async () => [], contextHistory: unused, fileTarget: unused, usage: unused, update: unused, delete: unused, deleteBranch: unused, markRead: unused, materials: { upload: vi.fn(unused), readSource: vi.fn(unused), read: vi.fn(unused), readArtifact: vi.fn(unused) }, computer: { state: vi.fn<ThreadsAPI['computer']['state']>(async target => ({ state: { work: target, rootWork: target, currentExecution: null, currentRootExecution: null, active: false, status: 'enabled', leases: [], requests: [], cleanups: [] }, activities: [] })), stop: vi.fn(unused), decide: vi.fn(unused) }, goals: { start: vi.fn(unused), update: unused, control: unused, list: async () => view.goals }, resources: { refresh: unused, skills: unused, draftSkills: unused }, followups: { arrangements: async () => [], eventSources: async () => [], putArrangement: unused, backlog: unused, sourceRoutes: async () => [], putSourceRoute: unused, removeSourceRoute: unused, jobSources: async () => [], register: unused, list: unused, get: unused, occurrence: unused, occurrences: unused, control: unused, pendingRegistrations: async () => [], cancelRegistration: unused }, listModels: async () => [{ providerId: 'fixture-provider', modelId: 'fixture-model' }], list: async () => [view.thread], create: async () => identity,
+  const api: ThreadsAPI = { inspectMany: async ids => ids.includes(view.thread.thread_id) ? [view.thread] : [], conversationTree: unused, treePreview: unused, attachments: { upload: vi.fn(async (_identity, request) => ({ ref: 'attachment:retained-original', filename: request.filename, mimeType: request.mimeType, byteLength: request.data.size })), read: vi.fn(async () => new Blob(['original'])) }, attention: unused, historyRuns: async (_identity, { headId }) => ({ head: headId, runs: [] }), historyRunPreview: async () => '', historyUsage: async () => [], contextHistory: unused, fileTarget: unused, usage: unused, update: unused, delete: unused, deleteBranch: unused, markRead: unused, materials: { upload: vi.fn(unused), readSource: vi.fn(unused), read: vi.fn(unused), readArtifact: vi.fn(unused) }, computer: { state: vi.fn<ThreadsAPI['computer']['state']>(async target => ({ state: { work: target, rootWork: target, currentExecution: null, currentRootExecution: null, active: false, status: 'enabled', leases: [], requests: [], cleanups: [] }, activities: [] })), stop: vi.fn(unused), decide: vi.fn(unused) }, goals: { start: vi.fn(unused), update: unused, control: unused, list: async () => view.goals }, resources: { refresh: unused, skills: unused, draftSkills: unused }, followups: { update: async () => { throw new Error("unused"); }, arrangements: async () => [], eventSources: async () => [], putArrangement: unused, backlog: unused, sourceRoutes: async () => [], putSourceRoute: unused, removeSourceRoute: unused, jobSources: async () => [], register: unused, list: unused, get: unused, occurrence: unused, occurrences: unused, control: unused, pendingRegistrations: async () => [], cancelRegistration: unused }, listModels: async () => [{ providerId: 'fixture-provider', modelId: 'fixture-model' }], list: async () => [view.thread], create: async () => identity,
     mediaRead: vi.fn(async input => ({ media: storedImage, partIndex: input.partIndex, chunkIndex: 0, chunkCount: 1, totalBytes: Buffer.from(imageData, 'base64').length, bytesBase64: imageData })),
     listMcpInteractions: vi.fn(async () => ({ items: [], nextCursor: null })), readMcpInteraction: unused, respondMcpInteraction: unused,
     reviewMcpSamplingRequest: unused, reviewMcpSamplingOutput: unused,
@@ -257,7 +257,7 @@ beforeEach(() => {
   recoveryService.api = undefined;
   // Recovery assertions count individual messages independently of the default
   // dialogue grouping. Presentation-specific cases choose their mode below.
-  useUIStore.setState({ recoveryPreference: 'conversation', chatRenderMode: 'live', contextPanelByDirectory: {} });
+  useUIStore.setState({ isScheduledTasksDialogOpen: false, scheduledTasksConversation: null, recoveryPreference: 'conversation', chatRenderMode: 'live', contextPanelByDirectory: {} });
   runtimeState.api = undefined; vi.mocked(attachProcessTerminal).mockClear();
   const documents: Pick<DocumentsAPI, 'resolveWorkspace'> = { resolveWorkspace: async () => ({ workspaceId: 'canonical-source-workspace', hostId: 'fixture-host', epoch: 1 }) };
   registerRuntimeAPIs({ documents } as RuntimeAPIs);
@@ -3060,17 +3060,18 @@ it('moves exhausted logs into history only after pending deliveries finish, with
   await act(async () => root.render(<ThreadConversation api={f.api} identity={identity} />));
   await openOverview('followups');
   expect(container.querySelector('[aria-label="Pending follow-up"]')).not.toBeNull();
-  expect(container.textContent).toContain('Log ended without satisfying the condition');
+  expect(container.querySelector('[aria-label="Pending follow-up"]')?.textContent).toContain('Waiting to deliver the observation result · Once');
   expect(container.textContent).toContain('Stream ended without a literal match');
   expect(container.textContent).toContain('ended without triggering · result awaiting delivery');
   expect(container.querySelector('[aria-label="Latest follow-up occurrence"]')).toBeNull();
-  expect(container.textContent).not.toContain('Waiting for the original trigger');
+  expect(container.textContent).not.toContain('Waiting for the condition');
   followup.observation.delivered = true; followup.observation.delivery_pending = false;
   await act(async () => f.emit({ cursor: 12, subject: followup.id, revision: 2, kind: 'followup.changed', data: {} }));
   expect(container.querySelector('[aria-label="Pending follow-up"]')).toBeNull();
   expect(button('Past follow-ups (1)')).toBeDefined();
   await act(async () => button('Past follow-ups (1)').click());
-  expect(container.querySelector('[aria-label="Past follow-up"]')?.textContent).toContain('Log ended without satisfying the condition');
+  expect(container.querySelector('[aria-label="Past follow-up"]')?.textContent).toContain('Ended · Once');
+  expect(container.querySelector('[aria-label="Past follow-up"]')?.textContent).toContain('Stream ended without a literal match');
   expect(button('Pause follow-up')).toBeUndefined(); expect(button('Cancel follow-up')).toBeUndefined();
   expect(container.textContent).toContain('ended without triggering · result delivered');
   // Real Catalog probe: failed original Run -> terminal Wait cleanup -> no-match EOF.
@@ -4873,4 +4874,37 @@ it('coalesces token frames and redraws only the streaming tail, not the composer
   expect(container.querySelector<HTMLTextAreaElement>('[aria-label="Message thread"]')?.value).toBe('Typing during output');
   await act(async () => button('Stop run').click());
   expect(f.cancelRun).toHaveBeenCalledWith('ui-run');
+});
+
+it('opens calendar from the conversation starter with its selected registered model, effort, and exact branch', async () => {
+  const f = fixture();
+  const model: ThreadModel = { providerId: 'fixture-provider', modelId: 'registered-model', thinkingLevel: 'xhigh' };
+  f.api.listModels = async () => [{ ...model, thinkingLevels: ['off', 'high', 'xhigh'] }];
+  useThreadDraftStore.getState().patch(threadComposerKey(threadHostKey(), identity), { model });
+  await act(async () => root.render(<ThreadConversation api={f.api} identity={identity} />));
+  await act(async () => button('Schedule starter').click());
+  expect(useUIStore.getState().scheduledTasksConversation).toEqual({ identity, model });
+  expect(useUIStore.getState().isScheduledTasksDialogOpen).toBe(true);
+  useUIStore.getState().setScheduledTasksDialogOpen(false);
+  useUIStore.getState().setScheduledTasksDialogOpen(true);
+  expect(useUIStore.getState().scheduledTasksConversation).toBeNull();
+});
+
+it('opens calendar from an unsubmitted native draft with its displayed model and effort without creating a Thread', async () => {
+  const f = fixture(); const create = vi.fn(f.api.create); f.api.create = create; runtimeState.api = f.api;
+  const model: ThreadModel = { providerId: 'fixture-provider', modelId: 'registered-model', thinkingLevel: 'xhigh' };
+  f.api.listModels = async () => [{ ...model, thinkingLevels: ['off', 'high', 'xhigh'] }];
+  let unbind: (() => void) | undefined;
+  try {
+    await act(async () => { unbind = bindThreadStore(f.api); });
+    await act(async () => {
+      const draftKey = useThreadStore.getState().openDraft();
+      useThreadDraftStore.getState().patch(draftKey, { model });
+      root.render(<ChatView />);
+    });
+    await act(async () => button('Schedule starter').click());
+    expect(useUIStore.getState().scheduledTasksConversation).toEqual({ model });
+    expect(useUIStore.getState().isScheduledTasksDialogOpen).toBe(true);
+    expect(create).not.toHaveBeenCalled();
+  } finally { unbind?.(); }
 });

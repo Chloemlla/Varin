@@ -14,6 +14,7 @@ const TRAY_GLIDE = springTransition('glide');
 import { ToolDisclosure } from './ToolDisclosure';
 import { invocationData, invocationStatus, operationInvocation, toolRecord, toolText } from './toolInvocation';
 import { fileChangePhase, fileChangeTargets, isFileChangeTool } from './fileChangePreview';
+import { computerResultSummary } from './computerToolPresentation';
 import { toolSubject } from './toolSubject';
 import { useToolTargets } from './toolTargetContext';
 import { isStandaloneTool } from './standaloneTools';
@@ -30,10 +31,12 @@ const actions: Record<string, I18nKey> = {
   script_run: 'chat.dialogue.script', script_open: 'chat.dialogue.scriptOpen', script_close: 'chat.dialogue.scriptClose',
   websearch: 'chat.dialogue.webSearch', webfetch: 'chat.dialogue.webRead', document_read: 'chat.dialogue.document',
   office_read: 'chat.dialogue.document', office_render: 'office.reader.preview', office_write: 'chat.dialogue.edit', office_export: 'chat.toolAction.export',
-  browser_tabs: 'chat.toolAction.list', browser_open: 'chat.toolAction.open', browser_read: 'chat.dialogue.webRead', browser_act: 'chat.toolAction.navigate', browser_files: 'chat.toolAction.save',
+  browser_resources: 'chat.toolAction.list', browser_tabs: 'chat.toolAction.list', browser_open: 'chat.toolAction.open', browser_read: 'chat.dialogue.webRead', browser_act: 'chat.toolAction.navigate', browser_files: 'chat.toolAction.save',
   todo: 'chat.dialogue.plan', memory: 'chat.dialogue.memory', render_ui: 'chat.dialogue.render',
   recovery_points: 'chat.dialogue.recovery', file_restore: 'chat.dialogue.restore',
   image_generate: 'chat.dialogue.image', image_edit: 'chat.dialogue.image',
+  computer_observe: 'chat.tools.observeComputer', computer_query: 'chat.tools.queryComputer',
+  computer_await: 'chat.tools.awaitComputer', computer_act: 'chat.tools.computer',
 };
 type Category = 'reads' | 'searches' | 'changes' | 'drafts' | 'branches' | 'commands' | 'scripts' | 'processes' | 'web' | 'collaboration' | 'plans' | 'memory' | 'discovery' | 'other';
 const categoryIcons: Record<Category, IconName> = {
@@ -142,6 +145,8 @@ export function ChatDialogueActivity({ process, executions, results, active, exp
     subject = (call.name === 'process_spawn' ? compact : '') || toolSubject(call, data, t, targets)
       || (call.name === 'script_run' ? toolText(scriptArguments(call).title) : '') || compact;
     if (subject === call.name) subject = '';
+    const receipt = computerResultSummary(call.name, data, toolRecord(call.arguments), t);
+    if (receipt && !current.item.streaming && !['running', 'waiting', 'background'].includes(current.status)) label = receipt;
   }
   const busy = liveThinking || current?.item.streaming || pending.some(row => row.status === 'running');
   const title = current || thinking ? [label, subject].filter(Boolean).join(' · ') : fullSummary || label;
