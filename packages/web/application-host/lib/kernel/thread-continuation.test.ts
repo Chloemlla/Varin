@@ -11,9 +11,9 @@ import { KernelClient } from './kernel-client.js';
 import { ExistingHostCredentialOwner } from './credential-owner.js';
 import { CredentialBridge } from './credential-bridge.js';
 import { modelCredentialBindingIdentity } from './model-binding-lifetime.js';
-import type { AgentRuntimeStreamEvent, LaunchIntent, Run, RuntimeEvent } from './protocol.generated.js';
+import type { AgentRuntimeStreamEvent, LaunchIntent, Run, RuntimeEvent, RunModelSelection, ModelSessionConfiguration } from './protocol.generated.js';
 import { waitWithSignal } from '../cancellation.js';
-import { ThreadAdapter } from './thread-adapter.js';
+import { ThreadAdapter, type ThreadModelAuthority } from './thread-adapter.js';
 import { ThreadCollaboration } from './thread-collaboration.js';
 import { registerThreadRoutes } from './thread-routes.js';
 
@@ -39,7 +39,7 @@ function fixture(prepareContext?: ContextPreparer) {
     pendingLaunches: vi.fn(async () => [structuredClone(launch)]), childForThread: vi.fn(async () => null),
     threads: vi.fn(async () => [{ thread_id: identity.threadId, parent_thread_id: null, observer_project_ids: [], branches: [{ branch_id: identity.branchId, active_run_id: run.id, head: null, latest_run: run }] }]),
     thread: vi.fn(async () => ({ thread_id: identity.threadId, parent_thread_id: null, observer_project_ids: [], branches: [{ branch_id: identity.branchId, active_run_id: run.id, head: null, latest_run: run }] })),
-    modelSelections: vi.fn(async () => ({ desired: null, active: null })),
+    modelSelections: vi.fn<AgentRuntimeClient['modelSelections']>(async () => ({ desired: null, active: null, exchange_closed: true })),
     resumeRun: vi.fn(async (runId: string, waitId: string) => {
       if (runId !== run.id || waitId !== receipt.wait_id) throw new Error('Not the recorded pause command');
       if (run.waiting_on === receipt.wait_id) { run.state = 'runnable'; run.waiting_on = null; launch.startable = true; launch.pause = null; }
@@ -52,13 +52,68 @@ function fixture(prepareContext?: ContextPreparer) {
     retainedModelOwner: vi.fn<AgentRuntimeClient['retainedModelOwner']>(() => undefined),
     releaseMainModelCredentials: vi.fn(), failLaunch: vi.fn(async () => launch),
   };
-  const models = { resolveModel: vi.fn(), rebindModel: vi.fn(async () => credentialOwner()) };
+  const models = { resolveModel: vi.fn(), rebindModel: vi.fn<ThreadModelAuthority['rebindModel']>(async () => credentialOwner()) };
   const errors: unknown[] = [];
   const adapter = new ThreadAdapter(runtime as unknown as AgentRuntimeClient, models, async () => {}, (_runId, error) => { errors.push(error); }, undefined, prepareContext);
   return { run, launch, receipt, runtime, models, adapter, errors, cancelPreparation: () => { preparation.abort(); preparation = new AbortController(); } };
 }
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
 afterEach(() => vi.unstubAllGlobals());
+
+it('Bot continuation resolves the current profile before attempting any retired model binding', async () => {
+  const f = fixture(); f.launch.startable = true; f.launch.pause = null;
+  f.run.configuration = { providerId: 'removed-provider', model: 'old' };
+  const current = { providerId: 'current-provider', modelId: 'current', thinkingLevel: 'off' as const };
+  const configuration = { providerId: current.providerId, model: current.modelId, thinkingLevel: 'off' } as ModelSessionConfiguration;
+  const owner = credentialOwner();
+  f.runtime.thread.mockImplementation(async () => ({ thread_id: identity.threadId, bot_id: 'bot', parent_thread_id: null,
+    observer_project_ids: [], branches: [{ branch_id: identity.branchId, active_run_id: f.run.id, head: null, latest_run: f.run }] }));
+  f.adapter.bindBotWorkProfile(async () => ({ homeDir: '/bot', model: current }));
+  f.models.resolveModel.mockResolvedValue({ configuration, credentialOwner: owner });
+  let desired: RunModelSelection | null = null;
+  f.runtime.modelSelections.mockImplementation(async () => ({ desired, active: null, exchange_closed: true }));
+  const selectModel = vi.fn<AgentRuntimeClient['selectModel']>(async (runId, key, configuration) => {
+    desired = { id: 'selection', binding_id: `model:${key}`, run_id: runId, revision: 1, configuration,
+      credential_scope: f.launch.selection.credential_scope, status: 'ready', failure: null };
+    return desired;
+  });
+  Object.assign(f.runtime, { selectModel });
+  f.models.rebindModel.mockImplementation(async config => {
+    expect(config).toEqual(configuration); return owner;
+  });
+  await f.adapter.continueLaunch(f.run.id);
+  expect(f.models.resolveModel).toHaveBeenCalledWith(current);
+  expect(f.runtime.rebindLaunch.mock.calls[0]?.[1]?.credentialOwner).toBe(owner);
+  expect(selectModel).toHaveBeenCalledTimes(2);
+  expect(selectModel.mock.calls[1]?.[1]).toBe(selectModel.mock.calls[0]?.[1]);
+  expect(f.errors).toEqual([]);
+});
+
+it('profile propagation leaves finished history alone and accepts completion racing with a live update', async () => {
+  const f = fixture(); f.run.state = 'completed';
+  const input = { ...identity, runId: f.run.id, key: 'profile', model: { providerId: 'provider', modelId: 'new' } };
+  await f.adapter.refreshBotModel(input);
+  expect(f.models.resolveModel).not.toHaveBeenCalled();
+  f.run.state = 'runnable';
+  f.models.resolveModel.mockResolvedValue({ configuration: {}, credentialOwner: credentialOwner() });
+  Object.assign(f.runtime, { selectModel: vi.fn(async () => { f.run.state = 'completed'; throw new Error('stale or terminal run execution'); }) });
+  await expect(f.adapter.refreshBotModel(input)).resolves.toBeUndefined();
+});
+
+it('recovery retains the active binding while its exchange remains open, preparing the next choice separately', async () => {
+  const f = fixture(); f.launch.startable = true; f.launch.pause = null;
+  const old = credentialOwner(), next = credentialOwner();
+  const configuration = { providerId: 'next', model: 'next' } as ModelSessionConfiguration;
+  const desired: RunModelSelection = { id: 'next', binding_id: 'model:next-key', run_id: f.run.id,
+    revision: 1, configuration, credential_scope: f.launch.selection.credential_scope, status: 'ready', failure: null };
+  f.runtime.modelSelections.mockResolvedValue({ desired, active: null, exchange_closed: false });
+  f.models.rebindModel.mockImplementation(async config => config === configuration ? next : old);
+  const selectModel = vi.fn<AgentRuntimeClient['selectModel']>(async () => desired);
+  Object.assign(f.runtime, { selectModel });
+  await f.adapter.continueLaunch(f.run.id);
+  expect(f.runtime.rebindLaunch.mock.calls[0]?.[1]?.credentialOwner).toBe(old);
+  expect(selectModel).toHaveBeenCalledWith(f.run.id, 'next-key', configuration, next, expect.any(AbortSignal));
+});
 
 it('queued input, startup discovery and generic continuation leave an explicit Pause untouched', async () => {
   const f = fixture();
@@ -586,15 +641,17 @@ it('subtree cancellation carries the original parent scope and never loads child
   expect(runtime.cancelTree.mock.calls).toHaveLength(accepted);
 });
 
-it('an unrelated observation error remains visible without blocking original saved-launch discovery or event replay', async () => {
+it.each(['observation', 'unaccepted dependency'] as const)('an unrelated %s error remains visible without blocking original saved-launch discovery or event replay', async stage => {
   const f = fixture(); f.launch.startable = true; f.launch.pause = null; f.run.state = 'runnable'; f.run.waiting_on = null;
-  const failure = new Error('Original child report content is unavailable');
-  const reconcileObservations = vi.fn(async (): Promise<string[]> => { throw failure; });
+  const failure = new Error(`Original ${stage} content is unavailable`);
+  const reconcileObservations = vi.fn(async (): Promise<string[]> => { if (stage === 'observation') throw failure; return []; });
+  const unacceptedChildDependencies = vi.fn(async () => { if (stage === 'unaccepted dependency') throw failure; return []; });
+  const releaseUnacceptedChildDependencies = vi.fn();
   let listener!: (event: AgentRuntimeStreamEvent) => void;
   const events: RuntimeEvent[] = [];
   const runtime = Object.assign(f.runtime, {
     onEvent: (handler: typeof listener) => { listener = handler; return () => {}; }, onExit: () => () => {}, onReady: () => () => {},
-    reconcileObservations, children: async () => [], unacceptedChildDependencies: async () => [],
+    reconcileObservations, children: async () => [], unacceptedChildDependencies, releaseUnacceptedChildDependencies,
     status: async () => ({ eventCursor: 0 }), events: async (cursor: number) => events.filter(event => event.cursor > cursor),
   });
   const continueRun = vi.fn(async (runId: string, signal: AbortSignal) => f.adapter.continueLaunch(runId, { signal }));
@@ -614,8 +671,48 @@ it('an unrelated observation error remains visible without blocking original sav
     expect(f.runtime.rebindLaunch).toHaveBeenCalledOnce();
     expect(f.runtime.pendingLaunches).toHaveBeenCalledOnce();
     expect(reconcileObservations).toHaveBeenCalledTimes(2);
+    expect(unacceptedChildDependencies).toHaveBeenCalledTimes(2);
+    expect(releaseUnacceptedChildDependencies).not.toHaveBeenCalled();
     expect(f.errors).toEqual([failure, failure]);
   } finally { collaboration.stop(); }
+});
+
+it.each(['active', 'stopped'] as const)('a failed dependency scan preserves reconciled Run delivery only for the %s Host epoch', async state => {
+  const f = fixture(); f.launch.startable = true; f.launch.pause = null; f.run.state = 'runnable'; f.run.waiting_on = null;
+  const failure = new Error('Original dependency discovery failed');
+  let reject!: (error: unknown) => void;
+  const scan = new Promise<never>((_resolve, fail) => { reject = fail; });
+  const unacceptedChildDependencies = vi.fn(async () => scan);
+  const releaseUnacceptedChildDependencies = vi.fn();
+  const runtime = Object.assign(f.runtime, {
+    onEvent: () => () => {}, onExit: () => () => {}, onReady: () => () => {},
+    reconcileObservations: async () => [f.run.id], children: async () => [], unacceptedChildDependencies, releaseUnacceptedChildDependencies,
+    status: async () => ({ eventCursor: 0 }), events: async () => [],
+  });
+  const continueRun = vi.fn(async (runId: string, signal: AbortSignal) => f.adapter.continueLaunch(runId, { signal }));
+  // No saved-launch scan or event can deliver this Run; only the original reconciliation result can.
+  const recoverLaunches = vi.fn(async () => {}), recoverColdBotWork = vi.fn(async () => {});
+  const collaboration = new ThreadCollaboration({ kernel: { reconcileChildToolHandoffs() {}, releaseChildToolHandoff() {} } as never,
+    storageAdapter: {} as never, resolveLiveSource: async () => { throw new Error('Unexpected source'); }, sourceCaptureOwners: {} as never,
+    runtime: runtime as unknown as AgentRuntimeClient, prepareContext: {} as never,
+    continueRun, recoverLaunches, recoverColdBotWork, onError: (_id, error) => f.errors.push(error) });
+  try {
+    const recovery = collaboration.recover();
+    await vi.waitFor(() => expect(unacceptedChildDependencies).toHaveBeenCalledOnce());
+    if (state === 'stopped') collaboration.stop();
+    reject(failure); await recovery;
+    if (state === 'active') {
+      await vi.waitFor(() => expect(f.runtime.rebindLaunch).toHaveBeenCalledOnce());
+      expect(continueRun).toHaveBeenCalledExactlyOnceWith(f.run.id, expect.any(AbortSignal));
+      expect(recoverLaunches).toHaveBeenCalledOnce(); expect(recoverColdBotWork).toHaveBeenCalledOnce();
+      expect(f.errors).toEqual([failure]);
+    } else {
+      expect(continueRun).not.toHaveBeenCalled(); expect(f.runtime.rebindLaunch).not.toHaveBeenCalled();
+      expect(recoverLaunches).not.toHaveBeenCalled(); expect(recoverColdBotWork).not.toHaveBeenCalled();
+      expect(f.errors).toEqual([]);
+    }
+    expect(releaseUnacceptedChildDependencies).not.toHaveBeenCalled();
+  } finally { reject(failure); collaboration.stop(); }
 });
 
 it('public source failure projection accepts typed owners and rejects forged reserved error codes', async () => {

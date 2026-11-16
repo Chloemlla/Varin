@@ -7,6 +7,7 @@ import { ContextPanel } from './ContextPanel';
 import { useUIStore } from '@/stores/useUIStore';
 import { useThreadStore } from '@/stores/useThreadStore';
 import { BOT_CONVERSATION_PANEL_SCOPE, openConversationTree } from '@/lib/openConversationTree';
+import { CONVERSATION_TOOL_MODES } from '@/lib/conversationTools';
 import { threadSummary } from '@/test/threadFixtures';
 
 const runtime = vi.hoisted(() => ({ api: undefined as ThreadsAPI | undefined }));
@@ -29,6 +30,7 @@ vi.mock('@/components/ui/sortable-tabs-strip', () => ({ SortableTabsStrip: () =>
 vi.mock('@/components/views/TerminalView', () => ({ TerminalView: () => null }));
 vi.mock('./RightSidebarTabs', () => ({ ProjectContextPanel: () => null }));
 vi.mock('./WorkspaceRecoveryPanel', () => ({ WorkspaceRecoveryPanel: () => null }));
+vi.mock('./ThreadFamilyPanel', () => ({ ThreadFamilyPanel: ({ owner }: { owner?: ThreadIdentity | null }) => <div data-collaboration-owner={owner?.threadId} data-collaboration-branch={owner?.branchId} /> }));
 vi.mock('./SidebarFilesTree', () => ({ SidebarFilesTree: () => null }));
 vi.mock('@/components/ui/dropdown-menu', () => ({
   DropdownMenu: ({ children }: React.PropsWithChildren) => <>{children}</>,
@@ -52,7 +54,7 @@ beforeEach(() => {
   const api: Pick<ThreadsAPI, 'snapshot' | 'contextInspection' | 'observe'> = {
     snapshot: vi.fn<ThreadsAPI['snapshot']>(async identity => ({ identity, eventCursor: 0, thread: threadSummary(identity.threadId), activeRun: null,
       history: [], historyPage: { head: null, previous: null }, inputs: [], operations: [], followups: [], goals: [], launch: null,
-      modelSelection: { desired: null, active: null }, policySelection: null, context: { checkpoint: null, jobs: [] } } as ThreadSnapshot)),
+      modelSelection: { desired: null, active: null, exchange_closed: true }, policySelection: null, context: { checkpoint: null, jobs: [] } } as ThreadSnapshot)),
     contextInspection: async () => ({ head: null, counts: { total: 0, user: 0, assistant: 0, tool: 0 }, latestRequest: null, contextRequest: null }),
     observe: async (_cursor, _listener, { signal }) => new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true })),
   };
@@ -131,4 +133,23 @@ it('keeps ordinary workbench context tied to its selected Thread when no shell o
   await switchTo('contextPanel.mode.context');
   expect(container.querySelector('[data-context-thread]')?.getAttribute('data-context-thread')).toBe(ordinary.threadId);
   expect(vi.mocked(runtime.api!.snapshot).mock.calls.map(([identity]) => identity)).toEqual([ordinary]);
+});
+
+it('shares the scoped tool switcher on mobile and follows the Bot selection for collaboration and recovery', async () => {
+  openConversationTree('bot');
+  const show = (identity: ThreadIdentity) => act(async () => root.render(<ContextPanel embedded layoutScope={BOT_CONVERSATION_PANEL_SCOPE}
+    surfaceModes={CONVERSATION_TOOL_MODES} contextOwner={{ identity, readOnly: false }}
+    renderConversationRecovery={() => <div data-conversation-details="recovery" data-owner={identity.threadId} />} />));
+  await show(bot);
+  await switchTo('collaboration.title');
+  expect(container.querySelector('[data-collaboration-owner]')?.getAttribute('data-collaboration-owner')).toBe(bot.threadId);
+  await show({ ...bot, threadId: 'next-bot', branchId: 'next-branch' });
+  expect(container.querySelector('[data-collaboration-owner]')?.getAttribute('data-collaboration-branch')).toBe('next-branch');
+  expect(container.textContent).not.toContain('conversationTools.activity');
+  await switchTo('chat.recovery.title');
+  expect(container.querySelector('[data-conversation-details]')?.getAttribute('data-owner')).toBe('next-bot');
+  expect(container.querySelector('[data-conversation-details]')?.getAttribute('data-conversation-details')).toBe('recovery');
+  expect(container.querySelector('[aria-label="contextPanel.actions.resizePanelAria"]')).toBeNull();
+  expect(container.querySelector('[data-context-panel]')?.getAttribute('style')).toContain('width:100%');
+  expect(useThreadStore.getState().selectedIdentity).toBe(ordinary);
 });

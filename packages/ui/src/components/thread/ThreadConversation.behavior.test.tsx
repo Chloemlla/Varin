@@ -29,6 +29,7 @@ import { ContextPanelContent } from '@/components/layout/ContextSidebarTab';
 import { CommandAutocomplete } from '@/components/chat/CommandAutocomplete';
 import { WorkbenchProfileContext } from '@/lib/workbench/profile-context';
 import { BOT_CONVERSATION_PANEL_SCOPE } from '@/lib/openConversationTree';
+import { ConversationToolsContext } from '@/lib/conversationTools';
 import { dict as en } from '@/lib/i18n/messages/en';
 import { ChildTaskMenu } from '../conversation/ChildTaskMenu';
 import { useTimelineViewStore } from '../conversation/timelineViewStore';
@@ -130,9 +131,8 @@ vi.mock('./ThreadComposer', () => ({ ThreadComposer: (props: React.ComponentProp
   <button type="button" disabled={props.attachmentDisabled} onClick={props.onAttachPdfs}>chat.fileAttachment.actions.attachPdfs</button>
   <button type="button" disabled={!props.onCompact} onClick={() => { void Promise.resolve(props.onCompact?.()).catch(() => {}); }}>Generate context summary</button>
   <button type="button" onClick={props.onOpenHistory}>Open conversation history</button>
-  {props.onOpenRecovery && <button type="button" onClick={props.onOpenRecovery}>Open conversation recovery</button>}
   <button type="submit" disabled={props.sendDisabled}>{props.retrying ? 'Retry delivery' : props.active ? 'Queue message' : 'Send'}</button>
-  {props.onStop && <button type="button" onClick={props.onStop}>Stop run</button>}
+  {props.onStop && <button type="button" onClick={props.onStop} aria-busy={props.stopping}>Stop run</button>}
   <ComposerCommandFixture actions={props.commandActions} />
   {props.value === '/' && <CommandAutocomplete api={props.api} identity={props.identity} source={props.source} searchQuery="" onClose={() => props.onChange('')}
     onCommandSelect={command => props.onChange(`/${command.name} `)} />}
@@ -201,7 +201,7 @@ const identity: ThreadIdentity = { runtime: 'agent', threadId: 'thread:ui-fixtur
 function initialSnapshot(active = false): ThreadSnapshot {
   const run = { id: 'ui-run', thread_id: identity.threadId, branch_id: identity.branchId, state: 'generating' as const, revision: 1, epoch: 1, configuration: { providerId: 'fixture-provider', model: 'fixture-model' }, cancel_requested: false, waiting_on: null };
   return { identity, eventCursor: 0, thread: { thread_id: identity.threadId, main_branch_id: identity.branchId, title: '', revision: 1, created_at_ms: 0, updated_at_ms: 0, pinned: false, archived: false, deleted_at_ms: null, activity_cursor: 0, read_cursor: 0, unread: false, bot_id: null, parent_thread_id: null, observer_project_ids: [null], branches: [{ branch_id: identity.branchId, head: null, active_run_id: active ? run.id : null, latest_run: active ? run : null }] }, activeRun: active ? run : null,
-    history: [], historyPage: { head: null, previous: null }, inputs: [], operations: [], followups: [], goals: [], launch: null, modelSelection: {desired:null,active:null}, policySelection: null, context: { checkpoint: null, jobs: [] } };
+    history: [], historyPage: { head: null, previous: null }, inputs: [], operations: [], followups: [], goals: [], launch: null, modelSelection: {desired:null,active:null,exchange_closed:true}, policySelection: null, context: { checkpoint: null, jobs: [] } };
 }
 function fixture(active = false) {
   const view = initialSnapshot(active);
@@ -212,7 +212,7 @@ function fixture(active = false) {
     input.revision = revision + 1; input.content = { text }; return input;
   });
   const cancelInput = vi.fn(async (id: string) => { const input = view.inputs.find(value => value.id === id)!; input.state = 'cancelled'; return input; });
-  const cancelRun = vi.fn(async () => {
+  const cancelRun = vi.fn<() => ReturnType<ThreadsAPI['cancelRun']>>(async () => {
     const run = { ...view.activeRun!, state: 'cancelled' as const, cancel_requested: true };
     view.activeRun = null; view.thread.branches[0]!.active_run_id = null; view.thread.branches[0]!.latest_run = run;
     return run;
@@ -636,6 +636,30 @@ it('active-thread controls queue the chosen mode, save/cancel queued text, and s
   await act(async () => { button('Stop run').click(); });
   expect(f.cancelRun).toHaveBeenCalledWith('ui-run');
   expect(button('Stop run')).toBeUndefined();
+});
+
+it('acknowledges stop immediately, retains server cancellation after remount, and releases failures for retry', async () => {
+  const f = fixture(true);
+  let reject!: (error: Error) => void;
+  f.cancelRun.mockImplementationOnce(() => new Promise((_resolve, failed) => { reject = failed; }));
+  await act(async () => root.render(<ThreadConversation api={f.api} identity={identity} />));
+  await act(async () => button('Stop run').click());
+  expect(button('Stop run').getAttribute('aria-busy')).toBe('true');
+  await edit('[aria-label="Message thread"]', 'Keep this draft');
+  expect(container.querySelector<HTMLTextAreaElement>('[aria-label="Message thread"]')!.value).toBe('Keep this draft');
+  await act(async () => reject(new Error('Stop request failed')));
+  expect(button('Stop run').getAttribute('aria-busy')).toBe('false');
+  expect(container.textContent).toContain('Stop request failed');
+  f.cancelRun.mockImplementationOnce(async () => { f.view.activeRun!.cancel_requested = true; return f.view.activeRun!; });
+  await act(async () => button('Stop run').click());
+  expect(button('Stop run').getAttribute('aria-busy')).toBe('true');
+  await act(async () => root.render(<ThreadConversation key="reopened" api={f.api} identity={identity} />));
+  expect(button('Stop run').getAttribute('aria-busy')).toBe('true');
+  f.view.thread.branches[0]!.active_run_id = 'next-run';
+  f.view.activeRun = { ...f.view.activeRun!, id: 'next-run', cancel_requested: false };
+  f.view.thread.branches[0]!.latest_run = f.view.activeRun;
+  await act(async () => f.emit({ cursor: 1, subject: 'next-run', kind: 'run.accepted', revision: 1, data: {} }));
+  expect(button('Stop run').getAttribute('aria-busy')).toBe('false');
 });
 
 it.each([
@@ -4170,19 +4194,29 @@ it.each([
   { surface: 'bot' as const, combinedUnavailable: true },
 ])('thread recovery rebuilds independent navigation Undo in $surface with combined recovery unavailable=$combinedUnavailable', async ({ surface, combinedUnavailable }) => {
   const f = navigationFixture();
-  await act(async () => root.render(<ThreadConversation surface={surface} api={f.api} identity={identity} />));
-  await act(async () => button('Open conversation recovery').click());
+  function Conversation() {
+    const [target, setTarget] = React.useState<HTMLDivElement | null>(null);
+    const [opened, setOpened] = React.useState(false);
+    return surface === 'bot' ? <ConversationToolsContext.Provider value={{ identity, target, mode: opened ? 'recovery' : undefined, bots: [] }}>
+      <button onClick={() => setOpened(true)}>Open conversation tools</button><div ref={setTarget} data-tools-content />
+      <ThreadConversation surface={surface} api={f.api} identity={identity} />
+    </ConversationToolsContext.Provider> : <ThreadConversation api={f.api} identity={identity} />;
+  }
+  const openRecovery = () => surface === 'bot' ? act(async () => button('Open conversation tools').click()) : openOverview('recovery');
+  await act(async () => root.render(<Conversation />));
+  await openRecovery();
   await act(async () => button('Restore before this message').click());
   const receipt = await f.navigate.mock.results[0]!.value;
   f.view.recovery = { navigation: receipt, operations: [], ...(combinedUnavailable ? { combinedUnavailable: 'Managed file recovery is unavailable. Conversation navigation remains available.' } : {}) };
   await act(async () => { root.unmount(); }); root = createRoot(container);
-  await act(async () => root.render(<ThreadConversation surface={surface} api={f.api} identity={identity} />));
+  await act(async () => root.render(<Conversation />));
   if (surface === 'bot') {
     expect(container.querySelector('[aria-label="Conversation recovery"]')).toBeNull();
     expect(button('Undo conversation recovery')).toBeUndefined();
   }
-  await act(async () => button('Open conversation recovery').click());
+  await openRecovery();
   expect(container.querySelectorAll('[aria-label="Conversation recovery"]')).toHaveLength(1);
+  if (surface === 'bot') expect(container.querySelector('[data-tools-content] [aria-label="Conversation recovery"]')).not.toBeNull();
   expect(container.querySelector<HTMLTextAreaElement>('[aria-label="Message thread"]')!.value).toBe('Original user instruction');
   expect(f.navigate).toHaveBeenCalledOnce();
   await edit('[aria-label="Message thread"]', 'Fresh draft after reopening');
@@ -4212,9 +4246,19 @@ it('Bot thread recovery reveals interrupted operations on demand without replayi
   const interrupted = { ...recovery.operation, state: 'files-restored' as const, conversationState: 'unchanged' as const };
   f.view.recovery = { navigation: null, operations: [interrupted] };
   recovery.getCombinedOperation.mockResolvedValueOnce({ status: 'ready', operation: interrupted });
-  await act(async () => root.render(<ThreadConversation surface="bot" api={f.api} identity={identity} />));
+  function Conversation() {
+    const [target, setTarget] = React.useState<HTMLDivElement | null>(null);
+    const panel = useUIStore(state => state.contextPanelByDirectory[BOT_CONVERSATION_PANEL_SCOPE]);
+    const mode = panel?.tabs.find(tab => tab.id === panel.activeTabId)?.mode;
+    return <ConversationToolsContext.Provider value={{ identity, target, mode, bots: [] }}>
+      <div ref={setTarget} data-tools-content /><ThreadConversation surface="bot" api={f.api} identity={identity} />
+    </ConversationToolsContext.Provider>;
+  }
+  await act(async () => root.render(<Conversation />));
   expect(container.querySelector('[aria-label="Conversation recovery"]')).toBeNull();
   await act(async () => button('View recovery').click());
+  expect(container.querySelector('[data-tools-content] [aria-label="Conversation recovery"]')).not.toBeNull();
+  expect(container.querySelector('[data-harness-overview-panel]')).toBeNull();
   await edit('[aria-label="Message thread"]', 'New draft while reviewing recovery');
   expect(button('Send').disabled).toBe(true);
   expect(recovery.applyCombinedRecovery).not.toHaveBeenCalled();

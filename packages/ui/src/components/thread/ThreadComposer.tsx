@@ -15,7 +15,7 @@ import { Icon } from '@/components/icon/Icon';
 import { ComposerEditor, type ComposerEditorHandle } from '@/components/chat/composer/editor/ComposerEditor';
 import { ComposerDictation } from '@/components/dictation/ComposerDictation';
 import { ModelSelector } from '@/components/sections/agents/ModelSelector';
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { useI18n } from '@/lib/i18n';
 import { useUIStore } from '@/stores/useUIStore';
 import { cn } from '@/lib/utils';
@@ -42,8 +42,8 @@ import { ExternalModelControls, ExternalModeControls, ExternalOptionMenu, Extern
 import { ThreadPermissionControl } from './ThreadPermissionControl';
 
 export function ThreadComposer({ editorRef, value, onChange, interactions, models, providerId, modelId, thinkingLevel, onModelChange,
-  modelDisabled, attachmentDisabled, imageDisabled, sendDisabled, pending, active, retrying, suggestion, suggestionError, onSuggestionDismiss, prepareSendMode,
-  onFiles, onAttachImages, onAttachPdfs, onStop, onGoal, goalArmed, children, attachmentNames, imageReferences, skills, hasInput, onWorkspace, workspaceLabel, workspacePath, permissionWorkspacePath, identityKey, messageHistory: sentMessageHistory = [], placement = 'bottom', queue, onCompact, onOpenHistory, onOpenRecovery, agentControls, backendControls, api, identity, source, references, commandActions, onReferenceSelect, backendCommands, referenceScope, pendingSource, attachmentCandidates, backendIdentity, external, connectionStatus }: {
+  modelDisabled, attachmentDisabled, imageDisabled, sendDisabled, pending, active, stopping = false, retrying, suggestion, suggestionError, onSuggestionDismiss, prepareSendMode,
+  onFiles, onAttachImages, onAttachPdfs, onStop, onGoal, goalArmed, children, attachmentNames, imageReferences, skills, hasInput, onWorkspace, workspaceLabel, workspacePath, permissionWorkspacePath, identityKey, messageHistory: sentMessageHistory = [], placement = 'bottom', queue, onCompact, onOpenHistory, agentControls, backendControls, api, identity, source, references, commandActions, onReferenceSelect, backendCommands, referenceScope, pendingSource, attachmentCandidates, backendIdentity, external, connectionStatus }: {
   editorRef: React.Ref<ComposerEditorHandle>; value: string; onChange(value: string, references?: readonly ComposerReference[], interactions?: readonly InteractionRange[]): void;
   interactions?: readonly InteractionRange[];
   referenceScope?: string; references?: readonly ComposerReference[]; api?: ThreadsAPI; identity?: ThreadIdentity; source?: ThreadSource; pendingSource?: ThreadDraftSkillOptions['source'];
@@ -55,11 +55,10 @@ export function ThreadComposer({ editorRef, value, onChange, interactions, model
   suggestion?: string; suggestionError?: string; onSuggestionDismiss?(): void;
   prepareSendMode?(mode: 'boundary' | 'next_run' | undefined): void;
   identityKey?: string; messageHistory?: readonly string[]; placement?: 'center' | 'bottom'; queue?: React.ReactNode; onCompact?(): void | Promise<void>; onOpenHistory?(): void;
-  onOpenRecovery?(): void;
   models: ThreadModelInfo[]; providerId: string; modelId: string; thinkingLevel: ThreadThinkingLevel;
   onModelChange(provider: string, model: string, thinking: ThreadThinkingLevel): void | Promise<void>;
   modelDisabled: boolean; attachmentDisabled: boolean; imageDisabled: boolean; sendDisabled: boolean;
-  pending: boolean; active: boolean; retrying: boolean;
+  pending: boolean; active: boolean; stopping?: boolean; retrying: boolean;
   onFiles(files: File[]): void; onAttachImages(): void; onAttachPdfs(): void; onStop?(): void; onGoal?(): void;
   hasInput: boolean; onWorkspace?(): void; workspaceLabel: string;
   goalArmed?: boolean;
@@ -80,7 +79,6 @@ export function ThreadComposer({ editorRef, value, onChange, interactions, model
   const motionId = React.useId();
   const isMobile = useUIStore(state => state.isMobile);
   const isExpandedInput = useUIStore(state => state.isExpandedInput);
-  const toggleExpandedInput = useUIStore(state => state.toggleExpandedInput);
   const goalEnabled = useUIStore(state => state.sessionGoalEnabled);
   const spellCheck = useUIStore(state => state.inputSpellcheckEnabled);
   const shortcuts = useUIStore(state => state.shortcutOverrides);
@@ -106,6 +104,7 @@ export function ThreadComposer({ editorRef, value, onChange, interactions, model
     if (identityKey && inputRef.current) return registerUiComposer(identityKey, inputRef.current);
   }, [identityKey]);
   const [autocomplete, setAutocomplete] = React.useState<AutocompleteTrigger | null>(null);
+  const returnToEditor = React.useRef(false);
   const [knownAgentNames, setKnownAgentNames] = React.useState<Set<string>>(() => new Set());
   const [confirmedMentions, setConfirmedMentions] = React.useState<Set<string>>(() => new Set());
   const commandRef = React.useRef<CommandAutocompleteHandle>(null);
@@ -131,7 +130,8 @@ export function ThreadComposer({ editorRef, value, onChange, interactions, model
   }, [scope, resetHistory]);
   const sending = pending;
   const loading = false;
-  const aborting = false;
+  const aborting = active && stopping;
+  const stopLabel = t(aborting ? 'chat.timeline.tools.stopping' : 'chat.chatInput.actions.stopGeneratingAria');
   const [insertedSuggestion, setInsertedSuggestion] = React.useState<{ text: string; identity?: string }>();
   React.useEffect(() => {
     if (insertedSuggestion && (!value.length || insertedSuggestion.text !== suggestion || insertedSuggestion.identity !== identityKey)) setInsertedSuggestion(undefined);
@@ -142,6 +142,9 @@ export function ThreadComposer({ editorRef, value, onChange, interactions, model
   const canSend = hasInput || Boolean(ghostSuggestion);
   const composerActions = { primary: active && !hasInput && !retrying ? 'stop' : 'send', showSecondaryStop: active && hasInput && Boolean(onStop) };
   const primaryBusy = loading || (composerActions.primary === 'stop' ? aborting : sending);
+  const sendLabel = t(retrying ? 'chat.messages.retry' : external?.delivery
+    ? external.delivery.mode === 'steer' ? 'external.sendCurrentTurn' : 'external.sendNextTurn'
+    : 'chat.chatInput.actions.sendMessageAria');
   const primaryIcon = { name: primaryBusy ? 'loader-4' : composerActions.primary === 'stop' ? 'stop' : 'arrow-up', spin: primaryBusy } as const;
   const footerIconButtonClass = 'flex size-8 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-interactive-hover hover:text-foreground disabled:cursor-not-allowed disabled:opacity-35';
   const handleAbort = () => onStop?.();
@@ -254,6 +257,22 @@ export function ThreadComposer({ editorRef, value, onChange, interactions, model
     setAutocomplete(trigger);
     if (!trigger) setLayer(undefined);
   }, [autocomplete, value]);
+  const openPicker = (kind: AutocompleteTrigger['kind']) => {
+    const editor = inputRef.current;
+    if (!editor) return;
+    external?.onInteract('menu');
+    dismissed.current = undefined; setLayer(undefined); setCommandError(undefined);
+    returnToEditor.current = true;
+    const text = editor.getValue(), cursor = editor.getSelection().end;
+    const current = resolveAutocompleteTrigger(text, cursor, { inputMode: 'normal' });
+    if (current?.kind === kind) { setAutocomplete(current); return; }
+    // Keep surrounding draft text outside the query, including insertion inside a sentence.
+    const prefix = cursor > 0 && !/\s/.test(text[cursor - 1]!) ? ' ' : '';
+    const suffix = cursor < text.length && !/\s/.test(text[cursor]!) ? ' ' : '';
+    const from = cursor + prefix.length;
+    editor.replaceRange(cursor, cursor, `${prefix}${kind === 'mention' ? '@' : '/'}${suffix}`, from + 1);
+    setAutocomplete({ kind, query: '', from, to: from + 1 });
+  };
   const handleCommandSelect = (command: CommandInfo, mode: 'confirm' | 'complete') => {
     if (!autocomplete || commandBusy || scope !== currentIdentity.current || commandContext.composer?.host !== getRuntimeEndpointGeneration() || inputRef.current?.getValue() !== value) return;
     if (command.source === 'backend') {
@@ -371,6 +390,9 @@ export function ThreadComposer({ editorRef, value, onChange, interactions, model
         <div ref={inputContentRef} className="flex min-w-0 shrink-0 flex-col" data-conversation-composer-input-content="true">
         {children}
         {external && <ExternalChoiceValidation key={backendIdentity} options={external} />}
+        {external?.delivery && <p className="px-3 pt-1 typography-micro text-muted-foreground" data-external-delivery-mode={external.delivery.mode}>
+          {t(external.delivery.mode === 'steer' ? 'external.sendCurrentTurn' : 'external.sendNextTurn')} · {t('external.nextTurnOptionsHint')}
+        </p>}
 
           {isMobile ? (
             <div className="flex min-w-0 items-center justify-end border-b border-border/40 px-2 py-1">
@@ -436,9 +458,8 @@ export function ThreadComposer({ editorRef, value, onChange, interactions, model
             maxLines={isExpandedInput ? 24 : 9}
           />
 
-          <div className="conversation-composer-hints" data-empty={!value.trim()} data-suggestion={availableSuggestion || suggestionError ? 'true' : undefined}>
+          <div className="conversation-composer-hints" data-suggestion={!autocomplete && (availableSuggestion || suggestionError) ? 'true' : undefined}>
             <div className="conversation-composer-hint-row min-h-0 overflow-hidden px-3 typography-micro">
-              <p>{backendControls === undefined ? t(botWorkbench ? 'chat.composer.botHint' : 'chat.composer.hint') : t('external.inputHint')}</p>
               <p aria-live="polite">
               {availableSuggestion && !autocomplete ? <button type="button" className="text-inherit transition-colors hover:text-primary"
                 title={availableSuggestion} aria-label={`${t('chat.suggestion.applyAria')}: ${availableSuggestion}`}
@@ -472,25 +493,35 @@ export function ThreadComposer({ editorRef, value, onChange, interactions, model
                   <button
                     type="button"
                     className={footerIconButtonClass}
-                    aria-label={t('chat.chatInput.actions.addAttachment')}
-                    title={t('chat.chatInput.actions.addAttachment')}
+                    aria-label={t('chat.composer.add')}
+                    title={t('chat.composer.add')}
                   >
                     <Icon name="add" className="size-4" />
                   </button>
                 </DropdownMenuTrigger>
-                <DropdownMenuContent side="top" align="start" className="min-w-48">
+                <DropdownMenuContent side="top" align="start" className="min-w-48" finalFocus={() => {
+                  if (!returnToEditor.current) return true;
+                  returnToEditor.current = false;
+                  inputRef.current?.focus({ preventScroll: true });
+                  return false;
+                }}>
+                  <DropdownMenuItem onSelect={() => openPicker('mention')} className="gap-2.5 py-1.5">
+                    <Icon name="file" className="size-4" />
+                    {t(backendControls !== undefined ? 'chat.composer.referenceAttachment' : botWorkbench ? 'chat.composer.botReference' : 'chat.composer.reference')}
+                    <span className="ml-auto pl-4 text-muted-foreground" aria-hidden="true">@</span>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onSelect={() => openPicker('command')} className="gap-2.5 py-1.5">
+                    <Icon name="command" className="size-4" />
+                    {t(backendControls !== undefined ? 'chat.chatInput.actions.commands' : 'chat.composer.commands')}
+                    <span className="ml-auto pl-4 text-muted-foreground" aria-hidden="true">/</span>
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
                   <DropdownMenuItem disabled={attachmentDisabled || imageDisabled} title={external && imageDisabled ? t(external.capabilities ? 'external.imagesUnsupported' : 'external.capabilitiesUnknown') : undefined} onClick={onAttachImages} className="gap-2.5 py-1.5">
                     <Icon name="attachment-2" className="size-4" />
                     {t('chat.fileAttachment.actions.chooseImages')}
                   </DropdownMenuItem>
                   <DropdownMenuItem disabled={attachmentDisabled || Boolean(external && !external.capabilities?.files)} title={external && !external.capabilities?.files ? t(external.capabilities ? 'external.filesUnsupported' : 'external.capabilitiesUnknown') : undefined} onClick={onAttachPdfs} className="gap-2.5 py-1.5">
                     <Icon name="file" className="size-4" />{t('chat.attachments.choose')}
-                  </DropdownMenuItem>
-                  {onOpenHistory && <DropdownMenuItem onClick={onOpenHistory}><Icon name="git-branch" className="size-4" />{t('chat.timeline.title')}</DropdownMenuItem>}
-                  {onOpenRecovery && <DropdownMenuItem onClick={onOpenRecovery}><Icon name="history" className="size-4" />{t('chat.recovery.title')}</DropdownMenuItem>}
-                  <DropdownMenuItem onClick={toggleExpandedInput} className="gap-2.5 py-1.5">
-                    <Icon name={isExpandedInput ? 'fullscreen-exit' : 'fullscreen'} className="size-4" />
-                    {isExpandedInput ? t('filesView.editor.exitFullscreen') : t('filesView.editor.fullscreen')}
                   </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
@@ -524,23 +555,24 @@ export function ThreadComposer({ editorRef, value, onChange, interactions, model
                       disabled={aborting}
                       onClick={() => void handleAbort()}
                       className="flex size-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-foreground/5 hover:text-foreground disabled:cursor-wait disabled:opacity-50"
-                      aria-label={t('chat.chatInput.actions.stopGeneratingAria')}
+                      aria-label={stopLabel}
+                      aria-busy={aborting}
                       data-conversation-composer-secondary-stop="true"
                     >
-                      <Icon
+                      <SwapIcon swapKey={aborting ? 'loader-4' : 'stop'} enter="settle"><Icon
                         name={aborting ? 'loader-4' : 'stop'}
                         className={cn('size-3.5', aborting && 'animate-spin')}
-                      />
+                      /></SwapIcon>
                     </button>
                   </TooltipTrigger>
-                  <TooltipContent side="top">{t('chat.chatInput.actions.stopGeneratingAria')}</TooltipContent>
+                  <TooltipContent side="top">{stopLabel}</TooltipContent>
                 </Tooltip>
               )}
               {prepareSendMode && active && hasInput && !retrying ? <DropdownMenu>
-                <DropdownMenuTrigger asChild><button type="button" className={footerIconButtonClass} disabled={pending} aria-label={t('bot.workspace.sendOptions')}><Icon name="arrow-down-s" className="size-3.5" /></button></DropdownMenuTrigger>
+                <DropdownMenuTrigger asChild><button type="button" className={footerIconButtonClass} disabled={pending} aria-label={t(external ? 'external.sendOptions' : 'bot.workspace.sendOptions')}><Icon name="arrow-down-s" className="size-3.5" /></button></DropdownMenuTrigger>
                 <DropdownMenuContent align="end">
-                  <DropdownMenuItem onSelect={() => submit('boundary')}><Icon name="arrow-up" className="size-4" />{t('bot.workspace.sendNow')}</DropdownMenuItem>
-                  <DropdownMenuItem onSelect={() => submit('next_run')}><Icon name="time" className="size-4" />{t('bot.workspace.sendLater')}<span className="ml-auto typography-micro text-muted-foreground">Alt ↵</span></DropdownMenuItem>
+                  {(!external || external.delivery?.canSteer) && <DropdownMenuItem onSelect={() => submit('boundary')}><Icon name="arrow-up" className="size-4" />{t(external ? 'external.sendCurrentTurn' : 'bot.workspace.sendNow')}</DropdownMenuItem>}
+                  <DropdownMenuItem onSelect={() => submit('next_run')}><Icon name="time" className="size-4" />{t(external ? 'external.sendNextTurn' : 'bot.workspace.sendLater')}<span className="ml-auto typography-micro text-muted-foreground">Alt ↵</span></DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu> : null}
               <Tooltip>
@@ -551,7 +583,7 @@ export function ThreadComposer({ editorRef, value, onChange, interactions, model
                       if (composerActions.primary === 'stop') void handleAbort();
                       else void submit();
                     }}
-                    disabled={composerActions.primary === 'stop' ? !onStop : sendDisabled}
+                    disabled={composerActions.primary === 'stop' ? !onStop || aborting : sendDisabled}
                     className={cn(
                       'flex size-8 items-center justify-center rounded-full transition-colors',
                       composerActions.primary === 'stop'
@@ -563,8 +595,8 @@ export function ThreadComposer({ editorRef, value, onChange, interactions, model
                           : 'cursor-not-allowed bg-transparent text-muted-foreground/35',
                     )}
                     aria-label={loading ? t('common.loading') : composerActions.primary === 'stop'
-                      ? t('chat.chatInput.actions.stopGeneratingAria')
-                      : t(retrying ? 'chat.messages.retry' : 'chat.chatInput.actions.sendMessageAria')}
+                      ? stopLabel
+                      : sendLabel}
                     aria-busy={loading || (composerActions.primary === 'stop' ? aborting : undefined)}
                     data-conversation-composer-primary-action={composerActions.primary}
                   >
@@ -576,8 +608,8 @@ export function ThreadComposer({ editorRef, value, onChange, interactions, model
                 </TooltipTrigger>
                 <TooltipContent side="top">
                   {loading ? t('common.loading') : composerActions.primary === 'stop'
-                    ? t('chat.chatInput.actions.stopGeneratingAria')
-                    : t(retrying ? 'chat.messages.retry' : 'chat.chatInput.actions.sendMessageAria')}
+                    ? stopLabel
+                    : sendLabel}
                 </TooltipContent>
               </Tooltip>
             </div>

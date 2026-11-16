@@ -791,13 +791,13 @@ fn external_terminal_before_explicit_handoff_is_not_lost() {
         .unwrap();
     let receipt = external("job", Outcome::Succeeded, Effect::Confirmed);
     let early = db.record_external_receipt("job", receipt.clone()).unwrap();
-    assert_eq!(early.phase, OperationPhase::Running);
+    assert_eq!(early.phase, OperationPhase::Terminal);
     db.handoff_operation("job", epoch).unwrap();
     let settled = db.operation("job").unwrap();
     assert_eq!(
         settled.phase,
         OperationPhase::Terminal,
-        "early terminal was buffered but never applied at explicit handoff"
+        "explicit handoff retains the executor's completed result"
     );
     assert_eq!(settled.outcome, Some(Outcome::Succeeded));
     assert_eq!(db.record_external_receipt("job", receipt).unwrap(), settled);
@@ -1073,9 +1073,9 @@ fn later_external_confirmation_resolves_lost_acceptance_receipt_without_handoff(
                 let early = db.record_external_receipt("job", receipt.clone()).unwrap();
                 assert_eq!(
                     (early.phase, early.effect),
-                    (OperationPhase::Running, Effect::Dispatched)
+                    (OperationPhase::Terminal, effect)
                 );
-                assert!(db.pending_resumptions().unwrap().is_empty());
+                assert!(!db.pending_resumptions().unwrap().is_empty());
                 drop(db);
                 db = f.open();
             } else {
@@ -1092,14 +1092,14 @@ fn later_external_confirmation_resolves_lost_acceptance_receipt_without_handoff(
             assert!(!interrupted.handed_off);
             assert_eq!(
                 (interrupted.outcome, interrupted.effect),
-                (Some(Outcome::Indeterminate), Effect::Unknown)
+                if persisted_before_crash { (Some(outcome), effect) } else { (Some(Outcome::Indeterminate), Effect::Unknown) }
             );
             let confirmed = db.record_external_receipt("job", receipt.clone()).unwrap();
             assert_eq!(
                 (confirmed.phase, confirmed.outcome, confirmed.effect),
                 (OperationPhase::Terminal, Some(outcome), effect)
             );
-            assert_eq!(confirmed.revision, interrupted.revision + 1);
+            assert_eq!(confirmed.revision, interrupted.revision + u64::from(!persisted_before_crash));
             assert_eq!(
                 db.capture_operation_read(confirmed.clone())
                     .load()
@@ -2103,6 +2103,7 @@ fn model_activation_after_a_closed_exchange_survives_reopen_without_rewriting_it
             .is_err(),
         "an active request cannot be switched"
     );
+    assert!(!db.model_selections(&receipt.run_id).unwrap().exchange_closed);
     db.commit_execution(
         &receipt.run_id,
         db.epoch(),
@@ -2133,6 +2134,7 @@ fn model_activation_after_a_closed_exchange_survives_reopen_without_rewriting_it
         .is_err(),
         "a changed binding requires a committed activation"
     );
+    assert!(db.model_selections(&receipt.run_id).unwrap().exchange_closed);
     assert!(
         db.activate_model_selection(&selection, db.epoch(), &bound.binding)
             .unwrap()
@@ -3613,7 +3615,7 @@ fn original_mcp_resource_holder_cleanup_and_late_ack_preserve_invocation() {
                 result: json!({"operationId":context.operation_id,"server":"original","uri":"original:resource","acknowledgement":ack}).into(),
             }).unwrap();
             let accepted = db.accept_mcp_resource(&binding, "original-listener", data, receipt).unwrap();
-            assert_eq!(accepted.phase, OperationPhase::Running);
+            assert_eq!(accepted.phase, OperationPhase::Terminal);
             assert!(accepted.external_receipt.unwrap().executor_stopped);
         }
         let unknown = ToolCompletion::Result { outcome: Outcome::Indeterminate, effect: Effect::Unknown,
@@ -4453,12 +4455,15 @@ fn generation_phase_attention_is_current_fenced_content_free_and_observed() {
         let wire = serde_json::to_value(snapshot).unwrap();
         wire["branches"].as_array().unwrap().iter().find(|branch| branch["branchId"] == "main").unwrap()["currentRun"]["generation"].clone()
     };
+    let activity = |db: &Catalog| db.thread_view("thread", "main", 20, None).unwrap()["modelActivity"].clone();
     assert!(generation(&db).is_null());
+    assert_eq!(activity(&db), json!({"requestId":"model-1","dispatched":true,"phase":null,"retry":null}));
     db.record_generation_phase(&receipt.run_id, epoch, "model-1", Some(GenerationPhase::Reasoning)).unwrap();
     receive.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
     let first = generation(&db);
     assert_eq!(first["phase"], "reasoning");
     assert_eq!(first["requestId"], "model-1");
+    assert_eq!(activity(&db)["phase"], "reasoning");
     let cursor = db.event_cursor().unwrap();
     assert_eq!(first["revision"], cursor);
     db.record_generation_phase(&receipt.run_id, epoch, "model-1", Some(GenerationPhase::Reasoning)).unwrap();
@@ -4468,8 +4473,10 @@ fn generation_phase_attention_is_current_fenced_content_free_and_observed() {
     assert_eq!(generation(&db), first);
     db.record_generation_phase(&receipt.run_id, epoch, "model-1", Some(GenerationPhase::Output)).unwrap();
     assert_eq!(generation(&db)["phase"], "output");
+    assert_eq!(activity(&db)["phase"], "output");
     db.record_generation_phase(&receipt.run_id, epoch, "model-1", None).unwrap();
     assert!(generation(&db).is_null());
+    assert!(activity(&db)["phase"].is_null());
     db.record_generation_phase(&receipt.run_id, epoch, "model-1", Some(GenerationPhase::Reasoning)).unwrap();
     db.commit_execution(&receipt.run_id, epoch, &ExecutionRecord::ModelFinished {
         request_id: "model-1".into(), outcome: ModelOutcome::Failed, finish_reason: None, items: vec![],
@@ -4481,11 +4488,14 @@ fn generation_phase_attention_is_current_fenced_content_free_and_observed() {
     let mut retry = request_snapshot(&receipt); retry.view.request_id = "model-2".into();
     independent_prepare(&mut db, &receipt, retry);
     assert!(generation(&db).is_null()); // Never replay previous request's last phase.
+    assert_eq!(activity(&db), json!({"requestId":"model-2","dispatched":true,"phase":null,"retry":null}));
     assert!(db.record_generation_phase(&receipt.run_id, epoch, "model-1", Some(GenerationPhase::Reasoning)).is_err());
     db.record_generation_phase(&receipt.run_id, epoch, "model-2", Some(GenerationPhase::ToolCall)).unwrap();
     assert_eq!(generation(&db)["phase"], "tool-call");
+    assert_eq!(activity(&db)["phase"], "tool-call");
     db.commit_execution(&receipt.run_id, epoch, &ExecutionRecord::StateChanged { state: RunState::Executing, waiting_on: None }).unwrap();
     assert!(generation(&db).is_null());
+    assert!(activity(&db).is_null());
     assert!(db.record_generation_phase(&receipt.run_id, epoch, "model-2", Some(GenerationPhase::Reasoning)).is_err());
     db.commit_execution(&receipt.run_id, epoch, &ExecutionRecord::StateChanged { state: RunState::Runnable, waiting_on: None }).unwrap();
     db.commit_execution(&receipt.run_id, epoch, &ExecutionRecord::StateChanged { state: RunState::Generating, waiting_on: None }).unwrap();
@@ -4493,6 +4503,7 @@ fn generation_phase_attention_is_current_fenced_content_free_and_observed() {
     db.record_generation_phase(&receipt.run_id, epoch, "model-2", Some(GenerationPhase::Reasoning)).unwrap();
     db.request_cancel_run(&receipt.run_id).unwrap();
     assert!(generation(&db).is_null());
+    assert!(activity(&db).is_null());
     assert!(db.record_generation_phase(&receipt.run_id, epoch, "model-2", Some(GenerationPhase::Reasoning)).is_err());
     let events = db.events_after(0, 1000).unwrap();
     for entry in events.iter().filter(|event| event.kind == "generation.phase_changed") {
@@ -4502,6 +4513,7 @@ fn generation_phase_attention_is_current_fenced_content_free_and_observed() {
     drop(db);
     let db = fixture.open();
     assert!(generation(&db).is_null());
+    assert!(activity(&db).is_null());
 }
 
 #[test]
@@ -4523,6 +4535,9 @@ fn retry_attention_requires_original_scheduled_wait_and_never_infers_resume_from
     assert!(retry(&db).is_null());
     db.record_retry_schedule(&receipt.run_id, epoch, "model-1", Some((1, 0))).unwrap();
     let observed = retry(&db); assert_eq!(observed["attempt"], 1); assert_eq!(observed["requestId"], "model-1");
+    let activity = db.thread_view("thread", "main", 20, None).unwrap()["modelActivity"].clone();
+    assert_eq!(activity["retry"], observed);
+    assert_eq!(activity["dispatched"], false);
     assert_eq!(observed["scheduledAtMs"], observed["retryAtMs"]);
     assert!(!retry(&db).is_null()); // An elapsed deadline is not execution evidence.
     assert!(db.record_retry_schedule(&receipt.run_id, epoch + 1, "model-1", Some((2, 1))).is_err());
@@ -4531,6 +4546,7 @@ fn retry_attention_requires_original_scheduled_wait_and_never_infers_resume_from
     db.record_retry_schedule(&receipt.run_id, epoch, "model-1", Some((2, 100))).unwrap();
     let mut next = request_snapshot(&receipt); next.view.request_id = "model-2".into(); independent_prepare(&mut db, &receipt, next);
     assert!(retry(&db).is_null());
+    assert!(db.thread_view("thread", "main", 20, None).unwrap()["modelActivity"]["retry"].is_null());
     assert!(db.record_retry_schedule(&receipt.run_id, epoch, "model-1", Some((3, 100))).is_err());
     assert!(!serde_json::to_string(&db.capture_attention_read().load(&|| false).unwrap()).unwrap().contains("private failure body"));
 }

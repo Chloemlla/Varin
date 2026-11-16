@@ -387,7 +387,7 @@ Sending is one choreography:
 - The composer docks on the travel spring through its motion `layout` animation.
 - `MessageHandoff` flies the message from wherever the composer is to its bubble. Each frame it reads the bubble's live position: x follows glide and y follows travel, so the flight arrives across first, a shallow arc. It also re-reads after every spring step (`onSpringStep` in `lib/motion/spring.ts`), so a scroll the timeline spring writes in the same frame is never one frame behind. The size eases into late changes in the bubble, such as a long message folding to its preview, and the copy inside is refreshed. The flight ends on the frame it reaches the bubble, which takes over in place; it ends early if the bubble leaves the view.
 - The primary button changes its icon in place (`SwapIcon`). The previous icon rises out, the spinner and arrow come up on glide, and Stop drops in on settle.
-- `useComposerHeightGlide` holds the input frame's height. Typing changes it at once. A send or clear, the delivery row arriving and leaving with a run, and attachments glide on the glide spring. While a glide runs it follows every later change, and the hint row moves with the frame (`data-height-glide`). The frame's height moves while its content (`data-conversation-composer-input-content`) is measured, so the observers never see their own writes. `ComposerEditor` applies a controlled value in a layout effect, so a cleared draft lands in the same commit as the rest of the composer.
+- `useComposerHeightGlide` holds the input frame's height. Typing changes it at once. A send or clear, the delivery row arriving and leaving with a run, and attachments glide on the glide spring. While a glide runs it follows every later change, and the suggestion row moves with the frame (`data-height-glide`). The frame's height moves while its content (`data-conversation-composer-input-content`) is measured, so the observers never see their own writes. `ComposerEditor` applies a controlled value in a layout effect, so a cleared draft lands in the same commit as the rest of the composer. The Add menu opens references and commands at the caret through the existing pickers; typing `@` or `/` still opens them directly. Focusing an empty editor does not reveal a permanent instruction row.
 
 Under reduced motion there is no flight, departure movement or height glide.
 
@@ -596,6 +596,13 @@ the list. Renaming uses the Thread catalog owner, and an uncertain instruction r
 Showing a resource or history view does not launch work. A follow-up registration observes its original
 Job/source and cursor; it never stops the observed Job or uses a renderer timer as a scheduler.
 
+The Bot shell's title-bar Conversation tools button opens the shared right-hand surface and remembers its last view.
+Timeline, Collaboration, Context and Conversation recovery use the same selector on desktop and mobile.
+The Add menu contains input actions. Bot profile/work management retains its own panel; switching between it and conversation
+tools preserves both layouts. The mounted conversation portals its existing recovery into the shell's detail slot,
+so opening the panel does not create another execution controller or snapshot reader. Tool-call details remain in the conversation;
+interactive products open in the Bot's own panel scope.
+
 The right-hand Collaboration surface reads original family dispatches, peer messages and final reports in one native
 event-cursor feed. Reports project the last assistant response from immutable execution history as child-to-organizer
 replies, preserving multipart text and original outcome. Each continuation retains its own execution identity;
@@ -603,7 +610,11 @@ reading the room never publishes another message or invokes a model. Dispatches 
 continuations never substitute their input. Internal code retrieval stays outside the room. Its virtual
 list prefetches older entries and merges by original message/dispatch/execution identity, including dispatch-only and report-only pages.
 `CollaborationMessage` shows explicit sender/recipient routes and message bubbles. User messages align
-right; Agents retain their avatars. Rendered body height determines long-message folding, including later
+right; Agents retain their avatars. In the Bot shell the room follows its selected Bot Thread/branch, independently of the ordinary
+workbench selection. Bot conversations use their existing profile name/figure; Bot-owned tasks retain their Agent identity.
+Task instructions and linked `work_report` messages reuse the original message feed and reply identity. The room's participant
+strip shows the current conversation's exchanges; the recipient picker retains the existing full directory.
+Rendered body height determines long-message folding, including later
 font/image/reflow changes. Expansion remains keyed to the entry in its room, animates in place and pauses
 automatic following; copy uses original full text. Messages retain native reply identities; dispatches and reports
 open a new send to the exact child branch without inventing a reply-to message ID.

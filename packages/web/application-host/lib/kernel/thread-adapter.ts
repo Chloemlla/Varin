@@ -31,6 +31,7 @@ import type { InputMode, InitialContext, InputSubmitParams, InputEnqueueParams, 
 import type { ExistingHostCredentialOwner } from './credential-owner.js';
 import { isAbortError, waitWithSignal } from '../cancellation.js';
 import { modelCredentialBindingIdentity, waitForModelBinding } from './model-binding-lifetime.js';
+import { botModelMatches } from '../bots/bot-model.js';
 import type { AgentRuntimeClient } from './agent-runtime-client.js';
 import type { ContextPreparer } from './thread-context.js';
 import { parseThreadSkills, type ThreadSkillInputPreparer } from './thread-skill-input.js';
@@ -194,39 +195,72 @@ export class ThreadAdapter {
   }
   private sourceDirectory?: SourceDirectory;
   private botWorkProfile?: (botId: string, signal: AbortSignal) => Promise<{ homeDir: string; model: ThreadModel } | null>;
-  private readonly coldBotPreparations = new Set<string>();
+  private conversationWorkModel?: (identity: ThreadIdentity, signal: AbortSignal) => Promise<ThreadModel | null>;
+  private readonly coldWorkPreparations = new Set<string>();
   bindBotWorkProfile(resolve: NonNullable<ThreadAdapter['botWorkProfile']>): void { this.botWorkProfile = resolve; }
-  /** Model/source preparation only; the original ingress retains scheduling and admission. */
+  bindConversationWorkModel(resolve: NonNullable<ThreadAdapter['conversationWorkModel']>): void { this.conversationWorkModel = resolve; }
+  /** Prepare the existing durable ingress; the process that requested work does not own this launch. */
   private botInactivityMinutes: () => Promise<number> = async () => 20;
   bindBotInactivityMinutes(read: () => Promise<number>): void { this.botInactivityMinutes = read; }
   async recoverBotWork(signal: AbortSignal): Promise<void> {
-    if (!this.botWorkProfile || !this.prepareContext) return;
+    const prepareContext = this.prepareContext;
+    if (!prepareContext || (!this.botWorkProfile && !this.conversationWorkModel)) return;
     for (const work of await this.runtime.pendingBotWork(signal, await this.botInactivityMinutes())) {
-      if (this.coldBotPreparations.has(work.inputId)) continue;
-      this.coldBotPreparations.add(work.inputId);
+      if (this.coldWorkPreparations.has(work.inputId)) continue;
+      this.coldWorkPreparations.add(work.inputId);
       void this.launchAdmitted(`cold:${work.inputId}`, async () => {
-        const profile = await this.botWorkProfile!(work.botId, signal);
-        if (!profile) return;
         const identity: ThreadIdentity = { runtime: 'agent', threadId: work.threadId, branchId: work.branchId };
-        const location = await this.resolveSource(identity, { resourceOwner: { kind: 'local' }, path: profile.homeDir }, signal);
-        const { source } = await this.prepareSource({ ...identity, key: work.inputId, resourceOwner: location.resourceOwner,
-          workspaceId: location.workspaceId, mode: 'live_root', content: { mode: 'saved-files' }, captureScopes: [] }, signal);
-        await this.admitSource(source, identity, undefined, signal);
-        const model = await waitForModelBinding(this.models.resolveModel(profile.model), model => model.credentialOwner.release(), signal);
+        const hold = async (reason: 'model_unavailable' | 'source_unavailable') => {
+          signal.throwIfAborted();
+          await this.runtime.holdColdWork({ inputId: work.inputId, revision: work.revision, reason }, signal);
+        };
+        let bot: { homeDir: string; model: ThreadModel } | null | undefined;
+        let model: Awaited<ReturnType<ThreadModelAuthority['resolveModel']>> | undefined;
         try {
-          const initialContext = await this.prepareContext!(identity, source, { mode: 'bot', threadRole: 'main', projectId: `bot:${work.botId}` }, signal);
-          const childDispatch = this.prepareChildProfiles ? await this.prepareChildProfiles({ modelOwner: model.credentialOwner,
-            parent: { configuration: model.configuration, credential_scope: await model.credentialOwner.scope() } }, signal) : undefined;
+          bot = work.botId ? await this.botWorkProfile?.(work.botId, signal) : null;
+          const selection = work.botId ? bot?.model : await this.conversationWorkModel?.(identity, signal);
+          if (selection) model = await waitForModelBinding(this.models.resolveModel(selection), model => model.credentialOwner.release(), signal);
+        } catch (error) {
+          if (!signal.aborted) await hold('model_unavailable');
+          throw error;
+        }
+        if (!model) { await hold('model_unavailable'); return; }
+        try {
+          let source: ThreadSource | null = null;
+          let initialContext: InitialContext;
+          try {
+            if (bot) {
+              const location = await this.resolveSource(identity, { resourceOwner: { kind: 'local' }, path: bot.homeDir }, signal);
+              source = (await this.prepareSource({ ...identity, key: work.inputId, resourceOwner: location.resourceOwner,
+                workspaceId: location.workspaceId, mode: 'live_root', content: { mode: 'saved-files' }, captureScopes: [] }, signal)).source;
+            } else {
+              const thread = await this.runtime.thread(identity.threadId, signal);
+              const canUseHostSources = await this.runtime.principalCanUseHostResources?.(thread.principal_id) ?? true;
+              if (canUseHostSources) source = await this.defaultDeviceSource?.(identity) ?? null;
+            }
+            if (source) await this.admitSource(source, identity, undefined, signal);
+            initialContext = work.botId
+              ? await prepareContext(identity, source, { mode: 'bot', threadRole: 'main', projectId: `bot:${work.botId}` }, signal)
+              : await prepareContext.main(identity, source, signal);
+          } catch (error) {
+            if (!signal.aborted) await hold('source_unavailable');
+            throw error;
+          }
+          const credentialScope = await model.credentialOwner.scope();
+          const childDispatch = this.prepareChildProfiles ? await this.prepareChildProfiles({ modelOwner: model.credentialOwner, ...(source ? { resourceOwner: source.resourceOwner } : {}),
+            parent: { configuration: model.configuration, credential_scope: credentialScope } }, signal) : undefined;
           signal.throwIfAborted();
           const receipt = await this.runtime.admitBotWork({ work, configuration: model.configuration, initialContext,
-            launch: { inheritSource: false, source: { resourceOwner: source.resourceOwner, workspaceId: source.workspaceId,
+            launch: { inheritSource: false, source: source ? { resourceOwner: source.resourceOwner, workspaceId: source.workspaceId,
               executionWorkspaceId: source.executionWorkspaceId, branchId: source.branchId ?? null, revision: source.revision ?? null,
-              mode: source.mode, liveRoot: source.liveRoot ?? null }, enabledTools: source.tools, credentialScope: await model.credentialOwner.scope(),
-              ...(childDispatch ? { childDispatch } : {}) } }, signal);
+              mode: source.mode, liveRoot: source.liveRoot ?? null,
+              ...(source.mode === 'native_workspace' && source.nativeScope ? { nativeScope: source.nativeScope } : {}),
+              ...(source.environmentRunId ? { environmentRunId: source.environmentRunId } : {}) } : null,
+              enabledTools: source?.tools ?? [], credentialScope, ...(childDispatch ? { childDispatch } : {}) } }, signal);
           void this.continueLaunch(receipt.run_id, { credentialOwner: model.credentialOwner, signal }).catch(() => undefined);
         } finally { model.credentialOwner.release(); }
       }, signal).catch(error => { if (!signal.aborted) this.onLaunchError(work.inputId, error); })
-        .finally(() => this.coldBotPreparations.delete(work.inputId));
+        .finally(() => this.coldWorkPreparations.delete(work.inputId));
     }
   }
   bindSourceDirectory(directory: SourceDirectory): void { this.sourceDirectory = directory; }
@@ -1036,7 +1070,8 @@ export class ThreadAdapter {
         stage = 'skills';
         const skill = await this.skillInput(identity, initialContext.resources, preparation.instruction, signal);
         stage = 'child_profiles';
-        const childDispatch = this.prepareChildProfiles ? await this.prepareChildProfiles({ modelOwner: model.credentialOwner, parent: {
+        const childDispatch = this.prepareChildProfiles ? await this.prepareChildProfiles({ modelOwner: model.credentialOwner,
+          ...(source ? { resourceOwner: source.resourceOwner } : {}), parent: {
           configuration: model.configuration, credential_scope: await model.credentialOwner.scope(),
         } }, signal) : undefined;
         signal.throwIfAborted();
@@ -1166,7 +1201,8 @@ export class ThreadAdapter {
               }
             }
             if (this.prepareChildProfiles) {
-              command.launch!.childDispatch = await this.prepareChildProfiles({ modelOwner: model.credentialOwner, parent: {
+              command.launch!.childDispatch = await this.prepareChildProfiles({ modelOwner: model.credentialOwner,
+                ...(candidateSource ? { resourceOwner: candidateSource.resourceOwner } : {}), parent: {
                 configuration: model.configuration, credential_scope: command.launch!.credentialScope ?? null,
               } });
             }
@@ -1286,11 +1322,14 @@ export class ThreadAdapter {
         const launch = await this.runtime.launch(runId);
         const scope = launch?.selection.credential_scope;
         if (!scope) throw new Error('Queued Run has no durable credential binding');
-        const configuration = run.configuration as ModelSessionConfiguration;
+        const selected = await this.runtime.modelSelections(runId);
+        const configuration = selected.desired?.configuration ?? run.configuration as ModelSessionConfiguration;
         if (!owner || owner.bindingIdentity !== modelCredentialBindingIdentity(configuration)) {
-          owner = this.runtime.retainedModelOwner(configuration, scope) ?? await this.models.rebindModel(configuration, scope);
+          owner = this.runtime.retainedModelOwner(configuration, selected.desired?.credential_scope ?? scope);
         }
-        await this.runtime.retainQueuedModel(runId, owner);
+        // Preserve an already retained implementation while queued. Actual model
+        // resolution belongs to continueLaunch, after current Bot settings apply.
+        if (owner) await this.runtime.retainQueuedModel(runId, owner);
         // Cancellation can win while the registration checks its captured scope.
         const retainedRun = await this.runtime.run(runId);
         if (['completed', 'failed', 'cancelled'].includes(retainedRun.state)) return;
@@ -1364,21 +1403,36 @@ export class ThreadAdapter {
     if(run.thread_id!==identity.threadId||run.branch_id!==identity.branchId)throw new Error('Run does not belong to the selected Thread branch');
     return this.runtime.inspectTools(runId,signal);
   }
-  async selectModel(input: ThreadIdentity & { runId: string; key: string; model: ThreadModel }) {
-    await this.requireIdentity(input);
-    const run = await this.requireRun(input.runId);
+  async selectModel(input: ThreadIdentity & { runId: string; key: string; model: ThreadModel }, signal?: AbortSignal) {
+    await this.requireIdentity(input, signal);
+    const run = await this.requireRun(input.runId, signal);
     if (run.thread_id !== input.threadId || run.branch_id !== input.branchId) throw new Error('Run belongs to another branch');
-    const model = await this.models.resolveModel(input.model);
+    const model = await waitForModelBinding(this.models.resolveModel(input.model), model => model.credentialOwner.release(), signal);
     try {
-      const previous = await this.runtime.modelSelections(run.id);
+      const previous = await this.runtime.modelSelections(run.id, signal);
       const existing = [previous.desired, previous.active].find(selection => selection?.binding_id === `model:${input.key}`);
       // The original candidate already froze its prepared profile catalog. Repeated key delivery
       // never makes that accepted selection depend on current settings.
       const childDispatch = !existing && this.prepareChildProfiles ? await this.prepareChildProfiles({ modelOwner: model.credentialOwner, parent: {
         configuration: model.configuration, credential_scope: await model.credentialOwner.scope(),
-      } }) : undefined;
-      return await this.runtime.selectModel(run.id, input.key, model.configuration, model.credentialOwner, undefined, childDispatch);
+      } }, signal) : undefined;
+      return await this.runtime.selectModel(run.id, input.key, model.configuration, model.credentialOwner, signal, childDispatch);
     } finally { model.credentialOwner.release(); }
+  }
+
+  /** Profile updates affect live work; finished Runs keep their historical configuration. */
+  async refreshBotModel(input: ThreadIdentity & { runId: string; key: string; model: ThreadModel }, signal?: AbortSignal): Promise<void> {
+    const run = await this.requireRun(input.runId, signal);
+    if (run.cancel_requested || ['completed', 'failed', 'cancelled'].includes(run.state)) return;
+    const selected = await this.runtime.modelSelections(run.id, signal);
+    if (botModelMatches(selected.desired?.configuration ?? run.configuration as ModelSessionConfiguration, input.model)) return;
+    try {
+      await this.selectModel({ ...input, key: `${input.key}:${selected.desired?.revision ?? 0}` }, signal);
+    } catch (error) {
+      signal?.throwIfAborted();
+      const current = await this.runtime.run(run.id, signal);
+      if (!current.cancel_requested && !['completed', 'failed', 'cancelled'].includes(current.state)) throw error;
+    }
   }
 
   assertImagesSupported(images: readonly unknown[] | undefined, configuration: unknown): void {
@@ -1601,25 +1655,38 @@ export class ThreadAdapter {
           await waitWithSignal(admission, signal);
         }
         // live_root is validated by rebindLaunch's existing LiveSource owner.
-        const scope = launch.selection.credential_scope;
-        if (!scope && !run.thread_id.startsWith('context-job-thread:')) throw new Error('Run has no durable credential binding; resubmit its original input key');
+        if (this.botWorkProfile && run.thread_id.startsWith('thread:')) {
+          const thread = await this.runtime.thread(run.thread_id, signal);
+          if (thread.bot_id && !thread.parent_thread_id) {
+            const profile = await this.botWorkProfile(thread.bot_id, signal);
+            if (!profile) throw new Error('Bot model is unavailable. Select an available model in Bot settings.');
+            const key = `bot-profile:${createHash('sha256').update(JSON.stringify(profile.model)).digest('hex')}`;
+            await this.refreshBotModel({ ...identity, runId, key, model: profile.model }, signal);
+          }
+        }
         let owner: ExistingHostCredentialOwner | undefined;
         let desiredOwner: ExistingHostCredentialOwner | undefined;
         try {
-          const supplied = options.credentialOwner;
-          const suppliedOwner = supplied && (supplied.bindingIdentity === undefined
-            || supplied.bindingIdentity === modelCredentialBindingIdentity(run.configuration as ModelSessionConfiguration)) ? supplied : undefined;
-          // This Run's own registration carries its original child-model graph. Another Run with
-          // the same main model has a different frozen child catalog and is only a fallback.
-          owner = suppliedOwner ?? (scope ? this.runtime.retainedModelOwner(run.configuration as ModelSessionConfiguration, scope, runId)
-            ?? this.runtime.retainedModelOwner(run.configuration as ModelSessionConfiguration, scope)
-            ?? await waitForModelBinding(this.models.rebindModel(run.configuration as ModelSessionConfiguration, scope), owner => owner.release(), signal) : undefined);
-          if (owner) await this.retainFrozenChildModels(owner, launch.selection.child_dispatch, signal);
           const selected = await this.runtime.modelSelections(runId, signal);
           const desired = selected.desired;
-          desiredOwner = desired?.credential_scope && desired.id !== selected.active?.id && desired.status !== 'failed'
-            ? this.runtime.retainedModelOwner(desired.configuration, desired.credential_scope)
-              ?? await waitForModelBinding(this.models.rebindModel(desired.configuration, desired.credential_scope), owner => owner.release(), signal) : undefined;
+          const initial = selected.exchange_closed ? desired : selected.active;
+          if (initial?.status === 'failed') throw new Error(`Selected model preparation failed: ${initial.failure ?? 'model unavailable'}`);
+          const configuration = initial?.configuration ?? run.configuration as ModelSessionConfiguration;
+          const scope = initial ? initial.credential_scope : launch.selection.credential_scope;
+          if (!scope && !run.thread_id.startsWith('context-job-thread:')) throw new Error('Run has no durable credential binding; resubmit its original input key');
+          const supplied = options.credentialOwner;
+          const suppliedOwner = supplied && (supplied.bindingIdentity === undefined
+            || supplied.bindingIdentity === modelCredentialBindingIdentity(configuration)) ? supplied : undefined;
+          // This Run's own registration carries its original child-model graph. Another Run with
+          // the same main model has a different frozen child catalog and is only a fallback.
+          owner = suppliedOwner ?? (scope ? this.runtime.retainedModelOwner(configuration, scope, runId)
+            ?? this.runtime.retainedModelOwner(configuration, scope)
+            ?? await waitForModelBinding(this.models.rebindModel(configuration, scope), owner => owner.release(), signal) : undefined);
+          if (owner && (!initial || initial.id === selected.active?.id)) await this.retainFrozenChildModels(owner, launch.selection.child_dispatch, signal);
+          if (desired?.credential_scope && desired.id !== initial?.id && desired.status !== 'failed') {
+            desiredOwner = this.runtime.retainedModelOwner(desired.configuration, desired.credential_scope)
+              ?? await waitForModelBinding(this.models.rebindModel(desired.configuration, desired.credential_scope), owner => owner.release(), signal);
+          }
           signal?.throwIfAborted();
           launch = await this.runtime.launch(runId, signal);
           if (!launch?.startable || !launch.requires_rebind) return;
@@ -1634,9 +1701,11 @@ export class ThreadAdapter {
           }
           signal.throwIfAborted();
           this.runtime.releaseMainModelCredentials(runId, selected);
-          if (desired && desiredOwner) {
-            await this.runtime.selectModel(runId, desired.id, desired.configuration, desiredOwner, signal);
-            this.runtime.releaseQueuedModel(runId, desiredOwner);
+          const selectedOwner = desiredOwner ?? (initial?.id === desired?.id ? owner : undefined);
+          if (desired && selectedOwner) {
+            // Reattach the original selection, including its frozen child catalog.
+            await this.runtime.selectModel(runId, desired.binding_id.slice('model:'.length), desired.configuration, selectedOwner, signal);
+            if (desiredOwner) this.runtime.releaseQueuedModel(runId, desiredOwner);
           }
           if (run.thread_id.startsWith('context-job-thread:')) {
             if (owner) await this.runtime.startRunWithCredentialOwner(runId, owner, signal);

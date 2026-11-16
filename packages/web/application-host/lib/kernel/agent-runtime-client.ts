@@ -16,7 +16,7 @@ import { isDeepStrictEqual } from 'node:util';
 import type { LiveSourceResolver } from './live-source.js';
 import type { PolicyModelPreparer } from './policy-models.js';
 import { waitWithSignal } from '../cancellation.js';
-import { waitForModelBinding } from './model-binding-lifetime.js';
+import { modelCredentialBindingIdentity, waitForModelBinding } from './model-binding-lifetime.js';
 import type { AgentPolicyLease, AgentPolicyBinding, AgentPolicyArtifactBinding } from './agent-policy.js';
 import type { AgentDriverLease, AgentDriverPreparer } from './agent-driver.js';
 import type { DriverBinding, DriverSelection } from './protocol.generated.js';
@@ -1059,6 +1059,9 @@ export class AgentRuntimeClient {
   pendingBotWork(signal?: AbortSignal, inactivityMinutes?: number): Promise<import('./protocol.generated.js').ColdBotWork[]> {
     return this.kernel.agentRuntimeRequest('runtime.bot.work.pending', inactivityMinutes === undefined ? {} : { inactivityMinutes }, signal);
   }
+  holdColdWork(input: import('./protocol.generated.js').BotWorkHoldParams, signal?: AbortSignal): Promise<unknown> {
+    return this.kernel.agentRuntimeRequest('runtime.bot.work.hold', input, signal);
+  }
   admitBotWork(input: import('./protocol.generated.js').BotWorkAdmitParams, signal?: AbortSignal): Promise<InputSubmitReceipt> {
     return this.kernel.agentRuntimeRequest('runtime.bot.work.admit', input, signal);
   }
@@ -2070,11 +2073,13 @@ export class AgentRuntimeClient {
       await this.admitStartingSource(runId, signal);
       const delegatedChild = await this.childExecutionForRun(runId, signal);
       const selected = await this.modelSelections(runId, signal);
+      const modelBinding = selected.desired && owner.bindingIdentity === modelCredentialBindingIdentity(selected.desired.configuration)
+        ? selected.desired.binding_id : selected.active?.binding_id;
       const credentialScope = await this.kernel.registerCredentialOwner(
         runId,
         owner,
         signal,
-        selected.active?.binding_id,
+        modelBinding,
       );
       const credentialEpoch = this.kernel.kernelEpoch;
       try {
@@ -2109,7 +2114,7 @@ export class AgentRuntimeClient {
         return receipt;
       } catch (error) {
         this.releaseToolComposition(runId);
-        if (this.kernel.kernelEpoch === credentialEpoch) this.kernel.unregisterCredentialOwner(runId, selected.active?.binding_id ?? null);
+        if (this.kernel.kernelEpoch === credentialEpoch) this.kernel.unregisterCredentialOwner(runId, modelBinding ?? null);
         throw error;
       }
     });

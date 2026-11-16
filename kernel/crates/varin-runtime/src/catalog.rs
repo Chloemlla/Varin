@@ -53,7 +53,7 @@ pub enum RuntimeError {
     },
 }
 type Result<T> = std::result::Result<T, RuntimeError>;
-pub(crate) const FORMAT: i64 = 99;
+pub(crate) const FORMAT: i64 = 100;
 fn sql_number(value: u64) -> Result<i64> {
     i64::try_from(value).map_err(|_| RuntimeError::Invalid("integer exceeds catalog range".into()))
 }
@@ -1653,6 +1653,20 @@ impl Catalog {
                 .is_some_and(|job| job.acceptance_ref.is_some())
             {
                 continue;
+            }
+            // A completed executor receipt can precede caller settlement and survive
+            // an interrupted ToolSettled commit. Consume that recorded fact before
+            // classifying lost workers as unknown; no execution is repeated.
+            if op.phase != OperationPhase::Terminal || op.outcome == Some(Outcome::Indeterminate) {
+                if let Some(receipt) = op.external_receipt.clone().filter(|receipt| receipt.executor_stopped) {
+                    if execution_persistence::apply_external_terminal(&mut op, &receipt) {
+                        op.revision += 1;
+                        put(&tx, "operations", &op.id, &op)?;
+                        event(&tx, &op.id, op.revision, "operation.recovered", serde_json::to_value(&op)?)?;
+                    }
+                    tx.execute("DELETE FROM resource_occupancy WHERE operation_id=?1", [&op.id])?;
+                    continue;
+                }
             }
             // Only an explicitly kernel-owned Result ends with this process. Host/broker and
             // remote calls may survive it, even when their caller contract returns a Result.

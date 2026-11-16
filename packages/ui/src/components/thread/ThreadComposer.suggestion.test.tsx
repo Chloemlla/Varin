@@ -8,7 +8,7 @@ import type { WorkbenchCommandRegistration, ComposerCommandAction } from '@/lib/
 import type { CommandInfo } from '@/components/chat/CommandAutocomplete';
 import { ThreadComposer } from './ThreadComposer';
 
-const editor = vi.hoisted(() => ({ props: undefined as React.ComponentProps<typeof import('@/components/chat/composer/editor/ComposerEditor').ComposerEditor> | undefined,
+const editor = vi.hoisted(() => ({ showMenus: false, props: undefined as React.ComponentProps<typeof import('@/components/chat/composer/editor/ComposerEditor').ComposerEditor> | undefined,
   selection: { start: 0, end: 0 }, menuKey: vi.fn(), registrations: [] as WorkbenchCommandRegistration[], commandProps: undefined as { onCommandSelect(command: CommandInfo, mode: 'confirm' | 'complete'): void; onClose(): void; additionalCommands: CommandInfo[]; children?: React.ReactNode } | undefined }));
 vi.mock('@/lib/commands/surface-command-registry', () => ({ useWorkbenchCommandRegistrations: () => editor.registrations }));
 vi.mock('@/lib/i18n', () => ({ useI18n: () => ({ t: (key: string) => key }) }));
@@ -24,7 +24,7 @@ vi.mock('@/components/motion/SwapIcon', () => ({ SwapIcon: ({ children }: React.
 vi.mock('@/components/motion/SwapText', () => ({ SwapText: () => null }));
 vi.mock('motion/react', () => ({ useIsPresent: () => true, AnimatePresence: ({ children }: React.PropsWithChildren) => children, motion: { div: React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivElement>>(({ children, ...props }, ref) => <div {...props} ref={ref}>{children}</div>) } }));
 vi.mock('@/components/ui/tooltip', () => ({ Tooltip: ({ children }: React.PropsWithChildren) => children, TooltipTrigger: ({ children }: React.PropsWithChildren) => children, TooltipContent: () => null }));
-vi.mock('@/components/ui/dropdown-menu', () => ({ DropdownMenu: ({ children }: React.PropsWithChildren) => children, DropdownMenuTrigger: ({ children }: React.PropsWithChildren) => children, DropdownMenuContent: () => null, DropdownMenuItem: () => null }));
+vi.mock('@/components/ui/dropdown-menu', () => ({ DropdownMenu: ({ children }: React.PropsWithChildren) => children, DropdownMenuTrigger: ({ children }: React.PropsWithChildren) => children, DropdownMenuContent: ({ children }: React.PropsWithChildren) => editor.showMenus ? <div role="menu">{children}</div> : null, DropdownMenuItem: ({ children, onSelect }: React.PropsWithChildren<{ onSelect?(): void }>) => <button type="button" onClick={onSelect}>{children}</button>, DropdownMenuSeparator: () => <hr /> }));
 vi.mock('@/components/chat/CommandAutocomplete', () => ({ CommandAutocomplete: React.forwardRef((props: NonNullable<typeof editor.commandProps>, ref) => { editor.commandProps = props; React.useEffect(() => () => { editor.commandProps = undefined; }, []); React.useImperativeHandle(ref, () => ({ handleKeyDown: editor.menuKey })); return props.children; }) }));
 vi.mock('@/components/chat/FileMentionAutocomplete', () => ({ FileMentionAutocomplete: React.forwardRef((_props, ref) => { React.useImperativeHandle(ref, () => ({ handleKeyDown: editor.menuKey })); return null; }) }));
 // Exercise the real composer keyboard/form routing through the existing editor port.
@@ -46,7 +46,7 @@ vi.mock('@/components/chat/composer/editor/ComposerEditor', () => ({ ComposerEdi
       const next = props.value.slice(0, editor.selection.start) + text + props.value.slice(editor.selection.end);
       const position = editor.selection.start + text.length; editor.selection = { start: position, end: position };
       props.onChange({ value: next, selection: editor.selection, references: [], interactions: [], markerObjects: [], fromPaste: false, insertedText: text });
-    }, focus: () => {}, blur: () => {}, isFocused: () => true, caretCoords: () => null, replaceRange: (from, to, insert) => { editor.selection = { start: from + insert.length, end: from + insert.length }; props.onChange({ value: props.value.slice(0, from) + insert + props.value.slice(to), selection: editor.selection, references: [], interactions: [], markerObjects: [], fromPaste: false, insertedText: insert }); }, selectAll: () => {},
+    }, focus: () => {}, blur: () => {}, isFocused: () => true, caretCoords: () => null, replaceRange: (from, to, insert, caret = from + insert.length) => { editor.selection = { start: caret, end: caret }; props.onChange({ value: props.value.slice(0, from) + insert + props.value.slice(to), selection: editor.selection, references: [], interactions: [], markerObjects: [], fromPaste: false, insertedText: insert }); }, selectAll: () => {},
     setSelection: (start, end = start) => { editor.selection = { start, end }; },
   }));
   return <textarea aria-label="editor" value={props.value} placeholder={props.suggestion ?? props.placeholder}
@@ -61,11 +61,13 @@ beforeEach(() => {
   vi.stubGlobal('Element', window.Element); vi.stubGlobal('Node', window.Node); vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
   vi.stubGlobal('requestAnimationFrame', (fn: FrameRequestCallback) => { fn(0); return 1; });
   container = document.createElement('div'); document.body.append(container); root = createRoot(container);
-  editor.selection = { start: 0, end: 0 }; sent = []; editor.menuKey.mockReset(); editor.registrations = []; editor.commandProps = undefined;
+  editor.showMenus = false; editor.selection = { start: 0, end: 0 }; sent = []; editor.menuKey.mockReset(); editor.registrations = []; editor.commandProps = undefined;
 });
 afterEach(() => { act(() => root.unmount()); vi.unstubAllGlobals(); });
 
-function Harness({ initial = '', workspace = true, actions, identityKey = 'original', composerKey, backendIdentity, backendCommands, external, onDraftChange }: {
+function Harness({ initial = '', workspace = true, actions, identityKey = 'original', composerKey, backendIdentity, backendCommands, external, onDraftChange, active = false, stopping = false, onStop, prepareSendMode }: {
+  stopping?: boolean; onStop?(): void;
+  active?: boolean; prepareSendMode?: React.ComponentProps<typeof ThreadComposer>['prepareSendMode'];
   initial?: string; workspace?: boolean; actions?: Record<string, ComposerCommandAction | undefined>; identityKey?: string;
   external?: React.ComponentProps<typeof ThreadComposer>['external'];
   composerKey?: string; backendIdentity?: string; backendCommands?: React.ComponentProps<typeof ThreadComposer>['backendCommands'];
@@ -79,11 +81,31 @@ function Harness({ initial = '', workspace = true, actions, identityKey = 'origi
     <ThreadComposer key={composerKey} commandActions={actions} identityKey={identityKey} backendIdentity={backendIdentity} backendCommands={backendCommands} external={external} backendControls={external ? <span>External harness</span> : undefined}
       editorRef={null} value={value} references={references} onChange={(next, nextReferences) => { setValue(next); setReferences(nextReferences ?? []); onDraftChange?.(next); }} suggestion={suggestion} onSuggestionDismiss={() => setSuggestion(undefined)}
       models={[]} providerId="provider" modelId="model" thinkingLevel="off" onModelChange={() => {}}
-      modelDisabled={false} attachmentDisabled={false} imageDisabled={false} sendDisabled={false} pending={false} active={false} retrying={false}
+      modelDisabled={false} attachmentDisabled={false} imageDisabled={false} sendDisabled={false} pending={false} active={active} stopping={stopping} onStop={onStop} retrying={false} prepareSendMode={prepareSendMode}
       onFiles={() => {}} onAttachImages={() => {}} onAttachPdfs={() => {}}
       onGoal={() => {}} hasInput={Boolean(value.trim())} onWorkspace={workspace ? () => {} : undefined} workspaceLabel="Project" attachmentNames={[]} skills={[]} />
   </form>;
 }
+it.each(['', 'A draft'])('keeps stopping feedback inside the existing button with draft %j', async initial => {
+  const stop = vi.fn();
+  await act(async () => root.render(<Harness initial={initial} active onStop={stop} />));
+  const selector = initial ? '[data-conversation-composer-secondary-stop]' : '[data-conversation-composer-primary-action="stop"]';
+  const original = container.querySelector<HTMLButtonElement>(selector)!;
+  await act(async () => original.click());
+  expect(stop).toHaveBeenCalledOnce();
+  await act(async () => root.render(<Harness initial={initial} active stopping onStop={stop} />));
+  const stopping = container.querySelector<HTMLButtonElement>(selector)!;
+  expect(stopping).toBe(original);
+  expect(stopping.getAttribute('aria-label')).toBe('chat.timeline.tools.stopping');
+  expect(stopping.getAttribute('aria-busy')).toBe('true');
+  expect(stopping.disabled).toBe(true);
+  expect(stopping.textContent).toBe('');
+  expect(container.querySelector<HTMLTextAreaElement>('textarea')!.disabled).toBe(false);
+  await act(async () => root.render(<Harness initial={initial} onStop={stop} />));
+  expect(container.querySelector(selector)).toBeNull();
+  expect(container.querySelector('[data-conversation-composer-primary-action="send"]')).not.toBeNull();
+});
+
 async function key(key: string, extra: Partial<KeyboardEvent> = {}) {
   let handled = false;
   await act(async () => { handled = editor.props!.onKeyDown!({ key, preventDefault() {}, stopPropagation() {}, ...extra } as KeyboardEvent); });
@@ -135,13 +157,30 @@ it('preserves IME confirmation, Shift+Tab focus navigation, and normal draft sub
   expect(sent).toEqual(['我自己写的']);
 });
 
-it.each(['/tre', '@file'])('preserves both hints and gives the %s menu Tab priority', async value => {
+it.each(['/tre', '@file'])('shows only the suggestion hint and gives the %s menu Tab priority', async value => {
   await act(async () => root.render(<Harness />));
-  expect(container.textContent).toContain('chat.composer.hint');
+  expect(container.textContent).not.toContain('chat.composer.hint');
   expect(container.textContent).toContain('chat.suggestion.acceptAndSendHint');
   await act(async () => editor.props!.onChange({ value, selection: { start: value.length, end: value.length }, references: [], interactions: [], markerObjects: [], fromPaste: false, insertedText: value }));
   expect(container.textContent).not.toContain('chat.suggestion.insertHint');
   await key('Tab'); expect(editor.menuKey).toHaveBeenCalledWith('Tab'); expect(editor.props!.value).toBe(value);
+});
+
+it.each([['reference', '@'], ['commands', '/']] as const)('opens the %s picker from Add at the caret without replacing the draft', async (label, sigil) => {
+  editor.showMenus = true;
+  await act(async () => root.render(<Harness initial="前文后文" />));
+  editor.selection = { start: 0, end: 2 };
+  const open = async () => act(async () => [...container.querySelectorAll<HTMLButtonElement>('[role="menu"] button')]
+    .find(button => button.textContent?.startsWith(`chat.composer.${label}`))!.click());
+  await open();
+  expect(editor.props!.value).toBe(`前文 ${sigil} 后文`);
+  expect(editor.selection).toEqual({ start: 4, end: 4 });
+  expect(editor.props!.autocomplete).toBeDefined();
+  expect(Boolean(editor.commandProps)).toBe(sigil === '/');
+  // Choosing the same entry reopens the current query rather than inserting another sigil.
+  await open();
+  expect(editor.props!.value).toBe(`前文 ${sigil} 后文`);
+  expect(sent).toEqual([]);
 });
 
 it('keeps an explicitly dismissed suggestion closed', async () => {
@@ -277,4 +316,28 @@ it('starts external preparation on focus or typing but not while mounting the co
   expect(interact).not.toHaveBeenCalled();
   await act(async () => editor.props!.onFocus?.()); expect(interact).toHaveBeenLastCalledWith('focus');
   await type('hello'); expect(interact).toHaveBeenLastCalledWith('input');
+});
+
+
+it.each([true, false])('offers only real external send choices (current-turn support: %s) and keeps Alt+Enter as next turn', async canSteer => {
+  editor.showMenus = true;
+  const prepareSendMode = vi.fn();
+  const external: NonNullable<React.ComponentProps<typeof ThreadComposer>['external']> = {
+    choice: {}, onChange: () => {}, onInteract: () => {}, delivery: { mode: canSteer ? 'steer' : 'next_turn', canSteer },
+  };
+  await act(async () => root.render(<Harness initial="Existing draft" external={external} active prepareSendMode={prepareSendMode} />));
+  const entries = [...container.querySelectorAll<HTMLButtonElement>('[role="menu"] button')];
+  expect(entries.some(item => item.textContent === 'external.sendCurrentTurn')).toBe(canSteer);
+  const later = entries.find(item => item.textContent?.startsWith('external.sendNextTurn'))!;
+  expect(later).toBeDefined();
+  expect(container.textContent).toContain('external.nextTurnOptionsHint');
+  await act(async () => later.click());
+  expect(prepareSendMode).toHaveBeenLastCalledWith('next_run');
+  expect(sent).toEqual(['Existing draft']);
+  if (canSteer) {
+    await act(async () => entries.find(item => item.textContent === 'external.sendCurrentTurn')!.click());
+    expect(prepareSendMode).toHaveBeenLastCalledWith('boundary');
+  }
+  await key('Enter', { altKey: true });
+  expect(prepareSendMode).toHaveBeenLastCalledWith('next_run');
 });

@@ -5,7 +5,7 @@ use crate::model::PathState;
 use serde::Deserialize;
 use serde_json::Value;
 
-pub(crate) const KERNEL_PROTOCOL_VERSION: u64 = 95;
+pub(crate) const KERNEL_PROTOCOL_VERSION: u64 = 96;
 pub(crate) const KERNEL_MAX_FRAME_BYTES: usize = 16777216;
 pub(crate) const KERNEL_REQUEST_WINDOW: usize = 256;
 pub(crate) const KERNEL_STREAM_CREDITS: usize = 4;
@@ -176,6 +176,7 @@ pub(crate) const KERNEL_CONTROL_METHODS: &[&str] = &[
     "source.authority.release",
     "runtime.bot.work.pending",
     "runtime.bot.work.admit",
+    "runtime.bot.work.hold",
     "runtime.bot.matters.list",
     "runtime.bot.matters.update",
     "runtime.bot.scope.inspect",
@@ -271,6 +272,7 @@ pub(crate) const KERNEL_CONTROL_RESPONSE_METHODS: &[&str] = &[
     "source.authority.release",
     "runtime.bot.work.pending",
     "runtime.bot.work.admit",
+    "runtime.bot.work.hold",
     "runtime.bot.matters.list",
     "runtime.bot.matters.update",
     "runtime.bot.scope.inspect",
@@ -813,6 +815,14 @@ pub(crate) struct BotScopeSuspension {
     pub(crate) bot_id: String,
     pub(crate) profile_revision: i64,
     pub(crate) activity_operation_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct BotWorkHoldParams {
+    pub(crate) input_id: String,
+    pub(crate) revision: i64,
+    pub(crate) reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -3632,6 +3642,7 @@ pub(crate) struct ChildWaitParams {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct FamilyListParams {
+    pub(crate) relationship: Option<String>,
     pub(crate) file_path: Option<String>,
     pub(crate) parent_thread_id: Option<String>,
     pub(crate) parent_branch_id: Option<String>,
@@ -4987,6 +4998,9 @@ pub(crate) fn validate_generated_method_params(method: &str, params: &Value) -> 
                 .map_err(|error| error.to_string())
         }
         "runtime.bot.scope.remove" => serde_json::from_value::<BotScopeSuspension>(params.clone())
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+        "runtime.bot.work.hold" => serde_json::from_value::<BotWorkHoldParams>(params.clone())
             .map(|_| ())
             .map_err(|error| error.to_string()),
         "runtime.bot.work.pending" => {

@@ -14,6 +14,7 @@ import { useI18n, type I18nKey } from '@/lib/i18n';
 import { cn, formatDirectoryName } from '@/lib/utils';
 import { revealResourceInEditor } from '@/lib/agent-editor/navigation';
 import { useUIStore } from '@/stores/useUIStore';
+import { BOT_CONVERSATION_PANEL_SCOPE } from '@/lib/openConversationTree';
 import { contextUsageKey, useThreadContextUsageStore } from '@/stores/useThreadContextUsageStore';
 import { useWorkOverviewStore } from '@/stores/useWorkOverviewStore';
 import { ChildTasks } from '../conversation/ChildTasks';
@@ -116,7 +117,7 @@ export function ThreadOverview({ api, identity, sessionKey, snapshot, request, d
   const inspectProduct = (value: ThreadProduct) => {
     if (value.kind === 'ui') {
       const key = `${sessionKey}:${value.call.id}`;
-      useUIStore.getState().openContextPanelTab(workspacePath ?? '', { mode: 'ui', targetPath: key, thread: identity, contentRef: value.receipt.ref, label: value.receipt.title, dedupeKey: key });
+      useUIStore.getState().openContextPanelTab(botWorkbench ? BOT_CONVERSATION_PANEL_SCOPE : workspacePath ?? '', { mode: 'ui', targetPath: key, thread: identity, contentRef: value.receipt.ref, label: value.receipt.title, dedupeKey: key });
     } else { show('outputs'); setProduct(value); }
   };
   const currentScope = React.useRef(true);
@@ -144,8 +145,8 @@ export function ThreadOverview({ api, identity, sessionKey, snapshot, request, d
     {(products.products.some(value => value.kind === 'file' && value.runId !== run?.id) || products.history.previous) && action('outputs', 'history', t('harness.overview.earlierProducts'))}
     {products.history.error && <button type="button" className="thread-overview-action typography-meta text-status-warning" onClick={() => void products.loadEarlier(true)}>{t('chat.context.retry')}</button>}
   </>;
-  const menuSections: Section[] = ['plan', 'goals', ...(api.collaboration || snapshot?.delegatedExecutions?.length ? ['threads' as const] : []), 'sources', 'context', 'memory', 'followups', 'recovery', ...(api.research ? ['research' as const] : []), ...(hasComputer ? ['computer' as const] : []), 'operations'];
-  const more = <DropdownMenu><DropdownMenuTrigger asChild><button type="button" aria-label={t('harness.overview.more')} className="rounded-md p-1.5 text-muted-foreground hover:bg-interactive-hover"><Icon name="more" className="size-4" /></button></DropdownMenuTrigger><DropdownMenuContent align="end">{menuSections.filter(section => section === 'plan' ? Boolean(api.plan) : section === 'operations' || Boolean(details[section])).map(section => <DropdownMenuItem key={section} onSelect={() => show(section)}>{t(section === 'followups' && botWorkbench ? 'arrangements.title' : titles[section]!)}</DropdownMenuItem>)}</DropdownMenuContent></DropdownMenu>;
+  const menuSections: Section[] = ['outputs', 'plan', 'goals', ...(api.collaboration || snapshot?.delegatedExecutions?.length ? ['threads' as const] : []), 'sources', 'context', 'memory', 'followups', 'recovery', ...(api.research ? ['research' as const] : []), ...(hasComputer ? ['computer' as const] : []), 'operations'];
+  const more = <DropdownMenu><DropdownMenuTrigger asChild><button type="button" aria-label={t('harness.overview.more')} className="rounded-md p-1.5 text-muted-foreground hover:bg-interactive-hover"><Icon name="more" className="size-4" /></button></DropdownMenuTrigger><DropdownMenuContent align="end">{menuSections.filter(section => section === 'plan' ? Boolean(api.plan) : section === 'operations' || section === 'outputs' || Boolean(details[section])).map(section => <DropdownMenuItem key={section} onSelect={() => show(section)}>{t(section === 'followups' && botWorkbench ? 'arrangements.title' : titles[section]!)}</DropdownMenuItem>)}</DropdownMenuContent></DropdownMenu>;
   const selectedOperation = operations.find(operation => operation.id === operationId);
   const back = () => { if (product || operationId) { setProduct(undefined); setOperationId(undefined); } else { setDetail(undefined); setChildId(undefined); } };
   const childTasks = snapshot && <ChildTasks api={api} identity={identity} children={snapshot.children ?? []} executions={snapshot.childExecutions ?? []} activity={snapshot.childActivity} directory={snapshot.childDirectory} pending={pending} readOnly={readOnly} onChanged={refresh} selectedId={childId}

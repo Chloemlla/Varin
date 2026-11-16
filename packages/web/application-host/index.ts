@@ -1,5 +1,5 @@
 import { calendarErrorCode } from './lib/scheduled-tasks/preparation-error.js';
-import { freezeProjectSourceSelection } from '@varin/application-client';
+import { defaultConversationModel, freezeProjectSourceSelection } from '@varin/application-client';
 import {createManagedTerminalOwner} from './lib/terminal/managed-owner.js';
 import {authorizeManagedTerminal,registerManagedTerminalRoutes} from './lib/terminal/managed-routes.js';
 import { createManagedProjectManagementOwner } from './lib/projects/managed-project-management.js';
@@ -245,7 +245,7 @@ import { createPromptToolCatalog } from './lib/memory/prompt-tool-catalog.js';
 
 import { createBotService } from './lib/bots/bot-service.js';
 import { createBotSessions } from './lib/bots/bot-sessions.js';
-import { botModelMatches, resolveBotModelSelection } from './lib/bots/bot-model.js';
+import { resolveBotModelSelection } from './lib/bots/bot-model.js';
 import { createBotLifecycleRuntime } from './lib/bots/bot-lifecycle-runtime.js';
 import { registerBotRoutes } from './lib/bots/bot-routes.js';
 import { createBotPresencePublisher } from './lib/bots/bot-presence.js';
@@ -1554,10 +1554,8 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
         for (const thread of scope.threads.filter(thread => sessions.has(thread.thread_id))) {
           for (const branch of thread.branches) {
             const run = branch.latest_run;
-            if (!run || run.cancel_requested) continue;
-            const selected = await agentRuntime.modelSelections(run.id);
-            const configuration = (selected.desired?.configuration ?? run.configuration) as Parameters<typeof botModelMatches>[0];
-            if (!botModelMatches(configuration, model)) await threads.selectModel({ runtime: 'agent', threadId: thread.thread_id, branchId: branch.branch_id, runId: run.id,
+            if (!run) continue;
+            await threads.refreshBotModel({ runtime: 'agent', threadId: thread.thread_id, branchId: branch.branch_id, runId: run.id,
               key: `bot-profile:${bot.id}:${profileRevision}:${branch.branch_id}`, model });
           }
         }
@@ -2216,7 +2214,7 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
     releaseDeletedResources: signal => threadMaterialLifetime.releaseDeleted(signal),
     releaseCollectedResources: signal => interactiveUi.releaseDeleted(signal),
     retryCollectedResources: signal => interactiveUi.releaseDeleted(signal, true),
-    onError: () => console.error('[ContentMaintenance] Deleted conversation cleanup will retry after runtime activity'),
+    onError: error => console.error('[ContentMaintenance]', errorMessage(error)),
   });
   requestSourceMaintenance=contentMaintenance.resourceIdle;
   const removeWorkspaceIdleMaintenance=kernelClient.onWorkspaceIdle(()=>contentMaintenance.resourceIdle());
@@ -2307,6 +2305,10 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
   registerInteractiveUiRoutes(app, interactiveUi, uiAuthController.requireAuth);
   kernelClient.setResourceOwner(createResourceOwner({ runtime: agentRuntime, resources: threadResources, ui: interactiveUi, attachments: threadAttachments,
     organization: async (request, run, signal) => {
+      if (request.action === 'executors') {
+        const { inspectExecutors } = await import('./lib/external-agents/executor-discovery.js');
+        return {result:await inspectExecutors(externalAgents, request.input, signal)};
+      }
       if (request.action === 'ensure_initialized') {
         if (Object.keys(request.input).length) throw new Error('Invalid organization initialization request');
         await ensureOrganization(run.principal_id ?? null);
@@ -2382,7 +2384,7 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
       onError: () => console.error('[Thread] Original process terminal requires attention'),
     }), createChildProfilePreparer({ models: modelAuthority,
       projects: async () => (sanitizeProjects((await readSettingsFromDisk()).projects) ?? []).map(project => ({ id: project.id, name: typeof project.label === 'string' && project.label || project.path, path: project.path, selection: freezeProjectSourceSelection(project), resource_owner: project.source?.resourceOwner ?? { kind: 'local' as const } })),
-      externalAgents: () => externalAgents.settings(),
+      externalAgents: owner => externalAgents.settings(undefined, owner),
       settings: () => modelsService.readGlobalInferenceSettings(),
       capabilities: signal => agentRuntime.childCapabilities(signal),
     }));
@@ -2423,6 +2425,15 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
     if (!bot || !await botService.canExecute(botId)) return null;
     const model = await botAgentModel(bot);
     return model ? { homeDir: bot.homeDir, model } : null;
+  });
+  threads.bindConversationWorkModel(async (identity, signal) => {
+    const defaults = await agentRuntime.organizationCreationDefaults(identity.threadId, signal);
+    const projects = sanitizeProjects((await readSettingsFromDisk()).projects) ?? [];
+    const project = defaults?.projectId ? projects.find(value => value.id === defaults.projectId) : undefined;
+    const localProject = project && (!project.source?.resourceOwner || project.source.resourceOwner.kind === 'local') ? project : undefined;
+    const settings = await modelsService.settings.snapshot(localProject?.path, localProject?.id);
+    signal.throwIfAborted();
+    return defaultConversationModel({ ...settings.global, ...settings.project }, await modelAuthority.listModels());
   });
   threads.bindInteractiveUiFork(interactiveUi.captureBranch);
   threads.bindTitles(threadTitles);
@@ -2576,6 +2587,8 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
       capture:{documents:documentsAuthority,prepareResources:threadResources.prepareSourceCapture,inspectInventory:(directory,signal)=>inspectSourceInventory(directory,signal)}})}),
     externalProjectSource:createManagedExternalProjectSourceOwner({kernel:kernelClient,storage:kernelStorageAdapter,hostId}),
     externalSettings: signal=>externalAgents.settings(signal),
+    externalDetect: (id,signal)=>externalAgents.detect(id,signal),
+    externalInspect: (id,refresh,signal)=>externalAgents.inspectExecutor(id,refresh,signal),
     prepareExternalLiveSource: liveSources.prepare,
     externalLaunch: (id, harness, sessionId, signal) => externalAgents.managedLaunch(id,harness,sessionId,signal),
     workspaceFiles: resourceFiles,
