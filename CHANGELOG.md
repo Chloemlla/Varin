@@ -3,6 +3,64 @@
 All notable changes to Varin are recorded here. The project is pre-1.0; the
 private runtime protocol and product surfaces still move together.
 
+## 0.9.50 - 2026-11-18
+
+### English
+
+Varin 0.9.50 makes it easier to set up external Agents on the device where they run, adds self-hosted HTTPS access, and cuts redundant traffic between devices. It also fixes the Android workbench startup failure seen after connecting to a Host.
+
+#### Set up and use external Agents
+
+- Discover and manage Agents on this Host or a device in Work Connections. Enable one directly from Settings, use an existing installation, or install and update supported packages on the selected device. Sign in through the Agent’s own CLI.
+- Find execution backends in a searchable, scrollable picker. The expanded catalog includes the official DeepSeek Harness ACP profile. [#383](https://github.com/Astrmira/Varin/pull/383)
+- Choose the model, reasoning effort and mode in the composer when the Agent exposes those controls. Codex also exposes its own permission profiles, including profiles available in the current working directory.
+- Replies show the Agent’s logo and the model and reasoning effort reported for that turn. Desktop and mobile show context occupancy when the Agent supplies it, including for Bot-dispatched external tasks. The last recorded measurement stays available when there is no live reading. Turn token usage remains available in the message footer.
+
+#### Connect across devices
+
+- Set up self-hosted access under **Settings → External access**. Use Varin-managed FRP forwarding, run your own forwarder, or connect an existing HTTPS reverse proxy. Download editable FRP and Caddy deployment files, with examples for existing Caddy and NGINX setups. [#376](https://github.com/Astrmira/Varin/issues/376)
+- Browser pairing survives Host restarts. You can revoke an individual device or turn off the external entry separately. Other Varin instances can connect to the same HTTPS endpoint through Work Connections.
+- Chat, editor and sidebar views share conversation updates. Connections that support the new transport use binary frames for remote desktop images and can stream attachments in a single request, reducing encoding overhead and round trips.
+
+#### Fixes and compatibility
+
+- Fix the Android workbench getting stuck after connecting to a Host or switching instances. Startup requests now go to the selected Host. [#387](https://github.com/Astrmira/Varin/pull/387)
+- Fix model tests and conversations with OpenAI-compatible gateways such as OpenDesign when later stream chunks have empty response IDs. The stream keeps the ID established by the first chunk, and model tests surface protocol errors with their specific cause. [#385](https://github.com/Astrmira/Varin/issues/385)
+- Make composer expansion and collapse animate from the current input size, including when the animation is interrupted. [#378](https://github.com/Astrmira/Varin/issues/378)
+- Add Magpie to the built-in model services for easier connection and model discovery. Update bundled Electron and Node.js, along with dependencies used for session authentication, network transport and document previews. [#382](https://github.com/Astrmira/Varin/pull/382) · [#386](https://github.com/Astrmira/Varin/pull/386)
+
+**Upgrading an existing Host.** This release updates the knowledge store to TriviumDB 0.9.1. Stop Varin and back up its data before the first start. If you return to an earlier version after the new writer saves data, restore the pre-upgrade backup. Source deployments should rebuild the application and Rust kernel together. [Cold backup and recovery](https://github.com/Astrmira/Varin/blob/v0.9.50/docs/ops/cold-backup.md)
+
+[Full changelog](https://github.com/Astrmira/Varin/compare/v0.9.49...v0.9.50)
+
+### 中文
+
+Varin 0.9.50 可以在实际运行 Agent 的设备上管理外部 Agent，新增自建 HTTPS 外部访问，并减少多端连接中的重复请求和传输开销。这版也修复了 Android 连接 Host 后工作台卡在启动页的问题。
+
+#### 在执行设备上管理和使用外部 Agent
+
+- 在设置里选择当前 Host 或工作连接中的设备，检测并启用已有程序，也可为支持的 Agent 安装和更新。登录继续在各 Agent 自己的 CLI 中完成。
+- 输入框的执行 Agent 列表支持搜索和滚动。内置目录扩充了可接入的 Agent，包括 DeepSeek Harness 官方 ACP 配置。 [#383](https://github.com/Astrmira/Varin/pull/383)
+- 直接在输入框选择外部 Agent 支持的模型、思考强度和模式。Codex 还可以切换当前工作目录可用的原生权限档位。
+- 回复抬头显示 Agent 的产品图标，以及该轮报告的模型和思考强度。桌面、移动端和 Bot 派发的外部任务在有数据时显示上下文占用。实时数据缺失时可查看上次记录，每轮 Token 用量仍可在消息底部查看。
+
+#### 自建外部访问与多端连接
+
+- 在 **设置 → 外部访问** 接入自建 HTTPS 地址。可以让 Varin 管理本端 FRP 转发，也可自行运行转发或接入已有反向代理。设置页提供可下载、可编辑的 FRP 与 Caddy 部署文件，以及接入已有 Caddy、NGINX 的示例。 [#376](https://github.com/Astrmira/Varin/issues/376)
+- 浏览器配对在 Host 重启后继续有效。可以单独撤销某台设备的授权，或关闭外部入口。其他 Varin 实例也能通过工作连接接入同一 HTTPS 地址。
+- 聊天、编辑器和侧栏共享同一份会话更新。支持新传输方式的连接会直接发送远程桌面图像的二进制数据，并在一次请求中连续传输附件，减少编码和网络往返。
+
+#### 修复与兼容性
+
+- 修复 Android 连接 Host 或切换实例后工作台卡在启动阶段的问题。工作台启动请求现在会发往用户当前连接的 Host。 [#387](https://github.com/Astrmira/Varin/pull/387)
+- 修复 OpenDesign 等 OpenAI 兼容网关的流式响应在后续分片返回空 ID 时，模型测试和对话失败的问题。后续空 ID 沿用首个分片的有效 ID，模型测试会显示具体的协议错误。 [#385](https://github.com/Astrmira/Varin/issues/385)
+- 改善输入框展开和收起的动画。连续切换时从输入框当下的尺寸接着动，减少跳动。 [#378](https://github.com/Astrmira/Varin/issues/378)
+- 新增 Magpie 内置模型服务，方便连接本地网关并发现模型。更新桌面内置的 Electron、Node.js，以及会话认证、网络传输和文档预览相关依赖。 [#382](https://github.com/Astrmira/Varin/pull/382) · [#386](https://github.com/Astrmira/Varin/pull/386)
+
+**已有 Host 升级。** 本版将知识库存储升级至 TriviumDB 0.9.1。首次启动前请停止 Varin 并备份数据。新版写入后如需回退，请恢复升级前的备份。源码部署请同时重新构建应用与 Rust 内核。 [冷备份与恢复](https://github.com/Astrmira/Varin/blob/v0.9.50/docs/ops/cold-backup.md)
+
+[完整更新记录](https://github.com/Astrmira/Varin/compare/v0.9.49...v0.9.50)
+
 ## 0.9.49 - 2026-11-16
 
 ### English
@@ -194,7 +252,7 @@ Desktop release targets cover Windows x64/ARM64, Linux x64/ARM64 and macOS Apple
 
 **Source deployments:** rebuild the application and Rust kernel together, then restart the Host. Supported conversation stores upgrade automatically on opening; keep a backup before upgrading.
 
-[Full changelog](https://github.com/Youzini-afk/Varin/compare/v0.9.46...v0.9.47)
+[Full changelog](https://github.com/Astrmira/Varin/compare/v0.9.46...v0.9.47)
 
 ### 中文
 
@@ -235,7 +293,7 @@ Varin 0.9.47 带来独立的浏览器连接、原生桌面查询与条件等待�
 
 **源码部署：** 请一起重新构建应用与 Rust 内核，然后重启 Host。受支持的会话存储会在打开时自动升级，升级前建议保留备份。
 
-[完整更新记录](https://github.com/Youzini-afk/Varin/compare/v0.9.46...v0.9.47)
+[完整更新记录](https://github.com/Astrmira/Varin/compare/v0.9.46...v0.9.47)
 
 ## 0.9.46 - 2026-11-13
 
@@ -274,7 +332,7 @@ Desktop release targets cover Windows x64/ARM64, Linux x64/ARM64 and macOS Apple
 
 **Source deployments:** rebuild the application and Rust kernel together, then restart the Host. Supported conversation stores upgrade automatically on opening; keep a backup before upgrading.
 
-[Full changelog](https://github.com/Youzini-afk/Varin/compare/v0.9.45...v0.9.46)
+[Full changelog](https://github.com/Astrmira/Varin/compare/v0.9.45...v0.9.46)
 
 ### 中文
 
@@ -311,7 +369,7 @@ Varin 0.9.46 减少打开会话、更新侧栏和显示流式回复时的重复�
 
 **源码部署：** 请一起重新构建应用与 Rust 内核，然后重启 Host。受支持的会话存储会在打开时自动升级，升级前建议保留备份。
 
-[完整更新记录](https://github.com/Youzini-afk/Varin/compare/v0.9.45...v0.9.46)
+[完整更新记录](https://github.com/Astrmira/Varin/compare/v0.9.45...v0.9.46)
 
 ## 0.9.44 - 2026-11-11
 
@@ -356,7 +414,7 @@ Desktop release targets cover Windows x64/ARM64, Linux x64/ARM64 and macOS Apple
 
 **Source deployments:** rebuild the application and Rust kernel together, then restart the Host. Supported conversation stores upgrade automatically on opening; keep a backup before upgrading.
 
-[Full changelog](https://github.com/Youzini-afk/Varin/compare/v0.9.43...v0.9.44)
+[Full changelog](https://github.com/Astrmira/Varin/compare/v0.9.43...v0.9.44)
 
 ### 中文
 
@@ -399,7 +457,7 @@ Desktop release targets cover Windows x64/ARM64, Linux x64/ARM64 and macOS Apple
 
 **源码部署请注意：**应用与 Rust 内核需要一起重新构建，再重启 Host。受支持的会话存储会在打开时自动升级，升级前请保留备份。
 
-[完整改动](https://github.com/Youzini-afk/Varin/compare/v0.9.43...v0.9.44)
+[完整改动](https://github.com/Astrmira/Varin/compare/v0.9.43...v0.9.44)
 
 ## 0.9.42 - 2026-11-09
 
@@ -429,7 +487,7 @@ Varin 0.9.42 improves conversation responsiveness and fixes races involving draf
 
 Desktop packages cover Windows x64/ARM64, Linux x64/ARM64 and macOS Apple Silicon. The signed Android APK connects to an existing Varin Host. Docker images are published for the standard and toolbelt environments.
 
-[Full changelog](https://github.com/Youzini-afk/Varin/compare/v0.9.41...v0.9.42)
+[Full changelog](https://github.com/Astrmira/Varin/compare/v0.9.41...v0.9.42)
 
 ### 中文
 
@@ -457,7 +515,7 @@ Varin 0.9.42 优化会话读取与响应，修复草稿编辑、切换 Host、�
 
 桌面安装包覆盖 Windows x64/ARM64、Linux x64/ARM64 和 macOS Apple Silicon；签名 Android APK 连接已有的 Varin Host 使用。同时发布标准环境与 toolbelt 环境的 Docker 镜像。
 
-[完整改动](https://github.com/Youzini-afk/Varin/compare/v0.9.41...v0.9.42)
+[完整改动](https://github.com/Astrmira/Varin/compare/v0.9.41...v0.9.42)
 
 ## 0.9.41 - 2026-11-08
 
@@ -471,12 +529,12 @@ Varin 0.9.41 adds groups and individual appearances for Bots, and fixes several 
 - Search by Bot, group or conversation name. Search temporarily expands matching groups, then restores your collapsed sections when cleared.
 - Choose an appearance for each Bot from its profile settings or right-side profile panel. Keep the original Varin colors, follow the application theme, or choose a fixed color.
 - Import PNG, JPEG, WebP or GIF artwork, or a ZIP appearance pack with separate images for different states. Adjust the framing of the large figure and small avatar independently. The selection is shared across clients connected to the same Host.
-- Use the selected appearance throughout the sidebar, conversation, work panel and mobile header. See the [appearance-pack format](https://github.com/Youzini-afk/Varin/blob/v0.9.41/docs/bot-appearances.md) to create your own.
+- Use the selected appearance throughout the sidebar, conversation, work panel and mobile header. See the [appearance-pack format](https://github.com/Astrmira/Varin/blob/v0.9.41/docs/bot-appearances.md) to create your own.
 
 ### Conversation and scheduling fixes
 
-- Fix Bot conversation navigation after an entry conversation has been deleted or replaced. Confirmed sessions open without waiting for the sidebar catalog to refresh. ([#301](https://github.com/Youzini-afk/Varin/issues/301))
-- Fix the HTTP 400 when opening the Bot `@` menu with an empty search. Its hint now describes file and task references. ([#309](https://github.com/Youzini-afk/Varin/issues/309))
+- Fix Bot conversation navigation after an entry conversation has been deleted or replaced. Confirmed sessions open without waiting for the sidebar catalog to refresh. ([#301](https://github.com/Astrmira/Varin/issues/301))
+- Fix the HTTP 400 when opening the Bot `@` menu with an empty search. Its hint now describes file and task references. ([#309](https://github.com/Astrmira/Varin/issues/309))
 - Fix the HTTP 400 in **Schedule → Arrangements and follows**. Connect the missing native request routes for arrangements, event sources and related delivery operations.
 - Translate the Agent calendar creation and editing interface into Chinese, including options, validation messages and accessibility labels. Changing the language preserves the current draft and the saved schedule values.
 
@@ -499,12 +557,12 @@ Varin 0.9.41 加入 Bot 分组与独立形象设置，并修复打开会话、�
 - 搜索支持 Bot、分组和会话名称，搜索时临时展开匹配结果，清空后恢复原来的折叠选择。
 - 在 Bot 档案设置或右侧档案页中更换形象。内置 Varin 可保持原始配色、跟随应用主题，或使用单独指定的颜色。
 - 支持导入 PNG、JPEG、WebP、GIF，以及包含不同状态图片的 ZIP 形象包。大形象和小头像可以分别调整构图，同一 Host 下的客户端共享选择。
-- 侧栏、聊天、工作面板和手机标题统一使用所选形象。自定义素材的制作方式见[形象包格式说明](https://github.com/Youzini-afk/Varin/blob/v0.9.41/docs/bot-appearances.md)。
+- 侧栏、聊天、工作面板和手机标题统一使用所选形象。自定义素材的制作方式见[形象包格式说明](https://github.com/Astrmira/Varin/blob/v0.9.41/docs/bot-appearances.md)。
 
 ### 会话与日程修复
 
-- 修复入口会话被删除或替换后的 Bot 会话跳转。已确认的会话可以直接打开，无需等待侧栏目录刷新。([#301](https://github.com/Youzini-afk/Varin/issues/301))
-- 修复 Bot 中只输入 `@` 就返回 HTTP 400 的问题，输入框提示也调整为引用文件或任务。([#309](https://github.com/Youzini-afk/Varin/issues/309))
+- 修复入口会话被删除或替换后的 Bot 会话跳转。已确认的会话可以直接打开，无需等待侧栏目录刷新。([#301](https://github.com/Astrmira/Varin/issues/301))
+- 修复 Bot 中只输入 `@` 就返回 HTTP 400 的问题，输入框提示也调整为引用文件或任务。([#309](https://github.com/Astrmira/Varin/issues/309))
 - 修复右侧“日程 → 安排与关注”的 HTTP 400，补齐安排、事件来源及相关投递操作在内核请求入口的转发。
 - Agent 日程创建和编辑界面补齐中文，包括选项、校验提示和无障碍标签。切换语言时保留当前草稿，保存的日程参数也保持正确。
 
@@ -545,7 +603,7 @@ Varin 0.9.41 加入 Bot 分组与独立形象设置，并修复打开会话、�
 
 #### Container deployment change
 
-Starting with this release, **`ghcr.io/youzini-afk/varin` is the standard environment**. Deployments that rely on the extra Java, Go, Rust, LSP or browser toolchain should use **`ghcr.io/youzini-afk/varin-toolbelt`** or the toolbelt Compose overlay. Existing exact 0.9.38 image references retain their original contents. See the [deployment guide](https://github.com/Youzini-afk/Varin/blob/v0.9.39/docs/ops/cloud-deployment.md) before updating a server that follows `latest`.
+Starting with this release, **`ghcr.io/youzini-afk/varin` is the standard environment**. Deployments that rely on the extra Java, Go, Rust, LSP or browser toolchain should use **`ghcr.io/youzini-afk/varin-toolbelt`** or the toolbelt Compose overlay. Existing exact 0.9.38 image references retain their original contents. See the [deployment guide](https://github.com/Astrmira/Varin/blob/v0.9.39/docs/ops/cloud-deployment.md) before updating a server that follows `latest`.
 
 Desktop release targets are Windows x64/ARM64, macOS Apple Silicon and Linux x64/ARM64, alongside a signed Android APK. Android connects to an existing Varin Host. Optional local embedding components remain separate downloads.
 
@@ -575,11 +633,11 @@ Desktop release targets are Windows x64/ARM64, macOS Apple Silicon and Linux x64
 
 #### 容器部署变更
 
-从本版开始，**`ghcr.io/youzini-afk/varin` 使用标准环境**。需要额外预装 Java、Go、Rust、LSP 或浏览器工具链的部署，请改用 **`ghcr.io/youzini-afk/varin-toolbelt`** 或 toolbelt Compose overlay。已发布的 0.9.38 精确镜像引用保留原有内容。跟随 `latest` 的服务器升级前请查看[部署说明](https://github.com/Youzini-afk/Varin/blob/v0.9.39/docs/ops/cloud-deployment.md)。
+从本版开始，**`ghcr.io/youzini-afk/varin` 使用标准环境**。需要额外预装 Java、Go、Rust、LSP 或浏览器工具链的部署，请改用 **`ghcr.io/youzini-afk/varin-toolbelt`** 或 toolbelt Compose overlay。已发布的 0.9.38 精确镜像引用保留原有内容。跟随 `latest` 的服务器升级前请查看[部署说明](https://github.com/Astrmira/Varin/blob/v0.9.39/docs/ops/cloud-deployment.md)。
 
 发布目标包含 Windows x64/ARM64、macOS Apple Silicon、Linux x64/ARM64，以及签名 Android APK。Android 连接已有的 Varin Host；可选本地嵌入组件继续单独下载。
 
-[Full changelog / 完整改动](https://github.com/Youzini-afk/Varin/compare/v0.9.38...v0.9.39)
+[Full changelog / 完整改动](https://github.com/Astrmira/Varin/compare/v0.9.38...v0.9.39)
 
 ## 0.9.34 - 2026-10-29
 
@@ -673,7 +731,7 @@ Varin 0.9.34 将外部 Agent Harness 接入工作区，加入按需隔离的版�
 - **私有数据格式：**Agent Catalog 从格式 78 改为 79，不提供不受支持私有存储的自动迁移。旧格式会保留原数据并明确拒绝打开；使用旧格式的安装可能需要单独的数据目录。升级时请保留重要的已有数据。
 - 桌面目标仍为 Windows x64/ARM64、Linux x64/ARM64 和 macOS Apple Silicon；macOS Intel 可选。Windows 安装包未签名，macOS 产物未签名、未公证；Android APK 使用独立配置的发布签名。npm 扩展开发包继续使用独立版本序列。
 
-[Full changelog / 完整提交记录](https://github.com/Youzini-afk/Varin/compare/v0.9.33...v0.9.34)
+[Full changelog / 完整提交记录](https://github.com/Astrmira/Varin/compare/v0.9.33...v0.9.34)
 
 ## 0.9.33 - 2026-10-26
 
@@ -753,7 +811,7 @@ Varin 0.9.33 扩展了通用、编程、科研与办公共用的 Agent 能力，
 - 升级前请备份重要应用数据。不支持或损坏的私有存储会明确拒绝打开，不自动迁移或替换；本版也不导入旧运行时数据。
 - 标准桌面构建目标为 Windows x64/ARM64、Linux x64/ARM64 和 macOS Apple Silicon。macOS 产物未签名、未公证；未配置签名凭据时，Windows 安装包也不签名。macOS Intel 仍为可选构建目标。npm 扩展开发包使用独立版本序列，不随桌面版升至 0.9.33。
 
-[Full changelog / 完整提交记录](https://github.com/Youzini-afk/Varin/compare/v0.9.32...v0.9.33)
+[Full changelog / 完整提交记录](https://github.com/Astrmira/Varin/compare/v0.9.32...v0.9.33)
 
 ## 0.9.32 - 2026-10-23
 
@@ -865,7 +923,7 @@ Varin 0.9.31 redesigns fast code retrieval, adds configurable model-request retr
 - Upgrade TriviumDB to 0.8.10 for interrupted-checkpoint recovery. Synchronize the cloud lockfile and Windows ARM64 build/loader, and avoid duplicate full checkpoints during index cleanup.
 - Update Wasmtime to 48.0.7, rustls-webpki to 0.103.16 and webpki-roots to 1.0.10 for upstream Wasm execution and certificate-trust security fixes.
 
-[完整提交记录 / Full changelog](https://github.com/Youzini-afk/Varin/compare/v0.9.30...v0.9.31)
+[完整提交记录 / Full changelog](https://github.com/Astrmira/Varin/compare/v0.9.30...v0.9.31)
 
 ## 0.9.30 - 2026-10-19
 
@@ -963,7 +1021,7 @@ Varin 0.9.30 moves Agent execution to its native Rust runtime, expands multi-age
 
 **Upgrade note:** This release uses the native Rust runtime. Conversation history from the previous Pi runtime is not imported automatically. Back up application data before upgrading and retain any older history you need to consult.
 
-[完整提交记录 / Full changelog](https://github.com/Youzini-afk/Varin/compare/v0.9.25...v0.9.30)
+[完整提交记录 / Full changelog](https://github.com/Astrmira/Varin/compare/v0.9.25...v0.9.30)
 
 ## 0.9.25 - 2026-10-09
 
@@ -1033,7 +1091,7 @@ Varin 0.9.25 improves concurrent tools, child-task startup, Windows Computer Use
 - Refine the elevated composer and diffuse focus halo, remove generation glow sweeps and improve conversation navigation and Agent/IDE transitions.
 - Update Pi, Electron, PDF, Canvas and related runtime dependencies.
 
-[完整提交记录 / Full changelog](https://github.com/Youzini-afk/Varin/compare/v0.9.24...v0.9.25)
+[完整提交记录 / Full changelog](https://github.com/Astrmira/Varin/compare/v0.9.24...v0.9.25)
 
 ## 0.9.24 - 2026-10-06
 
@@ -1136,7 +1194,7 @@ Varin 0.9.24 improves Agent collaboration, user questions, conversation navigati
 - Update affected Git, HTTP compression, proxy-address and source-map dependencies, and align mobile Capacitor runtimes.
   Apply and verify the local `sprintf-js` precision repair pending an upstream fix; merge/rebase continuation remains noninteractive.
 
-[完整提交记录 / Full changelog](https://github.com/Youzini-afk/Varin/compare/v0.9.23...v0.9.24)
+[完整提交记录 / Full changelog](https://github.com/Astrmira/Varin/compare/v0.9.23...v0.9.24)
 
 ## 0.9.23 - 2026-10-04
 
@@ -1225,7 +1283,7 @@ Varin 0.9.23 开放系统提示词编辑和分范围轻记忆，将普通 Agent 
 - 旧版在 Pi 技能目录生成的 `varin-research-environment`、`varin-multi-agent-models`、
   `varin-retrieval-setup`、`varin-remote-experiments` 需手动删除；新版不再自动生成。
 
-[完整提交记录 / Full changelog](https://github.com/Youzini-afk/Varin/compare/v0.9.22...v0.9.23)
+[完整提交记录 / Full changelog](https://github.com/Astrmira/Varin/compare/v0.9.22...v0.9.23)
 
 ## 0.9.22 - 2026-10-03
 
@@ -1319,7 +1377,7 @@ Varin 0.9.22 加入独立 Bot 模式，改善多语言听写和聊天显示，�
   支持语言选择，统一语音偏好与模型生命周期。
 - Wasmtime 升级至 48.0.4，纳入上游安全修复；验证并修复 braces 和 HTTP 缓存语义问题，修正 Docker 构建的 Pi 补丁路径。
 
-[完整提交记录 / Full changelog](https://github.com/Youzini-afk/Varin/compare/v0.9.21...v0.9.22)
+[完整提交记录 / Full changelog](https://github.com/Astrmira/Varin/compare/v0.9.21...v0.9.22)
 
 ## 0.9.11
 

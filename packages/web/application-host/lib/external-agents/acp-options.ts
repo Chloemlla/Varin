@@ -3,6 +3,7 @@ import type {
   ExternalInput,
 } from '@varin/application-client';
 import { record, text, type RecordValue } from './transport.js';
+import { describeTurnExecution } from './adapter.js';
 
 type ConfigOption = NonNullable<
   ExternalAgentCapabilities['configOptions']
@@ -72,11 +73,37 @@ export class AcpOptions {
   private legacyMode: string | undefined;
   private grokThinking: string | undefined;
   private grokEfforts = new Map<string, string[]>();
+  private nativeOptions: ConfigOption[] | undefined;
+  private kiroOptions: ConfigOption[] = [];
   constructor(
     readonly capabilities: ExternalAgentCapabilities,
     private readonly changed: () => void,
-    private readonly dialect?: 'grok',
+    private readonly dialect?: 'grok' | 'kiro',
   ) {}
+
+  turnExecution() {
+    const current = this.capabilities.current;
+    const toggle = this.kiroOptions.find(option => option.id === 'kiro:thinking');
+    const thinking = !toggle || toggle.currentValue === true ? current?.thinking
+      : toggle.currentValue === false ? 'off' : undefined;
+    return describeTurnExecution(this.capabilities, { model: current?.model, thinking });
+  }
+
+  kiroMetadata(value: RecordValue): void {
+    if (this.dialect !== 'kiro' || !Object.hasOwn(value, 'reasoning')) return;
+    const reasoning = record(value.reasoning);
+    const options: ConfigOption[] = [];
+    if (reasoning.support === 'toggleable')
+      options.push({ id: 'kiro:thinking', name: 'Thinking', type: 'boolean',
+        ...(typeof reasoning.thinkingEnabled === 'boolean' ? { currentValue: reasoning.thinkingEnabled } : {}), options: [] });
+    const levels = Array.isArray(reasoning.effortLevels) ? reasoning.effortLevels.filter((value): value is string => typeof value === 'string' && Boolean(value)) : [];
+    if (levels.length)
+      options.push({ id: 'kiro:effort', name: 'Reasoning effort', category: 'thought_level', type: 'select',
+        ...(typeof reasoning.effort === 'string' && levels.includes(reasoning.effort) ? { currentValue: reasoning.effort } : {}),
+        options: levels.map(value => ({ value, name: value })) });
+    this.kiroOptions = options;
+    this.publish();
+  }
 
   // Connection-level catalog defaults are not the current session's model/effort.
   catalog(value: unknown): void {
@@ -99,7 +126,7 @@ export class AcpOptions {
 
   adopt(value: RecordValue): void {
     if (Array.isArray(value.configOptions))
-      this.capabilities.configOptions = readAcpConfigOptions(
+      this.nativeOptions = readAcpConfigOptions(
         value.configOptions,
       );
     if (Object.hasOwn(value, 'models')) {
@@ -221,6 +248,8 @@ export class AcpOptions {
   }
 
   private publish(): void {
+    if (this.nativeOptions || this.kiroOptions.length || this.capabilities.configOptions)
+      this.capabilities.configOptions = [...(this.nativeOptions ?? []), ...this.kiroOptions];
     const model = this.category('model'),
       thinking = this.category('thought_level'),
       mode = this.category('mode');
@@ -296,9 +325,21 @@ export class AcpOptions {
     const setOption = async (id: string, value: string) => {
       const option = validate(id, value);
       const wire = option.type === 'boolean' ? value === 'true' : value;
+      if (this.dialect === 'kiro' && (id === 'kiro:thinking' || id === 'kiro:effort')) {
+        const before = this.kiroOptions;
+        const response = await request('_kiro.dev/commands/execute', { sessionId, command: id === 'kiro:thinking'
+          ? { command: 'reasoning', args: { thinkingEnabled: wire } } : { command: 'effort', args: { level: wire } } });
+        if (response.success === false) throw new Error(text(response.message) || 'Kiro rejected the option');
+        if (this.kiroOptions === before && option.currentValue !== wire) {
+          this.kiroOptions = before.map(entry => entry.id === id ? { ...entry, currentValue: undefined } : entry);
+          this.publish();
+        }
+        return;
+      }
       const response = await request('session/set_config_option', {
         sessionId,
         configId: id,
+        ...(option.type === 'boolean' ? { type: 'boolean' } : {}),
         value: wire,
       });
       if (!Array.isArray(response.configOptions))

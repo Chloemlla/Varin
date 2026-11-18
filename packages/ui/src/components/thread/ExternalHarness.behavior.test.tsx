@@ -2,7 +2,7 @@ import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { parseHTML } from 'linkedom';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { ExternalAgentError, type ExternalAgentsAPI, type ExternalAgentSettings, type ExternalConversationSnapshot, type ExternalObservation, type ThreadsAPI } from '@varin/application-client';
+import { CODEX_PERMISSION_PROFILE_OPTION, ExternalAgentError, type ExternalAgentsAPI, type ExternalAgentSettings, type ExternalConversationSnapshot, type ExternalObservation, type ThreadsAPI } from '@varin/application-client';
 import { ThreadDraftConversation } from './ThreadDraftConversation';
 import { ExternalConversationView } from './ExternalConversation';
 import { ExternalInteractionForm } from './ExternalInteractionForm';
@@ -13,6 +13,7 @@ import { useThreadDraftStore } from '@/stores/useThreadDraftStore';
 import { useMessageQueueStore } from '@/stores/messageQueueStore';
 import { insertDraftMarker, referenceMarkerObject, freezeDraftContentReferences } from '@/lib/agent-editor/contentReferences';
 import { externalAgentEn } from '@/lib/i18n/messages/external-agents';
+import opencodeLogo from '@/assets/harness-logos/opencode.svg';
 
 const f = vi.hoisted(() => ({ host: 1, listeners: new Set<() => void>(), api: undefined as ExternalAgentsAPI | undefined,
   composer: undefined as React.ComponentProps<typeof import('./ThreadComposer').ThreadComposer> | undefined,
@@ -136,23 +137,43 @@ const choose = (label: string, value: string) => act(async () => {
   const trigger = container.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`)!;
   const menu = trigger.parentElement!.querySelector('[role="menu"]')!;
   const text = ({ first: 'First model', second: 'Second model', 'value:long': 'Long' } as Record<string, string>)[value] ?? value;
-  [...menu.querySelectorAll<HTMLButtonElement>('button')].find(node => node.textContent === text)!.click();
+  [...menu.querySelectorAll<HTMLButtonElement>('button')].find(node => node.textContent?.toLowerCase() === text.toLowerCase())!.click();
 });
 const submit = () => act(async () => container.querySelector('form')!.dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true })));
 
-it('prepares before the first request, deduplicates focus and typing, and sends using the prepared identity and selected options', async () => {
-  const { api } = fixture(); let finish!: () => void;
+it('prepares a chat-only draft once and sends its selected options with the first request', async () => {
+  const { api, views, emit } = fixture(); let finish!: () => void;
+  const conversation = views.get('prepared')!.conversation;
+  conversation.cwd = '/varin/workspaces/private-directory';
+  conversation.privateWorkspace = true;
+  useThreadDraftStore.getState().patch('draft', { workspacePath: undefined });
   const connect = api.connect.getMockImplementation()!;
-  api.connect.mockImplementationOnce(id => new Promise(resolve => { finish = () => { void connect(id).then(resolve); }; }));
+  api.connect.mockImplementationOnce(id => new Promise(resolve => { finish = () => {
+    void connect(id).then(caps => {
+      views.get(id)!.capabilities!.configOptions!.push({ id: CODEX_PERMISSION_PROFILE_OPTION, name: 'Permissions', type: 'select', currentValue: ':workspace',
+        options: [{ value: ':workspace', name: ':workspace' }, { value: ':danger-full-access', name: ':danger-full-access' }] });
+      resolve(caps);
+    });
+  }; }));
   await renderDraft(); expect(button('Send').disabled).toBe(false); expect(api.connect).not.toHaveBeenCalled();
   await act(async () => { f.composer?.external?.onInteract('focus'); f.composer?.external?.onInteract('input'); });
   expect(api.create).toHaveBeenCalledOnce(); expect(api.connect).toHaveBeenCalledOnce(); expect(api.send).not.toHaveBeenCalled();
+  expect(api.create.mock.calls[0]![0]).not.toHaveProperty('cwd');
   await act(async () => finish());
   expect(container.textContent).toContain('Use session configuration (current: First model)'); expect(button('Send').disabled).toBe(false);
-  await choose('Model', 'first'); await choose('chat.context.thinking', 'high'); await choose('Verbosity', 'value:long');
+  await choose('Model', 'first'); await choose('chat.context.thinking', 'high'); await choose('Mode', 'Auto'); await choose('Verbosity', 'value:long');
+  await choose('Codex permissions', 'Full access');
+  expect(api.send).not.toHaveBeenCalled();
+  const catalog = views.get('prepared')!.capabilities!.configOptions!;
+  catalog.splice(catalog.findIndex(option => option.id === CODEX_PERMISSION_PROFILE_OPTION), 1);
+  await emit();
+  expect(container.textContent).toContain('The selected permission profile is unavailable');
   await submit();
-  expect(api.create).toHaveBeenCalledOnce(); expect(api.send).toHaveBeenCalledWith('prepared', expect.any(String), expect.objectContaining({ text: 'Original question', model: 'first', thinking: 'high', config: { verbosity: 'long' } }));
+  expect(api.create).toHaveBeenCalledOnce(); expect(api.send).toHaveBeenCalledWith('prepared', expect.any(String), expect.objectContaining({ text: 'Original question', model: 'first', thinking: 'high', mode: 'auto', permissionProfile: ':danger-full-access', config: { verbosity: 'long' } }));
   expect(f.select).toHaveBeenCalledWith('prepared');
+  await renderConversation();
+  expect(f.composer?.workspaceLabel).toBe('thread.composer.chatOnly');
+  expect(f.composer?.workspacePath).toBe(conversation.cwd);
 });
 
 it.each(['draft', 'conversation'] as const)('freezes external %s quote/image relations and preserves a newly inserted occurrence of the same quote on receipt', async surface => {
@@ -239,8 +260,11 @@ it('renders explicit authentication methods, retries failures, and never execute
 });
 
 it('separates current from next choices, clears hidden effort and does not duplicate backend commands', async () => {
-  fixture(); let chosen: ExternalSessionChoice = { model: 'first', thinking: 'high' };
-  const value = { ...capabilities(), modelsError: 'Catalog unavailable' };
+  fixture(); let chosen: ExternalSessionChoice = { thinking: 'high' };
+  const base = capabilities();
+  const value = { ...base, modelsError: 'Catalog unavailable',
+    current: { ...base.current, model: 'gpt-6.2-sol' },
+    models: [{ ...base.models[0]!, id: 'gpt-6.2-sol', name: 'GPT-6.2-Sol' }, { id: 'second', name: 'Claude Sonnet' }] };
   function Controls() {
     const [choice, setChoice] = React.useState(chosen); chosen = choice;
     const options: ExternalComposerOptions = { capabilities: value, source: 'live', choice, onChange: setChoice, onInteract: () => {} };
@@ -248,9 +272,11 @@ it('separates current from next choices, clears hidden effort and does not dupli
   }
   await act(async () => root.render(<Controls />));
   expect(container.querySelector('[role="alert"]')?.textContent).toContain('Catalog unavailable');
-  await choose('Model', 'second');
+  expect(container.querySelector('button[aria-label="Model"] [data-model-brand="openai"]')).not.toBeNull();
+  await choose('Model', 'Claude Sonnet');
+  expect(container.querySelector('button[aria-label="Model"] [data-model-brand="anthropic"]')).not.toBeNull();
   expect(chosen.thinking).toBeUndefined(); expect(container.querySelector('[aria-label="chat.context.thinking"]')).toBeNull();
-  expect(container.textContent).toContain('Use session configuration (current: First model)');
+  expect(container.textContent).toContain('Use session configuration (current: GPT-6.2-Sol)');
   expect(button('/plan')).toBeUndefined();
 });
 
@@ -688,7 +714,7 @@ it('uses source Host configuration and model defaults, never the coordinating Ho
   api.settings.mockResolvedValue({ revision: 3, defaultAgent: 'agent', agents: [{ ...f.settings!.agents[0]!, name: 'Source Agent', defaults: { model: 'source-model' } }] });
   useThreadDraftStore.getState().patch('draft', { sourceSelection: { resourceOwner: owner, path: '/project', mode: 'live_root', contentMode: 'saved-files', captureScopes: [] }, externalModels: { agent: 'coordinator-model' } });
   await renderDraft();
-  expect(api.settings).toHaveBeenCalledWith(expect.any(AbortSignal), owner);
+  expect(api.settings).toHaveBeenCalledWith(expect.any(AbortSignal), owner, false);
   expect(f.composer?.external?.choice.model).toBe('source-model');
   expect(api.create).not.toHaveBeenCalled();
   await focusComposer();
@@ -833,16 +859,29 @@ it('shows a supplement as a normal message without delivery copy or a separate c
 
 it('opens a supplementary input together with the actual shared execution result in scoped task details', async () => {
   const { view } = activeConversation();
+  view.conversation.profileId = 'opencode';
+  f.settings!.profiles = [{ id: 'opencode', name: 'OpenCode', harness: 'acp', description: '', platforms: [], launch: { command: 'opencode', args: [] } }];
+  view.capabilities = { ...capabilities(), current: { model: 'current-model', thinking: 'low' } };
   view.turns[0]!.status = 'completed'; view.conversation.activeTurn = undefined;
+  view.turns[0]!.execution = { model: 'original-model', modelName: 'Original model', thinking: 'high' };
   view.turns.push({ id: 'supplement', conversationId: 'prepared', key: 'supplement-key', status: 'completed', createdAt: 1, updatedAt: 1,
     consumedByTurnId: 'active', steering: { state: 'appended', targetTurnId: 'active' } });
   view.items.push({ id: 'original-user', turnId: 'active', kind: 'user', text: 'Original work', complete: true },
+    { id: 'shared-plan', turnId: 'active', kind: 'plan', text: 'Plan for the work', complete: true },
     { id: 'user-supplement', turnId: 'supplement', kind: 'user', text: 'Additional detail', complete: true },
     { id: 'shared-answer', turnId: 'active', kind: 'assistant', text: 'Actual shared answer', complete: true },
     { id: 'unrelated-answer', turnId: 'other-turn', kind: 'assistant', text: 'Unrelated historical answer', complete: true });
   await act(async () => root.render(<ExternalConversationView id="prepared" turnId="supplement" />));
   expect(container.textContent).toContain('Additional detail');
   expect(container.textContent).toContain('Actual shared answer');
+  const replyHeaders = container.querySelectorAll('header');
+  expect(replyHeaders).toHaveLength(1);
+  expect(replyHeaders[0]?.querySelector('[title="OpenCode"]')).not.toBeNull();
+  expect(replyHeaders[0]?.querySelector('[title="original-model"]')?.textContent).toBe('Original model');
+  expect(replyHeaders[0]?.textContent).toContain('settings.agents.thinking.high');
+  expect(replyHeaders[0]?.textContent).not.toContain('current-model');
+  expect(replyHeaders[0]?.querySelector('img')?.getAttribute('src')).toBe(opencodeLogo);
+  expect(container.textContent!.indexOf('OpenCode')).toBeLessThan(container.textContent!.indexOf('Plan for the work'));
   expect(container.textContent).not.toContain('Unrelated historical answer');
   expect(container.textContent).not.toContain('Shares the result of the turn that consumed this input.');
   expect(container.querySelector('form')).toBeNull();

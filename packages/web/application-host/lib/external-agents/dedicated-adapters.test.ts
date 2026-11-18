@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { PassThrough, Writable } from 'node:stream';
 import { describe, expect, it, vi } from 'vitest';
-import type { ExternalInteractionResponse, ExternalItem } from '@varin/application-client';
+import { CODEX_PERMISSION_PROFILE_OPTION, type ExternalInteractionResponse, type ExternalItem } from '@varin/application-client';
 import type { KernelManagedProcess } from '../kernel/process-service.js';
 import type { HarnessSink } from './adapter.js';
 import { connectCodex } from './codex.js';
@@ -126,6 +126,7 @@ function sink() {
     items,
     item: vi.fn<HarnessSink['item']>((item) => items.set(item.id, item)),
     usage: vi.fn<HarnessSink['usage']>(),
+    execution: vi.fn<NonNullable<HarnessSink['execution']>>(),
     interaction: vi.fn<HarnessSink['interaction']>(async () => ({ optionId: 'accept' })),
     beforeDispatch: vi.fn(async () => {}),
     started: vi.fn<(id: string) => void>(),
@@ -349,6 +350,52 @@ describe('Codex native turn ownership', () => {
     );
     await vi.waitFor(() => expect(s.started).toHaveBeenCalled());
     expect(connection.capabilities.current).toEqual({});
+    expect(s.execution).toHaveBeenLastCalledWith({});
+    peer.event('turn/completed', codexEvent('turn', { turn: { id: 'turn', status: 'completed' } }));
+    await result;
+  });
+  it('starts a Codex Plan turn with the selected model, effort and permission profile', async () => {
+    const peer = new Peer(), fallback = peer.handler;
+    peer.handler = (method, params) => {
+      if (method === 'collaborationMode/list') return { data: [{ mode: 'plan', name: 'Plan', reasoning_effort: 'medium' }] };
+      if (method === 'permissionProfile/list') {
+        expect(params.cwd).toBe('/workspace');
+        return params.cursor ? { data: [{ id: 'project-edit', allowed: true }] }
+          : { data: [{ id: ':read-only', allowed: true }, { id: ':danger-full-access', allowed: false }], nextCursor: 'page-two' };
+      }
+      if (method === 'thread/start') return { thread: { id: 'thread' }, sandbox: { type: 'readOnly' } };
+      if (method === 'turn/start') {
+        peer.event('thread/settings/updated', { threadId: 'thread', threadSettings: {
+          model: 'second-model', effort: 'high', collaborationMode: { mode: 'plan' },
+          activePermissionProfile: { id: 'project-edit' },
+        } });
+        return { turn: { id: 'turn' } };
+      }
+      return fallback(method, params);
+    };
+    const connection = await connectCodex(peer.transport, '/workspace'), s = sink();
+    expect(connection.capabilities.modes).toEqual([{ id: 'plan', name: 'Plan' }]);
+    const permissions = connection.capabilities.configOptions?.find(option => option.id === CODEX_PERMISSION_PROFILE_OPTION);
+    expect(permissions?.options.map(option => option.value)).toEqual([':read-only', 'project-edit']);
+    expect(permissions?.currentValue).toBe(':read-only');
+    await expect(connection.prompt({ text: 'Work', permissionProfile: ':danger-full-access' }, s)).rejects.toThrow('does not offer');
+    const result = connection.prompt({ text: 'Work', model: 'second-model', thinking: 'high', mode: 'plan', permissionProfile: 'project-edit' }, s);
+    const start = await peer.call('turn/start');
+    expect(start.params).toMatchObject({ permissions: 'project-edit', collaborationMode: { mode: 'plan', settings: {
+      model: 'second-model', reasoning_effort: 'high', developer_instructions: null,
+    } } });
+    await vi.waitFor(() => expect(s.started).toHaveBeenCalledWith('turn'));
+    expect(connection.capabilities.current).toEqual({ model: 'second-model', thinking: 'high', mode: 'plan' });
+    expect(s.execution).toHaveBeenLastCalledWith({ model: 'second-model', thinking: 'high' });
+    expect(permissions?.currentValue).toBe('project-edit');
+    peer.event('item/plan/delta', codexEvent('turn', { itemId: 'proposal', delta: 'Draft plan' }));
+    expect(s.items.get('proposal')).toMatchObject({ kind: 'plan', text: 'Draft plan' });
+    peer.event('item/completed', codexEvent('turn', { item: { type: 'plan', id: 'proposal', text: 'Final plan' } }));
+    expect(s.items.get('proposal')).toMatchObject({ kind: 'plan', text: 'Final plan', complete: true });
+    peer.event('model/rerouted', codexEvent('old-turn', { toModel: 'old-model' }));
+    expect(s.execution).toHaveBeenLastCalledWith({ model: 'second-model', thinking: 'high' });
+    peer.event('model/rerouted', codexEvent('turn', { toModel: 'routed-model' }));
+    expect(s.execution).toHaveBeenLastCalledWith({ model: 'routed-model' });
     peer.event('turn/completed', codexEvent('turn', { turn: { id: 'turn', status: 'completed' } }));
     await result;
   });
@@ -367,6 +414,24 @@ describe('Codex native turn ownership', () => {
 });
 
 describe('Claude SDK bridge adapter', () => {
+  it('reports the worker SDK separately from the external CLI and shows non-blocking native warnings', async () => {
+    const peer = new Peer(), fallback = peer.handler;
+    peer.handler = (method, params) => method === 'initialize'
+      ? { sessionId: 'claude-session', bridgeProtocol: 2, sdkVersion: 'worker-sdk', agentVersion: 'user-cli' }
+      : fallback(method, params);
+    const connection = await connectClaude(peer.transport, { command: 'unused', args: [] }, '/workspace');
+    expect(connection.capabilities.protocol).toMatchObject({ version: 'worker-sdk', agentVersion: 'user-cli' });
+    const s = sink(), result = connection.prompt({ text: 'hello' }, s);
+    const turn = String(record((await peer.call('prompt')).params).uuid);
+    const warning = { type: 'system', subtype: 'informational', level: 'warning', tag: 'hook_no_verdict',
+      uuid: 'hook-notice', content: 'The pre-tool hook did not return a verdict.' };
+    claudeEvent(peer, 'previous-turn', { ...warning, content: 'Unrelated warning' });
+    claudeEvent(peer, turn, warning);
+    claudeEvent(peer, turn, { type: 'result', subtype: 'success', is_error: false, usage: {} });
+    await expect(result).resolves.toMatchObject({ status: 'completed' });
+    expect([...s.items.values()]).toEqual([expect.objectContaining({ kind: 'notice', text: warning.content })]);
+    expect(s.interaction).not.toHaveBeenCalled();
+  });
   it('reconciles per-block completions without overwriting thinking or duplicating streamed text', async () => {
     const peer = new Peer(),
       connection = await connectClaude(
@@ -380,7 +445,8 @@ describe('Claude SDK bridge adapter', () => {
       turn = String(record(call.params).uuid);
     const stream = (event: RecordValue) =>
       claudeEvent(peer, turn, { type: 'stream_event', parent_tool_use_id: null, event });
-    stream({ type: 'message_start', message: { id: 'msg' } });
+    stream({ type: 'message_start', message: { id: 'msg', model: 'claude-observed' } });
+    expect(s.execution).toHaveBeenLastCalledWith({ model: 'claude-observed' });
     stream({
       type: 'content_block_start',
       index: 0,
@@ -535,6 +601,7 @@ describe('Pi 1.5 session RPC', () => {
       result = connection.prompt({ text: 'hello' }, s);
     await peer.call('prompt');
     peer.emit({ type: 'agent_start' });
+    expect(s.execution).toHaveBeenLastCalledWith({ model: 'provider/model', modelName: 'Model', thinking: 'low' });
     peer.emit({ type: 'message_start', message: { role: 'assistant', content: [] } });
     peer.emit({
       type: 'message_update',

@@ -5,6 +5,8 @@ import type { IconName } from '@/components/icon/icons';
 import { McpIcon } from '@/components/icons/McpIcon';
 import { McpDropdownContent } from '@/components/mcp/McpDropdown';
 import { ThreadSwitcherDropdown } from '@/components/thread/ThreadSwitcherDropdown';
+import { ExternalContextDetails } from '@/components/layout/ExternalContextUsage';
+import { useExternalContextSnapshot, type MeasuredExternalContext } from '@/components/layout/useExternalContextSnapshot';
 import { AboutSettings } from '@/components/sections/varin/AboutSettings';
 import { MobileAppUpdateToast } from '@/components/update/MobileAppUpdateToast';
 import { Button } from '@/components/ui/button';
@@ -36,8 +38,6 @@ import { useI18n } from '@/lib/i18n';
 import { isIPadApp } from '@/lib/platform';
 import { readStoredThemeState } from '@/lib/theme/themeStorage';
 import { resolveProjectForDirectory } from '@/lib/projectResolution';
-const clampPercent = (value: number) => Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : null;
-const resolveUsageTone = (value: number) => value >= 90 ? 'critical' : value >= 75 ? 'warn' : 'normal';
 import { runtimeFetch } from '@varin/application-client';
 import { getRuntimeApiBaseUrl, subscribeRuntimeEndpointChanged, switchRuntimeEndpointSafely } from '@varin/application-client';
 import { workspaceEvents } from '@/lib/workspaceEvents';
@@ -59,6 +59,7 @@ import { usePwaManifestSync } from '@/hooks/usePwaManifestSync';
 import { bindMobileWorkspaceShell } from './mobileWorkspaceShell';
 import { WorkbenchProfileBridge, WorkbenchReplacement, WORKBENCH_REPLACEMENT_TARGETS } from '@/lib/extensions/workbench-registry';
 import { WorkbenchShellHost } from '@/lib/extensions/workbench-shell-host';
+import { resetVarinExtensionCatalogForHostSwitch, startVarinExtensionCatalog } from '@/lib/extensions/catalog-store';
 import { MOBILE_WORKSPACE_DISCONNECTED_EVENT } from '@/workbenches/agent/AgentWorkspaceShell';
 import { MobileChangesSurface } from './MobileChangesSurface';
 import { MobileFilesSurface } from './MobileFilesSurface';
@@ -86,12 +87,12 @@ import { useEdgeSwipeSessionChat } from './useEdgeSwipeSessionSwitch';
 import { useNativePushRegistration } from './useNativePushRegistration';
 
 const MOBILE_SETTINGS_PAGES = [
-  'general', 'appearance', 'chat', 'sessions', 'notifications', 'voice', 'storage', 'history',
-  'model-connections', 'usage', 'agents', 'harness-bots', 'agent-prompt', 'agent-memory',
-  'harness-tools', 'harness-web', 'images', 'harness-computers', 'harness-permissions', 'harness-context',
-  'projects', 'editor', 'terminal', 'git', 'harness-retrieval', 'harness-embeddings', 'language-support',
-  'work-connections', 'remote-instances', 'network', 'access', 'tunnel', 'mcp-connections',
-  'skills', 'commands', 'extensions', 'about',
+  'general', 'appearance', 'chat', 'notifications', 'voice', 'storage', 'history',
+  'model-connections', 'model-roles', 'usage', 'agents', 'harness-bots', 'agent-prompt', 'agent-memory',
+  'harness-tools', 'harness-web', 'harness-computers', 'harness-permissions', 'harness-context',
+  'projects', 'editor', 'terminal', 'git', 'code-intel',
+  'devices', 'remote-access', 'proxy', 'workspaces', 'browsers', 'mcp-connections',
+  'skills', 'extensions', 'about',
 ] as const;
 
 type MobileAppProps = {
@@ -657,12 +658,6 @@ type OverflowItem = {
   badge?: number;
   onSelect: () => void;
 };
-
-type ContextDisplay = {
-  percentage: number;
-  tokens: string;
-  colorClass: string;
-} | null;
 
 const getProjectDisplayLabel = (project: ProjectEntry | null, fallbackDirectory: string): string => {
   if (project) return project.label?.trim() || getProjectLabel(project.path);
@@ -1324,61 +1319,14 @@ const MobileInstancesSurface: React.FC<{
   );
 };
 
-const ContextProgressIcon: React.FC<{ percentage: number }> = ({ percentage }) => {
-  const progressPct = clampPercent(percentage) ?? 0;
-  const tone = resolveUsageTone(percentage);
-  const progressColor = tone === 'critical'
-    ? 'var(--status-error)'
-    : tone === 'warn'
-      ? 'var(--status-warning)'
-      : 'var(--status-success)';
-  const size = 18;
-  const stroke = 3;
-  const radius = (size - stroke) / 2;
-  const circumference = 2 * Math.PI * radius;
-
-  return (
-    <svg
-      viewBox={`0 0 ${size} ${size}`}
-      className="size-[18px] -rotate-90"
-      role="progressbar"
-      aria-valuenow={Math.round(progressPct)}
-      aria-valuemin={0}
-      aria-valuemax={100}
-    >
-      <circle
-        cx={size / 2}
-        cy={size / 2}
-        r={radius}
-        fill="none"
-        stroke="var(--interactive-border)"
-        strokeWidth={stroke}
-      />
-      <circle
-        cx={size / 2}
-        cy={size / 2}
-        r={radius}
-        fill="none"
-        stroke={progressColor}
-        strokeWidth={stroke}
-        strokeLinecap="round"
-        strokeDasharray={circumference}
-        strokeDashoffset={circumference * (1 - progressPct / 100)}
-        className="transition-[stroke-dashoffset,stroke] duration-(--motion-dur-glide) ease-glide"
-      />
-    </svg>
-  );
-};
-
 const MetadataRow: React.FC<{
-  icon?: IconName;
-  iconNode?: React.ReactNode;
+  icon: IconName;
   label: string;
   children: React.ReactNode;
-}> = ({ icon, iconNode, label, children }) => (
+}> = ({ icon, label, children }) => (
   <div className="flex min-w-0 items-center gap-3 rounded-xl px-2.5 py-2.5">
     <span className="flex size-5 shrink-0 items-center justify-center text-muted-foreground">
-      {iconNode ?? (icon ? <Icon name={icon} className="size-[18px]" /> : null)}
+      <Icon name={icon} className="size-[18px]" />
     </span>
     <span className="shrink-0 typography-ui-label text-muted-foreground">{label}</span>
     <span className="min-w-0 flex-1 truncate text-right typography-ui-label font-medium text-foreground">
@@ -1391,9 +1339,9 @@ const SessionMetadataOverlay: React.FC<{
   open: boolean;
   onClose: () => void;
   anchorRef: React.RefObject<HTMLElement | null>;
-  contextDisplay: ContextDisplay;
+  externalContext: MeasuredExternalContext | undefined;
   branchLabel: string;
-}> = ({ open, onClose, anchorRef, contextDisplay, branchLabel }) => {
+}> = ({ open, onClose, anchorRef, externalContext, branchLabel }) => {
   const { t } = useI18n();
   const panelRef = React.useRef<HTMLDivElement>(null);
   const [shouldRender, setShouldRender] = React.useState(open);
@@ -1511,18 +1459,9 @@ const SessionMetadataOverlay: React.FC<{
           <MetadataRow icon="git-branch" label={t('mobile.header.metadata.branch')}>
             {branchLabel}
           </MetadataRow>
-          {contextDisplay ? (
-            <MetadataRow
-              iconNode={<ContextProgressIcon percentage={contextDisplay.percentage} />}
-              label={t('mobile.header.metadata.context')}
-            >
-              <span className="inline-flex items-baseline gap-1.5 tabular-nums">
-                <span className={cn('font-semibold', contextDisplay.colorClass)}>{contextDisplay.percentage.toFixed(1)}%</span>
-                <span className="text-muted-foreground">{contextDisplay.tokens}</span>
-              </span>
-            </MetadataRow>
-          ) : null}
-
+          {externalContext && <section className="border-t border-border/50 px-2.5 py-2.5 typography-meta">
+            <ExternalContextDetails snapshot={externalContext} />
+          </section>}
         </div>
       </div>
       <style>{`
@@ -1642,7 +1581,7 @@ const MobileSessionMetadataButton = React.memo(function MobileSessionMetadataBut
 
 
 
-  const contextDisplay: ContextDisplay = null;
+  const { snapshot: externalContext } = useExternalContextSnapshot();
 
   const branchLabel = isGitRepo === true
     ? (gitStatus?.current?.trim() || t('gitView.branch.detachedHead'))
@@ -1682,7 +1621,7 @@ const MobileSessionMetadataButton = React.memo(function MobileSessionMetadataBut
         open={open}
         onClose={() => onOpenChange(false)}
         anchorRef={metadataTriggerRef}
-        contextDisplay={contextDisplay}
+        externalContext={externalContext}
         branchLabel={branchLabel}
       />
     </>
@@ -1827,6 +1766,7 @@ const MobileShell: React.FC<{ onActiveConnectionDeleted: () => void }> = ({ onAc
   const [mcpOpen, setMcpOpen] = React.useState(false);
   const [instancesOpen, setInstancesOpen] = React.useState(false);
   const [settingsOpen, setSettingsOpen] = React.useState(false);
+  const settingsBackRef = React.useRef<(() => void) | null>(null);
   const [updateOpen, setUpdateOpen] = React.useState(false);
   const [settingsInitialMobileStage, setSettingsInitialMobileStage] = React.useState<'nav' | 'page-content'>('nav');
   const [overflowOpen, setOverflowOpen] = React.useState(false);
@@ -1995,7 +1935,8 @@ const MobileShell: React.FC<{ onActiveConnectionDeleted: () => void }> = ({ onAc
       return true;
     }
     if (settingsOpen) {
-      setSettingsOpen(false);
+      if (settingsBackRef.current) settingsBackRef.current();
+      else requestSettingsNavigation(() => setSettingsOpen(false));
       return true;
     }
     if (updateOpen) {
@@ -2085,6 +2026,7 @@ const MobileShell: React.FC<{ onActiveConnectionDeleted: () => void }> = ({ onAc
       <div
         className="varin-mobile-app-shell main-content-safe-area flex h-[100dvh] flex-row bg-background text-foreground"
         data-page-scroll-lock="true"
+        inert={settingsOpen} style={settingsOpen ? { display: 'none' } : undefined}
         data-mobile-layout-tier={mobileLayout.tier}
         data-mobile-layout-kind={mobileLayout.kind}
       >
@@ -2375,33 +2317,6 @@ const MobileShell: React.FC<{ onActiveConnectionDeleted: () => void }> = ({ onAc
           </MobileSurfaceShell>
         ) : null}
 
-        {settingsOpen ? (
-          <MobileSurfaceShell
-            open
-            onClose={() => requestSettingsNavigation(() => setSettingsOpen(false))}
-            ariaLabel={t('mobile.menu.settings')}
-            headerless
-            variant={surfaceVariant}
-            side="right"
-            sideWidth={mobileLayout.isTabletLandscape ? sidePanelWidth : undefined}
-          >
-            <ErrorBoundary>
-              <WorkbenchReplacement
-                target={WORKBENCH_REPLACEMENT_TARGETS.settings}
-                fallback={(
-                  <SettingsView
-                    forceMobile={!mobileLayout.isTabletLandscape}
-                    isWindowed
-                    initialMobileStage={settingsInitialMobileStage}
-                    visiblePageSlugs={[...MOBILE_SETTINGS_PAGES]}
-                    onClose={() => setSettingsOpen(false)}
-                  />
-                )}
-              />
-            </ErrorBoundary>
-          </MobileSurfaceShell>
-        ) : null}
-
         {updateOpen ? (
           <MobileSurfaceShell
             open
@@ -2420,6 +2335,12 @@ const MobileShell: React.FC<{ onActiveConnectionDeleted: () => void }> = ({ onAc
           </MobileSurfaceShell>
         ) : null}
       </div>
+      {settingsOpen ? <div className="main-content-safe-area h-[100dvh] overflow-hidden bg-background">
+        <ErrorBoundary><WorkbenchReplacement target={WORKBENCH_REPLACEMENT_TARGETS.settings} fallback={(
+          <SettingsView forceMobile={!mobileLayout.isTabletLandscape} initialMobileStage={settingsInitialMobileStage}
+            backActionRef={settingsBackRef} visiblePageSlugs={[...MOBILE_SETTINGS_PAGES]} onClose={() => setSettingsOpen(false)} />
+        )} /></ErrorBoundary>
+      </div> : null}
     </DedicatedMobileAppProvider>
   );
 };
@@ -2581,11 +2502,12 @@ export function MobileApp({ apis }: MobileAppProps) {
         setConnectionEpoch((epoch) => epoch + 1);
         return;
       }
+      if (isNativeMobileApp) resetVarinExtensionCatalogForHostSwitch();
       resetAppForRuntimeEndpointChange(detail);
       setRuntimeEndpointEpoch((epoch) => epoch + 1);
       setConnectionEpoch((epoch) => epoch + 1);
     });
-  }, []);
+  }, [isNativeMobileApp]);
 
   // On cold launch, silently reconnect to the most-recent saved instance so a
   // returning user — and notification deep-links — land in the app instead of the
@@ -2638,6 +2560,17 @@ export function MobileApp({ apis }: MobileAppProps) {
   React.useEffect(() => {
     if (catalogLoaded) setHasLoadedCatalog(true);
   }, [catalogLoaded]);
+
+  React.useEffect(() => {
+    if (!isNativeMobileApp || !catalogLoaded || !getRuntimeApiBaseUrl()) return;
+    // Restart the catalog after a Host switch even when the Surface loader is already running.
+    void Promise.all([
+      startVarinExtensionCatalog(),
+      import('@/lib/extensions/managed-runtime').then(({ startSurfaceExtensions }) => startSurfaceExtensions()),
+    ]).catch((error) => {
+      console.error('[Varin Extensions] Mobile workbench startup failed:', error);
+    });
+  }, [catalogLoaded, isNativeMobileApp, runtimeEndpointEpoch]);
 
   // Gated on the Thread catalog handshake (and re-run on instance switch): probing the
   // GitHub auth status before the runtime is reachable cached a "not connected"

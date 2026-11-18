@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { ExternalAgentCapabilities } from '@varin/application-client';
 import type { HarnessConnection, HarnessSink } from './adapter.js';
-import { assertSteeringContent, HarnessSteeringRejected } from './adapter.js';
+import { assertSteeringContent, describeTurnExecution, HarnessSteeringRejected } from './adapter.js';
 import { fileInputText } from './attachments.js';
 import { dedicatedOptions } from './dedicated-options.js';
 import { ContextUsage } from './context-usage.js';
@@ -14,6 +14,16 @@ import {
   text,
   type RecordValue,
 } from './transport.js';
+
+// Pi 1.5 exposes these model fields in get_available_models. The current
+// model's own get_available_thinking_levels result remains authoritative.
+function piThinkingLevels(model: RecordValue): string[] | undefined {
+  if (typeof model.reasoning !== 'boolean') return undefined;
+  if (!model.reasoning) return ['off'];
+  const mapping = record(model.thinkingLevelMap);
+  return ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].filter(level =>
+    mapping[level] !== null && (level === 'xhigh' || level === 'max' ? typeof mapping[level] === 'string' : true));
+}
 
 export async function connectPi(
   peer: HarnessTransport,
@@ -40,6 +50,7 @@ export async function connectPi(
         return {
           id: `${text(model.provider)}/${text(model.id)}`,
           name: text(model.name) || text(model.id),
+          thinkingLevels: piThinkingLevels(model),
         };
       })
       .filter((model) => model.id.split('/').every(Boolean));
@@ -263,10 +274,24 @@ export async function connectPi(
       return;
     }
     if (!sink || !dispatched || settled) return;
-    if (event.type === 'agent_start') runStarted = true;
+    if (event.type === 'agent_start') {
+      runStarted = true;
+      sink.execution?.(describeTurnExecution(capabilities));
+    }
     // Pi has no native run ID. Its ordered session lifecycle is the ownership
     // boundary; never attribute idle/pre-start/previous-settlement frames.
     if (!runStarted) return;
+    if (event.type === 'message_start' || event.type === 'message_end') {
+      const message = record(event.message);
+      const provider = text(message.provider), modelId = text(message.model);
+      if (message.role === 'assistant' && provider && modelId) {
+        const model = `${provider}/${modelId}`;
+        sink.execution?.(describeTurnExecution(capabilities, {
+          model,
+          thinking: model === capabilities.current?.model ? capabilities.current.thinking : undefined,
+        }));
+      }
+    }
     content?.receive(event);
     if (event.type === 'agent_settled') {
       settled = true;
@@ -364,6 +389,8 @@ export async function connectPi(
         if (selected.thinking)
           await peer.request('set_thinking_level', { level: selected.thinking });
         await refresh();
+        if (selected.thinking && capabilities.current?.thinking !== selected.thinking)
+          throw new Error(`Pi did not apply the selected thinking level: ${selected.thinking}`);
         if (failure) throw failure;
         if (sessionBusy || compacting)
           throw new Error(

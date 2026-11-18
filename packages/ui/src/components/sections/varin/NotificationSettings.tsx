@@ -1,17 +1,18 @@
 import React from 'react';
 import { SettingsDisclosure } from '../shared/SettingsDisclosure';
 import { Icon } from '@/components/icon/Icon';
+import { Btn } from '@/components/sections/shared/kit';
 import { useUIStore } from '@/stores/useUIStore';
 import { isDesktopShell } from '@/lib/desktop';
 import { toast } from '@/components/ui';
 import { getRegisteredRuntimeAPIs } from '@/lib/runtime-api/registry';
 import { Input } from '@/components/ui/input';
-import { Button } from '@/components/ui/button';
 import { getClientPlatform } from '@/lib/platform';
 import { useI18n } from '@/lib/i18n';
 import {
   SettingsSection,
   SettingsCheckboxRow,
+  SettingsFieldRow,
   SETTINGS_OPTION_STACK_CLASS,
 } from '@/components/sections/shared/SettingsSection';
 
@@ -486,16 +487,9 @@ export const NotificationSettings: React.FC = () => {
                   ariaLabel={t('settings.notifications.page.delivery.focusedAria')}
                 />
 
-                <div className="py-2">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => void handleTestNotification()}
-                  >
-                    {t('settings.notifications.page.delivery.testAction')}
-                  </Button>
-                </div>
+                <SettingsFieldRow label={t('settings.notificationsx.test')} description={t('settings.notificationsx.testHint')}>
+                  <Btn sm icon="notification-3" onClick={() => void handleTestNotification()}>{t('settings.notifications.page.delivery.testAction')}</Btn>
+                </SettingsFieldRow>
               </>
             )}
           </div>

@@ -23,6 +23,7 @@ function fixture() {
       claude_code_version: '2.1.316',
     })),
     setModel: vi.fn(async (_model: string) => {}),
+    setPermissionMode: vi.fn(async (_mode: string) => {}),
     applyFlagSettings: vi.fn(async (_flags: unknown) => {}),
     interrupt: vi.fn(async () => {}),
     close: vi.fn(() => {
@@ -91,12 +92,14 @@ it('restores exactly the requested SDK session and configures before enqueuing U
     bridgeProtocol: 2,
     sessionId,
     agentVersion: '2.1.316',
+    modes: expect.arrayContaining([{ id: 'plan', name: 'Plan' }]),
   });
   expect(f.options.resume).toBe(sessionId);
   expect(f.options.sessionId).toBeUndefined();
-  await f.bridge.handle({ method: 'configure', params: { model: 'sonnet', thinking: 'high' } });
+  await f.bridge.handle({ method: 'configure', params: { model: 'sonnet', thinking: 'high', mode: 'plan' } });
   expect(f.sdk.setModel).toHaveBeenCalledWith('sonnet');
   expect(f.sdk.applyFlagSettings).toHaveBeenCalledWith({ effortLevel: 'high' });
+  expect(f.sdk.setPermissionMode).toHaveBeenCalledWith('plan');
   await expect(
     f.bridge.handle({ method: 'prompt', params: { uuid: first, text: 'hello' } }),
   ).resolves.toMatchObject({ accepted: true, turnId: first });
@@ -158,6 +161,25 @@ it('labels SDK messages with their active admission and excludes late results ca
       .filter((frame) => frame.method === 'message')
       .map((frame) => record(frame.params).turnId),
   ).toEqual([first, first, second]);
+  f.bridge.close();
+});
+
+it('omits persistent suggestions when the CLI marks the permission as once-only', async () => {
+  const f = fixture();
+  await f.initialize();
+  await f.bridge.handle({ method: 'prompt', params: { uuid: first, text: 'read note' } });
+  await f.emit({ type: 'assistant', user_message_uuid: first,
+    message: { id: 'native', content: [{ type: 'tool_use', id: 'read-note', name: 'Read' }] } });
+  const answer = f.options.canUseTool!('Read', { file_path: 'note.txt' }, {
+    signal: new AbortController().signal, toolUseID: 'read-note', requestId: 'read-request',
+    suppressAlwaysAllowRule: true,
+    suggestions: [{ type: 'addRules', rules: [{ toolName: 'Read' }], behavior: 'allow', destination: 'session' }],
+  });
+  await vi.waitFor(() => expect(f.frames.some(frame => frame.method === 'permission')).toBe(true));
+  const permission = f.frames.find(frame => frame.method === 'permission')!;
+  expect(record(permission.params).suggestions).toBeUndefined();
+  f.bridge.respond({ id: permission.id, result: { behavior: 'allow', updatedInput: { file_path: 'note.txt' } } });
+  await expect(answer).resolves.toEqual({ behavior: 'allow', updatedInput: { file_path: 'note.txt' } });
   f.bridge.close();
 });
 

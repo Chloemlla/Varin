@@ -24,8 +24,11 @@ import { EMPTY_THREAD_DRAFT, useThreadDraftStore } from '@/stores/useThreadDraft
 import { useUIStore } from '@/stores/useUIStore';
 import { useMessageQueueStore } from '@/stores/messageQueueStore';
 import { useI18n } from '@/lib/i18n';
+import { formatDirectoryName } from '@/lib/utils';
+import { THINKING_LEVELS } from '@varin/protocol';
 import { ThreadComposer } from './ThreadComposer';
 import { HarnessSelector } from './HarnessSelector';
+import { HarnessIcon } from './HarnessIcon';
 import { Button } from '@/components/ui/button';
 import { Icon } from '@/components/icon/Icon';
 import { MarkdownRenderer } from '@/components/chat/MarkdownRenderer';
@@ -189,7 +192,8 @@ const Item = React.memo(function Item({
     );
   return (
     <div
-      className={item.kind === 'user' ? 'ml-auto w-fit max-w-full rounded-2xl bg-muted px-4 py-3' : 'py-2'}
+      data-conversation-user-message={item.kind === 'user' ? '' : undefined}
+      className={item.kind === 'user' ? 'ml-auto w-fit max-w-full rounded-xl bg-[var(--chat-user-message-bg)] px-4 py-3 text-[var(--chat-user-message)]' : 'py-2'}
     >
       {!(item.kind === 'user' && (item.contentReferences?.length || item.contentReferenceOccurrences?.length)) && item.images?.length ? (
         <div className="mb-3 flex flex-wrap gap-2">
@@ -286,6 +290,7 @@ function Messages({
   activeTurn,
   cwd,
   receipts,
+  replyHeader,
   readAttachment,
 }: {
   readAttachment(ref: string, signal: AbortSignal): Promise<Blob>;
@@ -293,6 +298,7 @@ function Messages({
   activeTurn?: string;
   cwd: string;
   receipts: ExternalTurn[];
+  replyHeader(execution: ExternalTurn['execution']): React.ReactNode;
 }) {
   const mode = useUIStore((state) => state.chatRenderMode);
   const groups: ExternalItem[][] = [];
@@ -325,38 +331,43 @@ function Messages({
   // Supplements can interleave their own input receipt with one real turn's
   // output. Its completion belongs after the last group, not every boundary.
   const lastGroupByTurn = new Map(groups.map((group, index) => [group[0]!.turnId, index]));
+  const shownReplies = new Set<string>();
   return (
     <>
       {groups.map((group, index) => {
-        const receipt = receipts.find((turn) => turn.id === group[0]!.turnId);
+        const first = group[0]!;
+        const startsReply = first.kind !== 'user' && !shownReplies.has(first.turnId);
+        if (startsReply) shownReplies.add(first.turnId);
+        const receipt = receipts.find((turn) => turn.id === first.turnId);
         const ended =
           receipt &&
           !receipt.consumedByTurnId && !receipt.steering &&
           ['completed', 'failed', 'cancelled', 'interrupted'].includes(receipt.status) &&
           lastGroupByTurn.get(receipt.id) === index;
+        const content = group.length === 1 ? (
+          <Item readAttachment={readAttachment}
+            item={first}
+            cwd={cwd}
+            active={first.turnId === activeTurn}
+            expanded={mode === 'live'}
+          />
+        ) : (
+          <ToolDisclosure id={`external-activity:${first.id}`}>
+            <summary className="flex cursor-pointer items-center gap-2 py-2 typography-meta text-muted-foreground">
+              <Icon name="arrow-right-s" className="size-3" />
+              <span className="min-w-0 truncate">{heading(group.at(-1)!)}</span>
+              <span className="tabular-nums">{group.length}</span>
+            </summary>
+            <div className="border-l border-border/50 pl-4">
+              {group.map((item) => (
+                <Item readAttachment={readAttachment} key={item.id} item={item} cwd={cwd} active={item.turnId === activeTurn} />
+              ))}
+            </div>
+          </ToolDisclosure>
+        );
         return (
-          <React.Fragment key={group[0]!.id}>
-            {group.length === 1 ? (
-              <Item readAttachment={readAttachment}
-                item={group[0]!}
-                cwd={cwd}
-                active={group[0]!.turnId === activeTurn}
-                expanded={mode === 'live'}
-              />
-            ) : (
-              <ToolDisclosure id={`external-activity:${group[0]!.id}`}>
-                <summary className="flex cursor-pointer items-center gap-2 py-2 typography-meta text-muted-foreground">
-                  <Icon name="arrow-right-s" className="size-3" />
-                  <span className="min-w-0 truncate">{heading(group.at(-1)!)}</span>
-                  <span className="tabular-nums">{group.length}</span>
-                </summary>
-                <div className="border-l border-border/50 pl-4">
-                  {group.map((item) => (
-                    <Item readAttachment={readAttachment} key={item.id} item={item} cwd={cwd} active={item.turnId === activeTurn} />
-                  ))}
-                </div>
-              </ToolDisclosure>
-            )}
+          <React.Fragment key={first.id}>
+            {startsReply ? <div>{replyHeader(receipt?.execution)}{content}</div> : content}
             {ended && (
               <>
                 <TurnFooter
@@ -664,6 +675,32 @@ function ExternalConversationSession({ id, host, readOnly, turnId }: { id: strin
   const consumedTurnId = turnId ? snapshot.turns.find(turn => turn.id === turnId)?.consumedByTurnId : undefined;
   const messages = [...new Map([...earlier, ...snapshot.items].map((item) => [item.id, item])).values()]
     .filter(item => !turnId || item.turnId === turnId || item.turnId === consumedTurnId);
+  const agent = c.executionSource?.resource_owner.kind === 'managed_host' ? undefined
+    : settings?.agents.find(agent => agent.id === c.configurationId && agent.harness === c.harness);
+  const profileId = c.profileId ?? agent?.profileId ?? c.configurationId;
+  const profile = settings?.profiles?.find(profile => profile.id === profileId && profile.harness === c.harness);
+  const agentName = profile?.name ?? (c.harness === 'acp' ? agent?.name ?? t('external.agent') : {
+    codex: 'Codex', claude: 'Claude Code', pi: 'Pi',
+  }[c.harness]);
+  const replyHeader = (execution: ExternalTurn['execution']) => {
+    const { model, modelName, thinking, thinkingName } = execution ?? {};
+    const level = thinking === 'none' ? 'off' : thinking;
+    const knownLevel = THINKING_LEVELS.find(value => value === level);
+    const effort = thinkingName ?? (knownLevel ? t(`settings.agents.thinking.${knownLevel}`) : thinking);
+    return (
+      <header className="flex min-h-6 min-w-0 flex-wrap items-center gap-x-2 gap-y-1 typography-meta text-muted-foreground">
+        <span className="flex min-w-0 items-center gap-2 font-medium text-foreground/85">
+          <HarnessIcon harness={c.harness} profileId={profileId} className="size-3.5" />
+          <span className="truncate" title={agentName}>{agentName}</span>
+        </span>
+        {model && <span className="min-w-0 truncate" title={model}>{modelName || model}</span>}
+        {effort && <span className="flex min-w-0 items-center gap-1" title={`${t('chat.context.thinking')} · ${effort}`}>
+          <Icon name="brain" className="size-3 shrink-0" />
+          <span className="truncate">{effort}</span>
+        </span>}
+      </header>
+    );
+  };
   const controls = <button type="button" title={t('external.details')} onClick={() => setDetails(true)}><HarnessSelector value={c.configurationId} harness={c.harness} /></button>;
   return (
     <section className="regular-chat-view relative flex h-full min-h-0 min-w-0 flex-col">
@@ -700,7 +737,7 @@ function ExternalConversationSession({ id, host, readOnly, turnId }: { id: strin
                     {t('external.history')}
                   </Button>
                 )}
-                <ImageReplyDraftContext.Provider value={readOnly?null:key}><Messages readAttachment={(ref, signal) => api.readAttachment(id, ref, signal)} items={messages} activeTurn={activeTurn} cwd={c.cwd} receipts={snapshot.turns} /></ImageReplyDraftContext.Provider>
+                <ImageReplyDraftContext.Provider value={readOnly?null:key}><Messages readAttachment={(ref, signal) => api.readAttachment(id, ref, signal)} items={messages} activeTurn={activeTurn} cwd={c.cwd} receipts={snapshot.turns} replyHeader={replyHeader} /></ImageReplyDraftContext.Provider>
               </ToolDisclosureScope>
             </div>
           </div>
@@ -860,7 +897,7 @@ function ExternalConversationSession({ id, host, readOnly, turnId }: { id: strin
                   onGoal={() => {}}
                   hasInput={Boolean(draft.text.trim() || draft.images.length || draft.files?.length || draft.markerObjects?.length)}
                   onWorkspace={() => setDetails(true)}
-                  workspaceLabel={c.cwd.split(/[\\/]/).at(-1) ?? c.cwd}
+                  workspaceLabel={c.privateWorkspace ? t('thread.composer.chatOnly') : formatDirectoryName(c.cwd)}
                   workspacePath={c.cwd}
                   imageReferences={draftImageReferences(draft)} attachmentNames={draft.files?.map(file => file.filename) ?? []}
                   skills={[]}

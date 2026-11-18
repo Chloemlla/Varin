@@ -20,6 +20,7 @@ import { registerThreadAttachmentRoutes } from './lib/kernel/thread-attachment-r
 import { createLocalSemanticEmbedder } from './lib/knowledge/semantic/local-embedder.js';
 import { isDeepStrictEqual } from 'node:util';
 import { permissionService } from './lib/kernel/permission-service.js';
+import { createPermissionJudge } from './lib/kernel/permission-judge.js';
 import { createPermissionPersistence } from './lib/kernel/permission-persistence.js';
 import { createLocalSemanticComponentManager } from './lib/knowledge/semantic/local-component.js';
 import { registerLocalSemanticComponentRoutes } from './lib/knowledge/semantic/local-component-routes.js';
@@ -256,6 +257,7 @@ import { createEnvironmentForwardJobRuntime, ENVIRONMENT_FORWARD_CAPABILITY } fr
 
 import { HostSshManager } from './lib/connections/ssh-manager.js';
 import { registerConnectionRoutes } from './lib/connections/connection-routes.js';
+import { createDeviceRegistry, registerDeviceRoutes } from './lib/devices/device-registry.js';
 import { attachConnectionProxy } from './lib/connections/host-proxy.js';
 import { configuredVmProviders } from './lib/computer/vm-provider.js';
 import { registerComputerRoutes } from './lib/computer/computer-routes.js';
@@ -275,7 +277,7 @@ import { createThreadFileTargetResolver } from './lib/kernel/thread-file-target.
 import { createResourceFilesOwner } from './lib/workspace/resource-files.js';
 import { registerResourceFileRoutes } from './lib/workspace/resource-file-routes.js';
 
-import { THINKING_LEVELS, resolveMessageTimeSettings } from '@varin/protocol';
+import { THINKING_LEVELS, resolveHarnessModelSlot, resolveMessageTimeSettings } from '@varin/protocol';
 import { createSettingsService, settingsDocumentRevision } from './lib/harness/settings-service.js';
 
 import { createClientSurfaceBridge } from './lib/harness/client-surfaces.js';
@@ -1303,6 +1305,7 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
     return externalAgentIdentity(cwd);
   } });
   const externalAgents = new ExternalAgentsService({ managed: () => ({coordinatorHostId:agentRuntime.coordinatorHostId,source:(owner,signal)=>agentRuntime.managedSource(owner,signal)}), kernel: kernelClient, spawn: externalAgentProcesses.spawn, spawnAdmitted: externalAgentProcesses.spawnAdmitted, directory: externalAgentDirectory,
+    fetch: (input, init) => egressRuntime.fetch(input, init), removeProgram: externalAgentProcesses.removeProgram, fileContext: externalAgentProcesses.fileContext,
     onError: operationId => console.error('[ExternalAgents] Execution or resource cleanup needs reconciliation:', operationId),
     resolveWorkspace: async cwd => {
       const canonicalRoot = await canonicalizePathIdentity(externalAgentDirectory);
@@ -1938,6 +1941,10 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
     const harness = await modelsService.settings.harness(trusted ? cwd : undefined);
     return { mode: harness.permissions?.mode ?? 'normal', rules: harness.permissions?.rules ?? [] };
   };
+  const judgePermission = createPermissionJudge({
+    selectModel: async () => resolveHarnessModelSlot('permissionJudge', (await modelsService.settings.harness()).models, null),
+    generate: input => modelText.generate(input),
+  });
   const globalMcpProcesses = createKernelProcessService({ client: kernelClient, resolveIdentity: async () => {
     const canonicalRoot = await canonicalizePathIdentity(agentMcpDir);
     const workspaceId = `mcp-host:${hostId}`;
@@ -2047,6 +2054,7 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
     admitWorkspaceRegistration: (id, signal) => documentsAuthority.admitWorkspaceRegistration(id, signal),
     projectTrusted: cwd => projectTrust.trusted(cwd),
     currentPolicy: agentMcpPolicy,
+    judgePermission,
   });
   managedMcpOwner.current = createManagedMcpPreparer({ runtime: () => agentRuntime, createLease: input => createManagedMcpLease({ ...input, ...(managedMcpInteractionsOwner.current ? { interactions: managedMcpInteractionsOwner.current } : {}) }),
     changed: runId => { void agentRuntime.refreshMcp(runId).catch(() => console.error('[MCP] Target contribution preparation requires attention')); },
@@ -2116,7 +2124,7 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
       } catch (error) { localLease.release(); targetLease?.release(); throw error; }
     }
     const originalTarget = targetLease;
-    try { return createMcpLease({ lease, kernel: kernelClient, tasks:mcpTaskRuntime,resources:mcpResourceRuntime,
+    try { return createMcpLease({ lease, kernel: kernelClient, tasks:mcpTaskRuntime,resources:mcpResourceRuntime, judgePermission,
       ...(originalTarget ? { retainChild: (binding: import('./lib/kernel/protocol.generated.js').SourceMcpChildBinding,
         selection: import('./lib/kernel/protocol.generated.js').McpBinding) => {
         const selected = selectMcpServers(selection, owner => owner.kind === 'managed_host');
@@ -2145,6 +2153,7 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
     // This is a user-scoped role. It does not inherit another Thread model binding.
     settings: async () => ({ global: await modelsService.readGlobalInferenceSettings() }),
   }), liveSources.validate, createExtensionTools({runtime:extensionRuntime,kernel:kernelClient,
+    judgePermission,
     permissionSubjects: createSettingsPermissionSubjects({ models: () => modelsService }),
     subscribeConfiguration: listener => { extensionConfigurationListeners.add(listener); return () => extensionConfigurationListeners.delete(listener); },
     prepareConfiguration: async (run, required) => {
@@ -2206,7 +2215,8 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
     resolveLiveSource: liveSources.validate, experiments: experimentService });
   const binaryFiles = createBinaryFileOwner({ kernel: kernelClient, runtime: agentRuntime, resolveLiveSource: liveSources.validate });
   const browserResources = new BrowserResources();
-  if (options.browser) browserResources.register(options.browser, 'Varin Browser', 'This Host', { dispose: false, source: 'embedded' });
+  if (options.browser) browserResources.register(options.browser, 'Varin Browser', 'This Host',
+    { dispose: false, source: 'embedded', device: { kind: 'service' } });
   const browserSettings = createBrowserSettings({ resources: browserResources, read: readSettingsFromDisk,
     update: change => updateSettingsOnDisk(current => change(current) as typeof current),
     environment: { endpoint: process.env.VARIN_BROWSER_CDP_ENDPOINT, scratchDirectory: process.env.VARIN_BROWSER_CDP_SCRATCH_DIRECTORY } });
@@ -2674,7 +2684,11 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
     externalChildSource:createManagedExternalChildSourceOwner({kernel:kernelClient,hostId,sources:createExternalSourceOwner({kernel:kernelClient,storage:kernelStorageAdapter,
       capture:{documents:documentsAuthority,prepareResources:threadResources.prepareSourceCapture,inspectInventory:(directory,signal)=>inspectSourceInventory(directory,signal)}})}),
     externalProjectSource:createManagedExternalProjectSourceOwner({kernel:kernelClient,storage:kernelStorageAdapter,hostId}),
-    externalSettings: signal=>externalAgents.settings(signal),
+    externalSettings: (signal, discover) => externalAgents.settings(signal, undefined, discover),
+    externalConfigure: (value, revision, key) => externalAgents.configure(value, revision, key),
+    externalInstallations: (input, signal) => externalAgents.installations(input, signal),
+    externalInstallationLog: (id, signal) => externalAgents.installationLog(id, signal),
+    externalGateway: (config, launch, signal) => externalAgents.connectProgramGateway(config, launch, signal),
     externalDetect: (id,signal)=>externalAgents.detect(id,signal),
     externalInspect: (id,refresh,signal)=>externalAgents.inspectExecutor(id,refresh,signal),
     prepareExternalLiveSource: liveSources.prepare,
@@ -2902,6 +2916,7 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
     originAllowed: isRequestOriginAllowed,
   });
   registerConnectionRoutes(app, connections, uiAuthController?.requireAuth ?? ((_request, _response, next) => next()));
+  registerDeviceRoutes(app, createDeviceRegistry(VARIN_DATA_DIR), uiAuthController?.requireAuth ?? ((_request, _response, next) => next()));
   const connectionProxy = attachConnectionProxy({
     isDraining: () => isShuttingDown,
     app, server, settings: connections.settingsStore,

@@ -42,6 +42,8 @@ pub enum ExternalCommand {
         key: String,
         id: String,
         configuration_id: String,
+        #[serde(default, skip_serializing_if="Option::is_none")]
+        profile_id: Option<String>,
         harness: String,
         title: String,
         cwd: String,
@@ -104,6 +106,11 @@ pub enum ExternalCommand {
         turn_id: String,
         native_id: String,
     },
+    TurnExecution {
+        id: String,
+        turn_id: String,
+        execution: Value,
+    },
     Admit {
         id: String,
         key: String,
@@ -125,6 +132,7 @@ pub enum ExternalCommand {
         native_id: Option<String>,
         error: Option<String>,
         usage: Option<Value>,
+        context_usage: Option<Value>,
     },
     Item {
         id: String,
@@ -456,7 +464,15 @@ mod tests {
         let snapshot = call(&mut c, json!({"action":"read","id":"external:a"})).unwrap();
         assert_eq!(snapshot["turns"][0]["nativeId"], "native-current");
         assert_eq!(snapshot["conversation"]["activeTurn"], *turn);
+        call(&mut c, json!({"action":"observe","id":"external:a","turnId":turn,"status":"running"})).unwrap();
+        let execution = json!({"model":"native-model","thinking":"high"});
+        call(&mut c, json!({"action":"turn_execution","id":"external:a","turnId":turn,"execution":execution})).unwrap();
         call(&mut c, json!({"action":"observe","id":"external:a","turnId":turn,"status":"completed","nativeId":"native-current"})).unwrap();
+        assert!(call(&mut c, json!({"action":"turn_execution","id":"external:a","turnId":turn,"execution":{"model":"later-model"}})).is_err());
+        drop(c);
+        let mut c = Catalog::open(directory.path()).unwrap();
+        let snapshot = call(&mut c, json!({"action":"read","id":"external:a"})).unwrap();
+        assert_eq!(snapshot["turns"][0]["execution"], execution);
     }
 
     #[test]
@@ -725,7 +741,9 @@ impl ExternalRead {
     }
 }
 fn capability_configuration(agent: &Value) -> Value {
-    json!({"harness":agent["harness"],"command":agent["command"],"args":agent["args"]})
+    let mut value = json!({"harness":agent["harness"],"command":agent["command"],"args":agent["args"]});
+    if let Some(profile) = agent["profileId"].as_str() { value["profileId"] = json!(profile); }
+    value
 }
 fn capability_cache(db: &Connection) -> Result<Value> {
     let body: Option<String> = db.query_row("SELECT body FROM external_settings WHERE id='capabilities'", [], |row| row.get(0)).optional()?;
@@ -929,7 +947,7 @@ impl Catalog {
                     let mut matched=false;
                     for historical_principal in [None,Some(None),Some(principal.clone())] {
                         for historical_private in [Some(private),None] {
-                            let original=ExternalCommand::Create {key:key.clone(),id:id.clone(),configuration_id:configuration_id.clone(),
+                            let original=ExternalCommand::Create {key:key.clone(),id:id.clone(),configuration_id:configuration_id.clone(),profile_id:receipt["profileId"].as_str().map(str::to_owned),
                                 harness:receipt["harness"].as_str().unwrap_or("").into(),title:title.clone().unwrap_or_else(||receipt["title"].as_str().unwrap_or("").into()),
                                 cwd:receipt["cwd"].as_str().unwrap_or("").into(),workspace_id:receipt["workspaceId"].as_str().map(str::to_owned),
                                 native_workspace:receipt.get("nativeWorkspace").cloned().map(serde_json::from_value).transpose()?,
@@ -1061,6 +1079,7 @@ impl Catalog {
                 organization,
                 id,
                 configuration_id,
+                profile_id,
                 harness,
                 title,
                 cwd,
@@ -1079,6 +1098,7 @@ impl Catalog {
                     return Err(RuntimeError::Invalid("unsupported external harness".into()));
                 }
                 let mut v = json!({"id":id,"configurationId":configuration_id,"harness":harness,"title":title,"cwd":cwd,"revision":1,"createdAt":now(),"updatedAt":now(),"archived":false,"pinned":false,"deleted":false});
+                if let Some(profile) = profile_id { v["profileId"] = json!(profile); }
                 if let Some(workspace) = workspace_id {
                     v["workspaceId"] = json!(workspace);
                 }
@@ -1147,7 +1167,8 @@ impl Catalog {
                 v
             }
             ExternalCommand::Read { id, before, limit } => {
-                let v = conversation(&tx, &id)?;
+                let mut v = conversation(&tx, &id)?;
+                let last_context_usage = v.as_object_mut().unwrap().remove("lastContextUsage");
                 let mut s = tx.prepare(
                     "SELECT body FROM external_turns WHERE conversation_id=?1 ORDER BY rowid",
                 )?;
@@ -1184,7 +1205,11 @@ impl Catalog {
                     None
                 };
                 items.reverse();
-                json!({"conversation":v,"turns":turns,"items":items.into_iter().map(|v|v.1).collect::<Vec<_>>(),"previous":previous})
+                let mut result = json!({"conversation":v,"turns":turns,"items":items.into_iter().map(|v|v.1).collect::<Vec<_>>(),"previous":previous});
+                if let Some(usage) = last_context_usage {
+                    result["lastContextUsage"] = usage;
+                }
+                result
             }
             ExternalCommand::Update {
                 id,
@@ -1347,6 +1372,18 @@ impl Catalog {
                 t
             }
             ExternalCommand::Admit { id, key, .. } => admit_turn(&tx,&id,&key,&p.body.unwrap(),self.epoch)?,
+            ExternalCommand::TurnExecution { id, turn_id, execution } => {
+                let v = conversation(&tx, &id)?;
+                let mut t = turn(&tx, &id, &turn_id)?;
+                if v["activeTurn"] != turn_id || t["epoch"].as_u64() != Some(self.epoch)
+                    || !matches!(t["status"].as_str(), Some("running" | "waiting_user" | "stopping"))
+                {
+                    return Err(RuntimeError::Conflict("external execution observation belongs to an inactive turn".into()));
+                }
+                t["execution"] = execution;
+                put(&tx, "external_turns", &turn_id, &t)?;
+                t
+            }
             ExternalCommand::SteerAdmit { id, key, target_turn_id, .. } => {
                 steering_target(&tx, &id, &target_turn_id, self.epoch)?;
                 let mut t = admit_turn(&tx, &id, &key, &p.body.unwrap(), self.epoch)?;
@@ -1458,6 +1495,7 @@ impl Catalog {
                 native_id,
                 error,
                 usage,
+                context_usage,
             } => {
                 let mut v = conversation(&tx, &id)?;
                 let mut t = turn(&tx, &id, &turn_id)?;
@@ -1501,6 +1539,9 @@ impl Catalog {
                 }
                 if terminal(&status) && v["activeTurn"] == turn_id {
                     v.as_object_mut().unwrap().remove("activeTurn");
+                    if let Some(usage) = context_usage {
+                        v["lastContextUsage"] = usage;
+                    }
                 }
                 if status == "interrupted" {
                     v["needsReview"] = json!(true);

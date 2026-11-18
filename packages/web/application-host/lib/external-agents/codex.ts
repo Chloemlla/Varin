@@ -1,15 +1,40 @@
-import type {
-  ExternalAgentCapabilities,
-  ExternalItem,
-  ExternalInteractionResponse,
+import {
+  CODEX_PERMISSION_PROFILE_OPTION,
+  type ExternalAgentCapabilities,
+  type ExternalAgentConfigOption,
+  type ExternalItem,
+  type ExternalInteractionResponse,
 } from '@varin/application-client';
 import type { HarnessConnection, HarnessSink, HarnessInput } from './adapter.js';
-import { assertSteeringContent, HarnessSteeringRejected } from './adapter.js';
+import { assertSteeringContent, describeTurnExecution, HarnessSteeringRejected } from './adapter.js';
 import { ContextUsage } from './context-usage.js';
 import { formInteraction } from './interaction-form.js';
 import { fileInputText } from './attachments.js';
 import { dedicatedOptions } from './dedicated-options.js';
 import { HarnessProtocolError, HarnessTransport, record, text, clientInfo, type RecordValue } from './transport.js';
+
+async function readCodexCatalog(peer: HarnessTransport, method: 'model/list' | 'permissionProfile/list', params: RecordValue, data: unknown[]) {
+  const catalog = method === 'model/list' ? 'model' : 'permission profile';
+  let cursor: string | undefined;
+  const cursors = new Set<string>();
+  do {
+    const page = await peer.request(method, { ...params, ...(cursor ? { cursor } : {}) });
+    if (!Array.isArray(page.data)) throw new Error(`Codex returned an invalid ${catalog} catalog`);
+    data.push(...page.data);
+    cursor = text(page.nextCursor) || undefined;
+    if (cursor && cursors.has(cursor)) throw new Error(`Codex repeated its ${catalog} catalog cursor`);
+    if (cursor) cursors.add(cursor);
+  } while (cursor);
+}
+
+const codexSandboxProfiles: Record<string, string> = {
+  readOnly: ':read-only', workspaceWrite: ':workspace', dangerFullAccess: ':danger-full-access',
+};
+
+function activeCodexPermission(snapshot: RecordValue) {
+  const sandbox = text(record(snapshot.sandboxPolicy ?? snapshot.sandbox).type);
+  return text(record(snapshot.activePermissionProfile).id) || codexSandboxProfiles[sandbox] || undefined;
+}
 
 export async function connectCodex(
   peer: HarnessTransport,
@@ -19,9 +44,9 @@ export async function connectCodex(
   // Resume/start may publish occupancy before its response or the model catalog.
   const early: RecordValue[] = [];
   const stopEarly = peer.onMessage(message => {
-    if (['thread/tokenUsage/updated', 'thread/status/changed', 'item/started', 'item/completed'].includes(text(message.method))) early.push(message);
+    if (['thread/tokenUsage/updated', 'thread/status/changed', 'thread/settings/updated', 'item/started', 'item/completed'].includes(text(message.method))) early.push(message);
   });
-  await peer.request('initialize', { clientInfo });
+  await peer.request('initialize', { clientInfo, capabilities: { experimentalApi: true } });
   await peer.send({ jsonrpc: '2.0', method: 'initialized' });
   const opened = await peer.request(
     existing ? 'thread/resume' : 'thread/start',
@@ -37,23 +62,34 @@ export async function connectCodex(
     const data: unknown[] = [];
     modelsError = undefined;
     try {
-      let cursor: string | undefined;
-      const cursors = new Set<string>();
-      do {
-        const page = await peer.request('model/list', cursor ? { cursor } : {});
-        if (!Array.isArray(page.data)) throw new Error('Codex returned an invalid model catalog');
-        data.push(...page.data);
-        cursor = text(page.nextCursor) || undefined;
-        if (cursor && cursors.has(cursor))
-          throw new Error('Codex repeated its model catalog cursor');
-        if (cursor) cursors.add(cursor);
-      } while (cursor);
+      await readCodexCatalog(peer, 'model/list', {}, data);
     } catch (error) {
       modelsError = String(error);
     }
     if (!modelsError || !modelData.length) modelData = data;
   };
-  await loadModels();
+  const profileData: unknown[] = [];
+  const [, modeCatalog] = await Promise.all([
+    loadModels(),
+    peer.request('collaborationMode/list', {}).catch((): RecordValue => ({})),
+    readCodexCatalog(peer, 'permissionProfile/list', { cwd: text(opened.cwd) || cwd }, profileData).catch(() => {}),
+  ]);
+  const profiles = profileData.map(record).flatMap(profile => {
+    const id = text(profile.id), description = text(profile.description);
+    return profile.allowed === true && id
+      ? [{ value: id, name: id, ...(description ? { description } : {}) }]
+      : [];
+  });
+  const permissionOption: ExternalAgentConfigOption | undefined = profiles.length ? {
+    id: CODEX_PERMISSION_PROFILE_OPTION, name: 'Codex permissions', type: 'select',
+    currentValue: activeCodexPermission(opened),
+    options: profiles,
+  } : undefined;
+  const modes = (Array.isArray(modeCatalog.data) ? modeCatalog.data : []).map(record)
+    .filter(preset => text(preset.mode) && text(preset.name));
+  let lastAcceptedModel = text(opened.model);
+  let reroutedModel: string | undefined;
+  let settingsRevision = 0;
 
   const models = () =>
     modelData
@@ -89,6 +125,8 @@ export async function connectCodex(
       ...(text(opened.reasoningEffort) ? { thinking: text(opened.reasoningEffort) } : {}),
     },
     models: models(),
+    modes: modes.map(preset => ({ id: text(preset.mode), name: text(preset.name) })),
+    ...(permissionOption ? { configOptions: [permissionOption] } : {}),
   };
   let sink: HarnessSink | undefined;
   let turnId: string | undefined;
@@ -128,9 +166,9 @@ export async function connectCodex(
     const id = text(raw.id);
     if (!id) return;
     const type = text(raw.type);
-    if (type === 'agentMessage')
+    if (type === 'agentMessage' || type === 'plan')
       publish(id, {
-        kind: 'assistant',
+        kind: type === 'plan' ? 'plan' : 'assistant',
         complete,
         text: typeof raw.text === 'string' ? raw.text : (items.get(id)?.text ?? ''),
       });
@@ -204,6 +242,22 @@ export async function connectCodex(
       for (const listener of activity) listener();
     }
     if (params.threadId !== sessionId) return;
+    if (message.method === 'thread/settings/updated') {
+      const settings = record(params.threadSettings);
+      const model = text(settings.model);
+      if (!model) return;
+      capabilities.current = {
+        model,
+        thinking: text(settings.effort) || undefined,
+        mode: text(record(settings.collaborationMode).mode) || undefined,
+      };
+      lastAcceptedModel = model;
+      if (permissionOption) permissionOption.currentValue = activeCodexPermission(settings);
+      settingsRevision++;
+      for (const listener of changed) listener();
+      if (sink && turnId && !settled && !reroutedModel) sink.execution?.(describeTurnExecution(capabilities));
+      return;
+    }
     if (message.method === 'item/started' || message.method === 'item/completed') {
       const item = record(params.item), id = text(item.id);
       if (item.type === 'commandExecution' && id) {
@@ -241,6 +295,10 @@ export async function connectCodex(
     const eventTurn = text(params.turnId) || nestedId;
     if (eventTurn !== turnId || (nestedId && nestedId !== turnId)) return;
     const method = text(message.method);
+    if (method === 'model/rerouted' && text(params.toModel)) {
+      reroutedModel = text(params.toModel);
+      sink.execution?.(describeTurnExecution(capabilities, { model: reroutedModel }));
+    }
     if (method === 'turn/plan/updated')
       sink.item({
         id: 'plan',
@@ -256,13 +314,13 @@ export async function connectCodex(
     if (method === 'item/started' || method === 'item/completed')
       translate(record(params.item), method === 'item/completed');
     if (
-      method === 'item/agentMessage/delta' ||
+      method === 'item/agentMessage/delta' || method === 'item/plan/delta' ||
       method === 'item/reasoning/summaryTextDelta' ||
       method === 'item/reasoning/textDelta'
     ) {
       const id = text(params.itemId);
       publish(id, {
-        kind: method === 'item/agentMessage/delta' ? 'assistant' : 'reasoning',
+        kind: method === 'item/plan/delta' ? 'plan' : method === 'item/agentMessage/delta' ? 'assistant' : 'reasoning',
         text: (items.get(id)?.text ?? '') + text(params.delta),
       });
     }
@@ -504,13 +562,30 @@ export async function connectCodex(
     async prompt(input: HarnessInput, next: HarnessSink) {
       if (failure) throw failure;
       if (sink) throw new Error('Codex turn already active');
-      const selected = dedicatedOptions(input, 'Codex');
+      const selected = dedicatedOptions(input, 'Codex', capabilities.modes);
+      const permission = input.permissionProfile;
+      if (permission !== undefined && !profiles.some(profile => profile.value === permission))
+        throw new Error('This Codex execution Host does not offer the selected permission profile');
+      const preset = selected.mode ? modes.find(mode => mode.mode === selected.mode) : undefined;
+      const modeModel = selected.model ?? (text(preset?.model) || capabilities.current?.model || lastAcceptedModel);
+      if (preset && !modeModel) throw new Error('Codex did not report a model for this collaboration mode');
+      const collaborationMode = preset ? {
+        mode: preset.mode,
+        // Codex reads model and effort from this object in preference to the outer fields.
+        settings: {
+          model: modeModel,
+          reasoning_effort: selected.thinking ?? (text(preset.reasoning_effort) ||
+            (modeModel === capabilities.current?.model ? capabilities.current?.thinking : undefined) || null),
+          developer_instructions: null,
+        },
+      } : undefined;
       sink = next;
       items.clear();
       baseline = cumulative;
       stopRequested = false;
       dispatched = false;
       settled = false;
+      reroutedModel = undefined;
       buffered = [];
       interactions = new AbortController();
       identity = new Promise((resolve) => {
@@ -531,9 +606,11 @@ export async function connectCodex(
         await next.beforeDispatch?.();
         if (failure) throw failure;
         if (stopRequested) return { status: 'cancelled' };
+        const beforeStart = settingsRevision;
         dispatched = true;
         const result = await peer.request('turn/start', {
           threadId: sessionId,
+          ...(permission === undefined ? {} : { permissions: permission }),
           input: [
             { type: 'text', text: fileInputText(input) },
             ...(input.images ?? []).map((image) => ({
@@ -541,8 +618,10 @@ export async function connectCodex(
               url: `data:${image.mimeType};base64,${image.data}`,
             })),
           ],
-          ...(selected.model ? { model: selected.model } : {}),
-          ...(selected.thinking ? { effort: selected.thinking } : {}),
+          ...(collaborationMode ? { collaborationMode } : {
+            ...(selected.model ? { model: selected.model } : {}),
+            ...(selected.thinking ? { effort: selected.thinking } : {}),
+          }),
         });
         turnId = text(record(result.turn).id);
         if (!turnId) {
@@ -553,19 +632,26 @@ export async function connectCodex(
           throw error;
         }
         latestTurn = turnId;
-        const current = { ...capabilities.current };
-        // turn/start acceptance is not an effective-option receipt. Preserve
-        // unchanged observations, but do not relabel requests/aliases as facts.
-        if (selected.model && selected.model !== current.model) {
-          delete current.model;
-          delete current.thinking;
+        if (settingsRevision === beforeStart) {
+          const current = { ...capabilities.current };
+          const requestedModel = collaborationMode?.settings.model ?? selected.model;
+          if (requestedModel && requestedModel !== current.model) {
+            delete current.model;
+            delete current.thinking;
+          }
+          if (collaborationMode || selected.thinking && selected.thinking !== current.thinking) delete current.thinking;
+          if (selected.mode && selected.mode !== current.mode) delete current.mode;
+          if (text(result.model)) current.model = text(result.model);
+          if (text(result.reasoningEffort)) current.thinking = text(result.reasoningEffort);
+          if (text(record(result.collaborationMode).mode)) current.mode = text(record(result.collaborationMode).mode);
+          if (permissionOption && permission !== undefined)
+            permissionOption.currentValue = activeCodexPermission(result) ?? (permissionOption.currentValue === permission ? permission : undefined);
+          lastAcceptedModel = current.model || requestedModel || lastAcceptedModel;
+          capabilities.current = current;
+          for (const listener of changed) listener();
         }
-        if (selected.thinking && selected.thinking !== current.thinking) delete current.thinking;
-        if (text(result.model)) current.model = text(result.model);
-        if (text(result.reasoningEffort)) current.thinking = text(result.reasoningEffort);
-        capabilities.current = current;
-        for (const listener of changed) listener();
         next.started?.(turnId);
+        next.execution?.(describeTurnExecution(capabilities));
         identify?.(turnId);
         for (const message of buffered) receive(message);
         buffered = [];

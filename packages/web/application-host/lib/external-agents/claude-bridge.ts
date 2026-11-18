@@ -4,10 +4,15 @@ import type {
   SDKUserMessage,
   PermissionResult,
   Options,
+  PermissionMode,
 } from '@anthropic-ai/claude-agent-sdk/core';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { record, text, type RecordValue } from './transport.js';
+
+// The worker's own Host manifest pins the SDK; the selected CLI reports its version separately.
+const sdkVersion: string = createRequire(import.meta.url)('../../../package.json').dependencies['@anthropic-ai/claude-agent-sdk'];
 
 type NativeCorrelation = {
   turnId: string;
@@ -15,6 +20,13 @@ type NativeCorrelation = {
   signal: AbortSignal;
   finish(matched: boolean): void;
 };
+
+const permissionModes = [
+  { id: 'default', name: 'Default' },
+  { id: 'acceptEdits', name: 'Accept edits' },
+  { id: 'plan', name: 'Plan' },
+  { id: 'dontAsk', name: 'Don’t ask' },
+] as const;
 
 /** Testable SDK-side owner; the worker below owns only JSONL framing. */
 export class ClaudeBridge {
@@ -32,7 +44,8 @@ export class ClaudeBridge {
   private readonly foreignTools = new Set<string>();
   private readonly correlations = new Set<NativeCorrelation>();
   private readonly approvals = new Map<string, (value: PermissionResult) => void>();
-  private current: { model?: string } = {};
+  private current: { model?: string; mode?: string } = {};
+  private modes: ReadonlyArray<{ id: PermissionMode; name: string }> = permissionModes;
   constructor(
     private readonly createQuery: typeof query,
     private readonly emit: (message: unknown) => void,
@@ -224,7 +237,7 @@ export class ClaudeBridge {
                 turnId,
                 name,
                 input,
-                suggestions: options.suggestions,
+                suggestions: options.suppressAlwaysAllowRule ? undefined : options.suggestions,
                 toolUseId: options.toolUseID,
               },
             });
@@ -237,10 +250,14 @@ export class ClaudeBridge {
         void this.read(this.session);
         const initialized = await this.session.initializationResult();
         if (this.failure) throw this.failure;
+        if (initialized.models?.some(model => model.supportsAutoMode === true))
+          this.modes = [...permissionModes, { id: 'auto', name: 'Auto' }];
         return {
           sessionId: this.sessionId,
           bridgeProtocol: 2,
+          sdkVersion,
           models: initialized.models,
+          modes: this.modes,
           commands: initialized.commands,
           agentVersion: initialized.claude_code_version,
           current: this.current,
@@ -259,8 +276,10 @@ export class ClaudeBridge {
     }
     if (message.method === 'configure') {
       if (this.turnId) throw new Error('Claude is already running');
-      if (p.mode !== undefined || Object.keys(record(p.config)).length)
+      if (Object.keys(record(p.config)).length)
         throw new Error('Claude does not expose these configuration controls');
+      const mode = this.modes.find(option => option.id === p.mode);
+      if (p.mode !== undefined && !mode) throw new Error('Claude does not offer that permission mode');
       if (
         p.thinking !== undefined &&
         !['low', 'medium', 'high', 'xhigh', 'max'].includes(text(p.thinking))
@@ -271,12 +290,17 @@ export class ClaudeBridge {
         await this.session.setModel(p.model);
         // setModel accepts aliases but returns no effective-model receipt. A
         // prior model is no longer current; wait for the next native init.
-        if (this.current === previous) this.current = {};
+        if (this.current === previous)
+          this.current = previous.mode && previous.mode !== 'auto' ? { mode: previous.mode } : {};
       }
       if (p.thinking !== undefined)
         await this.session.applyFlagSettings({
           effortLevel: p.thinking as 'low' | 'medium' | 'high' | 'xhigh' | 'max',
         });
+      if (mode) {
+        await this.session.setPermissionMode(mode.id);
+        this.current = { ...this.current, mode: mode.id };
+      }
       if (this.failure) throw this.failure;
       // Effort can be clamped by organization/model policy. Do not report the
       // requested effort as the effective one when the SDK supplies no receipt.
@@ -352,8 +376,12 @@ export class ClaudeBridge {
         const event = record(raw);
         if (text(event.session_id) && event.session_id !== this.sessionId)
           throw new Error('Claude changed the selected native session identity');
-        if (event.type === 'system' && event.subtype === 'init') {
-          this.current = { ...(text(event.model) ? { model: text(event.model) } : {}) };
+        if (event.type === 'system' && (event.subtype === 'init' ||
+            (event.subtype === 'status' && text(event.permissionMode)))) {
+          this.current = { ...this.current,
+            ...(text(event.model) ? { model: text(event.model) } : {}),
+            ...(text(event.permissionMode) ? { mode: text(event.permissionMode) } : {}),
+          };
           this.emit({
             jsonrpc: '2.0',
             method: 'capabilities',

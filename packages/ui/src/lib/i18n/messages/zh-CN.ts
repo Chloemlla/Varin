@@ -1,3 +1,4 @@
+import { settingsRedesignZh } from '@varin/application-client/settings-locales/settings-redesign';
 import { browserResourcesZhCN } from './browser-resources';
 import { conversationOrganizationZhCN } from './conversation-organization';
 import { companionAttentionZh } from './companion-attention';
@@ -676,7 +677,7 @@ export const dict: Record<I18nKey, string> = {
   "thread.composer.interrupt": "中断当前生成",
   "thread.composer.afterRun": "本轮结束后发送",
   "thread.composer.images": "添加图片",
-  "thread.composer.chatOnly": "未选择项目",
+  "thread.composer.chatOnly": "未选择",
   "thread.message.summarize": "总结到此处",
   "chat.fileAttachment.actions.attachPdfs": "添加 PDF",
   "chat.fileAttachment.actions.choosePdfs": "选择文档",
@@ -4787,4 +4788,5 @@ export const dict: Record<I18nKey, string> = {
   "chat.context.userSource": "用户消息",
   'chat.model.useImagesAsFiles': "将图片作为可读取文件",
   'chat.model.imagesAsFilesNotice': "此模型无法查看图片。图片将作为文件附件提供，不作为直接视觉输入。",
+  ...settingsRedesignZh,
 };

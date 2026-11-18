@@ -5,6 +5,7 @@ import { dedicatedOptions } from './dedicated-options.js';
 import { ContextUsage } from './context-usage.js';
 import { ClaudeContent } from './claude-content.js';
 import type { HarnessConnection, HarnessSink } from './adapter.js';
+import { describeTurnExecution } from './adapter.js';
 import { HarnessTransport, record, text, type RecordValue } from './transport.js';
 
 const claudeModels = (models: unknown): ExternalAgentCapabilities['models'] =>
@@ -162,6 +163,12 @@ export async function connectClaude(
       const usage = record(message.context_usage);
       context.update(usage.total_tokens, usage.raw_max_tokens);
     }
+    if (!message.parent_tool_use_id) {
+      const event = record(message.event);
+      const model = message.type === 'assistant' ? text(record(message.message).model)
+        : message.type === 'stream_event' && event.type === 'message_start' ? text(record(event.message).model) : '';
+      if (model) sink.execution?.(describeTurnExecution(capabilities, { model }));
+    }
     content?.receive(message);
     if (message.type === 'result') {
       const usage = record(message.usage);
@@ -312,7 +319,7 @@ export async function connectClaude(
     steering: false,
     protocol: {
       name: 'claude-agent-sdk',
-      version: '0.3.316',
+      ...(text(initialized.sdkVersion) ? { version: text(initialized.sdkVersion) } : {}),
       ...(text(initialized.agentVersion) ? { agentVersion: text(initialized.agentVersion) } : {}),
     },
     current: record(initialized.current),
@@ -322,6 +329,8 @@ export async function connectClaude(
       ...(text(record(value).argumentHint) ? { inputHint: text(record(value).argumentHint) } : {}),
     })),
     models: claudeModels(initialized.models),
+    modes: (Array.isArray(initialized.modes) ? initialized.modes : []).map(record)
+      .flatMap(mode => text(mode.id) && text(mode.name) ? [{ id: text(mode.id), name: text(mode.name) }] : []),
     modelsError: Array.isArray(initialized.models)
       ? undefined
       : 'Claude did not supply a model catalog; reconnect to obtain native session metadata',
@@ -355,7 +364,7 @@ export async function connectClaude(
     async prompt(input, next) {
       if (failure) throw failure;
       if (sink) throw new Error('Claude is already running');
-      const selected = dedicatedOptions(input, 'Claude');
+      const selected = dedicatedOptions(input, 'Claude', capabilities.modes);
       if (
         input.images?.some(
           (image) =>

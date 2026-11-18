@@ -1,3 +1,4 @@
+import { settingsRedesignZhTw } from '@varin/application-client/settings-locales/settings-redesign';
 import { conversationOrganizationZhTW } from './conversation-organization';
 import { browserResourcesZhTW } from './browser-resources/zh-TW';
 import { dict as enDict, type I18nKey } from './en';
@@ -527,7 +528,7 @@ export const dict: Record<I18nKey, string> = {
   "thread.composer.interrupt": "中斷目前生成",
   "thread.composer.afterRun": "本輪結束後傳送",
   "thread.composer.images": "新增圖片",
-  "thread.composer.chatOnly": "僅聊天",
+  "thread.composer.chatOnly": "未選擇",
   "thread.message.summarize": "總結至此處",
   "chat.fileAttachment.actions.attachPdfs": "加入 PDF",
   "chat.fileAttachment.actions.choosePdfs": "選擇文件",
@@ -4573,4 +4574,5 @@ export const dict: Record<I18nKey, string> = {
   'chat.model.imagesAsFilesNotice': "此模型無法查看圖片。圖片將作為檔案附件提供，不作為直接視覺輸入。",
   "settings.page.tunnel.title": "外部存取",
   "settings.page.tunnel.description": "管理目前 Host 的公開 HTTPS 存取與遠端通道。",
+  ...settingsRedesignZhTw,
 };
