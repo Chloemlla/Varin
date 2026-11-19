@@ -24,6 +24,7 @@ export * from "./transport/index.js";
 export { projectFolders, projectPathKey, projectContainsPath, parseProjectSourceBinding, projectResourceOwnerKey, parseVersionedProjectWorkspace } from './project-folders.js';
 export type { ProjectFolders } from './project-folders.js';
 export * from "./threads.js";
+export * from "./workspace-locations.js";
 export { defaultConversationModel } from './default-conversation-model.js';
 export * from "./thread-source-files.js";
 export * from "./thread-dispatch.js";
@@ -89,3 +90,4 @@ export * from './github-http.js';
 export * from './thread-observation.js';
 
 export * from "./browser-resources-http.js";
+export * from './bot-group-chat.js';

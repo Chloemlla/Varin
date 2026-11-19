@@ -1,6 +1,6 @@
 {
   "name": "@varin/electron",
-  "version": "0.9.50",
+  "version": "0.9.51",
   "license": "AGPL-3.0-only",
   "private": true,
   "description": "Varin desktop runtime",
@@ -25,6 +25,7 @@
   "trustedDependencies": [
     "electron"
   ],
+  "desktopReleaseRoles": ["full", "light"],
   "desktopPrerequisites": [
     "Electron runtime dependencies installed via bun install",
     "Bun available for sidecar compilation",

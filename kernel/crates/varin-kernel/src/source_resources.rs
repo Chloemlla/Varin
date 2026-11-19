@@ -973,7 +973,7 @@ pub(crate) fn prepare_request(
                 resource_epoch: p.resource_epoch,
             };
             let record = storage.source_authority(&address, false, epoch)?;
-            if matches!(record.purpose.as_str(), "mcp_owner" | "external_harness") {
+            if matches!(record.purpose.as_str(), "mcp_owner" | "external_harness" | "work_location_read") {
                 return Err(denied("This source owner does not admit file observations"));
             }
             let r = p.action.request();
@@ -1102,6 +1102,10 @@ pub(crate) fn prepare_request(
                 resource_epoch: p.resource_epoch,
             };
             let record = storage.source_authority(&address, false, epoch)?;
+            if matches!(record.purpose.as_str(), "work_location_read" | "work_location")
+                && record.operation_id.as_deref() != Some(p.operation_id.as_str()) {
+                return Err(denied("Work location control belongs to another Operation"));
+            }
             if let Some(receipt) = storage.recall_source_schedule(&record, &p.operation_id, method == "source.resource.cancel")? {
                 return Ok(receipt);
             }
@@ -1129,6 +1133,17 @@ pub(crate) fn prepare_request(
             let record = storage.source_authority(&address(&input), true, epoch)?;
             if record.result.phase != "ready" || matches!(record.purpose.as_str(), "result" | "process_view" | "script_environment" | "mcp_owner") {
                 return Err(denied("Source does not admit model tools"));
+            }
+            if matches!(record.purpose.as_str(), "work_location_read" | "work_location") {
+                let call = &input.call;
+                if record.operation_id.as_deref() != Some(call.operation_id.as_str())
+                    || record.result.scope.run_id() != Some(call.run_id.as_str())
+                    || !matches!(call.origin, varin_runtime::execution::ToolOrigin::ModelStep { .. })
+                    || call.origin.operation_id(&call.call_id) != call.operation_id
+                    || record.result.tool_binding.as_ref().is_none_or(|binding| !binding.enabled_tools.iter().any(|tool| tool.name() == call.name))
+                    || crate::work_locations::validate_location_path(&call.name, &call.arguments).is_err() {
+                    return Err(denied("Work location authority only admits its original Operation"));
+                }
             }
             let authorize = method == "source.resource.authorize";
             let read = if !authorize && crate::tools::managed_read_receipt_tool(&input.call.name) {
@@ -1175,6 +1190,7 @@ pub(crate) fn prepare_request(
                     resource_epoch: p.resource_epoch,
                 };
                 let record = storage.source_authority(&address, true, epoch)?;
+                if matches!(record.purpose.as_str(), "work_location_read" | "work_location") { return Err(denied("Work location authority only admits its original Operation")); }
                 if record.purpose == "mcp_owner" { return Err(denied("MCP owner only admits its dedicated process pipe")); }
                 if matches!(record.purpose.as_str(), "process_view" | "external_harness") { return Err(denied("Process authority only admits its original process projection")); }
                 if record.purpose == "script_environment" && !matches!(&action, SourceResourceAction::ProcessObservation { process_id, .. } if record.operation_id.as_deref() == Some(process_id.as_str())) {

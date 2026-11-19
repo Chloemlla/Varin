@@ -21,6 +21,7 @@ import { useThreadWorkFocus } from './useThreadWorkFocus';
 import { ChatTurnUserMessage } from '../conversation/ChatTimelineEntries';
 import { useFirstMessagePreview } from './useFirstMessagePreview';
 import { ThreadSourcePicker } from './ThreadSourcePicker';
+import { useWorkLocationLabel } from './useWorkLocationLabel';
 import { useProjectsStore } from '@/stores/useProjectsStore';
 import { projectModelSettingsId } from '@/lib/projectResolution';
 import { WorkOverviewControl } from './WorkOverviewControl';
@@ -102,6 +103,10 @@ export function ThreadDraftConversation({ api, draftKey, handoff }: { api: Threa
   const [readingFiles, setReadingFiles] = React.useState(false);
   const generation = React.useSyncExternalStore(subscribeRuntimeEndpointChanged, getRuntimeEndpointGeneration, getRuntimeEndpointGeneration);
   const sourcePath = draft.sourceSelection?.path ?? draft.workspacePath;
+  const { label: workspaceLabel } = useWorkLocationLabel(api.sources, generation, !draft.botId && sourcePath ? {
+    owner: draft.sourceSelection?.resourceOwner ?? { kind: 'local' }, path: sourcePath,
+    workspaceId: draft.sourceSelection?.expectedWorkspaceId,
+  } : undefined);
   const externalSourceUnsupported = !!draft.sourceSelection && draft.sourceSelection.mode !== 'live_root';
   const referenceScope = JSON.stringify([generation, draftKey, draft.sourceSelection ?? draft.workspacePath]);
   const preparation = useExternalDraftPreparation({ draftKey, host: generation, configurationId: draft.harnessId, cwd: sourcePath, name: external?.name });
@@ -323,7 +328,7 @@ export function ThreadDraftConversation({ api, draftKey, handoff }: { api: Threa
           sendDisabled={sendDisabled} pending={sending} active={false} retrying={locked} hasInput={hasInput}
           onFiles={files => void addFiles(files)} onAttachImages={() => fileInput.current?.click()} onAttachPdfs={() => pdfInput.current?.click()}
           onGoal={() => { if (!locked) patch({ goalArmed: !draft.goalArmed }); }} goalArmed={draft.goalArmed}
-          onWorkspace={draft.botId ? undefined : () => setWorkspaceOpen(true)} workspaceLabel={sourcePath ? formatDirectoryName(sourcePath) : t('thread.composer.chatOnly')}
+          onWorkspace={draft.botId ? undefined : () => setWorkspaceOpen(true)} workspaceLabel={draft.sourceSelection?.locationLabel ?? (!sourcePath && (draft.sourceDisabled || draft.harnessId) ? t('thread.composer.chatOnly') : workspaceLabel)}
           workspacePath={!draft.sourceSelection || draft.sourceSelection.resourceOwner.kind === 'local' ? sourcePath : undefined}
           imageReferences={draftImageReferences(draft)} attachmentNames={draft.files?.map(item => item.filename) ?? []} skills={[]}>
           <div className="space-y-2 px-3 empty:hidden">
@@ -353,7 +358,7 @@ export function ThreadDraftConversation({ api, draftKey, handoff }: { api: Threa
     <WorkOverviewControl open={workspaceOpen} compactOpen={false} rows={[]} attention={false}
       onOpenChange={setWorkspaceOpen} onCompactChange={() => {}} onSelect={() => {}}>
       {workspaceOpen && <div className="min-h-0 overflow-y-auto"><ThreadSourcePicker api={api} identity={null} initialPath={draft.workspacePath} draftSelection={draft.sourceSelection}
-        onDraftSelection={sourceChanged} active={locked} launch={null} prepared={null} onPrepared={ignorePrepared} onPreparingChange={ignorePrepared}
+        onDraftSelection={sourceChanged} chatOnly={draft.sourceDisabled} onUseDefault={draft.harnessId || draft.botId ? undefined : () => { if (!externalSending.current) void preparation.change({ workspacePath: undefined, projectId: undefined, sourceSelection: undefined, sourceDisabled: false, preparedSource: null }); }} active={locked} launch={null} prepared={null} onPrepared={ignorePrepared} onPreparingChange={ignorePrepared}
         onUseChatOnly={() => { if (!externalSending.current) void preparation.change({ workspacePath: undefined, projectId: undefined, sourceSelection: undefined, sourceDisabled: true, preparedSource: null }); }} /></div>}
     </WorkOverviewControl>
     </div>

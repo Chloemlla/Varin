@@ -1008,6 +1008,7 @@ export interface MessageSendParams {
   key: string;
   senderThreadId: string;
   senderBranchId: string;
+  senderGroupOperationId?: string;
   targetThreadId?: string;
   targetBranchId?: string;
   replyTo?: string;
@@ -1789,7 +1790,15 @@ export interface ThreadOperationsParams {
   branchId?: string;
 }
 
+export interface BranchWorkspace {
+  revision: number;
+  source: LaunchSource | null;
+}
+
+export interface SetBranchWorkspace { threadId: string; branchId: string; expectedRevision: number; source: LaunchSource | null; }
+
 export interface ThreadBranch {
+  workspace_default?: BranchWorkspace | null;
   branch_id: string;
   head: string | null;
   active_run_id: string | null;
@@ -2551,6 +2560,7 @@ export interface InitialContext {
 }
 
 export interface InputSubmitParams {
+  expectedWorkspaceRevision?: number;
   inputPreparation?: InputResourcePreparation;
   expectedContextCheckpoint?: string;
   initialContext?: InitialContext;
@@ -3105,6 +3115,7 @@ export type OperationCallCompletion<M = StoredMedia> =
   | { kind: 'job_accepted'; operation_id: string; phase: string; effect: Effect; lifetime: Lifetime; content?: OutputBody<M> };
 
 export interface Operation {
+  resource_source?: LaunchSource;
   host_job?: HostJobView;
   execution_owner: ExecutorOwner | null;
   external_receipt: ExternalReceiptView | null;

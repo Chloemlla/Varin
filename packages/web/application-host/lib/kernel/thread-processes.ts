@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import type { ThreadProcessesAPI, ThreadProcessTerminal, ThreadSource } from '@varin/application-client';
 import type { TerminalSessionApi } from '../terminal/session-api.js';
 import type { AgentRuntimeClient } from './agent-runtime-client.js';
@@ -24,8 +25,8 @@ export function createThreadProcesses(options: {
     if (input.runtime !== 'agent' || run.thread_id !== input.threadId || run.branch_id !== input.branchId
       || operation.managed_process?.purpose.kind !== 'process_job') throw new Error('Terminal must belong to this branch and original process operation');
     const launch = await runtime.launch(run.id);
-    const source = launch?.selection.source;
-    if (!source || source.mode === 'fixed_branch') throw new Error('Process has no physical source');
+    const source = operation.resource_source ?? launch?.selection.source;
+    if (!launch || !source || source.mode === 'fixed_branch') throw new Error('Process has no physical source');
     const terminal = options.terminal();
     if (!terminal?.adoptTerminalSession) throw new Error('Terminal runtime is unavailable');
     const sessionId = `agent-process:${createHash('sha256').update(JSON.stringify([run.thread_id, run.branch_id, operation.id])).digest('hex')}`;
@@ -36,9 +37,11 @@ export function createThreadProcesses(options: {
         || identity.threadId !== run.thread_id || identity.branchId !== run.branch_id) throw new Error('Terminal identity conflict');
       return { sessionId, cwd: existing.cwd, operationId: operation.id, processId: identity.processId, resourceOwner: source.resource_owner };
     }
-    const selection = savedSourceLaunch(run.id, source, sourceToolSchemas(launch!.selection).map(tool => tool.name) as ThreadSource['tools']);
+    const retainedView = source.resource_owner.kind === 'managed_host' || !isDeepStrictEqual(source, launch.selection.source);
+    const tools = retainedView ? ['process_inspect', 'process_read'] : sourceToolSchemas(launch.selection).map(tool => tool.name);
+    const selection = savedSourceLaunch(run.id, source, tools as ThreadSource['tools']);
     const authority = await admitRunSourceAuthority(kernel, runtime, selection, { resolveLiveSource: options.resolveLiveSource,
-      ...(source.resource_owner.kind === 'managed_host' ? { operationId: operation.id, retention: 'caller', purpose: 'process_view' } : {}) });
+      ...(retainedView ? { operationId: operation.id, retention: 'caller', purpose: 'process_view' } : {}) });
     let child: KernelManagedProcess | undefined;
     let unsubscribe: (() => void) | undefined;
     let disposed = false;

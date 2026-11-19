@@ -18,8 +18,13 @@ import type { WorkspaceWorkingStateRootAccess } from '../harness/working-state/t
 
 /** Resource discovery is independent of Thread existence. Callers admit their own
  * project/Thread scope before using this shared directory; it never grants execution. */
+type WorkspaceDirectory = import('@varin/application-client').ThreadLocationDirectory;
+type SourceTargets = Awaited<ReturnType<ThreadSourcesAPI['list']>> & {
+  workspace?: WorkspaceDirectory & { projects?: WorkspaceDirectory['locations'] };
+};
+
 export interface SourceDirectory {
-  list(signal?: AbortSignal): ReturnType<ThreadSourcesAPI['list']>;
+  list(signal?: AbortSignal): Promise<SourceTargets>;
   resolve(request: Parameters<ThreadSourcesAPI['resolve']>[1], signal?: AbortSignal): ReturnType<ThreadSourcesAPI['resolve']>;
   draftSkills?(request: Parameters<ThreadSourcesAPI['resolve']>[1], signal?: AbortSignal): Promise<import('@varin/application-client').ThreadSkillCatalog>;
 }
@@ -42,13 +47,15 @@ export function parseSourceResourceOwner(value: unknown): SourceResourceOwner {
 
 export function createThreadSourceDirectory(options: {
   documents: Pick<DocumentAuthority, 'resolveWorkspace' | 'admitWorkspaceRegistration'>;
+  localLabel?: string;
+  workspace?(): Promise<SourceTargets['workspace']>;
   remote?: Pick<ThreadSourceRemoteOwner, 'list' | 'resolve' | 'draftSkills'>;
 }): SourceDirectory {
   return {
     async list(signal) {
       signal?.throwIfAborted();
-      const remote = await options.remote?.list(signal);
-      return { targets: [{ resourceOwner: { kind: 'local' }, label: 'This Host', capabilities: [] }, ...(remote?.targets ?? [])],
+      const [remote, workspace] = await Promise.all([options.remote?.list(signal), options.workspace?.()]);
+      return { ...(workspace ? { workspace } : {}), targets: [{ resourceOwner: { kind: 'local' }, label: options.localLabel ?? 'This Host', capabilities: [] }, ...(remote?.targets ?? [])],
         unavailable: remote?.unavailable ?? [] };
     },
     async draftSkills(request, signal) {

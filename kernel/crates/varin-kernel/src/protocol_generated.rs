@@ -429,6 +429,7 @@ where
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct InputSubmitParams {
+    pub(crate) expected_workspace_revision: Option<i64>,
     pub(crate) input_preparation:
         Option<varin_runtime::catalog::resources::InputResourcePreparation>,
     pub(crate) expected_context_checkpoint: Option<String>,
@@ -1839,6 +1840,8 @@ pub(crate) struct ModelPresentationParams {
 pub(crate) type ThreadCatalogQuery = varin_runtime::catalog::threads::ThreadListQuery;
 
 pub(crate) type PrincipalQuery = varin_runtime::catalog::principals::PrincipalQuery;
+
+pub(crate) type SetBranchWorkspace = varin_runtime::catalog::branch_workspace::SetBranchWorkspace;
 
 pub(crate) type ThreadMetadataUpdateParams = varin_runtime::catalog::threads::ThreadUpdate;
 
@@ -3705,6 +3708,7 @@ pub(crate) struct MessageSendParams {
     pub(crate) key: String,
     pub(crate) sender_thread_id: String,
     pub(crate) sender_branch_id: String,
+    pub(crate) sender_group_operation_id: Option<String>,
     pub(crate) target_thread_id: Option<String>,
     pub(crate) target_branch_id: Option<String>,
     pub(crate) reply_to: Option<String>,
@@ -5653,6 +5657,11 @@ pub(crate) fn validate_generated_method_params(method: &str, params: &Value) -> 
         "runtime.thread.attention.read" => serde_json::from_value::<PrincipalQuery>(params.clone())
             .map(|_| ())
             .map_err(|error| error.to_string()),
+        "runtime.branch.workspace.set" => {
+            serde_json::from_value::<SetBranchWorkspace>(params.clone())
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }
         "runtime.thread.update" => {
             serde_json::from_value::<ThreadMetadataUpdateParams>(params.clone())
                 .map(|_| ())
