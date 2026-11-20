@@ -178,7 +178,6 @@ import { createContextAgent } from './lib/kernel/context-agent.js';
 import { registerAgentProfileRoutes } from './lib/kernel/agent-profile-routes.js';
 import { registerRuntimeMaintenanceRoutes } from './lib/kernel/runtime-maintenance-routes.js';
 import { createModelAuthority } from './lib/kernel/model-authority.js';
-import 'reflect-metadata';
 import { createBotDataCleanup } from './lib/bots/bot-data-cleanup.js';
 import { createHostResourceStorage, createHostResourceExecution } from './lib/kernel/host-resource-owners.js';
 import { createExperimentService } from './lib/harness/experiments.js';
@@ -196,7 +195,6 @@ import path from 'path';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import { createProxyMiddleware, responseInterceptor } from 'http-proxy-middleware';
-import webPush from 'web-push';
 import { ApplicationExtensionCatalog, ApplicationExtensionRuntime, ExtensionPackageManager } from '@varin/extension-host';
 import { VARIN_BUNDLED_LANGUAGE_SERVERS } from '@varin/extension-builtins';
 import { createDocumentAuthority, type DocumentAuthority, type DocumentMutationObservation } from './lib/documents/authority.js';
@@ -595,7 +593,6 @@ const {
 } = requestSecurityRuntime;
 
 const pushRuntime = createPushRuntime({
-  webPush,
   PUSH_SUBSCRIPTIONS_FILE_PATH,
   readSettingsFromDisk,
   updateSettingsOnDisk,
@@ -1157,7 +1154,7 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
   // eslint-disable-next-line prefer-const -- Deferred port: early document callbacks must observe undefined until wiring completes.
   let nativeWorkspaces:NativeWorkspaceOwner|undefined;
   let requestSourceMaintenance=()=>{};
-  let releaseSourcePreparations=async(_threads:readonly string[])=>{};
+  let releaseSourcePreparations = async (_threads: readonly string[]): Promise<boolean> => false;
   bindDocumentTextCodec(kernelClient);
   const projectTextEncoding = createProjectTextEncodingService({
     projects: async () => (sanitizeProjects((await readSettingsFromDisk()).projects) ?? []).filter(project => project.source?.resourceOwner.kind !== 'managed_host'),
@@ -1390,11 +1387,12 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
     // records already carry the backend job identity, so the experiment
     // reconcile inspects and re-polls rather than resubmitting.
     onSourceReachable: (owner) => {
+      requestSourceMaintenance();
       managedMcpOwner.current?.sourceReached(owner);
       managedMcpInteractionsOwner.current?.wake();
       mcpTaskRuntimeOwner.current?.sourceReached();
       mcpResourceRuntimeOwner.current?.sourceReached();
-      collaborationOwner.current?.sourceReached();
+      collaborationOwner.current?.sourceReached(owner);
       void scriptRuntimeOwner.current?.recoverSource(owner).catch(() => console.error("[Script] Original target stop remains pending"));
       void agentRuntime.reconcileSourceCleanup().catch((error: unknown) => {
         console.error("[VarinManagedTarget] Original source cleanup remains pending:", errorMessage(error));
@@ -1577,7 +1575,7 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
   // BC0: durable Bot identity. The profile record lives in the kernel catalog;
   // the Bot's work is ordinary Threads under the `bot:<id>` owner scope, and
   // its entry conversation is a native Thread and branch.
-  let reconcileBotGroupDelivery: ((botId: string) => void) | undefined;
+  const botGroupDelivery: { botChanged?: (botId: string) => void } = {};
   const botService = createBotService({
     client: kernelClient,
     hostId,
@@ -1639,7 +1637,7 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
       if (!botLifecycleRuntime) throw new Error('Bot lifecycle is not ready');
       return botLifecycleRuntime;
     },
-    onChange: (bot) => { broadcastGlobalUiEvent?.({ type: 'varin:bot-changed', properties: { botId: bot.id } }); botPresence.schedule(); reconcileBotGroupDelivery?.(bot.id); },
+    onChange: (bot) => { broadcastGlobalUiEvent?.({ type: 'varin:bot-changed', properties: { botId: bot.id } }); botPresence.schedule(); botGroupDelivery.botChanged?.(bot.id); },
     onDeleted: (botId) => { broadcastGlobalUiEvent?.({ type: 'varin:bot-changed', properties: { botId } }); botPresence.schedule(); },
     onOrganizationChange: () => { broadcastGlobalUiEvent?.({ type: 'varin:bot-organization-changed', properties: {} }); },
     onAppearanceLibraryChange: () => { broadcastGlobalUiEvent?.({ type: 'varin:bot-appearance-library-changed', properties: {} }); },
@@ -2727,8 +2725,9 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
       readRetrySettings: () => modelsService.readGlobalInferenceSettings().then(value => value.retry),
       onError: () => console.error('[Delegation] Original selection inference requires attention') } });
   const collaboration = new ThreadCollaboration({ runtime: agentRuntime, prepareProjectSource, prepareModel: delegationModels.prepare,
-    canExecuteThread: async threadId => {
+    canExecuteThread: async (threadId, botSubjects) => {
       const botId = (await agentRuntime.thread(threadId)).bot_id;
+      if (botSubjects && (!botId || !botSubjects.has(`bot:${botId}`))) return false;
       return !botId || (await botService.executionGate(botId)).permitted;
     },
     kernel: kernelClient, storageAdapter: kernelStorageAdapter, resolveLiveSource: liveSources.validate,
@@ -2741,7 +2740,16 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
     prepareContext: threadContext,
     prepareMaterials: threadMaterialLifetime.prepareChild,
     prepareSkillInput: createThreadSkillInputPreparer(threadResources),
-    onError: (operationId, _error) => console.error('[Collaboration] Preparation or delivery requires attention:', operationId ?? 'discovery'),
+    onError: (operationId, error, stage) => {
+      const code = error instanceof KernelClientError ? error.code
+        : error instanceof Error && 'code' in error && typeof error.code === 'string' && /^[a-z0-9_-]+$/i.test(error.code) ? error.code
+        : error instanceof Error ? error.name : 'unknown';
+      // Preparation can contain provider output or user content. Reconciliation
+      // diagnostics use the private kernel's own error message, without its details.
+      const detail = (error instanceof KernelClientError || error instanceof AggregateError) && !/prepar|start|resume|continue/i.test(stage)
+        ? error.message : undefined;
+      console.error('[Collaboration]', stage, operationId ?? 'discovery', code, ...(detail ? [detail] : []));
+    },
   });
   collaborationOwner.current = collaboration;
   externalAgents.startChildren(createExternalSourceOwner({ managed:{coordinatorHostId:agentRuntime.coordinatorHostId,source:(owner,signal)=>agentRuntime.managedSource(owner,signal)}, kernel: kernelClient, storage: kernelStorageAdapter, prepareProjectSource,
@@ -2848,7 +2856,7 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
     changed: () => broadcastGlobalUiEvent?.({ type: 'varin:bot-group-chat-changed', properties: {} }),
     onError: error => console.warn('[Bot group chat] Delivery reconciliation requires attention', error instanceof Error ? error.name : 'unknown'),
   });
-  reconcileBotGroupDelivery = botGroupChats.botChanged;
+  botGroupDelivery.botChanged = botGroupChats.botChanged;
   registerBotGroupChatRoutes(app, botGroupChats);
   registerBotRoutes(app, {
     bots: botService,

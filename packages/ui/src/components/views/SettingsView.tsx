@@ -6,6 +6,7 @@ import { SettingsDraftDialog } from '@/components/sections/shared/SettingsDraftD
 import { ErrorBoundary } from '@/components/ui/ErrorBoundary';
 import { McpIcon } from '@/components/icons/McpIcon';
 import { useUIStore } from '@/stores/useUIStore';
+import { activationPoint, type RecentPointer } from '@/lib/motion/pointer';
 import { useDeviceInfo } from '@/lib/device';
 import { isDesktopLocalOriginActive, isDesktopShell, isWebRuntime } from '@/lib/desktop';
 import { useI18n } from '@/lib/i18n';
@@ -24,7 +25,7 @@ import {
 
 type Stage = 'nav' | 'page';
 interface SettingsViewProps {
-  onClose?: () => void;
+  onClose?: (origin?: RecentPointer) => void;
   /** Force the phone layout regardless of device detection. */
   forceMobile?: boolean;
   /** Restrict top-level settings navigation to a specific product surface. */
@@ -100,7 +101,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onClose, forceMobile
   const activeMeta = React.useMemo(() => registrations.find(registration => registration.meta.slug === slug)?.meta ?? null, [registrations, slug]);
 
   const [stage, setStage] = React.useState<Stage>(() => (initialMobileStage === 'nav' && (requested === 'home') ? 'nav' : 'page'));
-  const [catalogStage, setCatalogStage] = React.useState<CatalogStage>('list');
+  const [catalogStage, setCatalogStage] = React.useState<CatalogStage>(() => useUIStore.getState().settingsCatalogSelection ? 'detail' : 'list');
   const [enterKey, setEnterKey] = React.useState(0);
   const pendingSelection = React.useRef(new Map<string, string>());
   const [pendingItem, setPendingItem] = React.useState<string | null>(null);
@@ -126,7 +127,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onClose, forceMobile
   }, [commit, slug]);
   const openItem = React.useCallback((page: string, item: string) => openPage(page, { item }), [openPage]);
 
-  const close = React.useCallback(() => { if (onClose) requestSettingsNavigation(onClose); }, [onClose]);
+  const close = React.useCallback((origin?: RecentPointer) => {
+    if (onClose) requestSettingsNavigation(() => onClose(origin));
+  }, [onClose]);
   const back = React.useCallback(() => {
     if (stage === 'page' && stackedCatalog && catalogStage === 'detail' && activeMeta?.kind === 'split') { setCatalogStage('list'); return; }
     if (stage === 'page' && stackedCatalog && catalogStage === 'detail' && rootRef.current?.querySelector('.sk-cat')) { setCatalogStage('list'); return; }
@@ -224,7 +227,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onClose, forceMobile
 
   /* Leaving the page stage on wide windows is not a thing; entering compact keeps the current page. */
   React.useEffect(() => { if (!compact) setStage('page'); }, [compact]);
-  React.useEffect(() => { setCatalogStage('list'); }, [runtimeEpoch]);
+  const previousRuntime = React.useRef(runtimeEpoch);
+  React.useEffect(() => {
+    if (previousRuntime.current !== runtimeEpoch) {
+      previousRuntime.current = runtimeEpoch;
+      setCatalogStage('list');
+    }
+  }, [runtimeEpoch]);
 
   const shellValue = React.useMemo<SettingsShellValue>(() => ({
     layout, catalogStage: stackedCatalog ? catalogStage : 'detail', setCatalogStage, openPage, closeSettings: onClose ? close : undefined,
@@ -254,7 +263,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onClose, forceMobile
   let resultIndex = -1;
   const nav = <nav className="sk-nav" aria-label={t('settings.shell.navigation')}>
     {phone ? <div className="sk-hstack" style={{ padding: '4px 10px 0' }}>
-      {onClose ? <Btn kind="ghost" icon="arrow-left-s" tip={t('settings.view.actions.closeSettings')} onClick={close} /> : null}
+      {onClose ? <Btn kind="ghost" icon="arrow-left-s" tip={t('settings.view.actions.closeSettings')} onClick={event => close(activationPoint(event))} /> : null}
     </div> : null}
     <span className="sk-nav-title">{t('settings.view.home.title')}</span>
     <div className="sk-search">

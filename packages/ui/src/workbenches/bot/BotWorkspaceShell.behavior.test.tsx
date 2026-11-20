@@ -4,7 +4,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { parseHTML } from 'linkedom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Run, ThreadSummary } from '@varin/protocol';
-import type { BotEntryResult } from '@varin/application-client';
+import { defaultBotAppearance, type BotEntryResult } from '@varin/application-client';
 import { BotWorkspaceShell } from './BotWorkspaceShell';
 import { useThreadStore } from '@/stores/useThreadStore';
 import { useUIStore } from '@/stores/useUIStore';
@@ -68,6 +68,7 @@ vi.mock('@/components/layout/ContextPanel', () => ({ ContextPanel: ({ layoutScop
 // own tests and must not create a real observation connection for this DOM.
 vi.mock('@/lib/varinEvents', () => ({ subscribeVarinEvents: () => () => {} }));
 vi.mock('@/components/thread/ThreadDraftConversation', () => ({ ThreadDraftConversation: ({ draftKey }: { draftKey: string }) => <div data-bot-draft={draftKey} /> }));
+vi.mock('@/components/dictation/ComposerDictation', () => ({ ComposerDictation: () => null }));
 vi.mock('@/components/thread/ThreadConversation', () => ({ ThreadConversation: ({ identity, readOnly, preferredModel, surface }: { identity: { threadId: string; branchId: string }; readOnly: boolean; preferredModel?: { providerId: string; modelId: string } | null; surface?: 'workbench' | 'bot' }) => { const openThreadContext = useOpenThreadContext(); return <div data-agent={identity.threadId} data-branch={identity.branchId} data-readonly={String(readOnly)} data-model={JSON.stringify(preferredModel)} data-surface={surface}><button onClick={() => openThreadContext({ runtime: 'agent', ...identity }, undefined, undefined, readOnly)}>Open context</button></div>; } }));
 vi.mock('@/stores/useDirectoryStore', () => ({ useDirectoryStore: { getState: () => ({ setDirectory: () => {} }) } }));
 vi.mock('@/lib/workbench/profile-context', () => ({ useWorkbenchProfileId: () => state.profileId }));
@@ -114,15 +115,13 @@ vi.mock('@/components/sections/bots/BotMenu', () => ({ BotMenu: ({ bot, onAction
   <button onClick={() => onAction('sleep')}>sleep-{bot.id}</button>
 </div> }));
 vi.mock('@/components/sections/bots/BotNameDialog', () => ({
-  BotNameDialog: ({ open, name, onNameChange, onSubmit }: {
-    open: boolean;
-    name: string;
-    onNameChange: (value: string) => void;
-    onSubmit: (event: React.FormEvent<HTMLFormElement>) => void;
-  }) => open ? <form onSubmit={onSubmit}>
+  BotNameDialog: ({ open, mode, name, onNameChange, onSubmit, submitLabel }: React.ComponentProps<typeof import('@/components/sections/bots/BotNameDialog').BotNameDialog>) => open ? <form onSubmit={event => {
+    event.preventDefault();
+    onSubmit(name.trim(), mode === 'create' ? defaultBotAppearance() : undefined);
+  }}>
     <input value={name} onChange={(event) => onNameChange(event.target.value)} />
     <button type="button" onClick={() => onNameChange('Named bot')}>set-name</button>
-    <button type="submit">settings.bots.save</button>
+    <button type="submit">{submitLabel}</button>
   </form> : null,
 }));
 vi.mock('@/components/ui/dialog', () => ({
@@ -183,6 +182,11 @@ describe('Bot workbench', () => {
     vi.stubGlobal('HTMLElement', window.HTMLElement);
     vi.stubGlobal('Element', window.Element);
     vi.stubGlobal('Node', window.Node);
+    vi.stubGlobal('MutationObserver', window.MutationObserver);
+    vi.stubGlobal('requestAnimationFrame', () => 1);
+    vi.stubGlobal('cancelAnimationFrame', () => {});
+    vi.stubGlobal('getComputedStyle', () => ({ lineHeight: '20px' }));
+    Object.assign(document, { getSelection: () => null, hasFocus: () => false });
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
     container = document.createElement('div');
     document.body.append(container);
@@ -212,7 +216,7 @@ describe('Bot workbench', () => {
     state.openWork.mockReset().mockResolvedValue(undefined);
     state.fork.mockReset(); state.copy.mockReset().mockResolvedValue({ ok: true });
     useThreadStore.setState({ selectedDraftKey: null, hostKey: 'host-a', selectedIdentity: { runtime: 'agent', threadId: 'ordinary', branchId: 'ordinary-main' }, threads: [], catalogError: null });
-    useUIStore.setState({ isSettingsDialogOpen: false, settingsPage: 'general', contextPanelByDirectory: {},
+    useUIStore.setState({ isSettingsDialogOpen: false, settingsPage: 'general', settingsCatalogSelection: null, contextPanelByDirectory: {},
       mainSurfaceSelectionRevision: 0, isScheduledTasksDialogOpen: false, scheduledTasksFocus: null,
       isArchivePageOpen: false, worktreesPageProjectId: null, isMultiRunLauncherOpen: false });
   });
@@ -224,14 +228,40 @@ describe('Bot workbench', () => {
   });
 
   it('opens a shared group separately from a Bot direct conversation', async () => {
-    const group = { id: 'release', name: 'Release', members: [{ botId: 'a', membership: 'first', name: 'Bot a', listening: true }],
+    const group = { id: 'release', name: 'Release', members: [{ botId: 'a', membership: 'first', name: 'Bot a', listening: false }],
       active: false, needsAttention: false, updatedAt: 1 };
     state.groupChat.mockImplementation(async (path: string) => path ? { ...group, posts: [] } : [group]);
     await render();
     await click('Release');
     expect(state.groupChat).toHaveBeenCalledWith('/release', undefined, expect.any(AbortSignal));
-    expect(container.querySelector('.group-chat-composer')).not.toBeNull();
+    const composer = container.querySelector('.group-chat-composer')!;
+    expect(composer.querySelector('[data-conversation-composer-input-frame] .cm-content')).not.toBeNull();
+    const panel = container.querySelector('[data-secondary] .bot-panel');
+    expect(panel?.getAttribute('data-open')).toBe('true');
+    expect(panel?.querySelector('[role="tab"][aria-label="Members"]')).not.toBeNull();
+    expect(container.querySelector('header[data-title="Release"] button[aria-label="Search group"]')).toBeNull();
+    await click('Close group panel');
+    expect(panel?.getAttribute('data-open')).toBe('false');
+    await click('Open group panel');
+    expect(panel?.getAttribute('data-open')).toBe('true');
+    await click('Search group');
+    expect(container.querySelector('input[aria-label="Search group"]')).not.toBeNull();
+    await click('Cancel');
+    const editor = EditorView.findFromDOM(composer.querySelector<HTMLElement>('.cm-content')!)!;
+    await act(async () => { editor.dispatch({ changes: { from: 0, insert: '@Bot' }, selection: { anchor: 4 }, userEvent: 'input.paste' }); });
+    expect(composer.querySelector('[role="listbox"]')).toBeNull();
+    expect(composer.querySelector('.cm-group-member')).toBeNull();
+    await act(async () => { composer.dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true })); });
+    expect(state.groupChat).toHaveBeenCalledWith('/release/post', expect.objectContaining({ text: '@Bot', addressed: [] }));
+    await click('@Bot a');
+    expect(composer.querySelector('.cm-group-member')?.textContent).toBe('@Bot a');
+    await act(async () => { composer.dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true })); });
+    expect(state.groupChat).toHaveBeenCalledWith('/release/post', expect.objectContaining({ text: '@Bot a', addressed: ['a'] }));
     expect(centre()).toBeNull();
+    await click('Schedule');
+    await click('tasksHub.title');
+    expect(useUIStore.getState().isScheduledTasksDialogOpen).toBe(true);
+    expect(useUIStore.getState().scheduledTasksConversation?.group).toMatchObject({ id: 'release' });
   });
 
   it('opens ordinary settings from the sidebar and preserves the last settings page', async () => {
@@ -377,7 +407,7 @@ describe('Bot workbench', () => {
     await click('settings.bots.create');
     await click('set-name');
     await act(async () => { document.querySelector('form')!.dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true })); });
-    expect(state.create).toHaveBeenCalledExactlyOnceWith({ name: 'Named bot' });
+    expect(state.create).toHaveBeenCalledExactlyOnceWith({ name: 'Named bot', appearance: defaultBotAppearance() });
     expect(useBotNavigation.getState().entry).toEqual(bot('new').entry);
   });
 
@@ -689,18 +719,19 @@ describe('Bot workbench', () => {
   it('opens the right-clicked Bot profile without switching the conversation', async () => {
     await render();
     await click('profile-b');
-    expect(container.querySelector('[data-details]')?.getAttribute('data-details')).toBe('b');
+    expect(useUIStore.getState()).toMatchObject({ isSettingsDialogOpen: true, settingsPage: 'harness-bots', settingsCatalogSelection: 'b' });
     expect(useBotNavigation.getState().entry).toEqual(bot('a').entry);
     expect(useThreadStore.getState().selectedIdentity?.threadId).toBe('ordinary');
   });
 
-  it('pushes the selected Bot’s profile over the tabs and returns to them', async () => {
+  it('opens the profile from the Bot panel and keeps the workbench state on return', async () => {
     await render();
-    await click('profile-a');
-    expect(container.querySelector('.bot-profile-page')).not.toBeNull();
-    expect(container.querySelector('[role="tab"][aria-selected="true"]')).toBeNull();
-    await click('bot.profile.back');
-    expect(container.querySelector('[role="tab"][aria-selected="true"]')?.id).toBe('bot-tab-overview');
+    await click('bot.tab.activity');
+    await click('bot.stage.editProfile');
+    expect(useUIStore.getState()).toMatchObject({ isSettingsDialogOpen: true, settingsPage: 'harness-bots', settingsCatalogSelection: 'a' });
+    await act(async () => useUIStore.getState().setSettingsDialogOpen(false));
+    expect(container.querySelector('[role="tab"][aria-selected="true"]')?.id).toBe('bot-tab-activity');
+    expect(centre()?.getAttribute('data-agent')).toBe('entry-a');
   });
 
   it('views a sleeping Bot read-only without waking it, and wakes it on request', async () => {
@@ -857,3 +888,4 @@ describe('Bot workbench', () => {
   });
 
 });
+import { EditorView } from '@codemirror/view';

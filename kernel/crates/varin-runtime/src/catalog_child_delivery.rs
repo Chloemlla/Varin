@@ -59,7 +59,9 @@ impl ChildReportPreparation {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         let snapshot = database.transaction()?;
-        let mut statement=snapshot.prepare("SELECT c.id FROM delegated_executions c JOIN runs r ON r.id=c.run_id WHERE json_extract(c.body,'$.report') IS NULL AND json_extract(r.body,'$.state') IN ('completed','failed','cancelled')")?;
+        let mut statement=snapshot.prepare("SELECT c.id FROM delegated_executions c JOIN runs r ON r.id=c.run_id
+            WHERE c.run_id IS NOT NULL AND json_extract(c.body,'$.report') IS NULL
+            AND json_extract(r.body,'$.state') IN ('completed','failed','cancelled')")?;
         for row in statement.query_map([], |row| row.get::<_, String>(0))? {
             let child = delegated::execution_task(&snapshot, &row?)?;
             let run: Run = record(
@@ -220,7 +222,7 @@ pub fn reconcile_reports(catalog: &std::sync::Mutex<Catalog>) -> Result<()> {
         let candidates = {
             let owner = lock()?;
             owner
-                .delegated_executions(None)?
+                .delegated_unknown_results()?
                 .into_iter()
                 .filter_map(|child| {
                     if let collaboration::ChildCodeResult::Published {
@@ -364,7 +366,7 @@ impl Catalog {
     pub fn capture_child_waits(&mut self) -> Result<Vec<ChildWaitPreparation>> {
         self.close_finished_parent_waits()?;
         let mut preparations = Vec::new();
-        for wait in read_all::<Wait>(&self.db, "waits")? {
+        for wait in observations::parked_waits(&self.db, "child-wait:")? {
             let Some(operation_id) = wait.id.strip_prefix("child-wait:") else {
                 continue;
             };
@@ -576,7 +578,10 @@ impl Catalog {
     }
     pub fn pending_child_continuations(&self) -> Result<Vec<String>> {
         // Delivered-but-not-launched work remains discoverable after a lost Host notification.
-        let mut statement=self.db.prepare("SELECT DISTINCT r.id FROM operations o JOIN runs r ON r.id=o.run_id JOIN run_launches l ON l.id=r.id WHERE json_extract(o.body,'$.executor') IN (?1,?2) AND json_extract(o.body,'$.phase')='terminal' AND json_extract(r.body,'$.state')='runnable' AND json_extract(r.body,'$.cancel_requested')=0 AND json_extract(l.body,'$.requires_rebind')=1 ORDER BY r.id")?;
+        let mut statement = self.db.prepare_cached("SELECT r.id FROM runs r INDEXED BY bot_inactivity_runs JOIN run_launches l ON l.id=r.id
+            WHERE json_extract(r.body,'$.state')='runnable' AND json_extract(r.body,'$.cancel_requested')=0 AND json_extract(l.body,'$.requires_rebind')=1
+            AND EXISTS(SELECT 1 FROM operations o WHERE o.run_id=r.id AND json_extract(o.body,'$.executor') IN (?1,?2) AND json_extract(o.body,'$.phase')='terminal')
+            ORDER BY r.id")?;
         let rows = statement
             .query_map([WAIT_TOOL,super::retrieval::CONTROL_TOOL], |row| row.get(0))?
             .collect::<std::result::Result<Vec<String>, _>>()?;
