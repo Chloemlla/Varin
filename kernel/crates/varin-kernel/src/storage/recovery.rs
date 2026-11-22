@@ -1545,6 +1545,46 @@ impl Storage {
         )
     }
 
+    pub(super) fn recovery_branch_operations(&self, input: &Value, grant_id: &str) -> Result<Value, KernelError> {
+        let workspace = self.recovery_workspace(input, grant_id)?;
+        let grant = self.load_grant(grant_id)?;
+        if workspace != format!("recovery-coordinator:{}", grant.host_id) || grant.run_id.is_some() || grant.thread_id.is_some() {
+            return Err(KernelError::Authorization("branch recovery summaries require the Host coordinator".into()));
+        }
+        // Return just the list fields. The editor draft, before-images and file
+        // targets belong to an individual operation and can be large.
+        let mut query = self.conn.prepare(
+            "WITH matching AS (
+               SELECT o.*, coalesce(result_json -> '$.plan', data_json -> '$.plan') AS plan,
+                 coalesce(result_json, data_json) AS current
+               FROM recovery_operations o WHERE kind='combined' AND thread_id=?1
+                 AND json_extract(data_json,'$.plan.conversation.branchId')=?2
+                 AND json_extract(data_json,'$.fileParticipant') IS NULL
+             )
+             SELECT json_object('id',operation_id,'workspaceId',workspace_id,'state',state,
+               'entryId',plan ->> '$.entryId', 'revision',plan ->> '$.revision',
+               'conversation',json(plan -> '$.conversation'), 'expectedLeafId',plan ->> '$.expectedLeafId',
+               'targetLeafId',plan ->> '$.targetLeafId', 'undoOf',plan ->> '$.undoOf',
+               'affectedPathCount',json_array_length(plan,'$.affectedPaths'),
+               'appliedPathCount',(SELECT count(*) FROM (
+                  SELECT value FROM json_each(current,'$.appliedPaths')
+                  UNION SELECT path FROM recovery_operation_files f WHERE f.workspace_id=m.workspace_id
+                    AND f.operation_id=m.operation_id AND phase IN ('target-observed','compensate-intent'))),
+               'conversationState',current ->> '$.conversationState','fileState',current ->> '$.fileState',
+               'navigationMarkerId',current ->> '$.navigationMarkerId','failure',json(current -> '$.failure'),
+               'createdAt',current ->> '$.createdAt','updatedAt',current ->> '$.updatedAt')
+             FROM matching m ORDER BY created_at DESC, operation_id")?;
+        let mut operations = Vec::new();
+        let mut rows = query.query(params![input["threadId"].as_str(), input["branchId"].as_str()])?;
+        while let Some(row) = rows.next()? {
+            let mut op: Value = serde_json::from_str(&row.get::<_, String>(0)?)?;
+            for name in ["failure", "undoOf", "navigationMarkerId"] {
+                if op[name].is_null() { op.as_object_mut().unwrap().remove(name); }
+            }
+            operations.push(op);
+        }
+        Ok(Value::Array(operations))
+    }
     pub(super) fn recovery_operation_list(
         &self,
         params_value: &Value,
@@ -1566,38 +1606,27 @@ impl Storage {
             ));
         }
         let kind = params_value.get("kind").and_then(Value::as_str);
-        let (sql, values) = if let Some(kind) = kind {
-            (
-                "SELECT operation_id, kind, state, data_json, revision, session_id, thread_id, run_id, created_at, updated_at FROM recovery_operations WHERE workspace_id = ?1 AND kind = ?2 ORDER BY updated_at DESC, rowid DESC LIMIT ?3 OFFSET ?4",
-                vec![
-                    Value::String(workspace_id.clone()),
-                    Value::String(kind.to_string()),
-                    Value::from(page_size + 1),
-                    Value::from(cursor),
-                ],
-            )
-        } else {
-            (
-                "SELECT operation_id, kind, state, data_json, revision, session_id, thread_id, run_id, created_at, updated_at FROM recovery_operations WHERE workspace_id = ?1 ORDER BY updated_at DESC, rowid DESC LIMIT ?2 OFFSET ?3",
-                vec![
-                    Value::String(workspace_id.clone()),
-                    Value::from(page_size + 1),
-                    Value::from(cursor),
-                ],
-            )
-        };
-        let mut statement = self.conn.prepare(sql)?;
-        let mut rows = if kind.is_some() {
-            statement.query(params![workspace_id, kind.unwrap_or(""), page_size, cursor])?
-        } else {
-            statement.query(params![workspace_id, page_size, cursor])?
+        let columns = "SELECT operation_id,kind,state,data_json,revision,session_id,thread_id,run_id,created_at,updated_at FROM recovery_operations WHERE workspace_id=?1";
+        let filter = if kind.is_some() { " AND kind=?4" } else { "" };
+        let resumable = if params_value["resumableOnly"] == true {
+            if kind != Some("combined") { return Err(KernelError::Operation("resumable lookup requires combined recovery".into())); }
+            " AND state NOT IN ('complete','aborted','compensated','needs-attention')
+              AND json_extract(data_json,'$.fileParticipant') IS NULL
+              AND (state != 'planned' OR json_extract(coalesce(result_json,data_json),'$.cancelRequested')=1
+                   OR json_extract(coalesce(result_json,data_json),'$.managedPreparation') IS NOT NULL)"
+        } else { "" };
+        let sql = format!("{columns}{filter}{resumable} ORDER BY updated_at DESC,rowid DESC LIMIT ?2 OFFSET ?3");
+        let mut statement = self.conn.prepare(&sql)?;
+        let limit = page_size.saturating_add(1);
+        let mut rows = match kind {
+            Some(kind) => statement.query(params![workspace_id, limit, cursor, kind])?,
+            None => statement.query(params![workspace_id, limit, cursor])?,
         };
         let mut operations = Vec::new();
         while let Some(row) = rows.next()? {
             let operation_id: String = row.get(0)?;
             operations.push(json!({"operationId": operation_id, "workspaceId": workspace_id, "kind": row.get::<_, String>(1)?, "state": row.get::<_, String>(2)?, "data": serde_json::from_str::<Value>(&row.get::<_, String>(3)?)?, "revision": row.get::<_, i64>(4)?, "sessionId": row.get::<_, Option<String>>(5)?, "threadId": row.get::<_, Option<String>>(6)?, "runId": row.get::<_, Option<String>>(7)?, "createdAt": row.get::<_, String>(8)?, "updatedAt": row.get::<_, String>(9)?}));
         }
-        let _ = values;
         let has_more = operations.len() as i64 > page_size;
         operations.truncate(page_size as usize);
         Ok(

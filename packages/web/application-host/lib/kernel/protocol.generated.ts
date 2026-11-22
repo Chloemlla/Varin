@@ -3,6 +3,8 @@
  * Do not hand-edit the wire shapes; run `node scripts/generate-kernel-protocol.mjs`.
  */
 
+import type { ThinkingLevel } from '@varin/protocol';
+
 export const KERNEL_PROTOCOL_VERSION = 96 as const;
 export const KERNEL_REQUEST_WINDOW = 256 as const;
 export const KERNEL_STREAM_CREDITS = 4 as const;
@@ -358,6 +360,7 @@ export type KernelMethod =
   | "storage.record.put"
   | "storage.record.get"
   | "storage.experiment.artifacts"
+  | "storage.experiment.recovery"
   | "storage.experiment.logChunks"
   | "storage.record.list"
   | "storage.record.workspaces"
@@ -426,6 +429,7 @@ export type KernelMethod =
   | "recovery.operation.file.cas"
   | "recovery.operation.complete"
   | "recovery.operation.list"
+  | "recovery.operation.branch"
   | "recovery.operation.release"
   | "operation.get"
   | "operation.release"
@@ -976,7 +980,7 @@ export interface DriverBinding {reference:string;artifact:DriverArtifact}
 
 export interface DriverModelInput {id:string;capabilityId:string|null;history:ModelConversationItem[];instructions:string[];tools:string[]}
 
-export interface DriverModelFailure {code:string;message:string;tool_name?:string|null;retry_after_ms:number|null;provider_request_id:string|null}
+export interface DriverModelFailure {code:string;message:string;tool_name?:string|null;transport_cause?:string;retry_after_ms:number|null;provider_request_id:string|null}
 
 export interface DriverModelItem {id:string;content:ModelContent;opaque:ModelOpaqueItem|null}
 
@@ -2551,6 +2555,10 @@ export interface KernelExperimentArtifactsParams {
   pageSize?: number;
 }
 
+export interface KernelExperimentRecoveryParams {
+  workspaceId?: string;
+}
+
 export interface KernelExperimentArtifactsResult {
   records: KernelRecordResult[];
   nextCursor: string | null;
@@ -3148,6 +3156,13 @@ export interface RecoveryRangeTurn {
   settled: boolean;
 }
 
+export interface RecoveryRangeParams {
+  threadId: string;
+  branchId: string;
+  entryId: string;
+  expectedHeadId?: string;
+}
+
 export interface NavigationSelectParams {
   threadId: string;
   branchId: string;
@@ -3174,7 +3189,7 @@ export interface NavigationSelection {
   expectedHeadId: string | null;
   targetHeadId: string | null;
   removedEntryIds: string[];
-  editorText?: string;
+  editorEntry?: HistoryReference;
 }
 
 export interface NavigationReceipt {
@@ -3300,7 +3315,9 @@ export interface ThreadTitlePrepareParams { threadId: string; branchId: string; 
 
 export interface ThreadTitleFinishParams { job: ThreadTitleJob; title: string | null; }
 
-export interface ThreadMetadataUpdateParams { threadId: string; key: string; expectedRevision: number; title?: string; pinned?: boolean; archived?: boolean; titleMode?: 'automatic' | 'manual'; }
+export interface ThreadModelPreference { providerId: string; modelId: string; thinkingLevel?: ThinkingLevel; temperature?: number }
+
+export interface ThreadMetadataUpdateParams { threadId: string; key: string; expectedRevision: number; title?: string; pinned?: boolean; archived?: boolean; titleMode?: 'automatic' | 'manual'; model?: ThreadModelPreference; }
 
 export interface ThreadDeleteParams { threadId: string; key: string; expectedRevision: number; }
 
@@ -3309,6 +3326,7 @@ export interface BranchDeleteParams { threadId: string; branchId: string; key: s
 export interface ThreadReadPositionParams { threadId: string; key: string; throughCursor: number; }
 
 export interface ThreadSummary {
+  model_preference?: ThreadModelPreference;
   creation_identity_known?: boolean;
   principal_id?: string | null;
   agent_code?: string;
@@ -5945,8 +5963,15 @@ export interface KernelRecoveryOperationGetParams {
   workspaceId: string;
 }
 
+export interface KernelBranchRecoveryParams {
+  workspaceId: string;
+  threadId: string;
+  branchId: string;
+}
+
 export interface KernelRecoveryOperationListParams {
   workspaceId: string;
+  resumableOnly?: boolean;
   kind?: string;
   cursor?: number;
   pageSize?: number;
@@ -7766,7 +7791,7 @@ export type KernelMethodParams = {
   "runtime.followup.occurrence": FollowupOccurrenceGetParams;
   "runtime.followup.update": FollowupUpdateParams;
   "runtime.followup.control": FollowupControlParams;
-  "runtime.branch.recovery.range": NavigationSelectParams;
+  "runtime.branch.recovery.range": RecoveryRangeParams;
   "runtime.run.recovery": RunParams;
   "runtime.recovery.labels": RecoveryLabelsParams;
   "runtime.branch.navigation.prepare": NavigationSelectParams;
@@ -7934,6 +7959,7 @@ export type KernelMethodParams = {
   "storage.record.get": KernelRecordGetParams;
   "storage.record.list": KernelRecordListParams;
   "storage.experiment.artifacts": KernelExperimentArtifactsParams;
+  "storage.experiment.recovery": KernelExperimentRecoveryParams;
   "storage.experiment.logChunks": KernelExperimentLogChunksParams;
   "storage.record.workspaces": KernelRecordWorkspacesParams;
   "storage.record.release": KernelRecordReleaseParams;
@@ -8002,6 +8028,7 @@ export type KernelMethodParams = {
   "recovery.operation.complete": KernelRecoveryOperationCompleteParams;
   "recovery.operation.conflicts": KernelRecoveryOperationConflictsParams;
   "recovery.operation.list": KernelRecoveryOperationListParams;
+  "recovery.operation.branch": KernelBranchRecoveryParams;
   "recovery.operation.release": KernelRecoveryOperationReleaseParams;
   "operation.get": KernelOperationGetParams;
   "operation.release": KernelOperationReleaseParams;
@@ -9658,7 +9685,7 @@ export type KernelRequest =
       kind: "request";
       id: string;
       method: "runtime.branch.recovery.range";
-      params: NavigationSelectParams;
+      params: RecoveryRangeParams;
       epoch?: string;
       grantId?: string;
     }
@@ -11169,6 +11196,15 @@ export type KernelRequest =
       v: typeof KERNEL_PROTOCOL_VERSION;
       kind: "request";
       id: string;
+      method: "storage.experiment.recovery";
+      params: KernelExperimentRecoveryParams;
+      epoch?: string;
+      grantId?: string;
+    }
+  | {
+      v: typeof KERNEL_PROTOCOL_VERSION;
+      kind: "request";
+      id: string;
       method: "storage.experiment.logChunks";
       params: KernelExperimentLogChunksParams;
       epoch?: string;
@@ -11774,6 +11810,15 @@ export type KernelRequest =
       id: string;
       method: "recovery.operation.list";
       params: KernelRecoveryOperationListParams;
+      epoch?: string;
+      grantId?: string;
+    }
+  | {
+      v: typeof KERNEL_PROTOCOL_VERSION;
+      kind: "request";
+      id: string;
+      method: "recovery.operation.branch";
+      params: KernelBranchRecoveryParams;
       epoch?: string;
       grantId?: string;
     }

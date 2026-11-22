@@ -358,6 +358,8 @@ const applyRead = (record: DocumentRecord, result: VarinDocumentReadResult): Doc
   };
 };
 
+type OpenRead = { revalidate: boolean; usingBuffer: boolean };
+
 type TextHistoryEntry = {
   beforeState: number;
   afterState: number;
@@ -381,7 +383,7 @@ export class DocumentRegistry {
   private readonly pendingSaves = new Map<string, { request: VarinDocumentWriteRequest; record: DocumentRecord }>();
   private readonly savingEdits = new Map<string, { base: string; buffer: string; edits: VarinTextEdit[]; states: Map<number, VarinTextEdit[]> }>();
   private readonly records = new Map<string, DocumentRecord>();
-  private readonly openOperations = new Map<string, Promise<DocumentRecord>>();
+  private readonly openOperations = new Map<string, { promise: Promise<DocumentRecord>; read: OpenRead }>();
   private readonly listeners = new Map<string, Set<DocumentListener>>();
   private readonly coordinationByAlias = new Map<string, string>();
   private readonly aliasesByCoordination = new Map<string, Map<string, DocumentIdentity>>();
@@ -707,24 +709,30 @@ export class DocumentRegistry {
     return true;
   }
 
-  open(identity: DocumentIdentity, options?: { reload?: boolean }): Promise<DocumentRecord> {
+  open(identity: DocumentIdentity, options?: { reload?: boolean; revalidate?: boolean }): Promise<DocumentRecord> {
     return this.resolveIdentity(identity).then((resolved) => {
       const key = this.keyFor(resolved);
       if (!options?.reload) {
         const pending = this.openOperations.get(key);
-        if (pending) return pending;
+        // A view may join a disk read or upgrade an undecided model acquisition.
+        // Once that acquisition has chosen the buffer it cannot satisfy a reopen.
+        if (pending && !(options?.revalidate && pending.read.usingBuffer)) {
+          if (options?.revalidate) pending.read.revalidate = true;
+          return pending.promise;
+        }
       }
-      const operation = this.performOpen(resolved, options);
-      if (options?.reload) return operation;
-      this.openOperations.set(key, operation);
+      const read = { revalidate: options?.revalidate === true, usingBuffer: false };
+      const currentRead = () => this.openOperations.get(key)?.read === read;
+      const operation = this.performOpen(resolved, read, options?.reload === true, currentRead);
+      this.openOperations.set(key, { promise: operation, read });
       void operation.finally(() => {
-        if (this.openOperations.get(key) === operation) this.openOperations.delete(key);
+        if (currentRead()) this.openOperations.delete(key);
       }).catch(() => undefined);
       return operation;
     });
   }
 
-  private async performOpen(identity: DocumentIdentity, options?: { reload?: boolean }): Promise<DocumentRecord> {
+  private async performOpen(identity: DocumentIdentity, read: OpenRead, reload: boolean, currentRead: () => boolean): Promise<DocumentRecord> {
     this.assertActive();
     while (this.isDirtyBarrierHeld(identity)) {
       await Promise.all([...this.dirtyBarriers.values()].filter(barrier => barrier.active
@@ -737,16 +745,18 @@ export class DocumentRegistry {
     // Retention can cross a Host request. Publish loading from the current
     // buffer, never from a snapshot taken before the editor could change it.
     const existing = this.records.get(key);
-    if (this.disposed || generation !== this.getGeneration()) {
+    if (this.disposed || generation !== this.getGeneration() || !currentRead()) {
       return existing ?? emptyRecord(identity, generation, this.createDocumentInstanceId());
     }
     if (
-      !options?.reload
+      !reload
       && existing
+      && (!read.revalidate || existing.dirty || existing.saving || this.pendingSaves.has(existing.documentInstanceId))
       && existing.connectionGeneration === generation
       && existing.status !== 'unloaded'
       && existing.status !== 'loading'
     ) {
+      read.usingBuffer = true;
       this.ensureWatch(identity.workspaceId);
       if (!existing.dirty) await this.restoreJournalIfNeeded(existing);
       return this.records.get(key) ?? existing;
@@ -758,13 +768,14 @@ export class DocumentRegistry {
       connectionGeneration: generation,
       // A controlled deletion is a recoverable document state, not a fresh
       // missing-file open. Keep its tombstone while checking disk again.
-      status: existing?.status === 'deleted' && existing.baseRevision === null ? 'deleted' : 'loading',
+      status: read.revalidate && existing?.status === 'ready' ? 'ready'
+        : existing?.status === 'deleted' && existing.baseRevision === null ? 'deleted' : 'loading',
     };
     this.commit(loading);
     this.ensureWatch(identity.workspaceId);
     try {
       const result = await this.documents.read(identity);
-      if (this.disposed || generation !== this.getGeneration()) return loading;
+      if (this.disposed || generation !== this.getGeneration() || !currentRead()) return this.records.get(key) ?? loading;
       const current = this.records.get(key) ?? loading;
       if (current.localEditRevision !== capturedEdit) {
         const next = applyRead({ ...current, dirty: true }, result);
@@ -782,7 +793,7 @@ export class DocumentRegistry {
       await this.restoreJournalIfNeeded(this.records.get(key) ?? next);
       return this.records.get(key) ?? next;
     } catch (error) {
-      if (this.disposed || generation !== this.getGeneration()) return loading;
+      if (this.disposed || generation !== this.getGeneration() || !currentRead()) return this.records.get(key) ?? loading;
       const current = this.records.get(key) ?? loading;
       if (current.dirty) {
         this.commit({
@@ -1713,20 +1724,23 @@ export class DocumentRegistry {
     });
   }
 
+  private releaseDirtyBarrier(barrier: DirtyBarrierHold): void {
+    if (!barrier.active) return;
+    barrier.active = false;
+    barrier.release();
+    this.dirtyBarriers.delete(barrier.barrierId);
+    for (const move of this.deferredResourceMoves.splice(0)) this.handleWatchEvent(move, move.from.workspaceId);
+    for (const [key, identity] of this.deferredWatchReloads) {
+      if (this.isDirtyBarrierHeld(identity)) continue;
+      this.deferredWatchReloads.delete(key);
+      void this.open(identity, { reload: true }).catch(error => this.reportJournalFailure(error));
+    }
+  }
+
   private async handleDirtyStateBarrier(event: VarinDirtyStateBarrierEvent): Promise<void> {
     const existing = this.dirtyBarriers.get(event.barrierId);
     if (event.action === 'release') {
-      if (existing) {
-        existing.active = false;
-        existing.release();
-        this.dirtyBarriers.delete(event.barrierId);
-        for (const move of this.deferredResourceMoves.splice(0)) this.handleWatchEvent(move, move.from.workspaceId);
-        for (const [key, identity] of this.deferredWatchReloads) {
-          if (this.isDirtyBarrierHeld(identity)) continue;
-          this.deferredWatchReloads.delete(key);
-          void this.open(identity, { reload: true }).catch(error => this.reportJournalFailure(error));
-        }
-      }
+      if (existing) this.releaseDirtyBarrier(existing);
       return;
     }
     if (existing?.active) return;
@@ -1763,15 +1777,9 @@ export class DocumentRegistry {
         ownerId: this.dirtyOwnerId,
         workspaceId: event.workspaceId,
       });
-      if (!result?.acknowledged) {
-        barrier.active = false;
-        barrier.release();
-        this.dirtyBarriers.delete(event.barrierId);
-      }
+      if (!result?.acknowledged) this.releaseDirtyBarrier(barrier);
     } catch (error) {
-      barrier.active = false;
-      barrier.release();
-      this.dirtyBarriers.delete(event.barrierId);
+      this.releaseDirtyBarrier(barrier);
       this.reportJournalFailure(error);
     }
   }
@@ -1785,7 +1793,7 @@ export class DocumentRegistry {
       for (const record of this.records.values()) {
         if (this.aliasesFor(record.identity).some(alias => alias.workspaceId === event.resource.workspaceId
           && (alias.resourceId === event.resource.resourceId || alias.resourceId.startsWith(`${event.resource.resourceId}/`)))) {
-          if (this.deferWatchReload(record) || record.status === 'loading' || record.saving || this.pendingSaves.has(record.documentInstanceId)) continue;
+          if (this.deferWatchReload(record) || record.saving || this.pendingSaves.has(record.documentInstanceId)) continue;
           void this.open(record.identity, { reload: true }).catch(error => this.reportJournalFailure(error));
         }
       }

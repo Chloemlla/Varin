@@ -159,7 +159,7 @@ mod tests {
         }).unwrap();
         db.update_thread(&threads::ThreadUpdate { thread_id:"queued-ui".into(), key:"archive-ui".into(),
             expected_revision:db.inspect_thread("queued-ui").unwrap()["revision"].as_u64().unwrap(),
-            title:None,pinned:None,archived:Some(true),title_mode:None }).unwrap();
+            title:None,pinned:None,archived:Some(true),title_mode:None, model: None }).unwrap();
         let refs = db.capture_material_retention(None, &[], true).unwrap().load().unwrap().ui_references.unwrap();
         assert!(refs.contains(&"ui-selection:queued".into()));
         assert!(refs.contains(&"ui:queued@1".into()));

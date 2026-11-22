@@ -267,6 +267,7 @@ struct Provider {
 enum Mode {
     ToolThenAnswer,
     RecoverToolThenAnswer,
+    CorrectUndeclared,
     CancelPrepared,
     PartialFailure,
 }
@@ -285,14 +286,20 @@ impl ModelProvider for Provider {
     ) -> Result<FinishReason, ModelFailure> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         let send = |emit: &mut dyn FnMut(ProviderEvent) -> Result<(), ExecutionError>, event| {
-            emit(event).map_err(|e| ModelFailure {
-                tool_name: None,
-                code: e.code,
-                message: e.message,
-                retry_after_ms: None,
-                provider_request_id: None,
-            })
+            emit(event).map_err(|e| ModelFailure::new(e.code, e.message))
         };
+        if matches!(self.mode, Mode::CorrectUndeclared) {
+            if call == 0 {
+                return Err(crate::tool_disclosure::model_tool_for(
+                    &request.view.binding.tools, request.view.binding.direct_tools.as_deref(), "read"
+                ).unwrap_err().into());
+            }
+            assert!(request.view.history.iter().any(|item| matches!(&item.content,
+                Content::Text { text } if text.contains("tool_invoke") && text.contains("read"))));
+            send(emit, ProviderEvent::ItemCompleted { item: ProviderItem { id: "answer".into(),
+                content: Content::Text { text: "corrected".into() }, opaque: None } })?;
+            return Ok(FinishReason::Stop);
+        }
         if matches!(self.mode, Mode::PartialFailure) {
             send(
                 emit,
@@ -306,6 +313,7 @@ impl ModelProvider for Provider {
                 code: "stream_lost".into(),
                 message: "connection lost".into(),
                 retry_after_ms: None,
+                transport_cause: None,
                 provider_request_id: Some("remote-request".into()),
             });
         }
@@ -602,6 +610,20 @@ fn interrupted_partial_tool_arguments_never_execute_and_remain_nonzero_unknown_u
 }
 
 #[test]
+fn undeclared_tool_feedback_continues_without_executing_rejected_calls() {
+    let fixture = Fixture::new();
+    let db = fixture.catalog();
+    let mut input = input(&db);
+    input.binding.tools.extend(crate::tool_disclosure::schemas());
+    input.binding.direct_tools = Some(vec!["tool_describe".into(), "tool_invoke".into()]);
+    let cancel = CancellationToken::default();
+    let engine = engine(db, Mode::CorrectUndeclared, cancel.clone(), ProgressSink::default());
+    assert_eq!(engine.run(input, cancel).unwrap().state, RunState::Completed);
+    assert_eq!(engine.provider.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(engine.tools.calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn model_retry_keeps_partial_attempt_and_never_replays_completed_tools() {
     struct RetryProvider { inner: Provider, calls: AtomicUsize, failed_body: Mutex<Option<Vec<u8>>> }
     impl ModelProvider for RetryProvider {
@@ -620,7 +642,7 @@ fn model_retry_keeps_partial_attempt_and_never_replays_completed_tools() {
                 emit(ProviderEvent::Usage { receipt: UsageReceipt { measurement:UsageMeasurement::Actual,
                     input_tokens:Some(7), output_tokens:Some(2), ..Default::default() } }).unwrap();
                 return Err(ModelFailure { tool_name: None, code:"stream_interrupted".into(), message:"lost stream".into(),
-                    retry_after_ms:None, provider_request_id:Some("failed-provider-request".into()) });
+                    retry_after_ms:None, transport_cause: None, provider_request_id:Some("failed-provider-request".into()) });
             }
             if attempt == 2 {
                 assert_eq!(request.serialized.wire_bytes().as_ref(), self.failed_body.lock().unwrap().as_ref().unwrap().as_slice());
@@ -674,13 +696,7 @@ fn supervisor_control_reaches_provider_while_catalog_is_locked() {
                 .unwrap()
                 .block_on(cancel.cancelled());
             self.stopped.send(()).unwrap();
-            Err(ModelFailure {
-                tool_name: None,
-                code: "cancelled".into(),
-                message: "provider observed cancellation".into(),
-                retry_after_ms: None,
-                provider_request_id: None,
-            })
+            Err(ModelFailure::new("cancelled", "provider observed cancellation"))
         }
     }
     let f = Fixture::new();
@@ -2932,7 +2948,7 @@ fn generation_phase_tracks_actual_callbacks_and_clears_every_provider_exit() {
             emit(ProviderEvent::ReasoningDelta { item_id: "r2".into(), text: "more".into() })?;
             match self.ending {
                 0 => Ok(FinishReason::Stop),
-                1 => Err(ModelFailure { code: "transport_error".into(), message: "fixture".into(), tool_name: None, retry_after_ms: None, provider_request_id: None }),
+                1 => Err(ModelFailure { code: "transport_error".into(), message: "fixture".into(), tool_name: None, retry_after_ms: None, transport_cause: None, provider_request_id: None }),
                 2 => { cancel.cancel(); emit(ProviderEvent::TextDelta { item_id: "late".into(), text: "must not publish".into() })?; unreachable!() },
                 _ => panic!("provider fixture panic"),
             }

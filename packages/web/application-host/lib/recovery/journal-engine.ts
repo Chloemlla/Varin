@@ -145,7 +145,7 @@ export interface RecoveryDurableOperationPort {
   updateOperationFile(input: { operationId: string; workspaceId: string; path: string; expectedRevision: number; expectedPhase: string; phase: string; observedFingerprint?: string; expected?: RecoveryState; target?: RecoveryState; safety?: RecoveryState; threadId?: string }): Promise<Record<string, unknown>>;
   completeOperation(input: { operationId: string; workspaceId: string; expectedRevision: number; state: string; result?: Record<string, unknown>; failure?: Record<string, unknown>; threadId?: string }): Promise<Record<string, unknown>>;
   getOperation(workspaceId: string, operationId: string, signal?: AbortSignal): Promise<Record<string, unknown> | null>;
-  listOperations(workspaceId: string, kind?: string, signal?: AbortSignal): Promise<Record<string, unknown>[]>;
+  listOperations(workspaceId: string, kind?: string, signal?: AbortSignal, options?: { resumableOnly: true }): Promise<Record<string, unknown>[]>;
   /** Original journal reservations across physical root aliases, restricted to the admitted target. */
   listOperationConflicts(input: RecoveryOperationConflictQuery): Promise<RecoveryOperationConflict[]>;
   releaseOperation(workspaceId: string, operationId: string): Promise<Record<string, unknown>>;
@@ -205,7 +205,7 @@ export interface WorkspaceRecoveryEngine extends RecoveryFileParticipantEngine {
   listCheckpoints(input: WorkspaceRecoveryCheckpointQuery): Promise<WorkspaceRecoveryCheckpointListResult>;
   listCombinedOperations(workspaceId: string, signal?: AbortSignal): Promise<WorkspaceCombinedRecoveryListResult>;
   listStorageWorkspaces(): Promise<RecoveryStorageWorkspaceListResult>;
-  prepareCombinedRecovery(input: WorkspaceCombinedRecoveryPrepareInput): Promise<WorkspaceCombinedRecoveryPrepareResult>;
+  prepareCombinedRecovery(input: WorkspaceCombinedRecoveryPrepareInput, navigation?: NavigationPrepared): Promise<WorkspaceCombinedRecoveryPrepareResult>;
   prepareCombinedUndo(operationId: string): Promise<WorkspaceCombinedRecoveryPrepareResult>;
   recordMutationAfter(input: WorkspaceRecoveryMutationAfterInput): Promise<WorkspaceRecoveryMutationResult>;
   recordMutationBefore(input: WorkspaceRecoveryMutationBeforeInput): Promise<WorkspaceRecoveryMutationResult>;
@@ -845,8 +845,8 @@ export const createWorkspaceRecoveryEngine = (options: CreateWorkspaceRecoveryEn
     draft.uncoveredReasons = [...new Set(draft.uncoveredReasons)].sort();
     return { ...draft, revision: revisionOf(draft) };
   };
-  const prepareCombined = async (input: WorkspaceCombinedRecoveryPrepareInput, participantInput?: RecoveryFileParticipantPrepare): Promise<WorkspaceCombinedRecoveryPlan> => {
-    const navigation: NavigationPrepared = participantInput ? { ...participantInput.navigation, journalTurns: participantInput.journalTurns } : await sessionNavigation.prepare(input);
+  const prepareCombined = async (input: WorkspaceCombinedRecoveryPrepareInput, participantInput?: RecoveryFileParticipantPrepare, selected?: NavigationPrepared): Promise<WorkspaceCombinedRecoveryPlan> => {
+    const navigation: NavigationPrepared = participantInput ? { ...participantInput.navigation, journalTurns: participantInput.journalTurns } : selected ?? await sessionNavigation.prepare(input);
     if (navigation.managedTurns?.length) {
       if (!options.coordinatorWorkspaceId) throw new RecoveryPrimitiveError('unavailable', 'Managed recovery has no original Host metadata coordinator', { origin: 'storage' });
       input = { ...input, workspaceId: options.coordinatorWorkspaceId };
@@ -1072,6 +1072,70 @@ export const createWorkspaceRecoveryEngine = (options: CreateWorkspaceRecoveryEn
     if (committed.editorText !== undefined) record.editorText = committed.editorText;
     record.navigationMarkerId = committed.markerId ?? committed.navigationMarkerId ?? null;
   };
+  const restoreFiles = async (record: CombinedOperationRecord, identity: RecoveryIdentity, barrier: TargetBarrierHandle): Promise<void> => {
+    for (const row of rowsFor(await getOperation(identity.workspaceId, record.id))) {
+      if (row.phase !== 'apply-intent' && row.phase !== 'target-observed') {
+        throw new RecoveryPrimitiveError('needs-attention', `Unresolved file recovery phase for ${row.path}: ${row.phase}`, { origin: 'storage' });
+      }
+      await barrier.settle();
+      await gateTarget(identity, record.targets, row.path).run([{ resourceId: row.path, scope: "subtree" }], async () => {
+        await checkCancellation(record);
+        const current = (await captureTarget(identity, record.targets, row.path, false)).state;
+        const target = targetFor(record, row.path).target;
+        if (!sameState(current, target)) {
+          if (row.phase === 'target-observed' || !sameState(current, safetyFor(record, row.path))) {
+            await transitionFile(record, row.path, 'needs-attention');
+            throw new RecoveryPrimitiveError('stale-plan', `File changed after safety capture: ${row.path}`, { details: { paths: [row.path] }, origin: 'conflict', retryable: true });
+          }
+          await applyTarget(identity, record.targets, row.path, target);
+          const verified = (await captureTarget(identity, record.targets, row.path, false)).state;
+          if (!sameState(verified, target)) {
+            await transitionFile(record, row.path, 'needs-attention');
+            throw new RecoveryPrimitiveError('needs-attention', `Restored file did not match its checkpoint: ${row.path}`, { origin: 'storage' });
+          }
+        }
+        if (row.phase === 'target-observed') {
+          if (record.safety[row.path]?.surfaces?.some(surface => surface.phase !== 'applied')) {
+            throw new RecoveryPrimitiveError('needs-attention', `Editor recovery remains unconfirmed for ${row.path}`, { origin: 'storage' });
+          }
+          return;
+        }
+        if (!record.appliedPaths.includes(row.path)) record.appliedPaths.push(row.path);
+        for (const surface of record.safety[row.path]?.surfaces ?? []) {
+          await surfaceRecovery.replace(identity, record.id, barrier.barrierFor(surface.workspaceId), surface,
+            'apply', () => saveSurfaceSafety(record, row.path));
+        }
+        await transitionFile(record, row.path, "target-observed");
+      });
+    }
+    await applyManaged(record);
+    await checkCancellation(record);
+    if (record.state === 'files-restored') return;
+    record.fileState = record.plan.affectedPaths.length > 0 ? "restored" : "unchanged";
+    record.state = "files-restored";
+    await persist(record);
+  };
+  const finishNavigation = async (record: CombinedOperationRecord, identity: RecoveryIdentity, barrier: TargetBarrierHandle): Promise<void> => {
+    if (record.state === 'files-restored') {
+      record.state = 'navigating-conversation';
+      await persist(record);
+    }
+    try {
+      await navigate(record);
+    } catch (error) {
+      record.failure = recoveryFailure(error, 'navigation-conflict');
+      if (error instanceof RecoveryPrimitiveError && error.code === 'navigation-conflict' && !error.retryable) {
+        await compensate(record, identity, identity.canonicalRoot, barrier);
+        throw error;
+      }
+      await persist(record);
+      throw new RecoveryPrimitiveError('navigation-conflict', record.failure.message, { cause: error, operationId: record.id, origin: 'navigation', retryable: true });
+    }
+    await completeManaged(record);
+    record.failure = null;
+    record.state = 'complete';
+    await persist(record);
+  };
   const applyCombined = async (located: LocatedOperation, input: WorkspaceCombinedRecoveryApplyInput, fileOnly = false): Promise<WorkspaceCombinedRecoveryOperation> => {
     const { identity, root } = located;
     const record = parseCombined(await getOperation(identity.workspaceId, input.operationId));
@@ -1082,7 +1146,7 @@ export const createWorkspaceRecoveryEngine = (options: CreateWorkspaceRecoveryEn
       if (record.cancelRequested && !TERMINAL_STATES.has(record.state)) throw new RecoveryPrimitiveError('recovery-in-progress', 'The original recovery cancellation is still being reconciled', { operationId: record.id, origin: 'storage', retryable: true });
       if (record.plan.revision !== input.expectedRevision) throw new RecoveryPrimitiveError("stale-plan", "Recovery plan changed before it was applied", { origin: "conflict", retryable: true });
       if (TERMINAL_STATES.has(record.state)) return publicOperation(record);
-      if (record.state !== "planned") { await reconcileCombined(identity.workspaceId, identity, await getOperation(identity.workspaceId, record.id)); return publicOperation(parseCombined(await getOperation(identity.workspaceId, record.id))); }
+      if (record.state !== "planned") { await reconcileCombined(identity, await getOperation(identity.workspaceId, record.id)); return publicOperation(parseCombined(await getOperation(identity.workspaceId, record.id))); }
       if (record.plan.coverage === "none" && !fileOnly) throw new RecoveryPrimitiveError("checkpoint-incomplete", "This conversation range has no restorable file paths", { origin: "coverage" });
       validateConflicts(record.plan.conflicts, record.plan.conflicts, input);
       barrier = await targetBarrier(identity, record.targets);
@@ -1106,42 +1170,7 @@ export const createWorkspaceRecoveryEngine = (options: CreateWorkspaceRecoveryEn
       }
       await barrier.settle();
       try {
-        for (const row of rowsFor(await getOperation(identity.workspaceId, record.id))) {
-          if (row.phase === "needs-attention") throw new RecoveryPrimitiveError("needs-attention", `File ${row.path} is in needs-attention state and blocks recovery`, { origin: "storage" });
-          if (row.phase === "target-observed") {
-            if (!record.appliedPaths.includes(row.path)) record.appliedPaths.push(row.path);
-            continue;
-          }
-          if (row.phase === "safety-observed" || (row.phase !== "apply-intent" && row.phase !== "pending")) continue;
-          await barrier.settle();
-          await gateTarget(identity, record.targets, row.path).run([{ resourceId: row.path, scope: "subtree" }], async () => {
-            await checkCancellation(record);
-            const current = (await captureTarget(identity, record.targets, row.path, false)).state;
-            if (!sameState(current, safetyFor(record, row.path))) {
-              await transitionFile(record, row.path, "needs-attention");
-              throw new RecoveryPrimitiveError("stale-plan", `File changed after safety capture: ${row.path}`, { details: { paths: [row.path] }, origin: "conflict", retryable: true });
-            }
-            await applyTarget(identity, record.targets, row.path, targetFor(record, row.path).target);
-            const verified = (await captureTarget(identity, record.targets, row.path, false)).state;
-            if (!sameState(verified, targetFor(record, row.path).target)) {
-              await transitionFile(record, row.path, "needs-attention");
-              throw new RecoveryPrimitiveError("needs-attention", `Restored file did not match its checkpoint: ${row.path}`, { origin: "storage" });
-            }
-            if (!record.appliedPaths.includes(row.path)) record.appliedPaths.push(row.path);
-            for (const surface of record.safety[row.path]?.surfaces ?? []) {
-              await surfaceRecovery.replace(identity, record.id, barrier!.barrierFor(surface.workspaceId), surface,
-                'apply', () => saveSurfaceSafety(record, row.path));
-            }
-            await transitionFile(record, row.path, "target-observed");
-          });
-          if (!record.appliedPaths.includes(row.path)) record.appliedPaths.push(row.path);
-          await persist(record);
-        }
-        await applyManaged(record);
-        await checkCancellation(record);
-        record.fileState = record.plan.affectedPaths.length > 0 ? "restored" : "unchanged";
-        record.state = "files-restored";
-        await persist(record);
+        await restoreFiles(record, identity, barrier);
       } catch (error) {
         if (error instanceof ManagedRecoveryPending) { record.failure = recoveryFailure(error); await persist(record); throw error; }
         if (record.appliedPaths.length > 0 || record.managedParticipants?.some(value => value.requested)) {
@@ -1164,22 +1193,7 @@ export const createWorkspaceRecoveryEngine = (options: CreateWorkspaceRecoveryEn
         }
         throw error;
       }
-      if (fileOnly) return publicOperation(record);
-      record.state = "navigating-conversation";
-      await persist(record);
-      try {
-        await navigate(record);
-      } catch (error) {
-        record.failure = recoveryFailure(error, "navigation-conflict");
-        if (error instanceof RecoveryPrimitiveError && error.code === "navigation-conflict" && !error.retryable) { await compensate(record, identity, root, barrier); throw error; }
-        record.state = "navigating-conversation";
-        await persist(record);
-        throw new RecoveryPrimitiveError("navigation-conflict", error instanceof Error ? error.message : "Conversation navigation failed", { cause: error, operationId: record.id, origin: "navigation" });
-      }
-      await completeManaged(record);
-      record.failure = null;
-      record.state = "complete";
-      await persist(record);
+      if (!fileOnly) await finishNavigation(record, identity, barrier);
       return publicOperation(record);
     } catch (error) {
       if (!(error instanceof RecoveryCancellationRequested)) throw error;
@@ -1271,7 +1285,7 @@ export const createWorkspaceRecoveryEngine = (options: CreateWorkspaceRecoveryEn
     return record.managedPreparation ? runOperation(record.id, async () => resolveManagedPreparation(parseCombined(await getOperation(record.workspaceId, record.id)))) : plan;
   };
 
-  const reconcileCombined = async (workspaceId: string, identity: RecoveryIdentity, stored: Record<string, unknown>): Promise<WorkspaceCombinedRecoveryOperation | null> => {
+  const reconcileCombined = async (identity: RecoveryIdentity, stored: Record<string, unknown>): Promise<WorkspaceCombinedRecoveryOperation | null> => {
     let record = parseCombined(stored);
     if (record.managedPreparation) { await resolveManagedPreparation(record, record.cancelRequested); if (!record.cancelRequested) return publicOperation(record); }
     if ((record.state === "planned" && !record.cancelRequested) || TERMINAL_STATES.has(record.state)) return null;
@@ -1282,93 +1296,17 @@ export const createWorkspaceRecoveryEngine = (options: CreateWorkspaceRecoveryEn
         await compensate(record, identity, identity.canonicalRoot, barrier);
         return publicOperation(record);
       }
-      if (record.state === "files-restored" || record.state === "navigating-conversation") {
-        const rows = rowsFor(stored);
-        if (rows.some((row) => row.phase !== "target-observed" && row.phase !== "safety-observed")) {
-          throw new RecoveryPrimitiveError("needs-attention", "Conversation recovery reached navigation with unresolved file phases", { origin: "storage" });
-        }
-        if (Object.values(record.safety).some(safety => safety.surfaces?.some(surface => surface.phase !== 'applied'))) {
-          throw new RecoveryPrimitiveError('needs-attention', 'Conversation recovery has an unconfirmed editor restore', { origin: 'storage' });
-        }
-        if (record.fileParticipant) return publicOperation(record);
-        if (record.state === 'files-restored') await applyManaged(record);
-        if (record.state === "files-restored") {
-          record.state = "navigating-conversation";
-          await persist(record);
-        }
-        try { await navigate(record); } catch (error) {
-          if (error instanceof RecoveryPrimitiveError && error.code === "navigation-conflict" && !error.retryable) { record.failure = recoveryFailure(error); await compensate(record, identity, identity.canonicalRoot, barrier); return publicOperation(record); }
-          throw error;
-        }
-        await completeManaged(record);
-        record.failure = null;
-        record.fileState = record.plan.affectedPaths.length > 0 ? "restored" : "unchanged";
-        record.state = "complete";
-        await persist(record);
-        return publicOperation(record);
+      if (record.state === 'applying-files' || record.state === 'files-restored') {
+        await restoreFiles(record, identity, barrier);
+      } else if (rowsFor(stored).some(row => row.phase !== 'target-observed')
+        || Object.values(record.safety).some(safety => safety.surfaces?.some(surface => surface.phase !== 'applied'))) {
+        throw new RecoveryPrimitiveError('needs-attention', 'Conversation navigation has an unconfirmed file or editor restore', { origin: 'storage' });
       }
-      const phases: OperationFilePhase[] = [];
-      for (const row of rowsFor(stored)) {
-        let phase = row.phase;
-        for (const surface of record.safety[row.path]?.surfaces ?? []) {
-          await surfaceRecovery.observe(record.id, barrier.barrierFor(surface.workspaceId), surface);
-        }
-        if (record.safety[row.path]?.surfaces?.length) await saveSurfaceSafety(record, row.path);
-        const surfaceApplied = record.safety[row.path]?.surfaces?.some(surface => surface.phase === 'applied') ?? false;
-        if (row.phase === "apply-intent" || row.phase === "compensate-intent") {
-          const current = (await captureTarget(identity, record.targets, row.path, false)).state;
-          if (row.phase === "apply-intent") {
-            if (sameState(current, targetFor(record, row.path).target) || (surfaceApplied && sameState(current, safetyFor(record, row.path)))) {
-              await transitionFile(record, row.path, "target-observed");
-              phase = "target-observed";
-              if (!record.appliedPaths.includes(row.path)) record.appliedPaths.push(row.path);
-            } else if (!sameState(current, safetyFor(record, row.path))) {
-              await transitionFile(record, row.path, "needs-attention");
-              phase = "needs-attention";
-            }
-          } else if (sameState(current, safetyFor(record, row.path)) && !surfaceApplied) {
-            await transitionFile(record, row.path, "safety-observed");
-            phase = "safety-observed";
-          } else if (!sameState(current, targetFor(record, row.path).target) && !sameState(current, safetyFor(record, row.path))) {
-            await transitionFile(record, row.path, "needs-attention");
-            phase = "needs-attention";
-          }
-        }
-        phases.push(phase);
-      }
-      if (phases.includes("needs-attention")) {
-        record.failure = recoveryFailure(new RecoveryPrimitiveError("needs-attention", "Operation has files in an unreconcilable state after crash", { origin: "storage" }), "needs-attention");
-        record.fileState = "needs-attention";
-        record.state = "needs-attention";
-        await persist(record);
-      } else if (!record.fileParticipant && record.managedParticipants?.length && phases.every(phase => phase === 'target-observed')) {
-        await applyManaged(record);
-        record.fileState = record.plan.affectedPaths.length ? 'restored' : 'unchanged';
-        record.state = 'navigating-conversation';
-        await persist(record);
-        try { await navigate(record); }
-        catch (error) {
-          if (error instanceof RecoveryPrimitiveError && error.code === 'navigation-conflict' && !error.retryable) {
-            record.failure = recoveryFailure(error); await compensate(record, identity, identity.canonicalRoot, barrier); return publicOperation(record);
-          }
-          throw error;
-        }
-        await completeManaged(record);
-        record.failure = null;
-        record.state = 'complete';
-        await persist(record);
-      } else if (phases.includes("compensate-intent") || phases.includes("target-observed")) {
-        await compensate(record, identity, identity.canonicalRoot, barrier);
-      } else if (phases.includes("safety-observed")) {
-        record.fileState = "compensated";
-        record.state = "compensated";
-        await persist(record);
-      } else {
-        record.state = "aborted";
-        await persist(record);
-      }
+      if (record.fileParticipant) return publicOperation(record);
+      await finishNavigation(record, identity, barrier);
     } catch (caughtError) {
       let error = caughtError;
+      if (record.state === 'compensated') return publicOperation(record);
       if (error instanceof RecoveryCancellationRequested && record.state !== 'navigating-conversation' && barrier) {
         record = parseCombined(await getOperation(record.workspaceId, record.id));
         try { await compensate(record, identity, identity.canonicalRoot, barrier); return publicOperation(record); }
@@ -1395,16 +1333,16 @@ export const createWorkspaceRecoveryEngine = (options: CreateWorkspaceRecoveryEn
     for (const registration of await operationWorkspaces()) {
       await track(() => runSerialized(`resume\0${registration.workspaceId}`, async () => {
         const identity = await identityFor(registration.workspaceId);
-        for (const summary of await durable.listOperations(registration.workspaceId, "combined")) {
-          if (TERMINAL_STATES.has(String(summary.state))) continue;
-          const candidate = await durable.getOperation(registration.workspaceId, requireString(summary.operationId, "Recovery operation id"));
-          if (summary.state === 'planned' && (!candidate || (!parseCombined(candidate).managedPreparation && !parseCombined(candidate).cancelRequested))) continue;
-          // A participant's original source proof must be re-admitted by its authenticated coordinator.
-          if (candidate && parseCombined(candidate).fileParticipant) continue;
-          if (candidate && sessionNavigation.ready?.(parseCombined(candidate).plan.conversation) === false) continue;
+        for (const summary of await durable.listOperations(registration.workspaceId, "combined", undefined, { resumableOnly: true })) {
           const operationId = requireString(summary.operationId, "Recovery operation id");
-          const reconciled = await runOperation(operationId, async () => reconcileCombined(registration.workspaceId, identity,
-            await getOperation(registration.workspaceId, operationId)));
+          const reconciled = await runOperation(operationId, async () => {
+            const stored = await durable.getOperation(registration.workspaceId, operationId);
+            if (!stored) return null;
+            const record = parseCombined(stored);
+            // Participants resume under their original coordinator's authenticated request.
+            if (record.fileParticipant || sessionNavigation.ready?.(record.plan.conversation) === false) return null;
+            return reconcileCombined(identity, stored);
+          });
           if (reconciled) output.push(reconciled);
         }
         const context: DurableFileOperationContext = {
@@ -1499,10 +1437,10 @@ export const createWorkspaceRecoveryEngine = (options: CreateWorkspaceRecoveryEn
         if (record.state === 'planned') { record.state = 'aborted'; await persist(record); }
         else if (!TERMINAL_STATES.has(record.state)) {
           record.cancelRequested = true; await persist(record);
-          await reconcileCombined(record.workspaceId, located.identity, await getOperation(record.workspaceId, record.id));
+          await reconcileCombined(located.identity, await getOperation(record.workspaceId, record.id));
         }
       } else if (!TERMINAL_STATES.has(record.state) && record.state !== 'planned') {
-        await reconcileCombined(record.workspaceId, located.identity, await getOperation(record.workspaceId, record.id));
+        await reconcileCombined(located.identity, await getOperation(record.workspaceId, record.id));
       }
       record = parseCombined(await getOperation(record.workspaceId, record.id));
       return { status: 'ready', operation: publicOperation(record) };
@@ -1543,7 +1481,7 @@ export const createWorkspaceRecoveryEngine = (options: CreateWorkspaceRecoveryEn
         } else if (!TERMINAL_STATES.has(record.state)) {
           // Navigation uncertainty is settled from its original Catalog receipt before any rollback.
           if (record.state !== 'navigating-conversation') { record.cancelRequested = true; await persist(record); }
-          await reconcileCombined(record.workspaceId, located.identity, await getOperation(record.workspaceId, record.id));
+          await reconcileCombined(located.identity, await getOperation(record.workspaceId, record.id));
         }
         return { operation: publicOperation(parseCombined(await getOperation(record.workspaceId, record.id))), status: "ready" as const };
       });
@@ -1617,7 +1555,7 @@ export const createWorkspaceRecoveryEngine = (options: CreateWorkspaceRecoveryEn
       }));
       return { status: "ready", workspaces: workspaces.filter((workspace) => workspace !== null) };
     }),
-    prepareCombinedRecovery: (input) => safe(async () => ({ plan: await track(() => prepareCombined(input)), status: "ready" })),
+    prepareCombinedRecovery: (input, selected) => safe(async () => ({ plan: await track(() => prepareCombined(input, undefined, selected)), status: "ready" })),
     prepareCombinedUndo: (operationId) => safe(async () => {
       return { plan: await runOperation(operationId, () => prepareUndo(operationId)), status: "ready" };
     }),

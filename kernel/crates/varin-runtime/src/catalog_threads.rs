@@ -3,6 +3,11 @@
 use super::*;
 use serde::Deserialize;
 
+pub(super) fn initialize_model_preferences(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS thread_model_preferences(thread_id TEXT PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE, model TEXT NOT NULL)")?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ThreadListQuery {
@@ -30,6 +35,8 @@ pub struct ThreadUpdate {
     pub archived: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title_mode: Option<titles::TitleMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<calendar::ModelSelection>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -367,12 +374,16 @@ impl Catalog {
             return Ok(receipt);
         }
         require_revision(&tx, &command.thread_id, command.expected_revision)?;
-        if command.title.is_none() && command.pinned.is_none() && command.archived.is_none() && command.title_mode.is_none() {
+        if command.title.is_none() && command.pinned.is_none() && command.archived.is_none() && command.title_mode.is_none() && command.model.is_none() {
             return Err(RuntimeError::Invalid("Thread update is empty".into()));
         }
         let title = command.title.as_deref().map(str::trim);
         if title.is_some_and(str::is_empty) {
             return Err(RuntimeError::Invalid("Thread title is empty".into()));
+        }
+        if let Some(model) = &command.model {
+            tx.execute("INSERT INTO thread_model_preferences(thread_id,model) VALUES(?1,?2) ON CONFLICT(thread_id) DO UPDATE SET model=excluded.model",
+                params![command.thread_id, serde_json::to_string(model)?])?;
         }
         if let Some(mode) = command.title_mode.or(title.map(|_|titles::TitleMode::Manual)) {
             titles::set_mode(&tx,&command.thread_id,mode)?;
@@ -527,7 +538,8 @@ fn inspect_selected<P: rusqlite::Params>(db: &Connection, filter: &str, paramete
                 json(latest.body),'workspace_default',json((SELECT json_object('revision',w.revision,'source',json(w.source)) FROM branch_workspaces w WHERE w.branch_id=b.id ORDER BY w.revision DESC LIMIT 1))) AS branch
             FROM branches b LEFT JOIN latest_runs latest ON latest.branch_id=b.id AND latest.position=1 WHERE b.thread_id=t.id AND NOT EXISTS(SELECT 1 FROM events e WHERE e.subject=b.id AND e.kind='branch.deleted') ORDER BY b.rowid)),
         (SELECT json_group_array(project_id) FROM (SELECT DISTINCT c.project_id FROM runs r JOIN branches b ON b.id=r.branch_id
-            LEFT JOIN context_checkpoints c ON c.id=r.context_checkpoint_id WHERE b.thread_id=t.id ORDER BY c.project_id))
+            LEFT JOIN context_checkpoints c ON c.id=r.context_checkpoint_id WHERE b.thread_id=t.id ORDER BY c.project_id)),
+        (SELECT model FROM thread_model_preferences WHERE thread_id=t.id)
         FROM selected t LEFT JOIN terminal ON terminal.root=t.id ORDER BY t.pinned DESC,t.updated_at_ms DESC,t.id"#);
     let mut query = db.prepare_cached(&sql)?;
     let rows = query.query_map(parameters, |r| Ok((
@@ -538,10 +550,11 @@ fn inspect_selected<P: rusqlite::Params>(db: &Connection, filter: &str, paramete
             "principal_id":r.get::<_,Option<String>>(10)?,"agent_code":r.get::<_,String>(11)?,
             "title_mode":r.get::<_,String>(12)?,"parent_thread_id":r.get::<_,Option<String>>(13)?}),
         r.get::<_,Option<String>>(14)?,r.get::<_,Option<String>>(15)?,r.get::<_,Option<String>>(16)?,
-        r.get::<_,Option<bool>>(17)?,r.get::<_,Option<bool>>(18)?,r.get::<_,String>(19)?,r.get::<_,String>(20)?
+        r.get::<_,Option<bool>>(17)?,r.get::<_,Option<bool>>(18)?,r.get::<_,String>(19)?,r.get::<_,String>(20)?,r.get::<_,Option<String>>(21)?
     )))?;
     rows.map(|row| {
-        let (mut summary,avatar,bot,scope,known,cycle,branches,projects) = row?;
+        let (mut summary,avatar,bot,scope,known,cycle,branches,projects,model) = row?;
+        if let Some(model) = model { summary["model_preference"] = serde_json::from_str(&model)?; }
         if cycle == Some(true) { return Err(RuntimeError::Invalid("Bot execution ancestry is cyclic".into())); }
         let bot = match (bot,scope) { (Some(bot),_) => Some(bot), (None,Some(scope)) => Some(scope.strip_prefix("bot:").filter(|id|!id.is_empty()).ok_or_else(||RuntimeError::Invalid("MemoryWork Bot identity is invalid".into()))?.to_owned()), _ => None };
         if bot.is_none() && known == Some(false) { summary["creation_identity_known"] = json!(false); }

@@ -135,7 +135,7 @@ it('cold materialized calendar uses the production native source backend and rep
     readOriginalSource: async () => ({ root: 'original-root', provenance: { consistency: 'fixed-root', selection: { captureIdentity } } }),
     pinBranch: async () => ({ workspaceId: original.workspaceId, branchId, revision: 0, root: 'original-root', release: async () => {} }),
   };
-  const native = { retainPrepared: vi.fn(async () => {}), open: vi.fn(async () => ({ grant: 'original-grant' })),
+  const native = { hostBackend: async () => ({ dependenciesReady: false }), retainPrepared: vi.fn(async () => {}), open: vi.fn(async () => ({ grant: 'original-grant' })),
     acquire: vi.fn(async () => ({ path: '/native/calendar' })) };
   const prepare = createThreadSourcePreparer({
     documents: { admitWorkspaceRegistration: async () => ({ canonicalPath: '/A/project' }) } as never,
@@ -157,6 +157,17 @@ it('cold materialized calendar uses the production native source backend and rep
     code: 'calendar_preparation:source_preparation:workspace_backend_unavailable',
   });
   expect(f.runtime.admitCalendar).not.toHaveBeenCalled();
+
+  // Same isolated access request, with a saved ordinary-directory baseline.
+  // The launcher materializes revision zero into a private per-run directory.
+  const physical = { consistency: 'stable-capture', captureIdentity, contentMode: 'saved-files', captureScopes: [], omittedDraftPaths: [] };
+  Object.assign(store, { readOriginalSource: async () => ({ root: 'original-root', provenance: physical }) });
+  native.open.mockClear();
+  await f.adapter.prepareCalendarWork(f.work, '/A/project', new AbortController().signal);
+  expect(native.open).not.toHaveBeenCalled();
+  expect(f.runtime.admitCalendar).toHaveBeenCalledWith(expect.objectContaining({ launch: expect.objectContaining({
+    source: expect.objectContaining({ mode: 'materialized', workspaceId: original.workspaceId, branchId, revision: 0 }),
+  }) }), expect.any(AbortSignal));
 });
 
 it.each(['identity', 'source_resolution', 'source_admission', 'model', 'context', 'admission'] as const)(

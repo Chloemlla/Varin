@@ -480,6 +480,32 @@ it('original research log bytes and drained stderr jointly resume one new Run an
   } finally { await fs.writeFile(release, 'finish cleanup'); }
 }, 60_000);
 
+it('discovers unfinished experiment work across restart, including cleanup after terminal delivery', async () => {
+  const f = await fixture((_body, response) => done(response));
+  const put = async (workspaceId: string, recordType: string, id: string, state: string, payload: object) => {
+    const grant = await f.kernel.issueGrant({ grantId: `seed:${workspaceId}:${recordType}:${id}`,
+      owningWorkspace: workspaceId, executionWorkspace: workspaceId,
+      capabilities: ['storage.read', 'storage.write', 'storage.maintenance'], pathScopes: [] });
+    await f.kernel.scoped(grant).putRecord({ workspaceId, operationId: `put:${workspaceId}:${recordType}:${id}`,
+      recordId: `${recordType}:${id}`, recordType, state, references: [], ownerIds: [],
+      payloadJson: JSON.stringify({ id, backend: 'local', specId: 'spec', ...payload }) });
+  };
+  await put('a', 'experiment.attempt', 'offline', 'submitted', { admissionStarted: true });
+  await put('b', 'experiment.attempt', 'collect', 'completed', { spawnDispatched: true, collection: 'pending' });
+  await put('b', 'experiment.attempt', 'release', 'completed', { spawnDispatched: true, collection: 'done' });
+  await put('b', 'experiment.job', 'release-job', 'exited', { attemptId: 'release', executorStopped: true });
+  await put('b', 'experiment.attempt', 'finished', 'completed', { spawnDispatched: true, collection: 'done' });
+  await put('b', 'experiment.job', 'finished-job', 'released', { attemptId: 'finished', executorStopped: true });
+  await f.close();
+  const reopened = await fixture((_body, response) => done(response), f.root);
+  const discovery = await reopened.kernel.issueGrant({ grantId: 'discovery', owningWorkspace: null, executionWorkspace: null,
+    capabilities: ['storage.maintenance'], pathScopes: [] });
+  const ids = async (workspaceId?: string) => (await reopened.kernel.experimentRecovery(workspaceId ? { workspaceId } : {}, discovery))
+    .map(s => `${s.workspaceId}/${s.attemptId}`).sort();
+  expect(await ids()).toEqual(['a/offline', 'b/collect', 'b/release']);
+  expect(await ids('b')).toEqual(['b/collect', 'b/release']);
+});
+
 it('samples a registered machine condition without opening resources and resumes one original Thread across restart', async () => {
   // Only physical measurements are controlled. HTTP, source admission, Storage,
   // Catalog, automatic sampling demand and subsequent Run delivery are real.

@@ -4,6 +4,8 @@ import { isModernMcpVersion } from './headers.js';
 import { McpClient, type McpRequestOptions, type Tool, type Resource, type ResourceTemplate } from './client.js';
 import { StdioTransport, StreamableHttpTransport, McpSessionExpiredError, type McpTransport } from './transport.js';
 import { mcpEnvironmentBindings, mcpEnvironmentCurrent, type McpServerEntry } from './configuration.js';
+import { McpPreparationError, type McpPreparationDetails } from './errors.js';
+import { EgressError } from '../harness/egress.js';
 import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 import { McpOAuthCredentialStore, mcpAuthProvider, mcpOAuthFetch, type McpOAuthSettings } from './auth.js';
@@ -17,15 +19,22 @@ export const mcpOAuthUrl = (entry: McpServerEntry): string | undefined => {
   const config = entry.config;
   return 'url' in config && !config.auth && !Object.keys(config.headers ?? {}).some(name => name.toLowerCase() === 'authorization') ? config.url : undefined;
 };
-function authenticationFailure(error: unknown): { wwwAuthenticate?: unknown } | undefined {
-  // SDK version negotiation wraps transport failures in Error.cause.
+function transportProblem(error: unknown) {
+  // SDK negotiation can wrap transport errors. The challenge stays with the OAuth owner.
+  const details: Pick<McpPreparationDetails, 'httpStatus' | 'network'> = {};
+  let challenge: unknown;
   const seen = new Set<object>();
   while (error && typeof error === 'object' && !seen.has(error)) {
     seen.add(error);
-    if ('status' in error && (error.status === 401 || error.status === 403)) return 'wwwAuthenticate' in error ? { wwwAuthenticate: error.wwwAuthenticate } : {};
+    if ('status' in error && typeof error.status === 'number' && Number.isInteger(error.status) && error.status >= 300 && error.status <= 599) {
+      details.httpStatus = error.status;
+      if ((error.status === 401 || error.status === 403) && 'wwwAuthenticate' in error) challenge = error.wwwAuthenticate;
+      break;
+    }
+    if (error instanceof EgressError) details.network ??= error.kind;
     error = 'cause' in error ? error.cause : undefined;
   }
-  return undefined;
+  return { details, challenge };
 }
 export function createDefaultTransport(entry: McpServerEntry, cwd: string, authProvider?: AuthProvider, fetchImpl?: typeof fetch): McpTransport {
   const config = entry.config;
@@ -50,7 +59,8 @@ export class McpServerConnection {
   readonly environmentBindings: Readonly<Record<string, string | undefined>>;
   readonly environmentIdentity: string | undefined;
   state: 'connecting' | 'connected' | 'disconnected' | 'needs-auth' | 'failed' | 'closed' = 'disconnected';
-  error: string | undefined;
+  connectionFailure: McpPreparationError | undefined;
+  get error() { return this.connectionFailure?.message; }
   tools: Tool[] = [];
   resources: Resource[] = [];
   resourceTemplates: ResourceTemplate[] = [];
@@ -99,7 +109,7 @@ export class McpServerConnection {
     return this.#opening;
   }
   async #open() {
-    this.state = 'connecting'; this.error = undefined; this.options.onChange?.(this);
+    this.state = 'connecting'; this.connectionFailure = undefined; this.options.onChange?.(this);
     let client: McpClient | undefined;
     try {
       const config = this.entry.config;
@@ -142,11 +152,14 @@ export class McpServerConnection {
     } catch (error) {
       await client?.close();
       if (this.#client === client) this.#client = undefined;
-      const authentication = authenticationFailure(error);
-      this.state = this.#shutdown.signal.aborted ? 'closed' : authentication ? 'needs-auth' : 'failed';
-      this.error = this.state === 'needs-auth' ? 'MCP sign-in required' : 'MCP connection unavailable';
-      this.challenge = authentication?.wwwAuthenticate;
-      this.options.onChange?.(this); throw error;
+      const { details, challenge } = transportProblem(error);
+      const failure = new McpPreparationError({ server: this.name, stage: 'connect', ...details });
+      this.connectionFailure = failure;
+      this.challenge = challenge;
+      this.state = this.#shutdown.signal.aborted ? 'closed' : failure.code === 'mcp-server-needs-auth' ? 'needs-auth' : 'failed';
+      this.options.onChange?.(this);
+      this.#shutdown.signal.throwIfAborted();
+      throw failure;
     }
   }
   #track(work: Promise<void>) {
@@ -199,10 +212,12 @@ export class McpServerConnection {
     }).catch(error => {
       if (this.#client === client) {
         this.directoriesReady.delete(kind);
-        const authentication = authenticationFailure(error);
-        this.directoryStates[kind] = authentication ? 'needs-auth' : 'failed';
-        if (authentication) this.challenge = authentication.wwwAuthenticate;
+        const { details, challenge } = transportProblem(error);
+        const needsAuth = details.httpStatus === 401 || details.httpStatus === 403;
+        this.directoryStates[kind] = needsAuth ? 'needs-auth' : 'failed';
+        if (needsAuth) this.challenge = challenge;
         this.options.onChange?.(this);
+        if (kind === 'tools' && !signal.aborted) throw new McpPreparationError({ server: this.name, stage: 'tools/list', ...details });
       }
       throw error;
     });
@@ -216,7 +231,7 @@ export class McpServerConnection {
   async getToolsClient(): Promise<McpClient> {
     const client = await this.getClient();
     if (!this.directoriesReady.has('tools')) await this.#refreshDirectory(client, 'tools');
-    if (this.#client !== client || client.connectionState !== 'connected') throw new Error('MCP connection unavailable');
+    if (this.#client !== client || client.connectionState !== 'connected') throw new McpPreparationError({ server: this.name, stage: 'connect' });
     return client;
   }
   async requestOnce<T>(run: (client: McpClient) => Promise<T>) { return run(await this.getClient()); }
@@ -227,7 +242,12 @@ export class McpServerConnection {
   async allResources(options: CallOptions) { return this.requestOnce(async client => { await options.beforeDispatch?.(); return client.listResources(options); }); }
   async allResourceTemplates(options: CallOptions) { return this.requestOnce(async client => { await options.beforeDispatch?.(); return client.listResourceTemplates(options); }); }
   async reconnect() { const old = this.#client; if (old) this.#disconnected(old); await old?.close(); await this.getClient(); }
-  async signOut() { await this.#client?.close(); this.#client = undefined; this.state = 'needs-auth'; }
+  async signOut() {
+    await this.#client?.close();
+    this.#client = undefined;
+    this.state = 'needs-auth';
+    this.connectionFailure = new McpPreparationError({ server: this.name, stage: 'connect' }, true);
+  }
   async close() {
     this.#shutdown.abort();
     await this.#opening?.catch(() => undefined);

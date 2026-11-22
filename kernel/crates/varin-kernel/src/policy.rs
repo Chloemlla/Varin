@@ -759,6 +759,18 @@ fn view_value(view: &PolicyView<'_>) -> Value {
 }
 fn event_view(event: &PolicyEvent) -> Value {
     match event {
+        PolicyEvent::ModelJobCompleted { action_id, receipt } => {
+            // policy@4 has a closed failure schema. Transport diagnostics belong to
+            // the stored attempt, including when that attempt informs a policy.
+            let mut public = serde_json::to_value(receipt).expect("policy receipt serializes");
+            if let Some(failure) = &receipt.failure {
+                public["failure"] = json!({
+                    "code": failure.code, "message": failure.message,
+                    "retry_after_ms": failure.retry_after_ms, "provider_request_id": failure.provider_request_id,
+                });
+            }
+            json!({"kind":"model_job_completed", "action_id": action_id, "receipt": public})
+        }
         PolicyEvent::ToolsCompleted { results } => {
             json!({"kind":"tools_completed","results":results.iter().map(|result|{
         let completion=match &result.completion{ToolCompletion::Result{outcome,effect,..}=>json!({"kind":"result","outcome":outcome,"effect":effect}),ToolCompletion::NotDispatched{..}=>json!({"kind":"not_dispatched"}),ToolCompletion::JobAccepted{operation_id,phase,effect,lifetime, ..}=>json!({"kind":"job_accepted","operation_id":operation_id,"phase":phase,"effect":effect,"lifetime":lifetime})};

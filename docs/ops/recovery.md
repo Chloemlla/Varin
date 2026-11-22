@@ -8,7 +8,11 @@ the original HistoryBranch.
 
 - **Conversation only** changes the selected history branch and restores the relevant editable input.
 - **Conversation and files** also prepares the recorded path changes for entries leaving that branch.
-  The preview shows real conflicts, incomplete coverage and unavailable owners.
+  The preview shows real conflicts, incomplete coverage and unavailable owners. Applying it restores the
+  affected files before moving the conversation. If the Host restarts midway, it resumes the same
+  operation, recognizes paths already restored, and finishes the remaining paths. A subsequent edit
+  to an affected file is surfaced for review. Undo uses the saved pre-recovery file states and the
+  original conversation receipt.
 - **Files only**, in the Recovery panel, restores all or selected recorded paths to a round's start,
   its end, or a named point. The conversation stays active. Naming a point saves the current content
   of paths already recorded by that conversation.

@@ -172,8 +172,8 @@ export const ResourceEditorHost: React.FC<ResourceEditorHostProps> = ({
 
   React.useEffect(() => {
     if (!needsDocument) return;
-    void registry.open(identity).catch(() => undefined);
-  }, [identity, needsDocument, registry]);
+    void registry.open(identity, { revalidate: true }).catch(() => undefined);
+  }, [identity, needsDocument, registry, tab.viewId]);
 
   const editorDocument = React.useMemo(() => createEditorDocumentController({
     identity,
@@ -471,7 +471,8 @@ export const ResourceEditorHost: React.FC<ResourceEditorHostProps> = ({
     </DropdownMenu> : null}
   </div>{needsText ? <DocumentEncodingNotice registry={registry} identity={identity} /> : null}</>;
 
-  if (needsDocument && (!record || record.status === 'loading' || record.status === 'unloaded')) {
+  // A background disk re-read retains the editable buffer and its focused view.
+  if (needsDocument && (!record || record.status === 'unloaded' || (record.status === 'loading' && record.baseRevision === null))) {
     return (
       <HostFrame chooser={ambiguousChooser} toolbar={toolbar}>
         <div className="flex h-full items-center justify-center typography-ui text-muted-foreground">

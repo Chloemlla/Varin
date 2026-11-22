@@ -10,6 +10,25 @@ pub struct HistoryReference {
     pub source: HistorySource,
     pub content_ref: String,
 }
+impl TryFrom<HistoryItem> for HistoryReference {
+    type Error = RuntimeError;
+    fn try_from(item: HistoryItem) -> Result<Self> {
+        let content_ref = item
+            .content
+            .get("content_object")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RuntimeError::Invalid("history content reference missing".into()))?
+            .to_string();
+        Ok(Self {
+            run_id: item.run_id,
+            id: item.id,
+            thread_id: item.thread_id,
+            parent: item.parent,
+            source: item.source,
+            content_ref,
+        })
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryPage {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -184,20 +203,7 @@ impl HistoryPageRead {
                 .ok_or_else(|| RuntimeError::NotFound(key.clone()))?;
             let item: HistoryItem = serde_json::from_str(&raw)?;
             cursor = item.parent.clone();
-            let content_ref = item
-                .content
-                .get("content_object")
-                .and_then(Value::as_str)
-                .ok_or_else(|| RuntimeError::Invalid("history content reference missing".into()))?
-                .to_string();
-            items.push(HistoryReference {
-                run_id: item.run_id,
-                id: item.id,
-                thread_id: item.thread_id,
-                parent: item.parent,
-                source: item.source,
-                content_ref,
-            });
+            items.push(HistoryReference::try_from(item)?);
         }
         items.reverse();
         let boundary_reset = cursor.is_none() && !reached_after;

@@ -55,7 +55,6 @@ import { SwapText } from '@/components/motion/SwapText';
 import { recentSwitchDirection } from '@/lib/motion/switchDirection';
 import { useI18n } from '@/lib/i18n';
 import { shouldResetDesktopMainTabToChat } from '@/components/layout/mainTabGuards';
-import { useShallow } from 'zustand/react/shallow';
 import type { IconName } from "@/components/icon/icons";
 import { toast } from '@/components/ui';
 import { copyTextToClipboard } from '@/lib/clipboard';
@@ -165,14 +164,7 @@ export const Header: React.FC<HeaderProps> = ({
   const navigationDirectory = useDirectoryStore(state => state.currentDirectory);
   const conversationWorkspace = useSelectedThreadWorkspace();
   const sessionDirectory = conversationWorkspace.composerKey ? conversationWorkspace.directory ?? '' : navigationDirectory;
-  const navigationProject = useProjectsStore(useShallow((state) => {
-    if (!state.activeProjectId) {
-      return null;
-    }
-    const project = state.projects.find((candidate) => candidate.id === state.activeProjectId);
-    return project ? { id: project.id, path: project.path, label: project.label } : null;
-  }));
-  const activeProject = conversationWorkspace.composerKey ? conversationWorkspace.project : navigationProject;
+  const activeProject = conversationWorkspace.project;
   const activeProjectLabel = React.useMemo(() => {
     if (!activeProject) {
       return conversationWorkspace.composerKey && sessionDirectory ? sessionDirectory.split(/[\\/]/).filter(Boolean).at(-1) ?? null : null;

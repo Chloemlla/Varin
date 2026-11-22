@@ -20,6 +20,7 @@ export function registerBotGroupChatRoutes(app: Express, groups: BotGroupChats) 
   app.get(root, handle(principal => groups.list(principal)));
   app.post(root, handle((principal, req) => groups.create(principal, req.body?.name, req.body?.members)));
   app.get(root + '/:group', handle((principal, req) => groups.page(principal, id(req), query(req.query.before), query(req.query.q))));
+  app.get(root + '/:group/activity', handle((principal, req) => groups.page(principal, id(req), query(req.query.before), undefined, undefined, 'activity')));
   app.get(root + '/:group/post/:post', handle((principal, req) => groups.postContext(principal, id(req), String(req.params.post))));
   app.post(root + '/:group/post', handle((principal, req) => groups.post(principal, id(req), req.body)));
   app.post(root + '/:group/change', handle((principal, req) => groups.change(principal, id(req), req.body)));

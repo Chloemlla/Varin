@@ -463,13 +463,7 @@ pub fn generate(
         })
     }))
     .unwrap_or_else(|_| {
-        Err(ModelFailure {
-            tool_name: None,
-            code: "provider_panicked".into(),
-            message: "Sampling provider failed after dispatch".into(),
-            retry_after_ms: None,
-            provider_request_id: None,
-        })
+        Err(ModelFailure::new("provider_panicked", "Sampling provider failed after dispatch"))
     });
     let forbidden = output.items.iter().any(|i| {
         matches!(
@@ -514,13 +508,10 @@ pub fn generate(
         usable,
         finish_reason: result.as_ref().ok().copied(),
         failure: result.err().or_else(|| {
-            forbidden.then(|| ModelFailure {
-                tool_name: None,
-                code: "mcp_sampling_output_unsupported".into(),
-                message: "Sampling returned unsupported tool or media output; original output was retained without execution".into(),
-                retry_after_ms: None,
-                provider_request_id: None,
-            })
+            forbidden.then(|| ModelFailure::new(
+                "mcp_sampling_output_unsupported",
+                "Sampling returned unsupported tool or media output; original output was retained without execution",
+            ))
         }),
         usage: output.usage.clone(),
     };
@@ -692,21 +683,9 @@ mod tests {
                     },
                 })
             };
-            output().map_err(|e| ModelFailure {
-                tool_name: None,
-                code: e.code,
-                message: e.message,
-                retry_after_ms: None,
-                provider_request_id: None,
-            })?;
+            output().map_err(|e| ModelFailure::new(e.code, e.message))?;
             if self.fail {
-                Err(ModelFailure {
-                    tool_name: None,
-                    code: "transport_interrupted".into(),
-                    message: "interrupted".into(),
-                    retry_after_ms: None,
-                    provider_request_id: None,
-                })
+                Err(ModelFailure::new("transport_interrupted", "interrupted"))
             } else {
                 Ok(FinishReason::Stop)
             }

@@ -1,5 +1,5 @@
 import { mcpHeaderDeclarations, mcpModelInputSchema } from './headers.js';
-import { McpAuthorityError, McpTaskRequestError, McpSamplingRejectedError } from './errors.js';
+import { McpAuthorityError, McpPreparationError, McpTaskRequestError, McpSamplingRejectedError } from './errors.js';
 /** Shared Application Host MCP authority for Agent consumers and independent settings. */
 import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
@@ -298,6 +298,10 @@ interface ConnectionRecord {
   taskListeners: Set<(taskId:string, unsupported?:boolean)=>void>;
   resourceGroups:Map<string,ResourceGroup>;
   clientDisposers:Array<()=>void>;
+}
+function requireConnected(server: string, record: ConnectionRecord | undefined): ConnectionRecord {
+  if (record?.connection.state === 'connected') return record;
+  throw record?.connection.connectionFailure ?? new McpPreparationError({ server, stage: 'connect' }, record?.connection.state === 'needs-auth');
 }
 function fail(code: string): never { throw new McpAuthorityError(code); }
 function stable(value: unknown): string {
@@ -634,13 +638,14 @@ export class McpAuthority {
       if ([...selected].some(name => !record.entries.has(name))) fail('mcp-selected-server-not-configured');
       const entries = [...record.entries.values()].filter(entry => selected.has(entry.name));
       if (entries.some(entry => entry.config.enabled === false)) fail('mcp-selected-server-disabled');
-      await Promise.all(entries.map(entry => this.connect(record.handle, publicEntry(entry))));
+      const handles = await Promise.all(entries.map(async entry => {
+        await this.connect(record.handle, publicEntry(entry));
+        const handle = requireConnected(entry.name, record.connections.get(entry.name));
+        await waitWithSignal(handle.connection.getToolsClient(), record.shutdown.signal);
+        return handle;
+      }));
       if (retention?.released) fail('mcp-definition-lease-unavailable');
       if (record.released) fail('mcp-preparation-cancelled');
-      const handles = [...record.connections.values()];
-      if (handles.some(connection => connection.connection.state === 'needs-auth')) fail('mcp-server-needs-auth');
-      if (handles.some(connection => connection.connection.state !== 'connected')) fail('mcp-connection-unavailable');
-      await Promise.all(handles.map(connection => waitWithSignal(connection.connection.getToolsClient(), record.shutdown.signal)));
       const pinned = new Map<string, { connection: ConnectionRecord; tool: McpTool; descriptor: McpAuthorityTool; validate: ValidateFunction | undefined }>();
       const project = (connection: ConnectionRecord): McpAuthorityTool[] => {
         connection.declarations = stable(connection.connection.tools);
@@ -689,16 +694,11 @@ export class McpAuthority {
         const entry = record.entries.get(server);
         if (!entry || entry.scope === 'extension') fail('mcp-selected-server-not-configured');
         if (entry.config.enabled === false) fail('mcp-selected-server-disabled');
-        const pending = this.connect(record.handle, publicEntry(entry));
-        // A cancelled observer does not close another Run's shared preparation/transport.
-        await new Promise<void>((resolve, reject) => {
-          const onAbort = () => { signal.removeEventListener('abort', onAbort); reject(new McpAuthorityError('mcp-preparation-cancelled')); };
-          signal.addEventListener('abort', onAbort, { once: true }); if (signal.aborted) onAbort();
-          pending.then(() => { signal.removeEventListener('abort', onAbort); resolve(); }, error => { signal.removeEventListener('abort', onAbort); reject(error); });
-        });
+        // Cancellation stops this observer while other Runs keep their shared connection.
+        try { await waitWithSignal(this.connect(record.handle, publicEntry(entry)), signal); }
+        catch (error) { if (signal.aborted) fail('mcp-preparation-cancelled'); throw error; }
         if (released || record.released || signal.aborted) fail('mcp-preparation-cancelled');
-        const connection = record.connections.get(server);
-        if (!connection || connection.connection.state !== 'connected') fail('mcp-connection-unavailable');
+        const connection = requireConnected(server, record.connections.get(server));
         this.#assertConnection(record, connection, undefined, undefined, true);
         return connection;
       };
@@ -948,7 +948,7 @@ export class McpAuthority {
     const tokenObservation = connection.oauthUrl ? stable(this.#store(scope.scope.agentDir).tokens(connection.name, connection.oauthUrl) ?? null) : '';
     if (record.tokenObservation !== tokenObservation) { record.tokenObservation = tokenObservation; record.credentialRevision++; }
     return { handle: record.handle, generation: record.generation, entry: publicEntry(record.entry), state: connection.state,
-      ...(record.revoked ? { error: record.revocationReason ?? 'mcp-owner-revoked' } : connection.error ? { error: connection.state === 'needs-auth' ? 'MCP sign-in required' : 'MCP connection unavailable' } : {}),
+      ...(record.revoked ? { error: record.revocationReason ?? 'mcp-owner-revoked' } : connection.error ? { error: connection.error } : {}),
       tools: record.revoked ? [] : structuredClone(connection.tools) as McpOwnerConnectionSnapshot['tools'], schemaVersions: Object.fromEntries(connection.tools.map(tool => [tool.name, this.#toolVersion(record, tool)])),
       hasResources: connection.hasResources, resources: structuredClone(connection.resources), resourceTemplates: structuredClone(connection.resourceTemplates),
       ...(connection.instructions ? { instructions: connection.instructions } : {}), timeoutMs: connection.timeoutMs,

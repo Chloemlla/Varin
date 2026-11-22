@@ -679,12 +679,16 @@ describe('affected-file workspace recovery journal', () => {
     expect(rejected).toMatchObject({ status: 'failed', failure: { code: 'dirty-state-unavailable' } });
   });
 
-  it('reconciles a crash in the apply-intent window by detecting the target was already written', async () => {
+  it('continues the same two-file rewind after restart without rewriting the first file', async () => {
     const { durable, engine, harness } = await createHarness();
     const notePath = path.join(harness.workspaceRoot, 'note.txt');
     await fs.promises.writeFile(notePath, 'before');
     seedTurn(harness);
     await seedChange(harness, 'after');
+
+    const secondPath = path.join(harness.workspaceRoot, 'second.txt');
+    await fs.promises.writeFile(secondPath, 'second before');
+    await seedChange(harness, 'second after', 'second.txt');
 
     const prepared = await prepareCombined(engine, {
       entryId: 'user-1', conversation: { kind: 'thread', threadId: 'session-1', branchId: 'branch-1' }, workspaceId: harness.identity.workspaceId,
@@ -740,20 +744,24 @@ describe('affected-file workspace recovery journal', () => {
     // crash happened before the phase update to target-observed.
     const crashedOperation = durable.snapshot(harness.identity.workspaceId, prepared.plan.id);
     expect(crashedOperation).not.toBeNull();
-    expect(crashedOperation!.files).toHaveLength(1);
+    expect(crashedOperation!.files).toHaveLength(2);
     expect(crashedOperation!.files.every((file) => file.phase === 'apply-intent')).toBe(true);
 
-    // Now create a fresh engine (simulating a restart) and call resumeCombinedOperations.
-    // It should reconcile: disk == target, phase == apply-intent → target-observed,
-    // then compensate writes safety ('after') back to disk.
+    expect(await fs.promises.readFile(secondPath, 'utf8')).toBe('second after');
+    const writeRemaining = vi.fn(realFileStore.applyState.bind(realFileStore));
+    const moveHead = vi.fn(async () => {
+      expect(await fs.promises.readFile(notePath, 'utf8')).toBe('before');
+      expect(await fs.promises.readFile(secondPath, 'utf8')).toBe('second before');
+      return { markerId: 'marker-1' };
+    });
     const restartEngine = createWorkspaceRecoveryEngine({
       authorityId: harness.authority.hostId,
       dataDir: harness.dataDir,
       documents: harness.authority,
       durableRecoveryStore: durable,
-      fileStore: realFileStore,
+      fileStore: { ...realFileStore, applyState: writeRemaining },
       sessionNavigation: {
-        commit: vi.fn(async () => ({ markerId: 'marker-1' })),
+        commit: moveHead,
         commitLeaf: vi.fn(async () => ({ markerId: 'marker-undo' })),
         prepare: vi.fn(async () => ({
           editorText: 'draft',
@@ -768,10 +776,10 @@ describe('affected-file workspace recovery journal', () => {
         })),
       },
     });
+    expect(await restartEngine.resumeCombinedOperations()).toMatchObject([{ id: prepared.plan.id, state: 'complete', appliedPathCount: 2 }]);
     await restartEngine.resumeCombinedOperations();
-
-    // After resume, the file should be compensated back to safety ('after').
-    expect(await fs.promises.readFile(notePath, 'utf8')).toBe('after');
+    expect(writeRemaining).toHaveBeenCalledOnce();
+    expect(moveHead).toHaveBeenCalledOnce();
   });
 
   it('reconciles a crash in the compensate-intent window by detecting safety was already written', async () => {
@@ -1153,7 +1161,7 @@ describe('managed file participants in the original recovery journal', () => {
   });
 
 
-  it('compensates confirmed local output when reopened B reconciles its interrupted file stage to compensated', async () => {
+  it('completes the joint rewind after B restarts with its file already restored', async () => {
     const { a, b, remote, navigation, prepared, apply, reopen } = await createPair(true);
     const dispatch = remote.apply;
     remote.apply = vi.fn(async (...args: Parameters<typeof dispatch>) => {
@@ -1168,11 +1176,11 @@ describe('managed file participants in the original recovery journal', () => {
     await a.engine.dispose();
     remote.read = read;
     const restarted = reopen();
-    expect((await restarted.resumeCombinedOperations())[0]?.state).toBe('compensated');
-    expect(ready(await restarted.getCombinedOperation(prepared.plan.id)).operation.conversationState).toBe('unchanged');
-    expect(navigation.commit).not.toHaveBeenCalled();
-    expect(await fs.promises.readFile(path.join(a.harness.workspaceRoot, 'note.txt'), 'utf8')).toBe('after-A');
-    expect(await fs.promises.readFile(path.join(b.harness.workspaceRoot, 'note.txt'), 'utf8')).toBe('after-B');
+    expect((await restarted.resumeCombinedOperations())[0]?.state).toBe('complete');
+    expect(ready(await restarted.getCombinedOperation(prepared.plan.id)).operation.conversationState).toBe('navigated');
+    expect(navigation.commit).toHaveBeenCalledOnce();
+    expect(await fs.promises.readFile(path.join(a.harness.workspaceRoot, 'note.txt'), 'utf8')).toBe('before-A');
+    expect(await fs.promises.readFile(path.join(b.harness.workspaceRoot, 'note.txt'), 'utf8')).toBe('before-B');
     await restarted.dispose();
   });
 

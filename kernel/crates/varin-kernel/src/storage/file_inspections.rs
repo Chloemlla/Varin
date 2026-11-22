@@ -382,6 +382,16 @@ fn evidence(row: &Row, states: &[FileState]) -> Result<(Option<Value>, &'static 
                     ),
                     "target-observed",
                 )
+            } else if row.envelope["intent"]["__recoveryTool"] == "file_restore"
+                && row.envelope["intent"]["expectedJson"].as_str()
+                    .map(serde_json::from_str::<FileState>).transpose()?
+                    .is_some_and(|before| Storage::file_state_matches(observed, &before)) {
+                // The original worker has drained and the selected file is
+                // still at its saved before-image. Finish without writing it.
+                (
+                    Some(json!({"status":"conflict","reconciled":true,"stateJson":serde_json::to_string(observed)?})),
+                    "restore-before-image-observed",
+                )
             } else {
                 (None, "target-not-observed")
             }
@@ -437,6 +447,21 @@ fn evidence(row: &Row, states: &[FileState]) -> Result<(Option<Value>, &'static 
         _ => unreachable!("validated original file operation"),
     })
 }
+#[cfg(test)]
+#[test]
+fn interrupted_file_restore_settles_only_at_its_target_or_before_image() {
+    let before = FileState::Missing;
+    let target = FileState::Directory { native: None, mode: None };
+    let row = Row {
+        id: "restore:file:0".into(), kind: "file.apply".into(), state: "started".into(),
+        envelope: json!({"intent":{"__recoveryTool":"file_restore","targetJson":serde_json::to_string(&target).unwrap(),
+            "expectedJson":serde_json::to_string(&before).unwrap()}}), created: 0, updated: 0,
+    };
+    assert_eq!(evidence(&row, &[before]).unwrap().0.unwrap()["status"], "conflict");
+    assert_eq!(evidence(&row, &[target]).unwrap().0.unwrap()["status"], "applied");
+    assert!(evidence(&row, &[FileState::Unsupported]).unwrap().0.is_none());
+}
+
 impl Storage {
     pub(crate) fn prepare_file_inspection(
         &self,

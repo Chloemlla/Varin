@@ -149,7 +149,7 @@ export function registerResourceFileRoutes(app: Express, options: {
       const signal = input.command?.kind === 'filename-search' || input.command?.kind === 'content-search' ? controller.signal : undefined;
       const { resourceOwner, taskSource } = await route(input);
       const command = { command: input.command, ...(input.selection !== undefined ? {selection:input.selection} : {}), ...(input.root ? { root: input.root } : {}), ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}), ...(taskSource ? { taskSource } : {}) };
-      const result = resourceOwner.kind === 'local' ? await options.local.request(command, signal)
+      const result = resourceOwner.kind === 'local' ? await options.local.request(command, signal, request.varinAuth?.client?.allowedDirectories)
         : await (await options.remote(resourceOwner)).workspace({ ...command, coordinatorHostId: options.runtime.coordinatorHostId }, signal);
       if (!response.destroyed) response.json(result);
     } catch (error) { if (!controller.signal.aborted) failure(response, error); }

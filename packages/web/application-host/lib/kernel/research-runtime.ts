@@ -1,6 +1,7 @@
 /** Trusted research handoff. Catalog owns invocation, ExperimentService owns every attempt.
 * Reopening this bridge only inspects original subjects; it never submits replacement work. */
 import { createMetricObserver } from './metric-followups.js';
+import { createResearchScan } from './research-scan.js';
 import { createResearchArtifactObserver } from './research-artifact-followups.js';
 import { isDeepStrictEqual } from 'node:util';
 import { parseVarinToolJson } from '@varin/extension-contract';
@@ -34,13 +35,17 @@ export function createResearchRuntime(options: {
   onError?: (error: Error) => void;
 }) {
   const { kernel, runtime, experiments, sources, resources } = options;
-  let disposed = false, started = false, dirty = false, work: Promise<void> | undefined;
+  let disposed = false, started = false;
+  type SourceOwner = ResearchScope['source']['resource_owner'];
+  let reachedSources: SourceOwner[] = [];
   const active = new Set<Promise<unknown>>();
   const admitting = new Set<string>();
   const userAdmissions = new Map<string, number>();
   const subjectKey = (workspaceId: string, subjectId: string) => JSON.stringify([workspaceId, subjectId]);
   const stops: Array<() => void> = [];
-  const report = (error: unknown) => options.onError?.(error instanceof Error ? error : new Error(String(error)));
+  const report = (stage: string, error: unknown) => {
+    if (!disposed) options.onError?.(new Error(`${stage}: ${error instanceof Error ? error.message : String(error)}`, { cause: error }));
+  };
   const ensure = () => { if (disposed)
     throw new HarnessServiceError('unavailable', 'Research runtime is detached'); };
   const request = <T, M extends Extract<KernelMethod, `runtime.${string}`>>(method: M, params: KernelMethodParams[M], signal?: AbortSignal): Promise<T> => kernel.agentRuntimeRequest<T, M>(method, params, signal);
@@ -77,57 +82,94 @@ export function createResearchRuntime(options: {
       ? { kind: 'user', key: op.origin.key } : { kind: 'tool', origin: op.origin.origin, callId: op.origin.call_id, toolName: op.origin.tool_name, schemaVersion: op.origin.schema_version };
     return caller(scope, { runtime: 'agent', actor, rootThreadId: scope.rootThreadId, threadId: run.thread_id, branchId: run.branch_id, runId: run.id, operationId: op.binding.operationId, executionOwner: op.binding.executionOwner, source: scope.source });
   };
-  const metrics = createMetricObserver({ kernel, resources, onError: report, onAccepted: () => runtime.reconcileObservations() });
-  const artifacts = createResearchArtifactObserver({ kernel, experiments, onError: report, onAccepted: () => runtime.reconcileObservations() });
-  const sync = async () => {
+  const metrics = createMetricObserver({ kernel, resources, onError: error => report('Metric observation', error), onAccepted: () => runtime.reconcileObservations() });
+  const artifacts = createResearchArtifactObserver({ kernel, experiments, onError: error => report('Experiment follow-up', error), onAccepted: () => runtime.reconcileObservations() });
+  // A durable notification contains only a cursor. Compare the pending job
+  // controls; experiment-side changes invalidate their own subjects separately.
+  const observedJobs = new Map<string, HostJobPending>();
+  let changedSubjects = new Set<string>();
+  const control = createResearchScan(async () => {
     const pending = await request<HostJobPending[], 'runtime.host_job.pending'>('runtime.host_job.pending', {});
-    for (const op of pending) {
-      if (op.binding.domain !== DOMAIN)
-        continue;
+    const reached = reachedSources;
+    reachedSources = [];
+    const subjects = changedSubjects;
+    changedSubjects = new Set();
+    const jobs = pending.filter(op => op.binding.domain === DOMAIN);
+    const live = new Set(jobs.map(op => op.binding.operationId));
+    for (const id of observedJobs.keys()) if (!live.has(id)) observedJobs.delete(id);
+    for (const op of jobs) {
+      if (disposed) return;
+      const { operationId, subject } = op.binding;
+      const changed = subject.kind === 'workspace' && subjects.has(subjectKey(subject.workspaceId, subject.subjectId));
+      if (!reached.length && !changed && isDeepStrictEqual(observedJobs.get(operationId), op)) continue;
+      observedJobs.set(operationId, op);
       try {
-        const subject = op.binding.subject;
-        if (subject.kind !== 'workspace')
-          throw new Error('Original research job requires a workspace subject');
+        if (subject.kind !== 'workspace') {
+          report(`Reconcile experiment ${operationId}`, 'Original research job requires a workspace subject');
+          continue;
+        }
         const receipt = await experiments.nativeReceipt(subject.workspaceId, subject.subjectId);
         if (receipt) {
-          if (!isDeepStrictEqual(binding(receipt), op.binding))
-            throw new Error('Original domain subject owner changed');
+          if (!isDeepStrictEqual(binding(receipt), op.binding)) {
+            report(`Reconcile experiment ${operationId}`, 'Original domain subject owner changed');
+            continue;
+          }
+          if (!disposed && reached.some(owner => isDeepStrictEqual(owner, receipt.owner.source.resource_owner))) {
+            // Recovery can wait on a remote machine. Keep cancellation and
+            // receipt delivery live while the experiment owner reattaches.
+            void own(experiments.resumeAttempt(subject.workspaceId, subject.subjectId))
+              .catch(error => report(`Resume experiment ${operationId}`, error));
+          }
           await handoff(receipt, op);
         }
         else if (op.accepted)
-          throw new Error('Accepted original experiment subject is unavailable');
+          report(`Reconcile experiment ${operationId}`, 'Accepted original experiment subject is unavailable');
         else if (!admitting.has(op.binding.operationId) && !userAdmissions.has(subjectKey(subject.workspaceId, subject.subjectId)) && await experiments.reconcileUnaccepted(await originalCaller(op), subject.subjectId)) {
           await request<HostJobPending, 'runtime.host_job.terminal'>('runtime.host_job.terminal', { binding: op.binding, outcome: op.cancelRequested ? 'cancelled' : 'failed', effect: 'none', executorStopped: true, content: { data: { status: 'not_accepted', sourceAdmissionDrained: true }, parts: [] } });
+        } else {
+          // An admission may still be draining at its original owner.
+          observedJobs.delete(operationId);
         }
       }
       catch (error) {
-        report(error);
+        // Retry transient IO / handoff errors on the next durable notification.
+        // A missing accepted record waits for that subject or its source to change.
+        observedJobs.delete(operationId);
+        report(`Reconcile experiment ${operationId}`, error);
       }
     }
-  };
-  const reconcileControl = (): Promise<void> => {
-    if (disposed)
-      return Promise.resolve();
-    dirty = true;
-    if (work)
-      return work;
-    work = (async () => { while (dirty && !disposed) {
-      dirty = false;
-      await sync();
-    } })().finally(() => { work = undefined; if (dirty && !disposed)
-      wake(); });
-    return work;
+  }, () => disposed, error => report('Discover pending experiments', error));
+  const attemptChanged = (workspaceId: string, attemptId: string) => {
+    if (started && !disposed) {
+      changedSubjects.add(subjectKey(workspaceId, attemptId));
+      void control.request();
+      void artifacts.reconcile();
+    }
   };
   const wake = () => {
     if (started && !disposed) {
-      // Metadata observation never owns the original cancellation/acceptance flight.
-      void reconcileControl().catch(report);
-      void metrics.reconcile().catch(error => { if (!disposed) report(error); });
-      void artifacts.reconcile().catch(error => { if (!disposed) report(error); });
+      void control.request();
+      void artifacts.reconcile();
+      void metrics.wake();
     }
   };
-  const reconcile = async (): Promise<void> => { await Promise.all([reconcileControl(), artifacts.reconcile(), metrics.reconcile()]); };
-  const own = <T>(pending: Promise<T>): Promise<T> => { active.add(pending); void pending.finally(() => { active.delete(pending); wake(); }).catch(() => undefined); return pending; };
+  const recovery = createResearchScan(() => experiments.ensureReconciled(), () => disposed, error => report('Resume experiments', error));
+  const recover = () => { observedJobs.clear(); void recovery.request(); wake(); };
+  const sourceReached = (owner: SourceOwner) => {
+    if (!started || disposed) return;
+    if (!reachedSources.some(source => isDeepStrictEqual(source, owner))) reachedSources.push(owner);
+    void control.request();
+    void artifacts.reconcile();
+  };
+  const reconcile = async (): Promise<void> => {
+    observedJobs.clear();
+    await Promise.all([control.request(), artifacts.reconcile(), metrics.reconcile()]);
+  };
+  const own = <T>(pending: Promise<T>): Promise<T> => {
+    active.add(pending);
+    void pending.finally(() => active.delete(pending)).catch(() => undefined);
+    return pending;
+  };
   const submit = async (scope: ResearchScope, owner: ResearchOwner, params: ExperimentSubmitParams, signal?: AbortSignal) => {
     if (owner.runtime !== 'agent')
       throw new Error('Actual native submission owner required');
@@ -158,7 +200,7 @@ export function createResearchRuntime(options: {
     }
     finally {
       admitting.delete(owner.operationId);
-      wake();
+      attemptChanged(scope.source.workspace_id, subjectId);
     }
   };
   const read = async (method: ResearchMethod, actor: ExperimentCaller, params: Record<string, unknown>): Promise<unknown> => {
@@ -204,7 +246,7 @@ export function createResearchRuntime(options: {
             userAdmissions.set(key, count);
           else
             userAdmissions.delete(key);
-          wake();
+          attemptChanged(scope.source.workspace_id, subjectId);
         }
       })());
     },
@@ -248,8 +290,16 @@ export function createResearchRuntime(options: {
       return result(output, 'confirmed');
     })()));
   };
-  return { user, capability, reconcile, start() { if (started || disposed)
-      return; started = true; metrics.start(); stops.push(runtime.onReady(wake), runtime.onEvent(wake), experiments.subscribeAttempts(wake)); wake(); },
+  return { user, capability, reconcile, sourceReached, start() {
+    if (started || disposed) return;
+    started = true;
+    metrics.start();
+    stops.push(runtime.onReady(recover), runtime.onEvent(event => {
+      if (event.stream === 'durable') wake();
+      else if (event.stream === 'resync') recover();
+    }), experiments.subscribeAttempts(attemptChanged));
+    recover();
+  },
     async dispose() { disposed = true; const artifactDrain = artifacts.dispose(); const metricDrain = metrics.dispose(); for (const stop of stops.splice(0))
-      stop(); await Promise.allSettled([artifactDrain, metricDrain, ...active, ...(work ? [work] : [])]); } };
+      stop(); await Promise.allSettled([artifactDrain, metricDrain, ...active, control.flight, recovery.flight]); } };
 }

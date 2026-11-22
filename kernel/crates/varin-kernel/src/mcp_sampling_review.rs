@@ -46,13 +46,7 @@ impl HttpTransport for Stream {
                 .expect("exact generation Stop did not wake the original transport");
             assert!(cancel.is_cancelled());
             self.cancelled.fetch_add(1, Ordering::SeqCst);
-            return Err(ModelFailure {
-                tool_name: None,
-                code: "cancelled".into(),
-                message: "Original generation transport cancelled".into(),
-                retry_after_ms: None,
-                provider_request_id: None,
-            });
+            return Err(ModelFailure::new("cancelled", "Original generation transport cancelled"));
         }
         let event = json!({"type":"response.completed","response":{"id":"original-sampling-response","status":"completed",
             "output":[{"id":"sample","type":"message","role":"assistant","content":[{"type":"output_text","text":ANSWER}],"opaqueOriginal":{"nullable":null,"empty":[]}}],

@@ -41,6 +41,32 @@ fn record_input(id: &str) -> Value {
 }
 
 #[test]
+fn a_busy_terminal_does_not_start_a_recovery_write() {
+    let (mut storage, root) = fixture();
+    let directory = root.join("work");
+    fs::create_dir(&directory).unwrap();
+    let registered = invoke(&mut storage, "file.root.register", &json!({
+        "workspaceId":"workspace", "executionWorkspaceId":"workspace", "canonicalRoot":directory
+    })).unwrap();
+    let path = registered["canonicalRoot"].as_str().unwrap();
+    let writer = json!({"processId":"terminal-1","kernelEpoch":"epoch","cwd":path,
+        "sourceRoot":path,"mode":"pty","status":"starting","writerActive":true});
+    storage.conn.execute("INSERT INTO process_records(process_id,workspace_id,execution_workspace_id,grant_id,kernel_epoch,cwd,job_name,params_hash,status_json)
+        VALUES('terminal-1','workspace','workspace','actor','epoch',?1,'test','test',?2)", params![path,writer.to_string()]).unwrap();
+    let _launch = storage.processes.prepare_launch("terminal-1", json!({})).unwrap();
+    let input = json!({"operationId":"restore-file","workspaceId":"workspace","rootId":registered["rootId"],
+        "path":"scratch.txt","expectedJson":"{\"kind\":\"missing\"}","targetJson":"{\"kind\":\"missing\"}"});
+    let error = invoke(&mut storage, "file.apply", &input).unwrap_err();
+    assert!(matches!(error, KernelError::ActiveProcessWriter(detail) if detail.contains("terminal-1")), "{:?}", input);
+    assert!(storage.operation_get(&json!({"operationId":"restore-file"})).unwrap().is_null());
+    storage.conn.execute("UPDATE process_records SET status_json=?1 WHERE process_id='terminal-1'",
+        params![json!({"status":"released","writerActive":false}).to_string()]).unwrap();
+    assert_eq!(invoke(&mut storage, "file.apply", &input).unwrap()["status"], "applied");
+    drop(storage);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn binary_file_apply_joins_the_original_journal_and_replays_after_temporary_owners_are_consumed() {
     let (mut storage, root) = fixture();
     let directory = root.join("binary-workspace");
@@ -619,4 +645,66 @@ fn isolated_external_source_authority_uses_the_original_derived_execution_identi
     assert!(open(&mut storage,"fixed-correct","workspace","principal","thread:child:dispatch",false).is_ok());
     assert!(open(&mut storage,"fixed-derived",&derived,"principal","thread:child:dispatch",false).is_err());
     drop(storage);fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn recovery_branch_summary_uses_the_original_branch_across_workspaces() {
+    let (mut storage, root) = fixture();
+    let query =
+        json!({"workspaceId":"recovery-coordinator:host","threadId":"thread","branchId":"main"});
+    assert!(invoke(&mut storage, "recovery.operation.branch", &query).is_err());
+    let coordinator = json!({"grantId":"coordinator","hostGeneration":"generation","owningWorkspace":"recovery-coordinator:host",
+        "executionWorkspace":"recovery-coordinator:host","capabilities":["recovery.maintenance"],"pathScopes":[]});
+    storage
+        .issue_grant(
+            &coordinator,
+            "host",
+            "generation",
+            &root.to_string_lossy(),
+            "epoch",
+        )
+        .unwrap();
+    for (id, workspace, branch) in [
+        ("a", "desk", "main"),
+        ("b", "server", "main"),
+        ("c", "desk", "elsewhere"),
+    ] {
+        let data = json!({"plan":{"conversation":{"kind":"thread","threadId":"thread","branchId":branch},"id":id,
+            "affectedPaths":["note"],"expectedLeafId":"after","targetLeafId":"before","entryId":"entry","revision":"v1"},
+            "fileState":"unchanged","conversationState":"unchanged","editorText":"private draft","appliedPaths":[],
+            "createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z"});
+        storage.conn.execute("INSERT INTO recovery_operations(operation_id,workspace_id,kind,state,thread_id,data_json,revision,created_at,updated_at)
+            VALUES(?1,?2,'combined','applying-files','thread',?3,1,'t','t')", rusqlite::params![id,workspace,data.to_string()]).unwrap();
+    }
+    storage.conn.execute("INSERT INTO recovery_operation_files(workspace_id,operation_id,ordinal,path,phase,revision,updated_at)
+        VALUES('desk','a',0,'note','target-observed',1,'t')", []).unwrap();
+    let (grant, params) = storage
+        .authorize(
+            Some("coordinator"),
+            "epoch",
+            "host",
+            "generation",
+            "recovery.operation.branch",
+            &query,
+        )
+        .unwrap();
+    let result = storage
+        .dispatch(
+            "recovery.operation.branch",
+            &params,
+            Some("coordinator"),
+            &grant,
+        )
+        .unwrap();
+    let rows = result.as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["id"], "a");
+    assert_eq!(rows[0]["appliedPathCount"], 1);
+    assert_eq!(rows[1]["workspaceId"], "server");
+    assert!(
+        rows.iter()
+            .all(|r| r.get("editorText").is_none() && r.get("failure").is_none())
+    );
+    drop(storage);
+    fs::remove_dir_all(root).unwrap();
 }

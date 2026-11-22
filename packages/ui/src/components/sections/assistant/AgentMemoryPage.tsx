@@ -1,4 +1,6 @@
 import React from 'react';
+import { sharedUserMemory, type BotMemoryItem } from '@varin/application-client';
+import { subscribeVarinEvents } from '@/lib/varinEvents';
 import { SettingsActionBar } from '../shared/SettingsActionBar';
 import { requestSettingsNavigation } from '@/lib/settings/drafts';
 import { agentScopeKey, type AgentMemoryNote, type AgentMemoryScope } from '@varin/protocol';
@@ -14,6 +16,47 @@ import { useHarnessSettings } from '../harness/useHarnessSettings';
 import { useConfigurationModels } from '../harness/ConfigurationModels';
 import { Btn, Disclosure, Empty, Field, Loading, Note, Page, Row, Section, Select, Sw, useSettingsShell, type SelectItem } from '../shared/kit';
 import { SettingsScopeLabel } from '../shared/SettingsScope';
+
+function SharedMemoryNotes({ query }: { query: string }) {
+  const { t } = useI18n();
+  const [items, setItems] = React.useState<BotMemoryItem[]>([]);
+  const [revision, reload] = React.useReducer(n => n + 1, 0);
+  const [draft, setDraft] = React.useState<{ item: BotMemoryItem; text: string }>();
+  const [error, setError] = React.useState('');
+  const [saving, setSaving] = React.useState(false);
+  React.useEffect(() => subscribeVarinEvents(event => {
+    if ((event.type === 'harness-knowledge-changed' && event.scope === 'user') || event.type === 'stream-ready') reload();
+  }), []);
+  React.useEffect(() => {
+    const controller = new AbortController();
+    void sharedUserMemory.list(controller.signal).then(rows => {
+      if (!controller.signal.aborted) { setItems(rows); setError(''); }
+    }, failure => { if (!controller.signal.aborted) setError(String(failure)); });
+    return () => controller.abort();
+  }, [revision]);
+  const update = async (item: BotMemoryItem, value: string | null) => {
+    setSaving(true);
+    try { await sharedUserMemory.edit(item, value); setDraft(undefined); reload(); return true; }
+    catch (failure) { setError(String(failure)); return false; }
+    finally { setSaving(false); }
+  };
+  const search = query.trim().toLocaleLowerCase();
+  const visible = items.filter(item => item.id === draft?.item.id || item.content.toLocaleLowerCase().includes(search));
+  if (!visible.length && !error && !draft) return null;
+  return <Section title={t('chat.context.owner.user')}>
+    {error && <Note kind="err" actions={<Btn sm onClick={reload}>{t('assistant.reload')}</Btn>}>{error}</Note>}
+    {visible.map(item => <article key={item.id} className="sk-mem">
+      {draft?.item.id === item.id ? <>
+        <Textarea autoFocus className="sk-area" value={draft.text} onChange={e => setDraft({ ...draft, text: e.target.value })} />
+        <SettingsActionBar placement="inline" dirty saving={saving} saveDisabled={!draft.text.trim() || draft.text === draft.item.content}
+          onSave={() => update(draft.item, draft.text)} onCancel={() => setDraft(undefined)} />
+      </> : <><p className="break-words">{item.content}</p><div className="sk-meta"><span className="sk-grow" />
+        <button type="button" className="sk-link" disabled={saving || !!draft} onClick={() => setDraft({ item, text: item.content })}>{t('assistant.edit')}</button>
+        <button type="button" className="sk-link" disabled={saving || !!draft} onClick={() => void update(item, null)}>{t('settings.memoryx.forget')}</button>
+      </div></>}
+    </article>)}
+  </Section>;
+}
 
 function MemoryRetrievalSettings() {
   const { t } = useI18n();
@@ -151,7 +194,7 @@ export function AgentMemoryPage({ initialScope, scopes, embedded = false, onCont
   </div> : null;
   const content = <>
     {settings.error && !draft ? <Note kind="err" actions={<Btn kind="ghost" sm onClick={() => void settings.load()}>{t('assistant.reload')}</Btn>}>{settings.error}</Note> : null}
-    <Section>
+    <Section title={!embedded && scope.kind === 'global' ? 'Agent' : undefined}>
       {draft && draft.id === undefined ? editor : null}
       {!settings.catalog && !settings.error ? <Loading /> : null}
       {settings.catalog && !items.length && !draft ? <Empty icon={filter ? 'search' : 'book-2'}
@@ -190,6 +233,7 @@ export function AgentMemoryPage({ initialScope, scopes, embedded = false, onCont
   </div> : <Page title={t('assistant.memory.title')} description={t('assistant.memory.description')}
     scope={<SettingsScopeLabel kind="host" />} saved={false} actions={add} lead={toolbar}>
     {content}
+    {scope.kind === 'global' && <SharedMemoryNotes key={settings.runtime} query={query} />}
     <MemoryRetrievalSettings />
   </Page>;
 }

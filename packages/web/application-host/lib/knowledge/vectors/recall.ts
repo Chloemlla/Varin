@@ -20,15 +20,20 @@ type Candidate = {
 
 const candidateKey = (scope: KnowledgeScope, id: number): string => `${scope}:${id}`;
 
-const textScore = (query: string, item: Knowledge): number => {
-  const haystack = `${item.content} ${item.trigger}`.toLowerCase();
-  return query.toLowerCase().split(/\s+/).filter(Boolean)
-    .reduce((score, term) => score + (haystack.includes(term) ? 1 : 0), 0);
-};
+const words = new Intl.Segmenter(undefined, { granularity: 'word' });
 
 const rankText = (candidates: readonly Candidate[], query: string): Map<string, number> => {
+  const terms = new Set(query.toLowerCase().split(/\s+/).filter(Boolean).flatMap(term =>
+    /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(term)
+      ? Array.from(words.segment(term)).filter(word => word.isWordLike).map(word => word.segment)
+      : [term]));
   const ranked = candidates
-    .map((candidate) => ({ candidate, score: textScore(query, candidate.item) }))
+    .map(candidate => {
+      const text = `${candidate.item.content} ${candidate.item.trigger}`.toLowerCase();
+      let score = 0;
+      for (const term of terms) if (text.includes(term)) score++;
+      return { candidate, score };
+    })
     .filter((row) => row.score > 0)
     .sort((left, right) => right.score - left.score || left.candidate.key.localeCompare(right.candidate.key));
   return new Map(ranked.map((row, index) => [row.candidate.key, index + 1]));

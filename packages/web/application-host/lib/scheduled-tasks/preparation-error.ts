@@ -8,7 +8,7 @@ export type CalendarPreparationStage = 'project' | 'identity' | 'source_resoluti
 // Persist only known owner codes, never exception messages, paths, prompt bodies or
 // provider responses. The stage remains useful even for an unclassified exception.
 const reasons = new Set([
-  'workspace_backend_unavailable', 'credential-scope-changed', 'model-configuration-changed',
+  'workspace_backend_unavailable', 'workspace_mount_unavailable', 'credential-scope-changed', 'model-configuration-changed',
   'credential-resolution-failed', 'model-channel-unavailable', 'model-channel-disabled',
   'model-unavailable', 'model-disabled', 'model-operation-unavailable', 'invalid-params',
   'operation-error', 'protocol-error', 'not-found', 'kernel-unavailable', 'kernel-grant-stale',

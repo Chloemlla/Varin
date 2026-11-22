@@ -25,6 +25,7 @@ import type {
 import { MCP_CAPABILITIES, type McpBinding, type McpBuiltinOperation } from './protocol.generated.js';
 import { deferToolJsonSchema } from '../models/schema.js';
 import { projectMcpOutput } from './mcp-output.js';
+import { McpPreparationError } from '../mcp/errors.js';
 import { McpAuthorityError, requiresMcpTask } from '../mcp/authority.js';
 import type { McpTaskRuntime } from './mcp-task-runtime.js';
 import type { McpResourceRuntime } from './mcp-resource-runtime.js';
@@ -407,16 +408,19 @@ export function createMcpLease(options: McpOwnerOptions): McpToolLease {
           content:{data:{error:{code:error.code,message:'Read the exact tool contract from path "", or repeat the original discovery query.'}},parts:[]}},true);
         // This receipt describes the capability-preparation operation, not tools/call. A definitive
         // preparation failure is settled; an aborted outstanding preparation remains uncertain.
-        if (discoverySelection)
+        if (discoverySelection) {
+          const problem = error instanceof McpPreparationError && !signal.aborted ? error : undefined;
           return receipt(
             {
               kind: 'result',
               outcome: signal.aborted ? discoverySelection.server ? 'indeterminate' : 'cancelled' : 'failed',
               effect: discoverySelection.server ? signal.aborted ? 'unknown' : 'confirmed' : 'none',
-              content: { data: { error: 'mcp_discovery_failed' }, parts: [] },
+              content: problem ? { data: { error: { code: problem.code, message: problem.message, ...problem.details } },
+                parts: [{ kind: 'text', text: problem.message }] } : { data: { error: 'mcp_discovery_failed' }, parts: [] },
             },
             !discoverySelection.server || !signal.aborted,
           );
+        }
         return noEffect('mcp_dispatch_rejected');
       }
       try {

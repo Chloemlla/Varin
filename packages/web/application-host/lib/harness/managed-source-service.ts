@@ -576,14 +576,11 @@ export function createManagedSourceService(options: ManagedSourceServiceOptions)
         await assertResourcePathAllowed(registration.canonicalPath, principal.allowedDirectories);
       }
       if (selection?.mode !== 'native_workspace' && input.command.kind === 'open' && input.command.path) await assertResourcePathAllowed(input.command.path, principal.allowedDirectories);
-      const selected = input.command.kind === 'open' && !input.command.path && !input.taskSource && principal.allowedDirectories?.length
-        ? { ...input, command: { ...input.command, path: principal.allowedDirectories[0]! } } : input;
-      const result = await options.workspaceFiles.request(selected, signal);
+      const result = await options.workspaceFiles.request(input, signal, principal.allowedDirectories);
       if (result.kind === 'opened' && selection?.mode !== 'native_workspace') {
         const registration = await documents.admitWorkspaceRegistration(result.workspaceId, signal);
         await assertResourcePathAllowed(registration.canonicalPath, principal.allowedDirectories);
       }
-      if ((result.kind === 'opened' || result.kind === 'locations') && principal.allowedDirectories?.length) result.locations = [...principal.allowedDirectories];
       return result;
     },
     async workspaceAsset(principal,input,signal) {

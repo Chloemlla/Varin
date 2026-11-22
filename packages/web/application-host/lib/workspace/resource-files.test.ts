@@ -2,9 +2,49 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { expect, it } from 'vitest';
-import type { DocumentAuthority } from '../documents/authority.js';
+import { createDocumentAuthority, type DocumentAuthority } from '../documents/authority.js';
+import { createDocumentRootGuard } from '../documents/allowed-roots.js';
 import type { KernelFileResourceBackend } from '../kernel/file-resource-backend.js';
 import { createResourceFilesOwner } from './resource-files.js';
+
+it('opens the restricted Host workspace on first use and advertises only browseable paired locations', async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'varin-file-locations-'));
+  const workspace = path.join(temp, 'workspaces'), project = path.join(workspace, 'expense-handoff');
+  const guard = createDocumentRootGuard({ fsPromises: fs, pathModule: path, workspace: { root: workspace, lockdown: true } });
+  const documents = createDocumentAuthority({ hostId: 'qa', dataDir: path.join(temp, 'data'), isAllowedRoot: guard, isTrusted: guard });
+  const files = createResourceFilesOwner(documents, {} as KernelFileResourceBackend, { restrictedRoot: workspace });
+  try {
+    await fs.mkdir(project, { recursive: true });
+    await fs.writeFile(path.join(project, 'summary.csv'), 'total,145.75');
+    const root = await fs.realpath(workspace), subdir = await fs.realpath(project);
+    const opened = await files.request({ command: { kind: 'open' } });
+    expect(opened).toMatchObject({ kind: 'opened', root, locations: [root] });
+    if (opened.kind !== 'opened') throw new Error('Expected an open workspace');
+    const location = { root: opened.root, workspaceId: opened.workspaceId };
+    expect(await files.request({ ...location, command: { kind: 'list', path: '' } })).toMatchObject({
+      kind: 'list', page: { entries: [{ name: 'expense-handoff' }] } });
+    const preview = await files.request({ ...location, command: { kind: 'bytes', path: 'expense-handoff/summary.csv', offset: 0 } });
+    expect(preview.kind === 'bytes' && Buffer.from(preview.bytesBase64, 'base64').toString()).toBe('total,145.75');
+    expect(await files.request({ command: { kind: 'locations' } })).toEqual({ kind: 'locations', locations: [root] });
+    await expect(files.request({ command: { kind: 'open', path: temp } })).rejects.toMatchObject({ code: 'path-escape' });
+
+    const outside = path.join(temp, 'outside');
+    await fs.mkdir(outside);
+    for (const [grants, expected] of [
+      [[outside, project], [subdir]], [[project, temp], [root, subdir]],
+    ] as const) {
+      await expect(files.request({ command: { kind: 'open' } }, undefined, grants))
+        .resolves.toMatchObject({ root: expected[0], locations: expected });
+      await expect(files.request({ command: { kind: 'locations' } }, undefined, grants))
+        .resolves.toMatchObject({ locations: expected });
+    }
+    await expect(files.request({ command: { kind: 'locations' } }, undefined, [outside])).resolves.toMatchObject({ locations: [] });
+    await expect(files.request({ command: { kind: 'open' } }, undefined, [outside])).rejects.toThrow('No permitted directory');
+  } finally {
+    await documents.dispose();
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
 
 it('opens an independent workspace at its admitted physical view, not its original configuration directory', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'varin-resource-view-'));
@@ -34,9 +74,9 @@ it('keeps native project selection logical while files and editor identities use
   const selection={mode:'native_workspace' as const,workspaceId:'physical-registration',executionWorkspaceId:'adopted-documents',branchId:'adopted',adoptionOperationId:'original-adoption'};
   const documents={resolveWorkspace:async ({path:root}:{path:string})=>{expect(root).toBe(mounted);return {workspaceId:'adopted-documents'};},
     admitWorkspaceRegistration:async()=>({hostId:'target',canonicalPath:original}),inspectWorkspace:async()=>({root:mounted})} as unknown as DocumentAuthority;
-  const files=createResourceFilesOwner(documents,{} as KernelFileResourceBackend,undefined,async selected=>{
+  const files=createResourceFilesOwner(documents,{} as KernelFileResourceBackend,{prepareProjectSelection:async selected=>{
     expect(selected).toEqual(selection);return {path:mounted,originalRoot:original};
-  });
+  }});
   try {
     const opened=await files.request({selection,command:{kind:'open',path:original}});
     expect(opened).toMatchObject({kind:'opened',root:original,workspaceId:'adopted-documents'});
@@ -71,8 +111,8 @@ it('searches the admitted native view with original compute adapters and preserv
     return {status: partial ? 'partial' : 'ready', scannedFiles: 1, records:[], kernelEpoch:'epoch', workspaceId:'view', jobId:'search', root:null, nextCursor:1, endCursor:1, message:null};
   }) };
   const owner = createResourceFilesOwner(documents as unknown as DocumentAuthority, {} as KernelFileResourceBackend,
-    undefined, async selected => {expect(selected).toEqual(selection);return {path:mounted,originalRoot:physical};},
-    {files:createFsSearchRuntime({compute}),content:createWorkspaceContentSearch({documents,compute})});
+    {prepareProjectSelection: async selected => {expect(selected).toEqual(selection);return {path:mounted,originalRoot:physical};},
+    search: {files:createFsSearchRuntime({compute}),content:createWorkspaceContentSearch({documents,compute})}});
   const location = {root:physical,workspaceId:'view',selection};
   try {
     expect(await owner.request({...location,command:{kind:'filename-search',path:'',query:'needle',includeHidden:true,respectGitignore:false}})).toEqual({kind:'filename-search',results:[{path:'nested/needle.ts'}],enumerationStatus:'complete'});

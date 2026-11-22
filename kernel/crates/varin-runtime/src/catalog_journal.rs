@@ -205,7 +205,43 @@ pub struct RecoveryRangeRead {
     content: crate::content::ContentStore,
     _publication: crate::content::ContentPublication,
 }
+// Earlier ModelSteps keep this boundary only in the immutable request. Decode
+// its header without resolving the history, media or serialized provider input.
+fn legacy_request_range(
+    content: &crate::content::ContentStore,
+    reference: &Value,
+    run: &str,
+    request: &str,
+) -> Result<crate::execution::HistoryRange> {
+    #[derive(serde::Deserialize)]
+    struct Binding {
+        history_range: crate::execution::HistoryRange,
+    }
+    #[derive(serde::Deserialize)]
+    struct View {
+        run_id: String,
+        request_id: String,
+        binding: Binding,
+    }
+    #[derive(serde::Deserialize)]
+    struct Snapshot {
+        view: View,
+    }
+    let snapshot: Snapshot = serde_json::from_slice(&content.load_bytes(reference, &|| false)?)?;
+    if snapshot.view.run_id != run || snapshot.view.request_id != request {
+        return Err(RuntimeError::Conflict(
+            "recovery invocation source changed".into(),
+        ));
+    }
+    Ok(snapshot.view.binding.history_range)
+}
 impl RecoveryRangeRead {
+    pub fn load_at_head(self, expected: Option<&str>) -> Result<Vec<RecoveryRangeTurn>> {
+        if expected.is_some() && self.head.as_deref() != expected {
+            return Err(RuntimeError::Conflict("conversation changed before file recovery preparation".into()));
+        }
+        self.load()
+    }
     pub fn load(self) -> Result<Vec<RecoveryRangeTurn>> {
         let db = history_views::current_history_owner(&self.database, self.epoch)?;
         let mut entries = Vec::new();
@@ -247,18 +283,11 @@ impl RecoveryRangeRead {
         for run_id in runs {
             let main_source = optional_record::<launch_content::LaunchMetadata>(&db, "run_launches", &run_id)?
                 .and_then(|launch| launch.selection.source);
-            let operations = {
-                let mut query = db.prepare("SELECT body FROM operations WHERE run_id=?1")?;
-                let values = query
-                    .query_map([&run_id], |row| row.get::<_, String>(0))?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                values
-            };
-            for raw in operations {
-                let operation: Operation = serde_json::from_str(&raw)?;
-                if operation.effect == Effect::None || operation.intent["kind"] != "tool" {
-                    continue;
-                }
+            let mut ops = db.prepare("SELECT body FROM operations WHERE run_id=?1 AND json_extract(body,'$.effect') != 'none' AND json_extract(body,'$.intent.kind')='tool'")?;
+            let mut rows = ops.query([&run_id])?;
+            let mut model_ranges: std::collections::HashMap<String, crate::execution::HistoryRange> = std::collections::HashMap::new();
+            while let Some(row) = rows.next()? {
+                let operation: Operation = serde_json::from_str(&row.get::<_, String>(0)?)?;
                 let intent = tool_content::ToolIntent::from_operation(&operation)?;
                 if intent.contract().read_only {
                     continue;
@@ -306,16 +335,20 @@ impl RecoveryRangeRead {
                 let range = match root.origin {
                     crate::execution::ToolOrigin::Driver { invocation_id } => super::driver::driver_call_metadata(&db, &invocation_id)?.history_range,
                     crate::execution::ToolOrigin::ModelStep { request_id } => {
-                        let step: ModelStep = record(&db, "model_steps", &request_id)?;
-                        let snapshot: crate::execution::RequestSnapshot =
-                            self.content.load_snapshot(&step.request)?;
-                        if snapshot.view.run_id != run_id || snapshot.view.request_id != request_id
-                        {
-                            return Err(RuntimeError::Conflict(
-                                "recovery invocation source changed".into(),
-                            ));
+                        if let Some(range) = model_ranges.get(&request_id) {
+                            range.clone()
+                        } else {
+                            let step: ModelStep = record(&db, "model_steps", &request_id)?;
+                            if step.run_id != run_id || step.id != request_id {
+                                return Err(RuntimeError::Conflict("recovery invocation source changed".into()));
+                            }
+                            let range = match step.history_range {
+                                Some(range) => range,
+                                None => legacy_request_range(&self.content, &step.request, &run_id, &request_id)?,
+                            };
+                            model_ranges.insert(request_id, range.clone());
+                            range
                         }
-                        snapshot.view.binding.history_range
                     }
                     crate::execution::ToolOrigin::PolicyAction { action_id, .. } => {
                         let operation: Operation = record(&db, "operations", &action_id)?;

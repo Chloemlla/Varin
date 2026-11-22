@@ -1558,6 +1558,7 @@ impl Catalog {
                     require_ancestor(&tx, &run.branch_id, anchor)?;
                 }
                 let step = ModelStep {
+                    history_range: Some(snapshot.view.binding.history_range.clone()),
                     generation: None,
                     goal: None,
                     superseded_by_input: None,

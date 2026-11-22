@@ -1,4 +1,4 @@
-import type { BotCreateInput, BotUpdateInput, BotModelSelection, BotReadyEntry, BotMemoryItem } from '@varin/application-client';
+import type { BotMemoryOwner, BotCreateInput, BotUpdateInput, BotModelSelection, BotReadyEntry, BotMemoryItem } from '@varin/application-client';
 import { createScheduledTasksHttpAPI, getRuntimeEndpointGeneration, subscribeRuntimeEndpointWillChange } from '@varin/application-client';
 import { create } from 'zustand';
 import { getRegisteredRuntimeAPIs } from '@/lib/runtime-api/registry';
@@ -17,15 +17,15 @@ export const updateBot = (id: string, patch: BotUpdateInput) => api().update(id,
 export const archiveBot = (id: string) => api().archive(id);
 export const deleteBot = (id: string) => api().remove(id);
 export const changeBotState = (id: string, action: 'sleep' | 'wake' | 'restore' | 'retry') => api().changeState(id, action);
-export const listBotMemory = (id: string, signal?: AbortSignal, includeInactive?: boolean) => api().memory.list(id, signal, includeInactive);
-export const readBotMemoryHistory = (id: string, memoryId: number, signal?: AbortSignal) => api().memory.history(id, memoryId, signal);
-export const readBotMemorySource = (id: string, memoryId: number, signal?: AbortSignal) => api().memory.source(id, memoryId, signal);
-export const updateBotMemory = (id: string, item: BotMemoryItem, action: 'correct' | 'forget' | 'archive', content?: string) => api().memory.update(id, item, action, content);
+export const listBotMemory = (id: string, signal?: AbortSignal, includeInactive?: boolean, owner?: BotMemoryOwner) => api().memory.list(id, signal, includeInactive, owner);
+export const readBotMemoryHistory = (id: string, memoryId: number, signal?: AbortSignal, owner?: BotMemoryOwner) => api().memory.history(id, memoryId, signal, owner);
+export const readBotMemorySource = (id: string, memoryId: number, signal?: AbortSignal, owner?: BotMemoryOwner) => api().memory.source(id, memoryId, signal, owner);
+export const updateBotMemory = (id: string, item: BotMemoryItem, action: 'correct' | 'forget' | 'archive', content?: string, owner?: BotMemoryOwner) => api().memory.update(id, item, action, content, owner);
 export const organizeBotMemory = (id: string, input: { ids?: number[]; reason?: string; query?: string }) => { const action = api().memory.organize; if (!action) throw new Error('Memory maintenance unavailable'); return action(id, input); };
 export const readBotMemoryMaintenance = (id: string, signal?: AbortSignal) => api().memory.maintenance?.(id, signal) ?? Promise.resolve([]);
 export const cancelBotMemoryMaintenance = (id: string, key: string) => { const action = api().memory.cancelMaintenance; if (!action) throw new Error('Memory maintenance unavailable'); return action(id, key); };
-export const restoreBotMemory = (id: string, current: BotMemoryItem, previous: BotMemoryItem) => { const action = api().memory.restore; if (!action) throw new Error('Memory restore unavailable'); return action(id, current, previous); };
-export const clearBotMemoryHistory = (id: string, ids: number[]) => { const action = api().memory.clearHistory; if (!action) throw new Error('Memory history cleanup unavailable'); return action(id, ids); };
+export const restoreBotMemory = (id: string, current: BotMemoryItem, previous: BotMemoryItem, owner?: BotMemoryOwner) => { const action = api().memory.restore; if (!action) throw new Error('Memory restore unavailable'); return action(id, current, previous, owner); };
+export const clearBotMemoryHistory = (id: string, ids: number[], owner?: BotMemoryOwner) => { const action = api().memory.clearHistory; if (!action) throw new Error('Memory history cleanup unavailable'); return action(id, ids, owner); };
 export const ensureBotEntry = (id: string, signal?: AbortSignal) => api().entry(id, signal);
 export const listBotWork = (id: string, signal?: AbortSignal) => api().work(id, signal);
 export const listBotSessions = (id: string, signal?: AbortSignal) => api().sessions.list(id, signal);

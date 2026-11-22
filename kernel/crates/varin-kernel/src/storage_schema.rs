@@ -51,6 +51,17 @@ pub(crate) const CATALOG_USER_VERSION: i64 = 16;
 // Run retirement addresses that Run's grants, excluding the unrelated Host-read
 // ledger from its index and from the shared Storage control path.
 pub(crate) const CATALOG_QUERY_INDEXES: &str = "
+    CREATE INDEX IF NOT EXISTS experiment_recovery_attempts ON domain_records(workspace_id,record_id)
+    WHERE record_type='experiment.attempt' AND (state IN ('submitted','queued','running','stopping')
+      OR (state IN ('completed','failed','cancelled') AND
+        (json_extract(payload_json,'$.collection')='pending'
+         OR (json_extract(payload_json,'$.commitmentId') IS NOT NULL AND coalesce(json_extract(payload_json,'$.commitmentReleased'),0)=0)
+         OR (coalesce(json_extract(payload_json,'$.spawnDispatched'),0)=0 AND json_extract(payload_json,'$.collectionCompletion') IS NULL))));
+    CREATE INDEX IF NOT EXISTS experiment_recovery_jobs ON domain_records(workspace_id,record_id)
+    WHERE record_type='experiment.job' AND state!='released' AND json_extract(payload_json,'$.executorStopped')=1;
+     CREATE INDEX IF NOT EXISTS recovery_operations_branch ON recovery_operations(thread_id, json_extract(data_json,'$.plan.conversation.branchId')) WHERE kind='combined';
+    CREATE INDEX IF NOT EXISTS recovery_operations_resumable ON recovery_operations(workspace_id,updated_at DESC)
+    WHERE kind='combined' AND state NOT IN ('complete','aborted','compensated','needs-attention');
     CREATE INDEX IF NOT EXISTS grants_run_lifetime
     ON grants(json_extract(grant_json,'$.run_id'), host_id, grant_id)
     WHERE json_extract(grant_json,'$.run_id') IS NOT NULL;

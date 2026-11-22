@@ -25,6 +25,7 @@ import {
 import {
   DocumentAuthorityError,
   DocumentPathError,
+  WorkspaceDirectoryError,
   DocumentUntrustedError,
   DocumentWorkspaceUnavailableError,
   DocumentWorkspaceUnregisteredError,
@@ -921,18 +922,22 @@ export const createDocumentAuthority = (options: DocumentAuthorityOptions) => {
     let canonicalPath: string;
     try {
       canonicalPath = await canonicalizePathIdentity(rawPath, { fsPromises, pathModule });
+      if (!(await fsPromises.stat(canonicalPath)).isDirectory()) {
+        throw new WorkspaceDirectoryError('The selected path is not a directory.', { code: 'path-escape', statusCode: 400 });
+      }
     } catch (error) {
-      if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
-        throw new DocumentAuthorityError('Workspace path does not exist', { code: 'failed', statusCode: 404 });
+      const code = (error as NodeJS.ErrnoException)?.code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        throw new WorkspaceDirectoryError('The selected directory does not exist on this Host.', { statusCode: 404 });
+      }
+      if (code === 'EACCES' || code === 'EPERM') {
+        throw new WorkspaceDirectoryError('This Host does not have permission to access the selected directory.', { statusCode: 403 });
       }
       throw error;
     }
-    const stat = await fsPromises.stat(canonicalPath);
-    if (!stat.isDirectory()) {
-      throw new DocumentPathError('Workspace path is not a directory', 400);
-    }
     if (!await allowedRoot(canonicalPath)) {
-      throw new DocumentPathError(`Workspace path is outside the Host deployment boundary: ${canonicalPath}`);
+      throw new WorkspaceDirectoryError('The selected directory is outside the workspace allowed by this Host. Choose a directory within it.',
+        { code: 'path-escape', statusCode: 403 });
     }
     return canonicalPath;
   };
@@ -2722,6 +2727,9 @@ export const createDocumentAuthority = (options: DocumentAuthorityOptions) => {
     advanceEpoch: mutations.advanceEpoch,
     setMaintenance: mutations.setMaintenance,
     registerWriter: mutations.registerWriter,
+    invalidateRestoredFile: (resource: DocumentResource) => {
+      watcherController(resource.workspaceId)?.publishMutation({ kind: 'invalidated', resource, reason: 'entry-changed' });
+    },
     emitWatchOverflow: (workspaceId: string) => {
       const controller = watcherController(workspaceId);
       if (!controller) return false;

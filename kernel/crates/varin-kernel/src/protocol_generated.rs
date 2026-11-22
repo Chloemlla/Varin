@@ -1626,10 +1626,11 @@ pub(crate) struct FollowupControlParams {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct NavigationSelectParams {
+pub(crate) struct RecoveryRangeParams {
     pub(crate) thread_id: String,
     pub(crate) branch_id: String,
     pub(crate) entry_id: String,
+    pub(crate) expected_head_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1637,6 +1638,14 @@ pub(crate) struct NavigationSelectParams {
 pub(crate) struct RecoveryLabelsParams {
     pub(crate) thread_id: String,
     pub(crate) run_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct NavigationSelectParams {
+    pub(crate) thread_id: String,
+    pub(crate) branch_id: String,
+    pub(crate) entry_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -2772,6 +2781,12 @@ pub(crate) struct KernelExperimentArtifactsParams {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct KernelExperimentRecoveryParams {
+    pub(crate) workspace_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct KernelExperimentLogChunksParams {
     pub(crate) workspace_id: String,
     pub(crate) attempt_id: String,
@@ -3355,9 +3370,18 @@ pub(crate) struct KernelRecoveryOperationConflictsParams {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct KernelRecoveryOperationListParams {
     pub(crate) workspace_id: String,
+    pub(crate) resumable_only: Option<bool>,
     pub(crate) kind: Option<String>,
     pub(crate) cursor: Option<i64>,
     pub(crate) page_size: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct KernelBranchRecoveryParams {
+    pub(crate) workspace_id: String,
+    pub(crate) thread_id: String,
+    pub(crate) branch_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -5536,7 +5560,7 @@ pub(crate) fn validate_generated_method_params(method: &str, params: &Value) -> 
                 .map_err(|error| error.to_string())
         }
         "runtime.branch.recovery.range" => {
-            serde_json::from_value::<NavigationSelectParams>(params.clone())
+            serde_json::from_value::<RecoveryRangeParams>(params.clone())
                 .map(|_| ())
                 .map_err(|error| error.to_string())
         }
@@ -6169,6 +6193,11 @@ pub(crate) fn validate_generated_method_params(method: &str, params: &Value) -> 
                 .map(|_| ())
                 .map_err(|error| error.to_string())
         }
+        "storage.experiment.recovery" => {
+            serde_json::from_value::<KernelExperimentRecoveryParams>(params.clone())
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }
         "storage.experiment.logChunks" => {
             serde_json::from_value::<KernelExperimentLogChunksParams>(params.clone())
                 .map(|_| ())
@@ -6460,6 +6489,11 @@ pub(crate) fn validate_generated_method_params(method: &str, params: &Value) -> 
         }
         "recovery.operation.list" => {
             serde_json::from_value::<KernelRecoveryOperationListParams>(params.clone())
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }
+        "recovery.operation.branch" => {
+            serde_json::from_value::<KernelBranchRecoveryParams>(params.clone())
                 .map(|_| ())
                 .map_err(|error| error.to_string())
         }

@@ -1,4 +1,7 @@
-import type { RecoveryConversation, RecoveryFileTarget } from '@varin/extension-contract';
+import { randomUUID } from 'node:crypto';
+import { createWorkspaceRecoveryAPI } from '@varin/extension-contract';
+import type { ApplicationExtensionRuntime } from '@varin/extension-host';
+import type { RecoveryConversation, RecoveryFileTarget, WorkspaceCombinedRecoveryPrepareInput } from '@varin/extension-contract';
 import type { ThreadAdapter } from '../kernel/thread-adapter.js';
 import type { AgentRuntimeClient } from '../kernel/agent-runtime-client.js';
 import type { KernelRecoveryStore } from '../kernel/kernel-recovery-store.js';
@@ -24,7 +27,29 @@ const identity = (conversation: RecoveryConversation) => {
         throw new Error('Thread navigation requires its original Thread');
     return { runtime: 'agent' as const, threadId: conversation.threadId, branchId: conversation.branchId };
 };
-export function createThreadRecoveryNavigation(owners: Owners): RecoverySessionNavigation {
+/** Lives on the Host invocation. A provider that delegates this same selection to
+ * the native journal can reuse its captured range without another history read. */
+export class ThreadRecoverySelection {
+    constructor(readonly input: WorkspaceCombinedRecoveryPrepareInput, private readonly read: () => ReturnType<RecoverySessionNavigation['prepare']>) {}
+    prepare(runtime: Pick<ApplicationExtensionRuntime, 'prepareService'>, signal?: AbortSignal) {
+        const scope = { id: randomUUID(), value: this };
+        return createWorkspaceRecoveryAPI(async request => {
+            const service = await runtime.prepareService(request, signal ? { signal } : {});
+            try {
+                const pin = service.pin();
+                try { return await pin.invoke(request.method, request.args, signal, scope); }
+                finally { pin.release(); }
+            } finally { service.release(); }
+        }).prepareCombinedRecovery(this.input);
+    }
+    navigationFor(input: WorkspaceCombinedRecoveryPrepareInput): ReturnType<RecoverySessionNavigation['prepare']> | undefined {
+        return input.workspaceId === this.input.workspaceId && input.entryId === this.input.entryId
+            && input.conversation.threadId === this.input.conversation.threadId && input.conversation.branchId === this.input.conversation.branchId
+            ? this.read() : undefined;
+    }
+}
+type PrepareFiles = (navigation: Awaited<ReturnType<ThreadAdapter['prepareNavigation']>>, range: Awaited<ReturnType<AgentRuntimeClient['recoveryRange']>>) => ReturnType<RecoverySessionNavigation['prepare']>;
+export function createThreadRecoveryNavigation(owners: Owners): RecoverySessionNavigation & { prepareFiles: PrepareFiles } {
     const { threads, runtime, store } = owners;
     const commit: RecoverySessionNavigation['commitLeaf'] = async (input) => {
         const selected = identity(input.conversation);
@@ -52,49 +77,54 @@ export function createThreadRecoveryNavigation(owners: Owners): RecoverySessionN
             throw new RecoveryPrimitiveError('navigation-conflict', error instanceof Error ? error.message : 'History navigation was rejected', { cause: error, origin: 'navigation', retryable: !rejected });
         }
     };
+    const prepareFiles: PrepareFiles = async (navigation, range) => {
+        const managedTurns: import('./managed-recovery-coordinator.js').ManagedRecoveryTurn[] = [];
+        const journalTurns: Array<{
+            workspaceId: string;
+            executionId: string;
+            restore: boolean;
+        }> = [];
+        const removed = new Set(navigation.removedEntryIds);
+        for (const turn of range) {
+            if (!turn.source || !turn.entryIds.some(id => removed.has(id)))
+                continue;
+            if (turn.source.resource_owner.kind === 'managed_host') {
+                managedTurns.push({ turn, restore: removed.has(turn.anchor.entryId) });
+                continue;
+            }
+            const workspaceId = turn.source.workspace_id;
+            journalTurns.push({ workspaceId, executionId: turn.anchor.executionId, restore: removed.has(turn.anchor.entryId) });
+            await store.recordTurnStart({ workspaceId, conversation: { kind: "thread", threadId: turn.anchor.threadId, branchId: turn.anchor.branchId }, executionId: turn.anchor.executionId,
+                runId: turn.anchor.runId, userEntryId: turn.anchor.entryId, runtimeGeneration: turn.anchor.epoch, workerId: 'kernel', activeWriterScopes: [], provenance: 'caused-by' });
+            if (turn.settled) await store.recordTurnSettled({ workspaceId, executionId: turn.anchor.executionId,
+                ...(turn.entryIds.at(-1) ? { assistantEntryId: turn.entryIds.at(-1)! } : {}), activeWriterScopes: turn.uncovered ? ['process/or-external'] : [],
+                mutationObserved: turn.uncovered, observationComplete: !turn.uncovered, observedResourceIds: [], provenance: 'caused-by',
+                ...(!turn.settled || turn.uncovered ? { failure: { code: 'checkpoint-incomplete' as const, message: !turn.settled ? 'Original input work is not settled' : 'Shell or external tool effects do not have complete before-images', retryable: false } } : {}),
+            });
+        }
+        return { journalTurns, managedTurns, expectedLeafId: navigation.expectedHeadId, targetLeafId: navigation.targetHeadId, removedEntryIds: navigation.removedEntryIds,
+            ...(navigation.editorText !== undefined ? { editorText: navigation.editorText } : {}), ...('editorImages' in navigation ? { editorImages: navigation.editorImages } : {}) };
+    };
     return {
+        prepareFiles,
         ready: () => true,
         commit,
         commitLeaf: commit,
-        async prepare(input) {
+        async prepare(input: Parameters<RecoverySessionNavigation['prepare']>[0]) {
             const selected = identity(input.conversation);
             const navigation = await threads.prepareNavigation({ ...selected, entryId: input.entryId });
-            const range = await runtime.recoveryRange({ threadId: selected.threadId, branchId: selected.branchId, entryId: input.entryId });
-            const managedTurns: import('./managed-recovery-coordinator.js').ManagedRecoveryTurn[] = [];
-            const journalTurns: Array<{
-                workspaceId: string;
-                executionId: string;
-                restore: boolean;
-            }> = [];
-            for (const turn of range) {
-                if (!turn.source || !turn.entryIds.some(id => navigation.removedEntryIds.includes(id)))
-                    continue;
-                if (turn.source.resource_owner.kind === 'managed_host') {
-                    managedTurns.push({ turn, restore: navigation.removedEntryIds.includes(turn.anchor.entryId) });
-                    continue;
-                }
-                const workspaceId = turn.source.workspace_id;
-                journalTurns.push({ workspaceId, executionId: turn.anchor.executionId, restore: navigation.removedEntryIds.includes(turn.anchor.entryId) });
-                await store.recordTurnStart({ workspaceId, conversation: { kind: "thread", threadId: turn.anchor.threadId, branchId: turn.anchor.branchId }, executionId: turn.anchor.executionId,
-                    runId: turn.anchor.runId, userEntryId: turn.anchor.entryId, runtimeGeneration: turn.anchor.epoch, workerId: 'kernel', activeWriterScopes: [], provenance: 'caused-by' });
-                if (turn.settled) await store.recordTurnSettled({ workspaceId, executionId: turn.anchor.executionId,
-                    ...(turn.entryIds.at(-1) ? { assistantEntryId: turn.entryIds.at(-1)! } : {}), activeWriterScopes: turn.uncovered ? ['process/or-external'] : [],
-                    mutationObserved: turn.uncovered, observationComplete: !turn.uncovered, observedResourceIds: [], provenance: 'caused-by',
-                    ...(!turn.settled || turn.uncovered ? { failure: { code: 'checkpoint-incomplete' as const, message: !turn.settled ? 'Original input work is not settled' : 'Shell or external tool effects do not have complete before-images', retryable: false } } : {}),
-                });
-            }
-            return { journalTurns, managedTurns, expectedLeafId: navigation.expectedHeadId, targetLeafId: navigation.targetHeadId, removedEntryIds: navigation.removedEntryIds,
-                ...(navigation.editorText !== undefined ? { editorText: navigation.editorText } : {}), ...('editorImages' in navigation ? { editorImages: navigation.editorImages } : {}) };
+            const range = await runtime.recoveryRange({ threadId: selected.threadId, branchId: selected.branchId, entryId: input.entryId, ...(navigation.expectedHeadId ? { expectedHeadId: navigation.expectedHeadId } : {}) });
+            return prepareFiles(navigation, range);
         },
-        async prepareLeaf(input) {
+        async prepareLeaf(input: Parameters<RecoverySessionNavigation['prepareLeaf']>[0]) {
             const selected = identity(input.conversation);
             if (!input.undoOf)
                 throw new RecoveryPrimitiveError('navigation-conflict', 'Returning to removed history requires its original recovery receipt', { origin: 'navigation' });
             const receipt = await threads.navigationReceipt({ ...selected, key: input.undoOf });
             if (!receipt || receipt.previousHeadId !== input.targetLeafId)
                 throw new RecoveryPrimitiveError('navigation-conflict', 'Original recovery navigation does not match this undo', { origin: 'navigation' });
-            const current = await threads.snapshot(selected);
-            if (current.historyPage.head !== receipt.headId)
+            const current = (await runtime.thread(selected.threadId)).branches.find(branch => branch.branch_id === selected.branchId);
+            if (!current || current.head !== receipt.headId)
                 throw new RecoveryPrimitiveError('navigation-conflict', 'Conversation changed after recovery; undo requires a new review', { origin: 'navigation' });
             return { expectedLeafId: receipt.headId, targetLeafId: receipt.previousHeadId };
         },

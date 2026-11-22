@@ -32,7 +32,7 @@ it('continues original research leaves after Job pending is empty and preserves 
     }
     throw new Error(method);
   } } as unknown as KernelClient;
-  const experiments = { subscribeAttempts: (fn: () => void) => { hints = fn; subscribed = true; return () => { subscribed = false; }; },
+  const experiments = { ensureReconciled: async () => {}, subscribeAttempts: (fn: () => void) => { hints = fn; subscribed = true; return () => { subscribed = false; }; },
     readArtifactObservation: async (caller: ExperimentCaller) => {
       assert.equal(caller.workspaceId, binding.subject.workspaceId); assert.equal(caller.owner.runtime, 'agent');
       if (caller.owner.runtime !== 'agent') throw new Error('actual native reader required');
@@ -42,7 +42,7 @@ it('continues original research leaves after Job pending is empty and preserves 
       if (reads === 1) { entered.resolve(); await release.promise; }
       return snapshot(captured);
     } } as unknown as ExperimentService;
-  const runtime = { onReady: () => () => {}, onEvent: (fn: () => void) => { events = fn; return () => {}; }, reconcileObservations: async () => [] } as unknown as AgentRuntimeClient;
+  const runtime = { onReady: () => () => {}, onEvent: (fn: (event: { stream: 'durable' }) => void) => { events = () => fn({stream: 'durable'}); return () => {}; }, reconcileObservations: async () => [] } as unknown as AgentRuntimeClient;
   const research = createResearchRuntime({ kernel, runtime, experiments, sources: {} as SourceService, resources: { subscribeSamples: () => () => {} } as unknown as ResourceService, onError: e => errors.push(e) });
   try {
     research.start(); await entered.promise; version = 2; hints(); release.resolve(); await research.reconcile();
@@ -66,8 +66,8 @@ it('keeps original cancellation responsive while an independent artifact metadat
       if (method === 'runtime.followup.research') return { works: [work('collection')], nextCursor: null };
       throw new Error(method);
     } } as unknown as KernelClient,
-    runtime: { onReady: () => () => {}, onEvent: (fn: () => void) => { event = fn; return () => {}; }, reconcileObservations: async () => [] } as unknown as AgentRuntimeClient,
-    experiments: { subscribeAttempts: () => () => {}, readArtifactObservation: async () => { entered.resolve(); await held.promise; return { attempt: { state: 'running' }, completion: null, artifacts: [], counts: { available: 0, failed: 0, expired: 0, pending: 0 } }; },
+    runtime: { onReady: () => () => {}, onEvent: (fn: (event: { stream: 'durable' }) => void) => { event = () => fn({stream: 'durable'}); return () => {}; }, reconcileObservations: async () => [] } as unknown as AgentRuntimeClient,
+    experiments: { ensureReconciled: async () => {}, subscribeAttempts: () => () => {}, readArtifactObservation: async () => { entered.resolve(); await held.promise; return { attempt: { state: 'running' }, completion: null, artifacts: [], counts: { available: 0, failed: 0, expired: 0, pending: 0 } }; },
       nativeReceipt: async () => ({ caller, owner: caller.owner, accepted: {}, attempt: { attemptId: other.subject.subjectId, state: 'running', cancelRequested: false }, executorStopped: false, recordRevision: 1 }),
       cancel: async () => { cancelled = true; } } as unknown as ExperimentService,
     sources: {} as SourceService, resources: { subscribeSamples: () => () => {} } as unknown as ResourceService, onError: e => errors.push(e),
@@ -91,8 +91,8 @@ it('discards an unstarted old-page metadata read after durable Pause and recheck
       if (method === 'runtime.followup.research') return { works: paused ? [heldWork()] : [heldWork(), work('collection')], nextCursor: null };
       throw new Error(method);
     } } as unknown as KernelClient,
-    runtime: { onReady: () => () => {}, onEvent: (fn: () => void) => { event = fn; return () => {}; }, reconcileObservations: async () => [] } as unknown as AgentRuntimeClient,
-    experiments: { subscribeAttempts: () => () => {}, readArtifactObservation: async (_caller: ExperimentCaller, _binding: HostJobBinding, selector: { name?: string }) => {
+    runtime: { onReady: () => () => {}, onEvent: (fn: (event: { stream: 'durable' }) => void) => { event = () => fn({stream: 'durable'}); return () => {}; }, reconcileObservations: async () => [] } as unknown as AgentRuntimeClient,
+    experiments: { ensureReconciled: async () => {}, subscribeAttempts: () => () => {}, readArtifactObservation: async (_caller: ExperimentCaller, _binding: HostJobBinding, selector: { name?: string }) => {
       if (selector.name === 'held') { artifactReads++; if (artifactReads === 1) { entered.resolve(); await held.promise; } } else collectionReads++;
       return { attempt: { state: 'running' }, completion: null, artifacts: [], counts: { available: 0, failed: 0, expired: 0, pending: 0 } };
     } } as unknown as ExperimentService,

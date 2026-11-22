@@ -1,5 +1,6 @@
 /** Transient consumer of original Catalog leaves and ExperimentService facts. No domain state or scheduler. */
 import { createResearchLogReader } from './research-log-followups.js';
+import { createResearchScan } from './research-scan.js';
 import type { ExperimentService } from '../harness/experiments.js';
 import type { ExperimentCaller } from '../harness/research-identity.js';
 import type { KernelClient } from './kernel-client.js';
@@ -72,33 +73,20 @@ export function createResearchArtifactObserver(options: { kernel: KernelClient; 
         for (const work of page.works) {
           // A committed hint can revoke another leaf while this page's prior read is held.
           // Discard unstarted metadata reads and recheck the original Catalog projection.
-          if (dirty) return;
+          if (updates.pending) return;
           current.add(JSON.stringify([work.key.ownerEpoch, work.key.followupId, work.key.generation, work.key.sourceIndex]));
-          try { moreLogBytes = await observe(work) || moreLogBytes; } catch (error) { if (controller.signal.aborted) throw error; options.onError(error); }
+          try { moreLogBytes = await observe(work) || moreLogBytes; } catch (error) {
+            if (controller.signal.aborted) throw error;
+            options.onError(new Error(`Follow-up ${work.key.followupId} for ${work.binding.operationId}: ${error instanceof Error ? error.message : String(error)}`, { cause: error }));
+          }
         }
         if (page.nextCursor !== null && page.nextCursor === after) throw new Error('Research observation cursor did not advance');
         after = page.nextCursor ?? undefined;
       } while (after !== undefined);
       for (const identity of seen) if (!current.has(identity)) seen.delete(identity);
       logs.retain(current);
-      if (moreLogBytes) dirty = true;
+      if (moreLogBytes) void updates.request();
   };
-  let dirty = false;
-  let work: Promise<void> | undefined;
-  const reconcile = (): Promise<void> => {
-    if (controller.signal.aborted) return Promise.resolve();
-    dirty = true;
-    if (work) return work;
-    work = (async () => {
-      while (dirty && !controller.signal.aborted) { dirty = false; await scan(); }
-    })().finally(() => {
-      work = undefined;
-      // A notification can arrive after the loop settles but before this cleanup runs.
-      if (dirty && !controller.signal.aborted) void reconcile().catch(error => {
-        if (!controller.signal.aborted) options.onError(error);
-      });
-    });
-    return work;
-  };
-  return { reconcile, async dispose() { controller.abort(); await Promise.allSettled(work ? [work] : []); } };
+  const updates = createResearchScan(scan, () => controller.signal.aborted, options.onError);
+  return { reconcile: updates.request, async dispose() { controller.abort(); await updates.flight; } };
 }

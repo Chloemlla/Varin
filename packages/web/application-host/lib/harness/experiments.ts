@@ -449,7 +449,16 @@ export function createExperimentService(deps: ExperimentServiceDeps) {
   let disposed = false;
   const contexts = new Map<string, Promise<ExperimentContext>>();
   const recordContexts = new Map<string, Promise<ExperimentContext>>();
-  const reconciliations = new Map<string, Promise<void>>();
+  let contextEpoch = deps.client.kernelEpoch;
+  const refreshContextEpoch = () => {
+    if (contextEpoch !== deps.client.kernelEpoch) {
+      contexts.clear();
+      recordContexts.clear();
+      contextEpoch = deps.client.kernelEpoch;
+    }
+  };
+  const reconciliations = new Map<string | undefined, Promise<void>>();
+  const resumeRequests = new Map<string, Promise<void>>();
   const jobs = sharedRuntime.jobs;
   const waiters = new Map<string, Set<(view: ExperimentAttemptView | null) => void>>();
   const queued = new Map<string, Set<string>>();
@@ -490,6 +499,7 @@ export function createExperimentService(deps: ExperimentServiceDeps) {
   // Recovery retains the attempt's original native owner. A workspace-only
   // maintenance grant cannot adopt a process started by an Agent Run.
   const contextAt = (caller: ExperimentCaller, canonicalRoot: string): Promise<ExperimentContext> => {
+    refreshContextEpoch();
     const owner = requireResearchOwner(caller);
     const key = `${caller.workspaceId}\0${caller.executionWorkspaceId}\0${owner.threadId}\0${owner.runId}\0${owner.operationId}\0${canonicalRoot}`;
     const existing = contexts.get(key);
@@ -522,6 +532,7 @@ export function createExperimentService(deps: ExperimentServiceDeps) {
   };
 
   const recordContext = (workspaceId: string): Promise<ExperimentContext> => {
+    refreshContextEpoch();
     const existing = recordContexts.get(workspaceId);
     if (existing) return existing;
     const creating = (async (): Promise<ExperimentContext> => {
@@ -720,12 +731,17 @@ export function createExperimentService(deps: ExperimentServiceDeps) {
       if (!current) throw new HarnessServiceError("failed", `Experiment attempt is unreadable: ${attemptId}`);
       if (onlyIf && !onlyIf(current)) return existing;
       try {
+        const nextState = typeof state === "function" ? state(current) : state;
+        const nextPayload = mutate(payloadOf(existing), existing.recordRevision + 1);
+        // Compare the stored representation: optional fields cleared with
+        // undefined disappear from JSON. An unchanged attempt has no new revision.
+        if (nextState === existing.state && JSON.stringify(nextPayload) === existing.payloadJson) return existing;
         const record = await putRecord(ctx, workspaceId, recordCaller(workspaceId, existing), {
           recordId: existing.recordId,
           recordType: "experiment.attempt",
-          state: typeof state === "function" ? state(current) : state,
+          state: nextState,
           expectedRecordRevision: existing.recordRevision,
-          payload: mutate(payloadOf(existing), existing.recordRevision + 1),
+          payload: nextPayload,
         });
         const view = attemptView(record);
         notify(workspaceId, attemptId, view);
@@ -1570,7 +1586,7 @@ export function createExperimentService(deps: ExperimentServiceDeps) {
       }
       signal?.throwIfAborted();
       const dispatch = await updateAttempt(ctx, workspaceId, caller, attempt.attemptId, "submitted", (p) => ({
-        ...p, backend: executionBackend.backend.backend, spawnDispatched: true, phase: "dispatching",
+        ...p, backend: executionBackend.backend.backend, spawnDispatched: true, phase: "dispatching", preparationError: undefined,
       }), (current) => current.state === "submitted");
       if (attemptView(dispatch)?.state !== "submitted") return;
       if (signal?.aborted) {
@@ -1739,39 +1755,28 @@ export function createExperimentService(deps: ExperimentServiceDeps) {
 
   const recordCaller = researchMaintenanceCaller;
 
-  const ensureReconciled = async (workspaceId: string): Promise<void> => {
+  const ensureReconciled = async (workspaceId?: string): Promise<void> => {
     const existing = reconciliations.get(workspaceId);
     if (existing) return existing;
     const reconciliation = (async () => {
-      const ctx = await recordContext(workspaceId);
-      const all: KernelRecordResult[] = [];
-      let cursor: number | undefined;
-      do {
-        const page = await ctx.scoped.listRecords({
-          workspaceId, recordType: "experiment.attempt", pageSize: 128,
-          ...(cursor === undefined ? {} : { cursor }),
-        });
-        all.push(...page.records);
-        cursor = page.nextCursor === null ? undefined : page.nextCursor;
-      } while (cursor !== undefined);
-      for (const record of all) {
-        const attempt = attemptView(record);
-        if (!attempt) { report(new Error(`Experiment attempt is unreadable: ${record.recordId}`)); continue; }
-        if (attempt.state === "lost") continue;
-        const caller = recordCaller(workspaceId, record);
-        try {
-          void reconcileAttempt(ctx, workspaceId, caller, record).catch(report);
-        } catch (error) {
-          report(new Error(`attempt ${attempt.attemptId} reconciliation is pending: ${errorMessage(error)}`));
-        }
+      const grant = await deps.client.issueGrant({ grantId: `experiment-discovery:${randomUUID()}`,
+        owningWorkspace: workspaceId ?? null, executionWorkspace: workspaceId ?? null,
+        capabilities: ["storage.maintenance"], pathScopes: [] });
+      let subjects;
+      try {
+        subjects = await deps.client.experimentRecovery(workspaceId === undefined ? {} : { workspaceId }, grant);
+      } finally { await deps.client.revokeGrant(grant.grantId); }
+      for (const subject of subjects) {
+        if (disposed) return;
+        void resumeAttempt(subject.workspaceId, subject.attemptId).catch(error =>
+          report(new Error(`Resume experiment ${subject.attemptId}: ${errorMessage(error)}`, { cause: error })));
       }
-      void drainQueue(workspaceId).catch(report);
     })();
     reconciliations.set(workspaceId, reconciliation);
     try {
       await reconciliation;
     } catch (error) {
-      report(error);
+      report(new Error(`Discover unfinished experiments${workspaceId ? ` in ${workspaceId}` : ""}: ${errorMessage(error)}`, { cause: error }));
     } finally {
       if (reconciliations.get(workspaceId) === reconciliation) reconciliations.delete(workspaceId);
     }
@@ -2068,7 +2073,7 @@ export function createExperimentService(deps: ExperimentServiceDeps) {
       throw new HarnessServiceError("not-found", `Machine is not registered: ${machineId}`);
     }
     return updateAttempt(ctx, caller.workspaceId, caller, attempt.attemptId, "submitted", (p) => ({ ...p, machineId,
-      resources, phase: "preparing", preparationError: undefined }), (view) => view.state === "submitted");
+      resources, phase: "preparing" }), (view) => view.state === "submitted");
   };
 
   const finishUnspawnedCancellation = async (ctx: ExperimentContext, workspaceId: string, record: KernelRecordResult): Promise<void> => {
@@ -2186,7 +2191,7 @@ export function createExperimentService(deps: ExperimentServiceDeps) {
               return;
             }
             fresh = await updateAttempt(ctx, workspaceId, caller, attempt.attemptId, (view) => view.state,
-              (p) => ({ ...p, admissionDrained: true, ...(outcome.status === "confirmed" ? { commitmentId: outcome.commitmentId } : {}) }));
+              (p) => ({ ...p, admissionDrained: true, preparationError: undefined, ...(outcome.status === "confirmed" ? { commitmentId: outcome.commitmentId } : {}) }));
             payload = payloadOf(fresh);
             signal.throwIfAborted();
           }
@@ -2365,7 +2370,6 @@ export function createExperimentService(deps: ExperimentServiceDeps) {
     caller: ExperimentCaller,
     attemptId: string,
   ): Promise<{ ctx: ExperimentContext; record: KernelRecordResult; view: ExperimentAttemptView }> => {
-    void ensureReconciled(caller.workspaceId).catch(report);
     const ctx = await recordContext(caller.workspaceId);
     const record = await getAttemptRecord(ctx, caller.workspaceId, attemptId);
     const view = record ? attemptView(record) : null;
@@ -2466,7 +2470,6 @@ export function createExperimentService(deps: ExperimentServiceDeps) {
     caller: ExperimentCaller,
     params: { state?: ExperimentAttemptState; specId?: string; limit?: number },
   ): Promise<ExperimentListResult> => {
-    void ensureReconciled(caller.workspaceId).catch(report);
     const ctx = await recordContext(caller.workspaceId);
     const attempts: ExperimentAttemptView[] = [];
     let cursor: number | undefined;
@@ -2557,8 +2560,11 @@ export function createExperimentService(deps: ExperimentServiceDeps) {
     timeoutMs?: number | null,
     signal?: AbortSignal,
   ): Promise<{ attempt: ExperimentAttemptView; timedOut: boolean }> => {
-    const { view } = await requireAttempt(caller, attemptId);
+    const { ctx, record, view } = await requireAttempt(caller, attemptId);
     if (TERMINAL.has(view.state)) return { attempt: view, timedOut: false };
+    // A waiter still needs an observer after a Host restart. Attach to the
+    // requested attempt only; reading metadata never initiates recovery.
+    void reconcileAttempt(ctx, caller.workspaceId, recordCaller(caller.workspaceId, record), record).catch(report);
     const deadline = timeoutMs === null ? null : timeoutMs === undefined ? 30_000 : Math.max(0, timeoutMs);
     if (signal?.aborted) return { attempt: view, timedOut: true };
     const key = attemptKey(caller.workspaceId, attemptId);
@@ -2915,11 +2921,6 @@ export function createExperimentService(deps: ExperimentServiceDeps) {
     }
   };
 
-  const refreshQueue = async (workspaceId: string): Promise<void> => {
-    await ensureReconciled(workspaceId);
-    await drainQueue(workspaceId);
-  };
-
   const detachObservers = (): void => {
     if (disposed) return;
     disposed = true;
@@ -2947,13 +2948,26 @@ export function createExperimentService(deps: ExperimentServiceDeps) {
     return () => sharedRuntime.listeners.delete(listener);
   };
 
-  sharedRuntime.resumers.set(serviceToken, (workspaceId, attemptId) => {
-    void (async () => {
+  const resumeAttempt = async (workspaceId: string, attemptId: string) => {
+    const key = attemptKey(workspaceId, attemptId);
+    // A reconnect may arrive while a probe of the previous connection is in
+    // flight. Keep one read after that probe, including a probe started by submit.
+    const previous = sharedRuntime.flights.get(key);
+    const queuedRead = resumeRequests.get(key);
+    if (queuedRead) return queuedRead;
+    const pending = (async () => {
+      await previous?.promise.catch(() => undefined);
+      if (disposed) return;
       const ctx = await recordContext(workspaceId);
       const record = await getAttemptRecord(ctx, workspaceId, attemptId);
-      if (record) await reconcileAttempt(ctx, workspaceId, recordCaller(workspaceId, record), record);
-    })().catch(report);
-  });
+      resumeRequests.delete(key);
+      if (record && !disposed) await reconcileAttempt(ctx, workspaceId, recordCaller(workspaceId, record), record);
+    })();
+    resumeRequests.set(key, pending);
+    try { await pending; }
+    finally { if (resumeRequests.get(key) === pending) resumeRequests.delete(key); }
+  };
+  sharedRuntime.resumers.set(serviceToken, (workspaceId, attemptId) => { void resumeAttempt(workspaceId, attemptId).catch(report); });
 
   const submissionId = (caller: ExperimentCaller, requestId: string): string => {
     if (!requestId.trim()) throw new HarnessServiceError("invalid-params", "Stable submission identity is required");
@@ -2979,7 +2993,6 @@ export function createExperimentService(deps: ExperimentServiceDeps) {
     const payload = payloadOf(record);
     const job = await ctx.scoped.getRecord(workspaceId, recordIdFor.job(jobIdFor(attemptId)));
     const stopped = originalExecutorStopped(record, attempt, job);
-    void reconcileAttempt(ctx, workspaceId, caller, record).catch(report);
     const owner = requireResearchOwner(caller);
     const accepted = payload.acceptance as import("@varin/protocol").ExperimentSubmitResult | undefined;
     if (!accepted || accepted.attempt.attemptId !== attemptId) throw new HarnessServiceError("unavailable", "Original experiment acceptance is missing");
@@ -2989,7 +3002,7 @@ export function createExperimentService(deps: ExperimentServiceDeps) {
 
   return {
     submit, list, get, logs, cancel, wait, collect, readArtifactObservation, readLogObservation, readArtifact, readArtifactPage, submissionId, reconcileUnaccepted, nativeReceipt,
-    stopForThreads, refreshQueue, ensureReconciled, subscribeAttempts,
+    stopForThreads, ensureReconciled, resumeAttempt, subscribeAttempts,
     detachObservers,
     dispose: detachObservers,
   };

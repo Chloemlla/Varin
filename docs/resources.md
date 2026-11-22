@@ -24,13 +24,13 @@ Key owners: [Documents](../packages/web/application-host/lib/documents/DOCUMENTA
 
 ## Source Selection & Multi-Location Execution
 
-- **User Files panel** (`/api/resource-files`): Uses explicit `(resourceOwner, workspaceId, root)`. Text editing routes through `DocumentsAPI` (forwarding to remote Hosts when configured, never hijacking the global active workspace).
-- **Live execution sources**: Ordinary Varin/lead/shared tasks get device filesystem access on their resource Host (project dir sets relative cwd; absolute paths follow OS account access unless Host deployment lockdown is enabled). Default start location comes from saved Host preference → Bot home dir / user home dir.
+- **User Files panel** (`/api/resource-files`) uses explicit `(resourceOwner, workspaceId, root)`. A restricted Host opens its workspace root by default. For a paired connection, the target offers shortcuts within both its workspace and the paired directories, and opens the first available location. An unrestricted Host defaults to the user's home directory. Text editing routes through `DocumentsAPI` on the selected Host.
+- **Live execution sources.** The working directory sets the starting point for relative paths and commands. Absolute paths follow OS account access unless Host deployment lockdown is enabled. An existing conversation keeps its selected source. A new Bot conversation honors its assigned project or location, otherwise it starts in the Bot home directory. If that directory lies outside the deployment boundary, it starts at the Host workspace root. Other new conversations use the saved Host location or the Host workspace root.
 - **Work locations**: Live native Runs use `work_locations({ query })` to find bookmarks/projects/paths, pass `location` per call on `file_*` / `process_spawn`, switch future default via `work_location_switch`, and copy/move across devices via `work_location_transfer` (moves verify target write before conditional source delete).
 - **Source modes**:
   - `LiveRoot`: Admitted physical directory (saved files; no OS isolation against external writers).
   - `FixedBranch`: Immutable branch/revision; materializes an execution copy on first command (`workspace MCP` still requires explicit execution source).
-  - `Materialized`: Bound execution copy + immutable baseline.
+  - `Materialized`: A physical directory is captured as an immutable baseline. Isolated work uses a mounted branch when available, or a private run directory on Hosts without the filesystem backend. An explicitly selected native workspace keeps its original branch backend.
   - `NativeWorkspace`: Logical `(workspace, branch, subdir)` mounted per Host epoch via WinFsp / FUSE / FSKit / macFUSE (mount path is ephemeral, never persisted).
   - Source-free: Valid when no file/process capability is needed.
 

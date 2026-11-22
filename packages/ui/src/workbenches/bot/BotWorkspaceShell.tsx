@@ -777,7 +777,6 @@ const BotWorkspace: React.FC<{ committed: boolean }> = ({ committed }) => {
     {activeDraftKey && threads && active ? <div className="min-h-0 flex-1"><ThreadDraftConversation key={activeDraftKey} api={threads} draftKey={activeDraftKey} handoff={messageHandoff} /></div> : ownsConversation && !busy && active ? <div className="min-h-0 flex-1">{selectedEntry && threads
       ? <ChildNavigationContext.Provider value={childNavigation}><MemoryNavigationContext.Provider value={memoryNavigation}>
         <ThreadConversation key={`${selectedEntry.threadId}:${selectedEntry.branchId}`} surface="bot" api={threads} identity={selectedEntry} messageHandoff={messageHandoff} onWorkChanged={refreshWork} onActivity={stage.onActivity}
-          inheritWorkbenchModel={!selected?.model}
           preferredModel={selected && entryResolution?.botId === selected.id && entryResolution.profileModelKey === profileModelKey ? entryResolution.model : null} readOnly={readOnly || conversationArchived}
           emptyHero={selected ? { visual: <BotFigure bot={selected} state={figure} size={64} />, title: t('bot.hero.title', { name: selected.name }) } : undefined}
           onBranchCreated={entry => { if (selected) void openBotConversation(selected.id, entry); refreshWork(); }} />

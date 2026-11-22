@@ -4,6 +4,12 @@ use crate::execution::CompletionKind;
 use serde::Deserialize;
 use std::collections::BTreeSet;
 
+pub(super) const PENDING_JOB: &str = "json_extract(body,'$.host_job') IS NOT NULL AND (
+    (json_extract(body,'$.host_job.binding.domain')='mcp.task' AND json_extract(body,'$.host_job.mcpHolderReleased')=0)
+    OR coalesce(json_extract(body,'$.external_receipt.executor_stopped'),0)=0
+    OR json_extract(body,'$.phase')!='terminal'
+    OR (json_extract(body,'$.host_job.mcpTask') IS NOT NULL AND json_extract(body,'$.host_job.mcpTask.resultRef') IS NULL))";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct McpEndpoint {
@@ -1077,7 +1083,9 @@ impl Catalog {
         Ok(target)
     }
     pub fn pending_host_jobs(&self) -> Result<Vec<Operation>> {
-        let mut query=self.db.prepare("SELECT body FROM operations WHERE json_extract(body,'$.host_job') IS NOT NULL AND ((json_extract(body,'$.host_job.binding.domain')='mcp.task' AND json_extract(body,'$.host_job.mcpHolderReleased')=0) OR coalesce(json_extract(body,'$.external_receipt.executor_stopped'),0)=0 OR json_extract(body,'$.phase')!='terminal' OR (json_extract(body,'$.host_job.mcpTask') IS NOT NULL AND json_extract(body,'$.host_job.mcpTask.resultRef') IS NULL)) ORDER BY rowid")?;
+        let mut query = self.db.prepare_cached(&format!(
+            "SELECT body FROM operations INDEXED BY pending_host_jobs WHERE {PENDING_JOB} ORDER BY rowid"
+        ))?;
         let rows = query.query_map([], |r| r.get::<_, String>(0))?;
         rows.map(|raw| Ok(serde_json::from_str(&raw?)?)).collect()
     }

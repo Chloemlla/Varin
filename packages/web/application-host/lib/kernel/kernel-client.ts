@@ -535,6 +535,10 @@ export class KernelScopedClient {
   recoveryOperationConflicts(params: KernelMethodParams["recovery.operation.conflicts"], signal?: AbortSignal): Promise<KernelRecoveryOperationConflictsResult> {
     return this.owner.recoveryOperationConflicts(params, this.grant, signal);
   }
+  recoveryBranchOperations(params: KernelMethodParams["recovery.operation.branch"], signal?: AbortSignal): Promise<unknown[]> {
+    return this.owner.recoveryBranchOperations(params, this.grant, signal);
+  }
+
   recoveryOperationList(params: KernelMethodParams["recovery.operation.list"], signal?: AbortSignal): Promise<Record<string, unknown>> {
     return this.owner.recoveryOperationList(params, this.grant, signal);
   }
@@ -796,6 +800,11 @@ export class KernelClient {
     if (!this.handshakeResult) await this.start();
     signal?.throwIfAborted();
     return this.credentialBridge.register(runId, owner, signal, bindingId, lifetime);
+  }
+  async withModelCredential<T>(runId: string, bindingId: string | undefined, owner: ExistingHostCredentialOwner,
+    signal: AbortSignal | undefined, use: (scope: CredentialScope) => Promise<T>): Promise<T> {
+    if (!this.handshakeResult) await this.start();
+    return this.credentialBridge.withModelBinding(runId, bindingId, owner, signal, use);
   }
   /** `runId` restricts the search to that Run's own registrations and their retained graph. */
   findModelCredentialOwner(configuration: import('./protocol.generated.js').ModelSessionConfiguration, scope: CredentialScope, runId?: string): ExistingHostCredentialOwner | undefined {
@@ -1921,6 +1930,10 @@ export class KernelClient {
   async recoveryOperationConflicts(params: KernelMethodParams["recovery.operation.conflicts"], grant: KernelGrantHandle, signal?: AbortSignal): Promise<KernelRecoveryOperationConflictsResult> {
     return this.requestRaw<KernelRecoveryOperationConflictsResult>("recovery.operation.conflicts", params, { signal, grant });
   }
+  recoveryBranchOperations(params: KernelMethodParams["recovery.operation.branch"], grant: KernelGrantHandle, signal?: AbortSignal): Promise<unknown[]> {
+    return this.requestRaw<unknown[]>("recovery.operation.branch", params, { signal, grant });
+  }
+
   async recoveryOperationList(params: KernelMethodParams["recovery.operation.list"], grant: KernelGrantHandle, signal?: AbortSignal): Promise<Record<string, unknown>> {
     return this.requestRaw<Record<string, unknown>>("recovery.operation.list", params, { signal, grant });
   }
@@ -2075,6 +2088,10 @@ export class KernelClient {
       ? result.workspaceIds.filter((id): id is string => typeof id === "string" && id.length > 0)
       : [];
     return { workspaceIds: ids };
+  }
+
+  async experimentRecovery(params: KernelMethodParams["storage.experiment.recovery"], grant: KernelGrantHandle): Promise<Array<{ workspaceId: string; attemptId: string }>> {
+    return this.requestRaw("storage.experiment.recovery", params, { grant });
   }
 
   async uiCleanup(params: KernelMethodParams["storage.ui.cleanup"], grant: KernelGrantHandle, signal?: AbortSignal): Promise<{ pending: boolean; failures: string[] }> {

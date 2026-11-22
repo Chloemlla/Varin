@@ -10,6 +10,7 @@ it('resolves profile thinking and inherited defaults, and detects thinking-only 
   expect(botModelMatches({ providerId: 'channel', model: 'upstream', catalogModelId: 'alias', thinkingLevel: 'high' }, high)).toBe(true);
   expect(resolveBotModelSelection({ providerId: 'channel', modelId: 'alias' }, {}, models)?.thinkingLevel).toBe('off');
   expect(resolveBotModelSelection(null, { defaultProvider: 'channel', defaultModel: 'alias', defaultThinkingLevel: 'high' }, models)).toEqual(high);
+  expect(resolveBotModelSelection(high, {}, [], 'display')).toEqual(high);
   expect(() => resolveBotModelSelection({ ...high, thinkingLevel: 'max' }, {}, models)).toThrow('thinking level is unavailable');
 });
 

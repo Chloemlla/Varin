@@ -9,6 +9,38 @@ import type { ExperimentService } from '../harness/experiments.js';
 import type { SourceService } from '../harness/sources.js';
 import type { ResourceService } from '../harness/resources.js';
 
+it('coalesces durable wakes and ignores streamed progress during a failed startup scan', async () => {
+  let notify!: (event: { stream: 'progress' | 'durable' }) => void;
+  let fail!: (error: Error) => void;
+  const held = new Promise<void>((_, reject) => { fail = reject; });
+  const calls = new Map<string, number>();
+  const errors: Error[] = [];
+  const research = createResearchRuntime({
+    kernel: { agentRuntimeRequest: async (method: string) => {
+      const count = (calls.get(method) ?? 0) + 1;
+      calls.set(method, count);
+      if (count === 1) await held;
+      return method === 'runtime.host_job.pending' ? [] : { works: [], nextCursor: null };
+    } } as unknown as KernelClient,
+    runtime: { onReady: () => () => {}, onEvent(fn: typeof notify) { notify = fn; return () => {}; } } as unknown as AgentRuntimeClient,
+    experiments: { subscribeAttempts: () => () => {}, ensureReconciled: async () => {} } as unknown as ExperimentService,
+    resources: { subscribeSamples: () => () => {} } as unknown as ResourceService,
+    sources: {} as SourceService, onError: error => errors.push(error),
+  });
+  try {
+    research.start();
+    await new Promise(resolve => setImmediate(resolve));
+    for (let i = 0; i < 1000; i++) notify({ stream: 'durable' });
+    fail(new Error('catalog unavailable'));
+    await new Promise(resolve => setImmediate(resolve));
+    for (let i = 0; i < 1000; i++) notify({ stream: 'progress' });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual([...calls.values()], [2, 2, 2]);
+    assert.equal(errors.length, 3);
+    assert.ok(errors.every(error => error.message.includes('catalog unavailable')));
+  } finally { await research.dispose(); }
+});
+
 it('research ingress preserves legal empty values and limit zero, and rejects malformed query shape once',()=>{
  assert.equal(decodeResearchParams('list',{limit:0}).limit,0);
  assert.deepEqual(decodeResearchParams('submit',{command:'run',cwd:'',title:'',inputs:[{path:'',role:''}]}),{command:'run',cwd:'',title:'',inputs:[{path:'',role:''}]});
@@ -72,10 +104,10 @@ it.each([false, true])('original subscriptions precede recheck and preserve one 
     if (method === 'runtime.host_job.terminal') { assert.equal(params.executorStopped, true); assert.equal((params.content as { data: { attempt: { collectionState: string } } }).data.attempt.collectionState, 'pending'); job.phase = 'terminal'; job.executorStopped = true; eventWake!(); return structuredClone(job); }
     throw new Error(`Unexpected operation: ${method}`);
   } } as unknown as KernelClient;
-  const runtime = { onReady: () => () => {}, onEvent: (fn: () => void) => { eventWake = fn; return () => { eventWake = undefined; }; }, reconcileObservations: async () => { observations++; return []; } } as unknown as AgentRuntimeClient;
+  const runtime = { onReady: () => () => {}, onEvent: (fn: (event: { stream: 'durable' }) => void) => { eventWake = () => fn({stream: 'durable'}); return () => { eventWake = undefined; }; }, reconcileObservations: async () => { observations++; return []; } } as unknown as AgentRuntimeClient;
   const experiments = { subscribeAttempts: (fn: () => void) => { attemptWake = fn; return () => { attemptWake = undefined; }; },
     nativeReceipt: async () => ({ caller: { workspaceId: 'ws' }, owner: actor, accepted, attempt: { attemptId: binding.subject.subjectId, state: 'completed', collectionState: 'pending', cancelRequested: false }, executorStopped: stopped }),
-    submit: async () => { submits++; assert.fail('reconciliation cannot resubmit'); },
+    ensureReconciled: async () => {}, submit: async () => { submits++; assert.fail('reconciliation cannot resubmit'); },
   } as unknown as ExperimentService;
   const errors: Error[] = [];
   let research = createResearchRuntime({ kernel, runtime, experiments, sources: {} as SourceService, resources: { subscribeSamples: () => () => {} } as unknown as ResourceService, onError: error => errors.push(error) });

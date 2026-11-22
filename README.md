@@ -23,8 +23,14 @@ English | [简体中文](.github/readme/README.zh-CN.md) | [繁體中文](.githu
 </p>
 
 <p align="center">
-  <img src=".github/readme/assets/varin-at-work.gif" alt="Varin reads, works with her team and responds as the work progresses" width="600" />
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/readme/assets/varin-cast-dark.webp" />
+    <source media="(prefers-color-scheme: light)" srcset=".github/readme/assets/varin-cast-light.webp" />
+    <img src=".github/readme/assets/varin-cast-light.webp" alt="Varin and her 15 built-in Bot characters gathered along a long banquet table" width="1100" />
+  </picture>
 </p>
+
+https://github.com/user-attachments/assets/a55fcac8-e198-4ca5-9c04-93239ae698f9
 
 ## Meet Varin
 
@@ -44,6 +50,8 @@ Varin is an open-source personal AI agent that works with your files, browser an
 Create multiple Bots, each with its own instructions, model, thinking level, memory, schedules and appearance. Choose from 16 built-in animated characters (including Varin), leave the choice on random when creating a Bot, or import custom images and animation packs.
 
 Start a group chat from the Bot sidebar to let several Bots work together on one timeline. Mention or reply to specific members to bring them in, use per-member listening for unaddressed posts, share files and search group history, and set up group schedules alongside direct conversations.
+
+https://github.com/user-attachments/assets/5b8fa63d-fc6b-4ad6-95bd-ffbb96ad458c
 
 [About the assistant](docs/bot.md) · [Appearances](docs/bot-appearances.md) · [Collaboration and task reuse](docs/collaboration.md)
 
@@ -137,6 +145,10 @@ Common tools are available directly; other capabilities are discovered as needed
 **Place the work where it belongs.** Run locally, self-host on a server, or connect from a browser or phone. The interface, Agent service, file workspace and computer-use device can be on different machines, and a single conversation can work across connected devices while keeping file links and recovery tied to where each change happened. [Deployment](docs/ops/cloud-deployment.md) · [Resources](docs/resources.md)
 
 **Keep an optional companion nearby.** The desktop companion follows the selected Bot's activity. Download its artwork and wake or put it to sleep from Settings.
+
+<p align="center">
+  <img src=".github/readme/assets/varin-at-work.gif" alt="Varin reads, works with her team and responds as the work progresses" width="600" />
+</p>
 
 <a id="how-the-harness-works"></a>
 

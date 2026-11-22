@@ -16,6 +16,19 @@ test('only assistant top-level dedicated fences activate; outer examples, quotes
     assert.equal(parseConversationContent(wrapped, { role: 'assistant' }).every(p => p.kind === 'markdown'), true);
   }
 });
+test('resolves the saved revision in a standalone provider tag across stream and reload', () => {
+  const ref = 'ui:abc123@1';
+  for (const tag of ['<varin-ui ref="' + ref + '" />', '<varin-ui>' + ref + '</varin-ui>',
+    '<varin-ui>\n' + JSON.stringify({ type: 'embed', ref }) + '\n</varin-ui>']) {
+    const parser = createConversationContentParser();
+    parser(tag.slice(0, -4), { role: 'assistant', streaming: true });
+    const parts = parser(tag, { role: 'assistant' });
+    assert.deepEqual(parts, parseConversationContent(tag, { role: 'assistant' }));
+    assert.equal(parts[0]?.kind === 'ui' && parts[0].node.type === 'embed' && parts[0].node.ref, ref);
+    assert.equal(parseConversationContent(tag, { role: 'user' })[0]?.kind, 'markdown');
+  }
+});
+
 test('streamed incomplete JSON stays hidden, interrupted/invalid/unknown definitions preserve exact raw fallback', () => {
   const partial = 'hello\n```varin-ui\n{"type":"choice"';
   assert.equal(parseConversationContent(partial, { role: 'assistant', streaming: true }).at(-1)?.kind, 'pending');

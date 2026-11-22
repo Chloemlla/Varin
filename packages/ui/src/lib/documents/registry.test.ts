@@ -880,6 +880,26 @@ describe('DocumentRegistry', () => {
     registry.dispose();
   });
 
+  test('reopening a file view reads current disk bytes after a missed watch event and keeps an unsaved draft', async () => {
+    const { api, files } = createMemoryDocuments();
+    const read = vi.spyOn(api, 'read');
+    const identity = resource('bulletin.txt');
+    const key = documentKey(identity);
+    const registry = new DocumentRegistry({ documents: api, getGeneration: () => 1, recoverySessionId: 'session' });
+    try {
+      files.set(key, { content: '15:30', revision: 'after' });
+      expect((await registry.open(identity)).buffer).toBe('15:30');
+      files.set(key, { content: '14:00', revision: 'restored' });
+      // The mounted Monaco model acquires the buffer while the enclosing
+      // file view asks to revalidate it after a close/reopen.
+      const [, reopened] = await Promise.all([registry.open(identity), registry.open(identity, { revalidate: true })]);
+      expect(reopened.buffer).toBe('14:00');
+      registry.applyTransaction(identity, 'draft', { origin: 'view' });
+      expect((await registry.open(identity, { revalidate: true })).buffer).toBe('draft');
+      expect(read).toHaveBeenCalledTimes(2);
+    } finally { registry.dispose(); }
+  });
+
   test('two views share one buffer and keep independent origins', async () => {
     const { api } = createMemoryDocuments();
     const identity = resource();

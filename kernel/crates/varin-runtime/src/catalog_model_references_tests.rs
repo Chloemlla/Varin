@@ -115,6 +115,7 @@ fn execution_numbers_follow_admission_across_branches_and_survive_rename() {
         pinned: None,
         archived: None,
         title_mode: None,
+        model: None,
     })
     .unwrap();
     assert_eq!(

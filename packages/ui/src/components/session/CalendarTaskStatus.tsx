@@ -12,6 +12,7 @@ const preparationReasons: Record<string, I18nKey> = {
   source_changed: 'calendar.failure.reason.source_changed',
   source_unavailable: 'calendar.failure.reason.source_unavailable',
   source_environment_unavailable: 'calendar.failure.reason.source_environment_unavailable',
+  workspace_mount_unavailable: 'calendar.failure.reason.workspace_mount_unavailable',
   workspace_backend_unavailable: 'calendar.failure.reason.workspace_backend_unavailable',
   'credential-resolution-failed': 'calendar.failure.reason.credentials_unavailable',
   'credential-scope-changed': 'calendar.failure.reason.binding_changed',

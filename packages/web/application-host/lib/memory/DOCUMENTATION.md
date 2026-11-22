@@ -36,6 +36,8 @@ Kernel tool bridges live in [`../kernel/memory-owner.ts`](../kernel/memory-owner
 
 ## Continuous Bot memory and maintenance
 
+A saved Bot memory is addressed by owner and row ID. The Bot panel opens the receipt in its Bot, conversation, or shared personal store. Global memory settings also edit personal rows in that same store; ordinary Agent notes retain their separate personalization scope.
+
 - **Background collection**: `bot-history.ts` pages recent exchanges via `HistoryPage.afterId` and per-branch `history-cursor:`, hydrating a model-budgeted chronological tail without creating empty stores or calling a model on empty discovery. Explicitly followed ordinary branches require a separate `memory` association.
 - **Archive vs forget**: `invalidAt` (archive) marks a memory no longer applicable while keeping history readable; `forgottenAt` (forget) additionally excludes its original source ranges and dependent revisions (`sources.memories`) from future model reads. New exclusions fix `redactedThrough` once, dropping affected provider continuations and rebuilding summaries/history/handoffs without altering UI history.
 - **Local maintenance (`memory-maintenance.ts`)**: Coalesced `maintenance:auto:<id>` progress (separate for Bot and shared user stores) reviews existing accounts using `MemoryWork` and commits rewrites, merges, splits, retirements, overviews, and dependency invalidations atomically via `maintainKnowledge` (`source.predecessors` tracks historical inputs; `source.memories` tracks live exact-version dependencies). Organizer batching requires a configured model `contextWindow` (reserving 25% capped by max output when unset). Native `memory` exposes `rewrite`, `organize`, `maintenance_status`, and `maintenance_cancel`.

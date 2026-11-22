@@ -59,6 +59,8 @@ pub(crate) enum KernelError {
     FileObservationSource(FileObservationSourceCode),
     #[error("file observation is busy under an existing writer or capture lease")]
     FileObservationBusy,
+    #[error("{0} is still active. Close it or wait for it to exit, then retry recovery.")]
+    ActiveProcessWriter(String),
     #[error("snapshot changed: {0}")]
     SnapshotChanged(String),
     #[error("activation held: {0}")]
@@ -110,6 +112,7 @@ pub(crate) fn error_code(error: &KernelError) -> &str {
         KernelError::Operation(_)
         | KernelError::FileObservationSource(_)
         | KernelError::FileObservationBusy
+        | KernelError::ActiveProcessWriter(..)
         | KernelError::SnapshotChanged(_) => "operation-error",
         KernelError::Cancelled => "cancelled",
         KernelError::ActivationHeld(_) => "activation-held",

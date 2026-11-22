@@ -10,7 +10,7 @@ export class ThreadRequestError extends Error {
       : code === 'thread-conflict' ? 'The conversation state changed while this request was in progress (409).'
       : code === 'model-images-unsupported' ? 'The selected model does not accept images. Choose an image-capable model or remove the images.'
       : code === 'http-body-too-large' ? 'The message exceeds this server’s request size limit. Reduce its attachments or adjust the server limit.'
-      : (code === 'workspace_backend_unavailable' || code.startsWith('resource-')) && detail ? detail : threadSourceFailureMessage(code) ?? `Thread request failed (${status})`);
+      : (code === 'workspace_backend_unavailable' || code === 'path-escape' || code.startsWith('resource-')) && detail ? detail : threadSourceFailureMessage(code) ?? `Thread request failed (${status})`);
     this.name = 'ThreadRequestError';
   }
 }
@@ -198,7 +198,7 @@ export function createThreadsHttpAPI(): ThreadsAPI {
     listModels: () => post('models', {}),
     selectModel: input => post('model/select',input),
     create: (key, options) => post('create', { key, ...options }), fork: input => post('fork', input), submit: input => post('submit', withClientTime(input)), enqueue: input => post('enqueue', withClientTime(input)),
-    prepareNavigation: input => post('navigation/prepare', input),
+    prepareNavigation: ({ withFiles, ...input }) => post(withFiles ? 'navigation/prepare-files' : 'navigation/prepare', input),
     recoverySource: input => post('recovery/source', input),
     navigate: input => post('navigate', input),
     navigationReceipt: input => post('navigation/receipt', input),

@@ -952,7 +952,8 @@ export async function openKnowledgeStoreEngine(deps: KnowledgeStoreEngineOptions
           for (const id of new Set(ids)) {
             const payload = db.getPayload(id) as Record<string, unknown> | null;
             const item = payload && knowledgeFromPayload(id, payload);
-            if (!item || item.forgottenAt !== undefined || item.historyCleared || item.status !== 'accepted') continue;
+            if (!item || (item.invalidAt !== undefined && !item.source?.memories?.length) || item.forgottenAt !== undefined || item.historyCleared
+              || item.status !== 'accepted' || item.source?.kind === 'user-correction') continue;
             const key = `maintenance:auto:${id}`;
             const previous = lookup({ type: 'organizer', key })[0]?.payload;
             const version = maintenanceVersion(item);
@@ -1090,6 +1091,7 @@ export async function openKnowledgeStoreEngine(deps: KnowledgeStoreEngineOptions
             if (explicitRemember && k.source?.spans?.length) {
               const previous = knowledgeSourceFromPayload(payload['source']);
               payload = { ...payload, source: { ...previous, ...k.source,
+                kind: previous?.kind === 'user-correction' ? previous.kind : k.source.kind,
                 spans: mergeSourceSpans([...(previous?.spans ?? []), ...k.source.spans]) } };
             }
             if (explicitRemember && payload['status'] === 'suggested') payload = { ...payload, status: 'accepted',
@@ -1294,21 +1296,10 @@ export async function openKnowledgeStoreEngine(deps: KnowledgeStoreEngineOptions
         const current = await store.getKnowledge(id);
         if (!current) return null;
         if (expectedScope && current.scope !== expectedScope) return null;
-        const catalog = (await store.listKnowledge({ scope: current.scope }))
-          .filter((item) => item.scope === current.scope);
-        const byId = new Map(catalog.map((item) => [item.id, item]));
         const outgoingOf = (from: NodeId): NodeId[] => db.getEdges(from)
           .filter((edge) => edge.label === "supersedes")
           .map((edge) => edge.targetId);
-        const incomingOf = (to: NodeId): NodeId[] => {
-          const found: NodeId[] = [];
-          for (const item of catalog) {
-            for (const edge of db.getEdges(item.id)) {
-              if (edge.label === "supersedes" && edge.targetId === to) found.push(item.id);
-            }
-          }
-          return found;
-        };
+        const incomingOf = (to: NodeId): NodeId[] => db.getIncomingEdges(to, 'supersedes').map(edge => edge.sourceId);
         const collect = (start: NodeId, neighbors: (from: NodeId) => NodeId[]): Knowledge[] => {
           const collected: Knowledge[] = [];
           const seen = new Set<NodeId>([start]);
@@ -1317,8 +1308,9 @@ export async function openKnowledgeStoreEngine(deps: KnowledgeStoreEngineOptions
             const from = queue.shift()!;
             for (const nextId of neighbors(from)) {
               if (seen.has(nextId)) continue;
-              const next = byId.get(nextId);
-              if (!next) continue;
+              const payload = db.getPayload(nextId) as Record<string, unknown> | null;
+              const next = payload && knowledgeFromPayload(nextId, payload);
+              if (!next || next.scope !== current.scope || next.historyCleared) continue;
               seen.add(nextId);
               collected.push(next);
               queue.push(nextId);

@@ -60,6 +60,34 @@ it('model authority resolves explicit Mistral prompt switches and Responses stri
 function owner(overrides: Partial<CredentialOwnerOptions> = {}) {
   return new ExistingHostCredentialOwner({ providerId: 'fixture-provider', providerFamily: 'openai-responses', endpoint: 'https://model.example.test/v1/responses', currentScope: async () => ({ ...scope }), runtime: { getAuth: async () => ({ auth: { apiKey: 'fake-test-key' } }) }, ...overrides });
 }
+it('shares an exact model binding across concurrent admissions and isolates rollback', async () => {
+  const bridge = new CredentialBridge(() => 'epoch', async () => {}, () => {});
+  const released = vi.fn(), model = owner({ bindingIdentity: 'model', release: released });
+  const entered = deferred<void>(), finish = deferred<void>();
+  const pending = bridge.withModelBinding('run', 'model:choice', model, undefined, async () => {
+    entered.resolve(); await finish.promise; throw new Error('start failed');
+  });
+  await entered.promise;
+  try {
+    const policy = owner({ bindingIdentity: 'policy' });
+    await bridge.register('run', policy, undefined, 'policy:planning');
+    await expect(bridge.withModelBinding('run', 'model:choice', owner({ bindingIdentity: 'other' }), undefined, async () => {}))
+      .rejects.toMatchObject({ code: 'credential-scope-changed' });
+    await expect(bridge.withModelBinding('run', 'model:choice', owner({ bindingIdentity: 'model', currentScope: async () => ({ ...scope, generation: 8 }) }), undefined, async () => {}))
+      .rejects.toMatchObject({ code: 'credential-scope-changed' });
+    const fork = model.fork();
+    try { await bridge.withModelBinding('run', 'model:choice', fork, undefined, async actual => expect(actual).toEqual(scope)); }
+    finally { fork.release(); }
+    finish.resolve(); await expect(pending).rejects.toThrow('start failed');
+    model.release();
+    expect(released).not.toHaveBeenCalled();
+    bridge.unregister('run', 'model:choice');
+    expect(released).toHaveBeenCalledOnce();
+    const stillPlanning = bridge.findOwner('policy', scope, 'run');
+    expect(stillPlanning).toBeDefined(); stillPlanning?.release(); policy.release();
+  } finally { finish.resolve(); bridge.close(); }
+});
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (error: unknown) => void;

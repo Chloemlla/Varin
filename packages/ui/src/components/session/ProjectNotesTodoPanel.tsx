@@ -45,18 +45,11 @@ import { createWorktreeThread } from '@/lib/agent-runtime/worktreeThread';
 import { cn } from '@/lib/utils';
 import { actionInstruction } from '@/lib/actionInstructions';
 import { getCurrentIntlLocale, useI18n } from '@/lib/i18n';
-import { runtimeFetch } from '@varin/application-client';
+import { getRuntimeEndpointGeneration, runtimeFetch } from '@varin/application-client';
 import { TodoSendDialog, type TodoSendExecution } from './TodoSendDialog';
 
 const TODO_PANEL_MIN_ITEMS = 5;
 const TODO_PANEL_MAX_ITEMS = 15;
-
-// Per-project chain of in-flight saveProjectNotesAndTodos calls. Subsequent
-// saves await the previous one so a fast todo toggle or blur that lands
-// while the debounced notes save is still on the wire is appended, not
-// racing against it. The chain is module-scoped so it survives remounts
-// (e.g. when the user switches the right sidebar tab away and back).
-const projectSaveChainByProject = new Map<string, Promise<unknown>>();
 
 const getEffectiveItemHeight = (padding: number) => {
   const scale = Math.sqrt(padding / 100);
@@ -177,8 +170,7 @@ export const ProjectNotesTodoPanel: React.FC<ProjectNotesTodoPanelProps> = ({
   const [pendingSendTarget, setPendingSendTarget] = React.useState<PendingSendTarget | null>(null);
   const [isSendDialogSubmitting, setIsSendDialogSubmitting] = React.useState(false);
   const [contextReloadTick, setContextReloadTick] = React.useState(0);
-  const notesHydratedRef = React.useRef(false);
-  const lastSavedNotesRef = React.useRef('');
+  const pendingNotes = React.useRef<(() => void) | null>(null);
   const notesDebounceTimerRef = React.useRef<number | null>(null);
   const todoPanelHeight = useUIStore((state) => state.todoPanelHeight);
   const setTodoPanelHeight = useUIStore((state) => state.setTodoPanelHeight);
@@ -196,34 +188,13 @@ export const ProjectNotesTodoPanel: React.FC<ProjectNotesTodoPanelProps> = ({
   const padding = useUIStore((state) => state.padding);
 
   const persistProjectData = React.useCallback(
-    async (nextNotes: string, nextTodos: VarinProjectTodoItem[]) => {
-      if (!projectRef) {
-        return false;
-      }
-      const key = projectRef.id;
-      // Serialize concurrent saves per project: a fast toggle/strike while the
-      // debounce-driven notes save is in flight no longer races the network.
-      const previous = projectSaveChainByProject.get(key) ?? Promise.resolve();
-      const next = previous.catch(() => undefined).then(() =>
-        saveProjectNotesAndTodos(projectRef, {
-          notes: nextNotes,
-          todos: nextTodos,
-        })
-      );
-      projectSaveChainByProject.set(key, next);
+    async (patch: { notes?: string; todos?: VarinProjectTodoItem[] }) => {
+      if (!projectRef) return;
       try {
-        const saved = await next;
-        if (!saved) {
-          toast.error(t('rightSidebar.contextNotesTodo.toast.saveNotesFailed'));
-        }
-        return saved;
-      } finally {
-        if (projectSaveChainByProject.get(key) === next) {
-          projectSaveChainByProject.delete(key);
-        }
-      }
-    },
-    [projectRef, t]
+        if (await saveProjectNotesAndTodos(projectRef, patch)) return;
+      } catch { /* Keep the draft in the editor and report the unsuccessful save. */ }
+      toast.error(t('rightSidebar.contextNotesTodo.toast.saveNotesFailed'));
+    }, [projectRef, t]
   );
 
   React.useEffect(() => {
@@ -243,7 +214,8 @@ export const ProjectNotesTodoPanel: React.FC<ProjectNotesTodoPanelProps> = ({
       try {
         const data = await getProjectContextData(projectRef);
         const nextPlans = await Promise.all(
-          data.plans.map((plan) => toPlanListItem(projectRef, plan, t('rightSidebar.contextNotesTodo.plan.defaultTitle')))
+          data.plans.map((plan) => toPlanListItem(projectRef, plan, t('rightSidebar.contextNotesTodo.plan.defaultTitle'))
+            .catch(() => ({ ...plan, title: plan.path.split('/').pop() || t('rightSidebar.contextNotesTodo.plan.defaultTitle') })))
         );
         if (cancelled) {
           return;
@@ -251,8 +223,6 @@ export const ProjectNotesTodoPanel: React.FC<ProjectNotesTodoPanelProps> = ({
         setNotes(data.notes);
         setTodos(sortTodosWithCompletedLast(data.todos));
         setPlans(nextPlans);
-        lastSavedNotesRef.current = data.notes;
-        notesHydratedRef.current = true;
         setNewTodoText('');
         setExpandedTodoIds(new Set());
       } catch {
@@ -261,8 +231,6 @@ export const ProjectNotesTodoPanel: React.FC<ProjectNotesTodoPanelProps> = ({
           setNotes('');
           setTodos([]);
           setPlans([]);
-          lastSavedNotesRef.current = '';
-          notesHydratedRef.current = true;
         }
       } finally {
         if (!cancelled) {
@@ -347,40 +315,27 @@ export const ProjectNotesTodoPanel: React.FC<ProjectNotesTodoPanelProps> = ({
     event.preventDefault();
   }, [todoPanelHeight]);
 
-  const cancelNotesDebounce = React.useCallback(() => {
-    if (notesDebounceTimerRef.current !== null) {
-      window.clearTimeout(notesDebounceTimerRef.current);
-      notesDebounceTimerRef.current = null;
-    }
+  const flushNotes = React.useCallback(() => {
+    if (notesDebounceTimerRef.current !== null) window.clearTimeout(notesDebounceTimerRef.current);
+    notesDebounceTimerRef.current = null;
+    const save = pendingNotes.current;
+    pendingNotes.current = null;
+    save?.();
   }, []);
-
-  const handleNotesBlur = React.useCallback(() => {
-    cancelNotesDebounce();
-    lastSavedNotesRef.current = notes;
-    void persistProjectData(notes, todos);
-  }, [cancelNotesDebounce, notes, persistProjectData, todos]);
-
+  // A pending edit belongs to its original project when the panel is closed or switched.
   React.useEffect(() => {
-    if (!projectRef || !notesHydratedRef.current) {
-      return;
-    }
-
-    if (notes === lastSavedNotesRef.current) {
-      return;
-    }
-
-    notesDebounceTimerRef.current = window.setTimeout(() => {
-      notesDebounceTimerRef.current = null;
-      lastSavedNotesRef.current = notes;
-      void persistProjectData(notes, todos);
-    }, 400);
-
-    return () => {
-      cancelNotesDebounce();
+    window.addEventListener('pagehide', flushNotes);
+    return () => { window.removeEventListener('pagehide', flushNotes); flushNotes(); };
+  }, [projectRef?.id, flushNotes]);
+  const editNotes = (value: string) => {
+    setNotes(value);
+    const generation = getRuntimeEndpointGeneration();
+    pendingNotes.current = () => {
+      if (generation === getRuntimeEndpointGeneration()) void persistProjectData({ notes: value });
     };
-  }, [cancelNotesDebounce, notes, persistProjectData, projectRef, todos]);
-
-  React.useEffect(() => () => cancelNotesDebounce(), [cancelNotesDebounce]);
+    if (notesDebounceTimerRef.current !== null) window.clearTimeout(notesDebounceTimerRef.current);
+    notesDebounceTimerRef.current = window.setTimeout(flushNotes, 400);
+  };
 
   const handleAddTodo = React.useCallback(() => {
     const trimmed = newTodoText.trim();
@@ -396,8 +351,8 @@ export const ProjectNotesTodoPanel: React.FC<ProjectNotesTodoPanelProps> = ({
     });
     setTodos(nextTodos);
     setNewTodoText('');
-    void persistProjectData(notes, nextTodos);
-  }, [newTodoText, notes, persistProjectData, todos]);
+    void persistProjectData({ todos: nextTodos });
+  }, [newTodoText, persistProjectData, todos]);
 
   const handleToggleTodoExpanded = React.useCallback((id: string) => {
     setExpandedTodoIds((previous) => {
@@ -423,18 +378,18 @@ export const ProjectNotesTodoPanel: React.FC<ProjectNotesTodoPanelProps> = ({
         ? [...remainingTodos, updatedTodo]
         : insertTodoBeforeCompleted(remainingTodos, updatedTodo);
       setTodos(nextTodos);
-      void persistProjectData(notes, nextTodos);
+      void persistProjectData({ todos: nextTodos });
     },
-    [notes, persistProjectData, todos]
+    [persistProjectData, todos]
   );
 
   const handleDeleteTodo = React.useCallback(
     (id: string) => {
       const nextTodos = todos.filter((todo) => todo.id !== id);
       setTodos(nextTodos);
-      void persistProjectData(notes, nextTodos);
+      void persistProjectData({ todos: nextTodos });
     },
-    [notes, persistProjectData, todos]
+    [persistProjectData, todos]
   );
 
   const handleClearCompletedTodos = React.useCallback(() => {
@@ -443,8 +398,8 @@ export const ProjectNotesTodoPanel: React.FC<ProjectNotesTodoPanelProps> = ({
       return;
     }
     setTodos(nextTodos);
-    void persistProjectData(notes, nextTodos);
-  }, [notes, persistProjectData, todos]);
+    void persistProjectData({ todos: nextTodos });
+  }, [persistProjectData, todos]);
 
   const handleTodoReorder = React.useCallback(
     (event: DragEndEvent) => {
@@ -459,9 +414,9 @@ export const ProjectNotesTodoPanel: React.FC<ProjectNotesTodoPanelProps> = ({
       }
       const nextTodos = sortTodosWithCompletedLast(arrayMove(todos, oldIndex, newIndex));
       setTodos(nextTodos);
-      void persistProjectData(notes, nextTodos);
+      void persistProjectData({ todos: nextTodos });
     },
-    [notes, persistProjectData, todos]
+    [persistProjectData, todos]
   );
 
   const todoSensors = useSensors(
@@ -536,7 +491,6 @@ export const ProjectNotesTodoPanel: React.FC<ProjectNotesTodoPanelProps> = ({
         routeToChat();
 
         let identity: ThreadIdentity;
-        let directory = await projectExecutionPath(projectRef);
         if (pendingSendTarget.kind === 'worktree') {
           if (!canCreateWorktree) {
             toast.error(t('rightSidebar.contextNotesTodo.toast.worktreeRequiresGitRepo'));
@@ -547,15 +501,13 @@ export const ProjectNotesTodoPanel: React.FC<ProjectNotesTodoPanelProps> = ({
             projectsState.setActiveProjectIdOnly(projectRef.id);
           }
           const created = await createWorktreeThread();
-          identity = await useThreadStore.getState().materializeDraft(created.draftKey); directory = created.path;
+          identity = await useThreadStore.getState().materializeDraft(created.draftKey);
         } else {
-          identity = await createThreadForSubmission({
-            directory,
-          });
+          identity = await createThreadForSubmission({ projectId: projectRef.id });
         }
 
         setPendingSendTarget(null);
-        await submitThreadPrompt(identity, promptText, { providerId: execution.providerID, modelId: execution.modelID, thinkingLevel: execution.thinkingLevel }, directory);
+        await submitThreadPrompt(identity, promptText, { providerId: execution.providerID, modelId: execution.modelID, thinkingLevel: execution.thinkingLevel });
 
         toast.success(
           pendingSendTarget.kind === 'worktree'
@@ -727,8 +679,8 @@ export const ProjectNotesTodoPanel: React.FC<ProjectNotesTodoPanelProps> = ({
         </div>
         <Textarea
           value={notes}
-          onChange={(event) => setNotes(event.target.value.slice(0, VARIN_PROJECT_NOTES_MAX_LENGTH))}
-          onBlur={handleNotesBlur}
+          onChange={(event) => editNotes(event.target.value.slice(0, VARIN_PROJECT_NOTES_MAX_LENGTH))}
+          onBlur={flushNotes}
           placeholder={t('rightSidebar.contextNotesTodo.notes.placeholder')}
           resizedHeight={notesPanelHeight}
           onResizeHeightChange={setNotesPanelHeight}

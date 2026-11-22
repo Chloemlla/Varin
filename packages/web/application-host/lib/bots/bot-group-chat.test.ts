@@ -72,6 +72,8 @@ describe('Bot group chat delivery', () => {
     try {
       await expect.poll(async () => (await reopened.page('user', id)).posts.at(-1)?.text).toBe('The image is ready.');
       const group = await reopened.page('user', id);
+      const activity = await reopened.page('user', id, undefined, undefined, undefined, 'activity');
+      expect(activity.posts.at(-1)?.text).toBe('The image is ready.');
       expect(group.posts.at(-1)?.quoteId).toBe('user:request');
       expect(group.posts.at(-1)?.author).toEqual({ kind: 'bot', botId: 'ops', name: 'Ops' });
       await reopened.post('user', id, { id: 'reply', text: 'Package is public', addressed: [], quoteId: group.posts.at(-1)!.id, reply: true });

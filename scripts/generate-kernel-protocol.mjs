@@ -63,11 +63,13 @@ const extensionModelsGenerated = '// Generated from kernel/protocol/schema.json.
   + ["HistoryRange", "ModelOpaqueItem", "ModelToolCall", "ModelToolCompletion", "ModelContent", "ModelConversationItem", "RequestBinding", "RequestOrigin", "RequestView", "ModelUsageReceipt", "ProviderEvent", "FinishReason", "ModelProtocolCall", "ModelProtocolResult", "ModelSessionConfiguration", "UsagePricing", "UsageLongContextPricing", "TokenizerBinding", "ModelHttpConfiguration", "ResourceActivation", "AgentResourceReference"].map(name => renderDto(name, schema.dto[name])).join('\n\n') + '\n';
 const extensionDriversGenerated = '// Generated from kernel/protocol/schema.json. Do not hand-edit.\nimport type { ExecutionError, LaunchTool } from \'./nested-tools.generated.js\';\nimport type { ModelConversationItem, ModelContent, ModelOpaqueItem, ModelToolCompletion, ModelUsageReceipt, FinishReason } from \'./model-protocol.generated.js\';\n\n'
   + ["DriverTerminalOutcome", "DriverFinishInput", "DriverFinishReceipt", "DriverWaitInput", "DriverWaitReceipt", "DriverContextInput", "DriverContextReceipt", "DriverCancelInput", "DriverCancelReceipt", "DriverRecovery", "DriverModelInput", "DriverModelFailure", "DriverModelItem", "DriverModelReceipt", "DriverToolInput", "DriverToolReceipt", "DriverCheckpointInput", "DriverCheckpoint", "DriverDeliveryInput", "DriverDeliveryReceipt", "DriverReceiptInput", "DriverReceipt", "DriverRunInput", "DriverRunOutcome"].map(name => renderDto(name, schema.dto[name])).join('\n\n') + '\n';
-const protocolGenerated = '// Generated from kernel/protocol/schema.json. Do not hand-edit.\n\n' + avatarTypes + dtoEntries.filter(([name]) => (schema.runtimeExports ?? []).includes(name)).map(([name, spec]) => renderDto(name, spec)).join('\n\n') + '\n';
+const protocolGenerated = "// Generated from kernel/protocol/schema.json. Do not hand-edit.\nimport type { ThinkingLevel } from './types.js';\n\n" + avatarTypes + dtoEntries.filter(([name]) => (schema.runtimeExports ?? []).includes(name)).map(([name, spec]) => renderDto(name, spec)).join('\n\n') + '\n';
 const generated = `/**
  * Generated from \`kernel/protocol/schema.json\`.
  * Do not hand-edit the wire shapes; run \`node scripts/generate-kernel-protocol.mjs\`.
  */
+
+import type { ThinkingLevel } from '@varin/protocol';
 
 export const KERNEL_PROTOCOL_VERSION = ${schema.protocolVersion} as const;
 export const KERNEL_REQUEST_WINDOW = ${schema.requestWindow} as const;

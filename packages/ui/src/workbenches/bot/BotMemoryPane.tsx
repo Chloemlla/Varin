@@ -1,5 +1,5 @@
 import React from 'react';
-import { getRuntimeEndpointGeneration, type BotMemoryItem, type BotMemoryMaintenance } from '@varin/application-client';
+import { getRuntimeEndpointGeneration, type BotMemoryOwner, type BotMemoryItem, type BotMemoryMaintenance } from '@varin/application-client';
 import type { MemorySourceExcerpt } from '@varin/protocol';
 import { Icon } from '@/components/icon/Icon';
 import { Textarea } from '@/components/ui/textarea';
@@ -7,6 +7,8 @@ import { Button } from '@/components/ui/button';
 import { getCurrentIntlLocale, useI18n } from '@/lib/i18n';
 import { documentMotionLevel } from '@/lib/motion/preference';
 import { listBotMemory, readBotMemoryHistory, readBotMemorySource, updateBotMemory, organizeBotMemory, readBotMemoryMaintenance, cancelBotMemoryMaintenance, restoreBotMemory, clearBotMemoryHistory } from '@/lib/bots';
+import { memoryFocusId, memoryFocusTarget } from '@/components/conversation/memoryNavigation';
+import { subscribeVarinEvents } from '@/lib/varinEvents';
 import { springTiming } from '@/lib/motion/tokens';
 import { useBotLayout } from './botLayout';
 import { useBotPanel } from './botPanelModel';
@@ -18,8 +20,9 @@ import type { BotRead } from './useBotFacts';
 const message = (cause: unknown) => cause instanceof Error ? cause.message : String(cause);
 type Detail = { sources: BotRead<MemorySourceExcerpt[]>; history: BotRead<BotMemoryItem[]> };
 
-function MemoryItem({ item, open, onToggle, onChanged, onForgotten }: {
+function MemoryItem({ item, owner, open, onToggle, onChanged, onForgotten }: {
   item: BotMemoryItem;
+  owner: BotMemoryOwner;
   open: boolean;
   onToggle(): void;
   onChanged(): void;
@@ -35,7 +38,7 @@ function MemoryItem({ item, open, onToggle, onChanged, onForgotten }: {
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [leaving, setLeaving] = React.useState(false);
-  const focused = model.focus?.tab === 'memory' && model.focus.id === String(item.id);
+  const focused = model.focus?.tab === 'memory' && model.focus.id === memoryFocusId(owner, item.id);
   const flash = useFlash(focused, model.focus?.token);
   const ref = React.useRef<HTMLElement>(null);
   useScrollIntoFocus(ref, focused, model.focus?.token);
@@ -48,10 +51,10 @@ function MemoryItem({ item, open, onToggle, onChanged, onForgotten }: {
     const settle = <K extends keyof Detail>(key: K, read: Detail[K]) => {
       if (!controller.signal.aborted && host === getRuntimeEndpointGeneration()) setDetail(current => current ? { ...current, [key]: read } : current);
     };
-    void readBotMemorySource(model.bot.id, item.id, controller.signal).then(value => settle('sources', { status: 'ready', value }), cause => settle('sources', { status: 'failed', value: null, error: message(cause) }));
-    void readBotMemoryHistory(model.bot.id, item.id, controller.signal).then(value => settle('history', { status: 'ready', value }), cause => settle('history', { status: 'failed', value: null, error: message(cause) }));
+    void readBotMemorySource(model.bot.id, item.id, controller.signal, owner).then(value => settle('sources', { status: 'ready', value }), cause => settle('sources', { status: 'failed', value: null, error: message(cause) }));
+    void readBotMemoryHistory(model.bot.id, item.id, controller.signal, owner).then(value => settle('history', { status: 'ready', value }), cause => settle('history', { status: 'failed', value: null, error: message(cause) }));
     return () => controller.abort();
-  }, [open, model.bot.id, item.id, item.revision]);
+  }, [open, model.bot.id, item.id, item.revision, owner]);
   React.useEffect(() => { if (!open) { setEditing(false); setConfirming(false); setError(null); } }, [open]);
 
   const act = async (operation: () => Promise<void>) => {
@@ -59,7 +62,7 @@ function MemoryItem({ item, open, onToggle, onChanged, onForgotten }: {
     try { await operation(); } catch (cause) { setError(message(cause)); } finally { setBusy(false); }
   };
   const forget = () => act(async () => {
-    await updateBotMemory(model.bot.id, item, 'forget');
+    await updateBotMemory(model.bot.id, item, 'forget', undefined, owner);
     setLeaving(true);
     const glide = springTiming('glide');
     setTimeout(onForgotten, documentMotionLevel() === 'full' ? glide.duration : 0);
@@ -71,7 +74,7 @@ function MemoryItem({ item, open, onToggle, onChanged, onForgotten }: {
       {editing ? <div className="space-y-2">
         <Textarea value={draft} onChange={event => setDraft(event.target.value)} rows={4} aria-label={t('bot.memory.edit')} autoFocus />
         <div className="flex gap-1.5">
-          <Button size="sm" disabled={busy || !draft.trim() || draft === item.content} onClick={() => { void act(async () => { await updateBotMemory(model.bot.id, item, 'correct', draft); setEditing(false); onChanged(); }); }}>{t('settings.bots.save')}</Button>
+          <Button size="sm" disabled={busy || !draft.trim() || draft === item.content} onClick={() => { void act(async () => { await updateBotMemory(model.bot.id, item, 'correct', draft, owner); setEditing(false); onChanged(); }); }}>{t('settings.bots.save')}</Button>
           <Button size="sm" variant="ghost" disabled={busy} onClick={() => { setEditing(false); setDraft(item.content); }}>{t('settings.common.actions.cancel')}</Button>
         </div>
       </div> : <button type="button" className="flex w-full flex-col gap-1.5 text-left" aria-expanded={open} onClick={onToggle}>
@@ -109,8 +112,8 @@ function MemoryItem({ item, open, onToggle, onChanged, onForgotten }: {
               <span className="text-[12px] text-muted-foreground">{t('settings.bots.memory.history')}</span>
               {detail.history.value.filter(row => row.id !== item.id).map(row => <p key={row.id} className="m-0 border-l-2 border-border pl-2.5 text-[12px] text-muted-foreground">
                 <time dateTime={new Date(row.createdAt).toISOString()}>{new Intl.DateTimeFormat(locale, { month: 'short', day: 'numeric' }).format(row.createdAt)}</time> · {row.content}
-                {!item.inactive && row.inactive ? <button type="button" className="ml-2 text-primary hover:underline" disabled={busy} onClick={() => { void act(async () => { await restoreBotMemory(model.bot.id, item, row); onChanged(); }); }}>{t('bot.memory.restore')}</button> : null}
-                {row.inactive ? <button type="button" className="ml-2 hover:text-foreground" disabled={busy} onClick={() => { void act(async () => { await clearBotMemoryHistory(model.bot.id, [row.id]); setDetail(current => current?.history.status === 'ready' ? { ...current, history: { status: 'ready', value: current.history.value.filter(value => value.id !== row.id) } } : current); onChanged(); }); }}>{t('bot.memory.clearHistory')}</button> : null}
+                {!item.inactive && row.inactive ? <button type="button" className="ml-2 text-primary hover:underline" disabled={busy} onClick={() => { void act(async () => { await restoreBotMemory(model.bot.id, item, row, owner); onChanged(); }); }}>{t('bot.memory.restore')}</button> : null}
+                {row.inactive ? <button type="button" className="ml-2 hover:text-foreground" disabled={busy} onClick={() => { void act(async () => { await clearBotMemoryHistory(model.bot.id, [row.id], owner); setDetail(current => current?.history.status === 'ready' ? { ...current, history: { status: 'ready', value: current.history.value.filter(value => value.id !== row.id) } } : current); onChanged(); }); }}>{t('bot.memory.clearHistory')}</button> : null}
               </p>)}
             </div> : null}
             {detail?.history.status === 'failed' ? <p role="alert" className="typography-meta text-destructive">{detail.history.error}</p> : null}
@@ -123,9 +126,9 @@ function MemoryItem({ item, open, onToggle, onChanged, onForgotten }: {
               </div>
             </div> : <div className="flex flex-wrap gap-1.5">
               {!item.inactive ? <Button size="sm" variant="outline" disabled={busy} onClick={() => { setDraft(item.content); setEditing(true); }}><Icon name="edit" className="size-3.5" />{t('bot.memory.edit')}</Button> : null}
-              {item.inactive ? <Button size="sm" variant="outline" disabled={busy} onClick={() => { void act(async () => { await restoreBotMemory(model.bot.id, item, item); onChanged(); }); }}>{t('bot.memory.restore')}</Button> : null}
-              {!item.inactive ? <Button size="sm" variant="outline" disabled={busy} onClick={() => { void act(async () => { await updateBotMemory(model.bot.id, item, 'archive'); onChanged(); }); }}>{t('bot.memory.obsolete')}</Button> : null}
-              {!item.inactive ? <Button size="sm" variant="outline" disabled={busy} onClick={() => { void act(async () => { await organizeBotMemory(model.bot.id, { ids: [item.id] }); onChanged(); }); }}>{t('bot.memory.organize')}</Button> : null}
+              {item.inactive ? <Button size="sm" variant="outline" disabled={busy} onClick={() => { void act(async () => { await restoreBotMemory(model.bot.id, item, item, owner); onChanged(); }); }}>{t('bot.memory.restore')}</Button> : null}
+              {!item.inactive ? <Button size="sm" variant="outline" disabled={busy} onClick={() => { void act(async () => { await updateBotMemory(model.bot.id, item, 'archive', undefined, owner); onChanged(); }); }}>{t('bot.memory.obsolete')}</Button> : null}
+              {!item.inactive && owner === 'bot' ? <Button size="sm" variant="outline" disabled={busy} onClick={() => { void act(async () => { await organizeBotMemory(model.bot.id, { ids: [item.id] }); onChanged(); }); }}>{t('bot.memory.organize')}</Button> : null}
               <Button size="sm" variant="outline" className="text-destructive" disabled={busy} onClick={() => setConfirming(true)}>{t('bot.memory.forget')}</Button>
             </div>}
           </div>
@@ -139,6 +142,25 @@ function MemoryItem({ item, open, onToggle, onChanged, onForgotten }: {
 export function BotMemoryPane() {
   const { t } = useI18n();
   const model = useBotPanel();
+  const [selected, setSelected] = React.useState<'bot' | 'user' | 'session'>('bot');
+  const target = React.useMemo(() => memoryFocusTarget(model.focus?.tab === 'memory' ? model.focus.id : undefined), [model.focus]);
+  const threadId = model.session?.identity.threadId ?? (typeof target?.owner === 'object' ? target.owner.threadId : undefined);
+  React.useEffect(() => {
+    if (target) setSelected(typeof target.owner === 'object' ? 'session' : target.owner);
+  }, [target]);
+  const owner = React.useMemo<BotMemoryOwner>(() =>
+    selected === 'session' && threadId ? { threadId } : selected === 'user' ? 'user' : 'bot', [selected, threadId]);
+  return <>
+    <BotSegment<'bot' | 'user' | 'session'> label={t('bot.tab.memory')} value={typeof owner === 'object' ? 'session' : owner} onChange={setSelected}
+      options={[{ value: 'bot', label: t('chat.context.owner.bot') }, { value: 'user', label: t('chat.context.owner.user') },
+        ...(threadId ? [{ value: 'session' as const, label: t('chat.context.owner.session') }] : [])]} />
+    <MemoryList key={JSON.stringify([model.bot.id, owner])} owner={owner} />
+  </>;
+}
+
+function MemoryList({ owner }: { owner: BotMemoryOwner }) {
+  const { t } = useI18n();
+  const model = useBotPanel();
   const scope = useBotLayout(state => state.memoryScope);
   const setScope = useBotLayout(state => state.setMemoryScope);
   const [search, setSearch] = React.useState('');
@@ -150,6 +172,13 @@ export function BotMemoryPane() {
   const [organizing, setOrganizing] = React.useState(false);
   const botId = model.bot.id;
   const endpointGeneration = getRuntimeEndpointGeneration();
+  React.useEffect(() => owner === 'bot' ? undefined : subscribeVarinEvents(event => {
+    if (event.type === 'harness-knowledge-changed' && (owner === 'user'
+      ? event.scope === 'user' : event.scope === 'session' && event.workspaceId === owner.threadId)) refresh();
+  }), [owner]);
+  const focus = model.focus?.tab === 'memory' ? model.focus.id : undefined;
+  const targetId = memoryFocusTarget(focus)?.id;
+  const addressed = targetId !== undefined && memoryFocusId(owner, targetId) === focus ? targetId : undefined;
   const sharedRevision = model.facts.memory.status === 'ready' ? model.facts.memory.value : null;
   React.useEffect(() => { setJobs([]); setMaintenanceError(null); }, [botId, endpointGeneration]);
   React.useEffect(() => {
@@ -168,25 +197,25 @@ export function BotMemoryPane() {
           timer = setTimeout(() => { void load(); }, 1500);
       } catch (error) { if (!controller.signal.aborted) setMaintenanceError(message(error)); }
     };
-    void load();
+    if (owner === 'bot') void load();
     return () => { controller.abort(); if (timer) clearTimeout(timer); };
-  }, [botId, revision, sharedRevision, endpointGeneration]);
+  }, [botId, revision, sharedRevision, endpointGeneration, owner]);
   React.useEffect(() => {
     const controller = new AbortController();
     const host = getRuntimeEndpointGeneration();
     setRead(current => ({ status: 'loading', value: current.value }));
-    void listBotMemory(botId, controller.signal, scope === 'all').then(value => {
+    void listBotMemory(botId, controller.signal, scope === 'all' || addressed !== undefined, owner).then(value => {
       if (!controller.signal.aborted && host === getRuntimeEndpointGeneration()) setRead({ status: 'ready', value });
     }, cause => {
       if (!controller.signal.aborted && host === getRuntimeEndpointGeneration()) setRead(current => ({ status: 'failed', value: current.value, error: message(cause) }));
     });
     return () => controller.abort();
-  }, [botId, scope, revision, sharedRevision]);
+  }, [botId, scope, revision, sharedRevision, owner, endpointGeneration, addressed]);
   React.useEffect(() => {
-    if (model.focus?.tab === 'memory') setOpenId(Number(model.focus.id));
-  }, [model.focus]);
+    if (addressed !== undefined) { setOpenId(addressed); setSearch(''); }
+  }, [addressed, model.focus?.token]);
   const query = search.trim().toLocaleLowerCase();
-  const items = (read.value ?? []).filter(item => !query || `${item.content} ${item.trigger}`.toLocaleLowerCase().includes(query))
+  const items = (read.value ?? []).filter(item => !item.inactive || scope === 'all' || item.id === addressed).filter(item => !query || `${item.content} ${item.trigger}`.toLocaleLowerCase().includes(query))
     .sort((a, b) => Number(Boolean(a.inactive)) - Number(Boolean(b.inactive)) || b.createdAt - a.createdAt);
   const changed = () => { refresh(); model.facts.refreshMemory(); };
   return <>
@@ -198,10 +227,10 @@ export function BotMemoryPane() {
     <div className="bot-pane-bar">
       <BotSegment label={t('bot.tab.memory')} value={scope} onChange={setScope}
         options={[{ value: 'current', label: t('bot.memory.current') }, { value: 'all', label: t('bot.memory.all') }]} />
-      <Button size="sm" variant="ghost" disabled={organizing} onClick={() => {
+      {owner === 'bot' && <Button size="sm" variant="ghost" disabled={organizing} onClick={() => {
         setOrganizing(true); setMaintenanceError(null);
         void organizeBotMemory(botId, search.trim() ? { query: search.trim() } : {}).then(() => refresh(), cause => setMaintenanceError(message(cause))).finally(() => setOrganizing(false));
-      }}>{t('bot.memory.organize')}</Button>
+      }}>{t('bot.memory.organize')}</Button>}
     </div>
     {jobs.map(job => <div key={job.key} className="mx-2 my-1 flex items-start gap-2 text-[12px] text-muted-foreground" role="status">
       <span className="min-w-0 flex-1 break-words">{job.maintenance?.cancelled ? t('bot.memory.cancelled') : job.status === 'failed' ? job.lastError
@@ -214,10 +243,10 @@ export function BotMemoryPane() {
       <button type="button" className="shrink-0 text-foreground hover:underline" onClick={refresh}>{t('settings.harness.retry')}</button>
     </div> : null}
     {read.status === 'loading' && !read.value ? <p role="status" className="px-4 py-6 text-center typography-meta text-muted-foreground">{t('common.loading')}</p> : null}
-    {read.value && read.value.length === 0 ? <p className="px-4 py-7 text-center text-[13px] text-muted-foreground">{t('settings.bots.memory.empty')}</p> : null}
+    {read.value && read.value.length === 0 ? <p className="px-4 py-7 text-center text-[13px] text-muted-foreground">{t(owner === 'bot' ? 'settings.bots.memory.empty' : 'assistant.memory.empty')}</p> : null}
     {read.value && read.value.length > 0 && !items.length ? <p className="px-4 py-7 text-center text-[13px] text-muted-foreground">{t('bot.memory.noMatch')}</p> : null}
     <div className="relative mt-1">
-      {items.map(item => <MemoryItem key={`${item.id}:${item.revision}`} item={item} open={openId === item.id}
+      {items.map(item => <MemoryItem key={`${item.id}:${item.revision}`} item={item} owner={owner} open={openId === item.id}
         onToggle={() => setOpenId(current => current === item.id ? null : item.id)}
         onChanged={changed}
         onForgotten={() => { setRead(current => current.value ? { ...current, value: current.value.filter(value => value.id !== item.id) } as BotRead<BotMemoryItem[]> : current); changed(); }} />)}

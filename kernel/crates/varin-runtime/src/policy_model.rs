@@ -402,6 +402,7 @@ impl<
                     .into(),
                     message: "planning request was not dispatched".into(),
                     retry_after_ms: None,
+                    transport_cause: None,
                     provider_request_id: None,
                 }),
                 usable: false,
@@ -455,13 +456,7 @@ impl<
                 output: None,
                 usage: job.output.usage.clone(),
                 finish_reason: None,
-                failure: Some(ModelFailure {
-                    tool_name: None,
-                    code: error.code,
-                    message: error.message,
-                    retry_after_ms: None,
-                    provider_request_id: None,
-                }),
+                failure: Some(ModelFailure::new(error.code, error.message)),
                 usable: false,
             };
             self.persistence.record_policy_model(
@@ -502,13 +497,7 @@ impl<
             })
         }))
         .unwrap_or_else(|_| {
-            Err(ModelFailure {
-                tool_name: None,
-                code: "provider_panicked".into(),
-                message: "planning provider panicked".into(),
-                retry_after_ms: None,
-                provider_request_id: None,
-            })
+            Err(ModelFailure::new("provider_panicked", "planning provider panicked"))
         });
         let forbidden = job.output.items.iter().any(|i| {
             matches!(
@@ -550,13 +539,10 @@ impl<
             usage: job.output.usage.clone(),
             finish_reason: result.as_ref().ok().copied(),
             failure: result.err().or_else(|| {
-                forbidden.then(|| ModelFailure {
-                    tool_name: None,
-                    code: "planning_tool_calls_forbidden".into(),
-                    message: "tool-free planning returned tool calls; originals retained without execution".into(),
-                    retry_after_ms: None,
-                    provider_request_id: None,
-                })
+                forbidden.then(|| ModelFailure::new(
+                    "planning_tool_calls_forbidden",
+                    "tool-free planning returned tool calls; originals retained without execution",
+                ))
             }),
             usable,
         };

@@ -34,13 +34,7 @@ impl ModelProvider for ControlledModel {
         cancel: &CancellationToken,
         emit: &mut dyn FnMut(ProviderEvent) -> Result<(), ExecutionError>,
     ) -> Result<FinishReason, ModelFailure> {
-        let failure = |code: &str| ModelFailure {
-            tool_name: None,
-            code: code.into(),
-            message: code.into(),
-            retry_after_ms: None,
-            provider_request_id: None,
-        };
+        let failure = |code: &str| ModelFailure::new(code, code);
         let (finish, receive) = mpsc::channel();
         self.sends
             .send(Generation {

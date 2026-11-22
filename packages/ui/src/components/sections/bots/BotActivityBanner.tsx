@@ -28,8 +28,9 @@ export function BotActivityBanner({ bot, busy, onAction }: { bot: BotSummary; bu
       : state === 'wake-failed' ? 'settings.bots.wakeFailed' : 'settings.bots.asleep';
   return <div className="space-y-2 border-b border-border px-4 py-3 typography-meta" role="status">
     <div className="flex items-center gap-2"><Icon name="moon" className="size-4" /><span className="flex-1">{t(label)}</span>
-      {state === 'sleeping' || state === 'waking' ? <Button size="sm" variant="ghost" disabled={busy} onClick={() => onAction('retry')}>{t('settings.harness.retry')}</Button> : <Button size="sm" variant="outline" disabled={busy} onClick={() => onAction(bot.archived ? 'restore' : state === 'sleep-failed' || state === 'wake-failed' ? 'retry' : 'wake')}>
-        {t(bot.archived ? 'settings.bots.restore' : state === 'sleep-failed' ? 'settings.bots.sleepRetry' : 'settings.bots.wakeContinue')}
+      {state === 'sleep-failed' && <Button size="sm" variant="ghost" disabled={busy} onClick={() => onAction('retry')}>{t('settings.bots.sleepRetry')}</Button>}
+      {state === 'sleeping' || state === 'waking' ? <Button size="sm" variant="ghost" disabled={busy} onClick={() => onAction('retry')}>{t('settings.harness.retry')}</Button> : <Button size="sm" variant="outline" disabled={busy} onClick={() => onAction(bot.archived ? 'restore' : state === 'wake-failed' ? 'retry' : 'wake')}>
+        {t(bot.archived ? 'settings.bots.restore' : 'settings.bots.wakeContinue')}
       </Button>}
     </div>
     {state === 'asleep' ? <p className="text-muted-foreground">New Bot execution is paused. Opening history does not wake it.</p> : null}

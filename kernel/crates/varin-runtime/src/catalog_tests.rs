@@ -4481,7 +4481,7 @@ fn generation_phase_attention_is_current_fenced_content_free_and_observed() {
     db.commit_execution(&receipt.run_id, epoch, &ExecutionRecord::ModelFinished {
         request_id: "model-1".into(), outcome: ModelOutcome::Failed, finish_reason: None, items: vec![],
         interrupted_deltas: vec![], usage: UsageReceipt::default(), failure: Some(ModelFailure {
-            code: "transport_error".into(), message: "fixture".into(), tool_name: None, retry_after_ms: None, provider_request_id: None,
+            code: "transport_error".into(), message: "fixture".into(), tool_name: None, retry_after_ms: None, transport_cause: None, provider_request_id: None,
         }),
     }).unwrap();
     assert!(generation(&db).is_null());
@@ -4526,12 +4526,13 @@ fn retry_attention_requires_original_scheduled_wait_and_never_infers_resume_from
     assert!(db.record_retry_schedule(&receipt.run_id, epoch, "model-1", Some((1, 0))).is_err()); // still dispatched
     db.commit_execution(&receipt.run_id, epoch, &ExecutionRecord::ModelFinished {
         request_id: "model-1".into(), outcome: ModelOutcome::Failed, finish_reason: None, items: vec![], interrupted_deltas: vec![],
-        usage: UsageReceipt::default(), failure: Some(ModelFailure { code: "transport_error".into(), message: "private failure body".into(), tool_name: None, retry_after_ms: None, provider_request_id: None }),
+        usage: UsageReceipt::default(), failure: Some(ModelFailure { code: "transport_error".into(), message: "private failure body".into(), tool_name: None, retry_after_ms: None, transport_cause: Some("connection refused".into()), provider_request_id: None }),
     }).unwrap();
     let retry = |db: &Catalog| {
         let snapshot = serde_json::to_value(db.capture_attention_read().load(&|| false).unwrap()).unwrap();
         snapshot["branches"][0]["currentRun"]["retry"].clone()
     };
+    assert_eq!(db.model_output("model-1").unwrap().unwrap()["record"]["failure"]["transport_cause"], "connection refused");
     assert!(retry(&db).is_null());
     db.record_retry_schedule(&receipt.run_id, epoch, "model-1", Some((1, 0))).unwrap();
     let observed = retry(&db); assert_eq!(observed["attempt"], 1); assert_eq!(observed["requestId"], "model-1");

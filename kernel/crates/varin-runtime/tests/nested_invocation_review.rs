@@ -69,13 +69,7 @@ impl ModelProvider for Provider {
                 opaque: None,
             },
         })
-        .map_err(|e| ModelFailure {
-            tool_name: None,
-            code: e.code,
-            message: e.message,
-            retry_after_ms: None,
-            provider_request_id: None,
-        })?;
+        .map_err(|e| ModelFailure::new(e.code, e.message))?;
         Ok(if first {
             FinishReason::ToolCalls
         } else {

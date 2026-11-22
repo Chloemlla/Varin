@@ -269,7 +269,7 @@ export function stateLine(bot: BotSummary, state: BotFigurePose, details: { need
       if (bot.archived) return { key: 'bot.state.archived', tone: 'none' };
       const activity = bot.activity?.state;
       if (activity === 'sleeping') return { key: 'bot.state.goingToSleep', tone: 'none' };
-      if (activity === 'sleep-failed') return { key: 'bot.state.sleepFailed', tone: 'warn' };
+      if (activity === 'sleep-failed') return { key: 'bot.state.sleepFailed', tone: 'warn', wake: true };
       if (activity === 'wake-failed') return { key: 'bot.state.wakeFailed', tone: 'warn', wake: true };
       return { key: 'bot.state.sleeping', tone: 'none', wake: true };
     }

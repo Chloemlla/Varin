@@ -40,6 +40,7 @@ fn bot_scope_waits_for_real_provider_and_operation_workers_then_preserves_unknow
                 code: "cancelled".into(),
                 message: "actual provider exit".into(),
                 retry_after_ms: None,
+                transport_cause: None,
                 provider_request_id: Some("original-transport".into()),
             })
         }

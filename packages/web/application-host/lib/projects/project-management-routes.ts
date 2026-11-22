@@ -5,6 +5,25 @@ import { PROJECT_GIT_READ, encodeProjectCommandResult } from '@varin/application
 import type { ManagedSourceClient } from '../harness/managed-remote-client.js';
 
 const actions = new Set(['github-command','git-command','resources','trust-read','trust-update','git-branches','git-root-context','github-auth','github-issues','github-prs','github-issue','github-issue-comments','github-pr-context','worktrees','worktree-create','worktree-validate','worktree-remove','worktree-remote-branch-delete','worktree-bootstrap','inspect','enable','disable','backend','backend-settings']);
+export function registerProjectPreferencesRoutes(app: Express, options: {
+  requireAuth: RequestHandler;
+  authorize(request: Request, response: Response): Promise<boolean>;
+  projects(): Promise<ProjectEntry[]>;
+  preferences: ReturnType<typeof import('./project-config.js').createProjectConfigRuntime>['projectPreferences'];
+}) {
+  for (const method of ['get', 'patch'] as const) app[method]('/api/projects/:projectId/preferences', options.requireAuth, async (request, response) => {
+    response.setHeader('Cache-Control', 'no-store');
+    try {
+      if (!await options.authorize(request, response)) { response.sendStatus(403); return; }
+      const project = (await options.projects()).find(entry => entry.id === request.params.projectId);
+      if (!project) { response.sendStatus(404); return; }
+      const result = await options.preferences(project.id, project.path, method === 'patch'
+        ? { patch: request.body?.patch, expected: request.body?.expected } : undefined);
+      response.status(result.conflict ? 409 : 200).json(result);
+    } catch (error) { response.status(400).json({ message: error instanceof Error ? error.message : 'Project preferences unavailable' }); }
+  });
+}
+
 export function registerProjectManagementRoutes(app: Express, options: {
   requireAuth: RequestHandler;
   authorize(request: Request, response: Response): Promise<boolean>;

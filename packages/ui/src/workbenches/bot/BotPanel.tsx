@@ -30,7 +30,7 @@ function BotStage() {
   const model = useBotPanel();
   const { bot, line } = model;
   const state = bot.activity?.state ?? 'awake';
-  const resting = state !== 'awake' && state !== 'sleep-failed';
+  const resting = state !== 'awake';
   const transitioning = state === 'sleeping' || state === 'waking';
   const text = t(line.key, line.params);
   const mark = stateIcon(line);
@@ -46,9 +46,12 @@ function BotStage() {
         <DropdownMenuContent align="end" className="min-w-[180px]">
           <DropdownMenuItem onSelect={() => model.openProfile()}><Icon name="user" className="size-4" />{t('bot.profile.title')}</DropdownMenuItem>
           <DropdownMenuItem disabled={model.readOnly || model.busy} onSelect={model.newSession}><Icon name="chat-new" className="size-4" />{t('bot.session.new')}</DropdownMenuItem>
-          {!bot.archived && !bot.deletion ? <DropdownMenuItem disabled={transitioning || model.busy} onSelect={() => model.changeState(state === 'sleep-failed' || state === 'wake-failed' ? 'retry' : resting ? 'wake' : 'sleep')}>
-            <Icon name={resting ? 'play' : 'moon'} className="size-4" />{t(state === 'sleep-failed' ? 'settings.bots.sleepRetry' : resting ? 'settings.bots.wake' : 'settings.bots.sleep')}
+          {!bot.archived && !bot.deletion ? <DropdownMenuItem disabled={transitioning || model.busy} onSelect={() => model.changeState(state === 'wake-failed' ? 'retry' : resting ? 'wake' : 'sleep')}>
+            <Icon name={resting ? 'play' : 'moon'} className="size-4" />{t(resting ? 'settings.bots.wake' : 'settings.bots.sleep')}
           </DropdownMenuItem> : null}
+          {state === 'sleep-failed' && !bot.archived && !bot.deletion && <DropdownMenuItem disabled={model.busy} onSelect={() => model.changeState('retry')}>
+            <Icon name="moon" className="size-4" />{t('settings.bots.sleepRetry')}
+          </DropdownMenuItem>}
         </DropdownMenuContent>
       </DropdownMenu>
     </div>

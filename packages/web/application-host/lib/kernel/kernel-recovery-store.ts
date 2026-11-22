@@ -22,7 +22,7 @@ import type {
   RecoveryState,
   RegularFileState,
 } from "../recovery/journal-files.js";
-import { parseRecoveryConversation, parseRecoveryFileTarget } from "@varin/extension-contract";
+import { parseRecoveryConversation, parseRecoveryFileTarget, parseWorkspaceCombinedRecoveryOperation } from "@varin/extension-contract";
 import { normalizeResourceId, parseRecoveryState, sameState } from "../recovery/journal-files.js";
 import type {
   DurableRecoveryChangeSelection,
@@ -931,13 +931,19 @@ export class KernelRecoveryStore {
     return operation;
   }
 
-  async listOperations(workspaceId: string, kind?: string, signal?: AbortSignal): Promise<Record<string, unknown>[]> {
+  async branchOperations(coordinatorWorkspace: string, branch: { threadId: string; branchId: string }, signal?: AbortSignal) {
+    const client = await this.adapter.recoveryMetadataClient(coordinatorWorkspace);
+    const operations = await client.recoveryBranchOperations({ workspaceId: coordinatorWorkspace, ...branch }, signal);
+    return operations.map(parseWorkspaceCombinedRecoveryOperation);
+  }
+
+  async listOperations(workspaceId: string, kind?: string, signal?: AbortSignal, options?: { resumableOnly: true }): Promise<Record<string, unknown>[]> {
     signal?.throwIfAborted();
     if (this.scopedActor) {
       if (workspaceId !== this.scopedActor.identity.workspaceId || !this.scopedActor.metadataReader) {
         throw new Error("Workspace operation inspection requires its explicit metadata reader");
       }
-      return this.scopedActor.metadataReader.listOperations(workspaceId, kind, signal);
+      return this.scopedActor.metadataReader.listOperations(workspaceId, kind, signal, options);
     }
     const client = await this.adapter.recoveryMetadataClient(workspaceId);
     const output: Record<string, unknown>[] = [];
@@ -947,6 +953,7 @@ export class KernelRecoveryStore {
       const value = await client.recoveryOperationList({
         workspaceId,
         ...(kind ? { kind } : {}),
+        ...options,
         pageSize: 512,
         ...(cursor === undefined ? {} : { cursor }),
       }, signal);

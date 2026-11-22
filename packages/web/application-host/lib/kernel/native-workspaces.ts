@@ -258,10 +258,14 @@ function createWorkspaceOwner(owners: Owners, sessions: ReturnType<typeof create
             }
             catch (error) {
                 entry.view = await actor.inspectWorkspace(address).catch(() => entry.view);
-                throw error;
+                if (ownerSignal.aborted || !entry.view.mount?.error) throw error;
+                await requireNativeWorkspaceBackend(actor, ownerSignal);
+                throw new KernelClientError({ code: 'workspace_mount_unavailable', message: entry.view.mount.error });
             }
-            if (entry.view.mount?.state !== 'ready' || !entry.view.mount.path || !entry.view.rootId)
-                throw new Error('Native workspace mount is unavailable');
+            if (entry.view.mount?.state !== 'ready' || !entry.view.mount.path || !entry.view.rootId) {
+                await requireNativeWorkspaceBackend(actor, ownerSignal);
+                throw new KernelClientError({ code: 'workspace_mount_unavailable', message: entry.view.mount?.error ?? 'Native workspace mount is unavailable' });
+            }
             return entry;
         })().finally(() => opening.delete(branch));
         const flight = { work, controller, observers: 0 };
@@ -323,7 +327,7 @@ function createWorkspaceOwner(owners: Owners, sessions: ReturnType<typeof create
         }
         if (view.mount?.state !== 'ready' || !view.mount.path || !view.rootId) {
             entry.view = { ...entry.view, mount: view.mount };
-            throw new Error('The original native source mount is unavailable');
+            throw new KernelClientError({ code: 'workspace_mount_unavailable', message: view.mount?.error ?? 'The original native source mount is unavailable' });
         }
         documentViews.set(documentId(source), { ...source });
         return { address, rootId: view.rootId, path: view.mount.path, hostId: owners.kernel.handshake!.hostId };
@@ -378,13 +382,16 @@ function createWorkspaceOwner(owners: Owners, sessions: ReturnType<typeof create
         }
         return undefined;
     };
-    const inspectBackend = async (projectId: string, signal?: AbortSignal) => {
-        if (!(await owners.projects()).some(project => project.id === projectId)) throw new Error('Project is unavailable');
+    const hostBackend = async (signal?: AbortSignal) => {
         const grant = await owners.kernel.issueGrant({ grantId: `workspace-backend:${randomUUID()}`,
             capabilities: ['storage.read'], pathScopes: [''] }, signal);
         try {
             return await owners.kernel.scoped(grant).inspectWorkspaceBackend(signal);
         } finally { await owners.kernel.revokeGrant(grant.grantId); }
+    };
+    const inspectBackend = async (projectId: string, signal?: AbortSignal) => {
+        if (!(await owners.projects()).some(project => project.id === projectId)) throw new Error('Project is unavailable');
+        return hostBackend(signal);
     };
     const openBackendSettings = async (projectId: string, signal?: AbortSignal) => {
         if (!(await owners.projects()).some(project => project.id === projectId)) throw new Error('Project is unavailable');
@@ -741,6 +748,6 @@ function createWorkspaceOwner(owners: Owners, sessions: ReturnType<typeof create
             }
         }
     };
-    return { projectLifecycle, prepare, prepareSelection, acquire, resolveId, resolvePath, textEncodingSource, enable, disable, inspectProject, inspectBackend, openBackendSettings, open, snapshot, releaseSource, retainReference, releaseReference, retireSource, retainPrepared };
+    return { projectLifecycle, hostBackend, prepare, prepareSelection, acquire, resolveId, resolvePath, textEncodingSource, enable, disable, inspectProject, inspectBackend, openBackendSettings, open, snapshot, releaseSource, retainReference, releaseReference, retireSource, retainPrepared };
 }
 export type NativeWorkspaceOwner = ReturnType<typeof createNativeWorkspaceOwner>;

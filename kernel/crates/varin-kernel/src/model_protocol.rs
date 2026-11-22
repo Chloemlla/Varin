@@ -172,6 +172,7 @@ fn failure(message: impl ToString) -> ModelFailure {
         code: "model_protocol_unavailable".into(),
         message: message.to_string(),
         retry_after_ms: None,
+        transport_cause: None,
         provider_request_id: None,
     }
 }

@@ -101,6 +101,7 @@ test('a directory authorization failure is distinct from a failed connection or 
   const { connection } = await fixture(request => request.method === 'tools/list'
     ? new Response(null, { status: 401, headers: { 'www-authenticate': 'Bearer scope="tools"' } }) : empty(request.method));
   await connection.getClient();
+  await expect(connection.getToolsClient()).rejects.toMatchObject({ code: 'mcp-server-needs-auth', details: { server: 'fixture', stage: 'tools/list', httpStatus: 401 } });
   await expect.poll(() => connection.directoryStates.tools).toBe('needs-auth');
   expect(connection.state).toBe('connected');
   expect(connection.directoryStates.resources).toBe('ready');
@@ -112,8 +113,12 @@ test.each([401, 403, 503])('preserves HTTP %s classification through SDK negotia
   const challenge = 'Bearer resource_metadata="https://fixture/metadata"';
   const { connection } = await fixture(request => empty(request.method), undefined, request => request.method === 'server/discover'
     ? new Response(null, { status, headers: { 'www-authenticate': challenge } }) : undefined);
-  await expect(connection.getClient()).rejects.toThrow();
+  await expect(connection.getClient()).rejects.toMatchObject({
+    code: status === 503 ? 'mcp-connection-unavailable' : 'mcp-server-needs-auth',
+    details: { server: 'fixture', stage: 'connect', httpStatus: status },
+  });
   expect(connection.state).toBe(status === 503 ? 'failed' : 'needs-auth');
   expect(connection.challenge).toBe(status === 503 ? undefined : challenge);
-  expect(connection.error).toBe(status === 503 ? 'MCP connection unavailable' : 'MCP sign-in required');
+  expect(connection.error).toContain(`HTTP ${status}`);
+  expect(connection.error).not.toContain('resource_metadata');
 });

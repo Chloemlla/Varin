@@ -4,7 +4,13 @@ import { Readable } from 'node:stream';
 const responseHeaders = (raw: Record<string, string | string[]>): Headers => {
   const headers = new Headers();
   for (const [name, value] of Object.entries(raw)) {
-    for (const part of Array.isArray(value) ? value : [value]) headers.append(name, part);
+    // A non-ASCII name has no HTTP field semantics.
+    if (/[\u0080-\u{10ffff}]/u.test(name)) continue;
+    for (const part of Array.isArray(value) ? value : [value]) {
+      // Chromium can return decoded Unicode. Fetch represents header values as bytes.
+      const bytes = /[\u0100-\u{10ffff}]/u.test(part) ? Buffer.from(part, 'utf8').toString('latin1') : part;
+      headers.append(name, bytes);
+    }
   }
   return headers;
 };
@@ -16,9 +22,7 @@ export const createDesktopNetworkFetch = (networkSession: Session) => (
   url: string,
   init: RequestInit,
 ): Promise<Response> => new Promise((resolve, reject) => {
-  let prepared: Request;
-  try { prepared = new Request(url, init); }
-  catch (error) { reject(error); return; }
+  const prepared = new Request(url, init);
   const outbound = net.request({
     url: prepared.url,
     method: prepared.method,
@@ -34,47 +38,66 @@ export const createDesktopNetworkFetch = (networkSession: Session) => (
     settled = true;
     reject(error);
   };
-  const onAbort = (): void => {
+  const abort = (error: unknown): void => {
+    fail(error);
     outbound.abort();
-    fail(init.signal?.reason ?? new Error('request aborted'));
   };
+  const onAbort = (): void => abort(init.signal?.reason ?? new Error('request aborted'));
+  outbound.on('error', fail);
+  outbound.on('close', () => {
+    init.signal?.removeEventListener('abort', onAbort);
+    if (!settled) fail(new Error('Network request closed before receiving a response'));
+  });
   if (init.signal?.aborted) { onAbort(); return; }
   init.signal?.addEventListener('abort', onAbort, { once: true });
-  outbound.on('close', () => init.signal?.removeEventListener('abort', onAbort));
-  outbound.on('error', fail);
-  outbound.on('redirect', (statusCode, _method, redirectUrl, rawHeaders) => {
+
+  const respond = (build: () => Response, stopRedirect = false): void => {
     if (settled) return;
-    const headers = responseHeaders(rawHeaders);
-    if (!headers.has('location')) headers.set('location', redirectUrl);
-    settled = true;
-    resolve(new Response(null, { status: statusCode, headers }));
-    outbound.abort();
-  });
-  outbound.on('response', (incoming) => {
-    if (settled) return;
-    const status = incoming.statusCode;
-    if (status < 200 || status > 599) {
-      fail(new Error(`invalid HTTP response status ${status}`));
-      outbound.abort();
+    try {
+      const response = build();
+      settled = true;
+      resolve(response);
+    } catch (error) {
+      abort(error);
       return;
     }
+    if (stopRedirect) outbound.abort();
+  };
+  outbound.on('redirect', (statusCode, _method, redirectUrl, rawHeaders) => respond(() => {
+    const headers = responseHeaders(rawHeaders);
+    // Chromium has resolved the target, including escaping Unicode in the URL.
+    const location = headers.get('location');
+    if (!location || /[\u0080-\u{10ffff}]/u.test(location)) headers.set('location', new URL(redirectUrl, prepared.url).href);
+    return new Response(null, { status: statusCode, headers });
+  }, true));
+  outbound.on('response', incoming => respond(() => {
+    const status = incoming.statusCode;
+    const headers = responseHeaders(incoming.headers);
     const noBody = prepared.method === 'HEAD' || status === 204 || status === 205 || status === 304;
-    // Electron's declaration lists EventEmitter, but its runtime response is
-    // a Node Readable (verified in the main process). Preserve backpressure.
+    // Electron exposes a Node Readable at runtime. Preserve its backpressure.
     const body = noBody ? null : Readable.toWeb(incoming as unknown as Readable) as ReadableStream<Uint8Array>;
-    settled = true;
-    resolve(new Response(body, { status, headers: responseHeaders(incoming.headers) }));
-  });
-  for (const [name, value] of prepared.headers) outbound.setHeader(name, value);
-  if (!prepared.body) { outbound.end(); return; }
-  outbound.chunkedEncoding = true;
-  void (async () => {
-    const reader = prepared.body!.getReader();
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done || init.signal?.aborted) break;
-      outbound.write(Buffer.from(value));
+    return new Response(body, { status, headers });
+  }));
+  const send = async (): Promise<void> => {
+    for (const [name, value] of prepared.headers) outbound.setHeader(name, value);
+    if (!prepared.body) { outbound.end(); return; }
+    outbound.chunkedEncoding = true;
+    const reader = prepared.body.getReader();
+    // An early response or abort can close the request during a pending upload read.
+    let closed = false;
+    const stopUpload = () => { closed = true; void reader.cancel().catch(() => undefined); };
+    outbound.once('close', stopUpload);
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done || closed || init.signal?.aborted) break;
+        outbound.write(Buffer.from(value));
+      }
+      if (!closed && !init.signal?.aborted) outbound.end();
+    } finally {
+      outbound.off('close', stopUpload);
+      reader.releaseLock();
     }
-    if (!init.signal?.aborted) outbound.end();
-  })().catch((error) => { fail(error); outbound.abort(); });
+  };
+  void send().catch(abort);
 });

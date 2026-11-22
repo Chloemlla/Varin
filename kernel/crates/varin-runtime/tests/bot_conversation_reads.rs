@@ -140,6 +140,7 @@ fn same_principal_direct_bots_discover_and_read_without_lending_agent_authority(
         pinned: None,
         archived: Some(true),
         title_mode: None,
+        model: None,
     })
     .unwrap();
     let directory = db

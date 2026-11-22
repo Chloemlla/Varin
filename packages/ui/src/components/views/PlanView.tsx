@@ -527,7 +527,6 @@ export const PlanView: React.FC<PlanViewProps> = ({ targetPath = null }) => {
       try {
         routeToChat();
         let identity: ThreadIdentity;
-        let directory = currentProjectRef.path;
         if (pendingPlanSend.target === 'worktree') {
           if (!canCreateWorktree) return;
           const projectsState = useProjectsStore.getState();
@@ -535,11 +534,9 @@ export const PlanView: React.FC<PlanViewProps> = ({ targetPath = null }) => {
             projectsState.setActiveProjectIdOnly(currentProjectRef.id);
           }
           const created = await createWorktreeThread();
-          identity = await useThreadStore.getState().materializeDraft(created.draftKey); directory = created.path;
+          identity = await useThreadStore.getState().materializeDraft(created.draftKey);
         } else {
-          identity = await createThreadForSubmission({
-            directory: currentProjectRef.path,
-          });
+          identity = await createThreadForSubmission({ projectId: currentProjectRef.id });
         }
         const goalObjective = execution.runAsGoal === true
           ? [
@@ -553,7 +550,7 @@ export const PlanView: React.FC<PlanViewProps> = ({ targetPath = null }) => {
           .filter((value): value is string => Boolean(value?.trim()))
           .join('\n\n');
         setPendingPlanSend(null);
-        await submitThreadPrompt(identity, promptText, { providerId: execution.providerID, modelId: execution.modelID, thinkingLevel: execution.thinkingLevel }, directory, goalObjective ?? undefined);
+        await submitThreadPrompt(identity, promptText, { providerId: execution.providerID, modelId: execution.modelID, thinkingLevel: execution.thinkingLevel }, undefined, goalObjective ?? undefined);
 
         setPendingPlanSend(null);
       } catch (error) {

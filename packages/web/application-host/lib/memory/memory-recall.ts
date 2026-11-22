@@ -117,7 +117,7 @@ const judgeCandidates = async (
     const payload = result.node.payload;
     return {
       id: `m${index}`,
-      label: `[${payload.scope ?? "workspace"}] #${result.node.id}`,
+      label: `[${payload.scope ?? "workspace"}; ${(payload.source as { kind?: string } | undefined)?.kind ?? "memory"}] #${result.node.id}`,
       text: `${payload.content}\ntrigger: ${payload.trigger}`,
     };
   });
@@ -127,7 +127,7 @@ const judgeCandidates = async (
     instructions: `Material m${index} is a durable memory recalled for the current request. Does it contribute to the goal: a decision, requirement, preference, judgment, commitment, or outcome the answer must respect?`,
     criteria: {
       yes: "The memory changes what a correct answer or next step looks like",
-      no: "Unrelated, stale, or already covered by the visible conversation",
+      no: "Unrelated, stale, already covered, or an inferred account that conflicts with the user's own correction of the same fact",
     },
   }));
   let decided: HarnessFastDecisionResult;

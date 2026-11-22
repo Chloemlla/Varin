@@ -90,6 +90,18 @@ export function BotGroupChat({ group, bots, api, sequence, panelTarget, onOpenPa
   const [error, setError] = React.useState('');
   const [busy, setBusy] = React.useState(false);
   const [tab, setTab] = React.useState<'members' | 'activity' | 'schedule'>('members');
+  const [activityBefore, setActivityBefore] = React.useState<string>();
+  const [activity, setActivity] = React.useState<BotGroupPage>();
+  React.useEffect(() => {
+    if (tab !== 'activity') return;
+    const controller = new AbortController();
+    const query = activityBefore ? '?' + new URLSearchParams({ before: activityBefore }) : '';
+    void botGroupRequest<BotGroupPage>(id + '/activity' + query, undefined, controller.signal).then(value => {
+      if (!controller.signal.aborted) setActivity(value);
+    }, failure => { if (!controller.signal.aborted) setError(messageError(failure)); });
+    return () => controller.abort();
+  }, [tab, id, sequence, activityBefore]);
+  const activityPage = (before?: string) => { setActivity(undefined); setActivityBefore(before); };
   const [memberDetail, setMemberDetail] = React.useState<string>();
   const [adding, setAdding] = React.useState(false);
   const [deleting, setDeleting] = React.useState(false);
@@ -196,7 +208,7 @@ export function BotGroupChat({ group, bots, api, sequence, panelTarget, onOpenPa
   const detail = members.find(member => member.botId === memberDetail);
   const detailBot = detail && bots.find(bot => bot.id === detail.botId);
   const addable = bots.filter(bot => !bot.archived && !bot.deletion && !members.some(member => member.botId === bot.id));
-  const newestFirst = [...posts].reverse();
+  const newestFirst = [...(tab === 'activity' ? activity?.posts ?? [] : posts)].reverse();
   const deliveries = newestFirst.flatMap(post => post.delivery.filter(runningOrNotable).map(delivery => ({ post, delivery })));
   const listen = (member: BotGroupMember) => <Switch checked={member.listening} title={L('listen')}
     aria-label={displayName(member.botId) + ' · ' + L('listen')}
@@ -212,7 +224,7 @@ export function BotGroupChat({ group, bots, api, sequence, panelTarget, onOpenPa
     <span className="min-w-0 flex-1"><b className="block truncate">{displayName(delivery.botId)}</b><small className="block truncate">{post.text}</small></span>
     <small data-tone={troubled(delivery) ? 'warn' : undefined}>{L(working(delivery) ? 'inProgress' : delivery.state === 'asleep' ? 'asleep' : delivery.state === 'execution-failed' ? 'workFailed' : delivery.state === 'failed' ? 'failed' : 'silent')}</small>
   </button>;
-  const historyPosts = newestFirst.filter(post => post.fact || post.work || post.scheduleName || post.watchName || post.informs || (post.author.kind === 'bot' && post.addressed.length));
+  const historyPosts = newestFirst.filter(post => post.fact || post.work || post.scheduleName || post.watchName || post.informs || post.author.kind === 'bot');
   const date = (at: number) => new Date(at).toLocaleDateString(getCurrentIntlLocale(), { month: 'short', day: 'numeric' });
   const historyByDate = new Map<string, BotGroupPost[]>();
   for (const post of historyPosts) {
@@ -242,7 +254,7 @@ export function BotGroupChat({ group, bots, api, sequence, panelTarget, onOpenPa
       <div><b>{L('listening')}</b><small>{listenSource(detail) ?? L('listeningHint')}</small></div>{listen(detail)}
     </div>
     <div className="group-chat-member-actions">
-      {detailBot?.activity?.state === 'asleep' && <Button size="sm" onClick={() => onWake(detailBot)}>{L('wake')}</Button>}
+      {detailBot && (detailBot.activity?.state === 'asleep' || detailBot.activity?.state === 'sleep-failed') && <Button size="sm" onClick={() => onWake(detailBot)}>{L('wake')}</Button>}
       <Button variant="outline" size="sm" onClick={() => { revealChat(); onDirect(detail.botId); }}>{L('private')}</Button>
       {detailBot && <Button variant="ghost" size="sm" onClick={() => onProfile(detailBot)}>{L('profile')}</Button>}
       <Button variant="ghost" size="sm" className="text-destructive" onClick={() => void change({ kind: 'remove', botId: detail.botId })}>{L('remove')}</Button>
@@ -281,7 +293,10 @@ export function BotGroupChat({ group, bots, api, sequence, panelTarget, onOpenPa
         </b>{post.text && <small className="block truncate">{post.text}</small>}</span>
       </button>)}</div>
     </section>)}
-    {!deliveries.length && !historyByDate.size && <p className="group-chat-panel-note">{L('emptyActivity')}</p>}
+    {activity?.before && <button type="button" className="group-chat-older" onClick={() => activityPage(activity.before)}>{L('older')}</button>}
+    {activityBefore && <button type="button" className="group-chat-older" onClick={() => activityPage()}>{L('latest')}</button>}
+    {!activity && <p className="group-chat-panel-note" role="status">{L('loading')}</p>}
+    {activity && !deliveries.length && !historyByDate.size && <p className="group-chat-panel-note">{L('emptyActivity')}</p>}
   </div>;
   const memberPane = <aside className="bot-panel-body group-chat-panel" aria-label={group.name} onKeyDown={event => {
     if (event.key === 'Escape' && drawer) drawer.setRightSidebarOpen(false);

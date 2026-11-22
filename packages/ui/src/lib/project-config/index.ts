@@ -74,12 +74,12 @@ export const getProjectNotesAndTodos = async (
 
 export const saveProjectNotesAndTodos = async (
   project: VarinProjectRef,
-  value: VarinProjectNotesTodos,
+  value: Partial<VarinProjectNotesTodos>,
 ): Promise<boolean> => {
   const sanitized = sanitizeProjectNotesAndTodos(value);
   return varinProjectConfigStore.update(project, {
-    projectNotes: sanitized.notes,
-    projectTodos: sanitized.todos,
+    ...(value.notes !== undefined ? { projectNotes: sanitized.notes } : {}),
+    ...(value.todos !== undefined ? { projectTodos: sanitized.todos } : {}),
   });
 };
 
@@ -148,11 +148,11 @@ export const createProjectPlanFile = async (
   project: VarinProjectRef,
   value: { title: string; body: string },
 ): Promise<VarinProjectPlanFileLink | null> => {
-  const paths = await varinProjectConfigStore.getPaths(project);
+  const directory = await varinProjectConfigStore.planDirectory(project);
   const title = sanitizePlanTitle(value.title) || 'Plan';
   const createdAt = Date.now();
   const id = createProjectPlanId();
-  const filePath = `${paths.canonicalDirectory}/plans/${createdAt}-${slugifyPlanTitle(title)}.md`;
+  const filePath = `${directory}/${createdAt}-${slugifyPlanTitle(title)}.md`;
   if (!await varinProjectConfigStore.writeText(project, filePath, formatProjectPlanMarkdown(title, value.body))) {
     return null;
   }

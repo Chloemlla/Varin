@@ -1,3 +1,4 @@
+import { McpPreparationError } from '../mcp/errors.js';
 /** Target-side contribution views over the existing MCP authority. Catalog stays on A. */
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
@@ -495,7 +496,8 @@ export function createManagedMcpService(options: {
     try { return { ok: true, value: await work(), executorStopped: true }; }
     catch (error) {
       const failure = mcpTaskFailure(error);
-      return { ok: false, error: failure, executorStopped: !failure.dispatched || failure.settlement !== 'unknown' };
+      return { ok: false, error: error instanceof McpPreparationError ? { ...failure, preparation: error.details } : failure,
+        executorStopped: !failure.dispatched || failure.settlement !== 'unknown' };
     }
   };
   return {

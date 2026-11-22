@@ -33,17 +33,9 @@ import { classifyIp, type EgressAddressClass } from "./http-target.js";
 const require = createRequire(import.meta.url);
 const loadUndici = () => require("undici") as typeof import("undici");
 
-export type EgressErrorKind =
-  | "dns"
-  | "scheme-denied"
-  | "proxy-unavailable"
-  | "proxy-auth"
-  | "proxy-config-invalid"
-  | "tls"
-  | "connect"
-  | "timeout"
-  | "cancelled"
-  | "unknown";
+export const egressErrorKinds = ['dns', 'scheme-denied', 'proxy-unavailable', 'proxy-auth',
+  'proxy-config-invalid', 'tls', 'connect', 'timeout', 'cancelled', 'unknown'] as const;
+export type EgressErrorKind = typeof egressErrorKinds[number];
 
 /** Error with a stable machine-readable classification. */
 export class EgressError extends Error {

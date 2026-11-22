@@ -137,13 +137,7 @@ impl ModelProvider for Provider {
     ) -> Result<FinishReason, ModelFailure> {
         self.requests.lock().unwrap().push(r.clone());
         let mut send = |event| {
-            emit(event).map_err(|e| ModelFailure {
-                tool_name: None,
-                code: e.code,
-                message: e.message,
-                retry_after_ms: None,
-                provider_request_id: None,
-            })
+            emit(event).map_err(|e| ModelFailure::new(e.code, e.message))
         };
         send(ProviderEvent::TextDelta {
             item_id: "answer".into(),
@@ -201,6 +195,7 @@ impl ModelProvider for Provider {
                 code: "truncated_stream".into(),
                 message: "fixture partial response".into(),
                 retry_after_ms: None,
+                transport_cause: None,
                 provider_request_id: Some("provider-partial-id".into()),
             });
         }

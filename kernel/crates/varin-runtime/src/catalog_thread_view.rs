@@ -7,14 +7,7 @@ pub(super) fn model_request_id(item: &HistoryItem) -> Option<String> {
     if item.source != HistorySource::Assistant {
         return None;
     }
-    let encoded = item
-        .content
-        .get("id")?
-        .as_str()?
-        .strip_prefix("model-item:")?;
-    let (length, rest) = encoded.split_once(':')?;
-    let end = length.parse::<usize>().ok()?;
-    rest.get(..end).map(str::to_owned)
+    crate::execution::model_request_from_history_id(item.content.get("id")?.as_str()?).map(str::to_owned)
 }
 fn effectful(value: &Value) -> bool {
     matches!(

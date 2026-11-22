@@ -230,7 +230,7 @@ pub fn model_tool_for<'a>(tools: &'a [ToolSchema], direct: Option<&[String]>, na
         "unknown_tool_schema", name, "This tool is not available to the current request. Use tool_describe to inspect the available directory; tool_invoke cannot enable an unavailable tool."))?;
     if enabled(tools) && !is_declared_for(tool, direct) {
         return Err(call_error("tool_not_declared", name,
-            "This tool was not registered in the model request. Read its reference with tool_describe and call tool_invoke with reference and arguments; do not call the target name directly. No tool was executed."));
+            "This tool was not registered directly. Use tool_invoke with name and arguments; consult tool_describe for parameter details. No tool was executed."));
     }
     Ok(tool)
 }

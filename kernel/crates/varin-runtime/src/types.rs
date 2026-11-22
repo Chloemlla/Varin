@@ -160,6 +160,9 @@ pub struct ProviderOriginal {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelStep {
+    /// Frozen at request admission for readers locating effects on a conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_range: Option<crate::execution::HistoryRange>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation: Option<crate::generation_metrics::GenerationMetrics>,
     #[serde(default)]

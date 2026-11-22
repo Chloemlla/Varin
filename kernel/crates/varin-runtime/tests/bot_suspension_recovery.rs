@@ -91,6 +91,7 @@ impl ModelProvider for Provider {
                 code: "review_cancelled".into(),
                 message: "original local executor left".into(),
                 retry_after_ms: None,
+                transport_cause: None,
                 provider_request_id: Some("review-remote-original".into()),
             });
         }

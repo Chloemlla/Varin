@@ -1,8 +1,19 @@
+import { CredentialOwnerError } from './credential-owner.js';
+import { KernelClientError } from './kernel-error.js';
+import { McpAuthorityError, McpPreparationError } from '../mcp/errors.js';
 import { sourceFailureCode } from './source-admission-error.js';
 import { SourceCaptureError } from '../harness/working-state/source-preparation.js';
 import type { ExecutionError, SourceFailureCode } from './protocol.generated.js';
 
 export type PreparationFailureCode = SourceFailureCode | 'binding_changed' | 'credentials_unavailable' | 'preparation_failed' | 'workspace_backend_unavailable';
+
+/** Shared desktop logs may include a public failure code or an MCP owner's diagnostic. */
+export function preparationLogReason(error: unknown): string {
+  if (error instanceof McpPreparationError) return error.message;
+  if (error instanceof CredentialOwnerError || error instanceof KernelClientError || error instanceof McpAuthorityError) return error.code;
+  if (error instanceof Error && /^mcp[-_][a-z0-9_-]+$/.test(error.message)) return error.message;
+  return sourceFailureCode(error) ?? 'preparation_failed';
+}
 
 /** Preserve the owner's diagnostic separately from the stable recovery category. */
 export function preparationFailure(error: unknown, stage: string): { code: PreparationFailureCode; detail: string; failure?: ExecutionError } {

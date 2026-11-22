@@ -52,7 +52,7 @@ const validateScope = (scope: CredentialScope): CredentialScope => {
     || !Number.isSafeInteger(scope.generation) || scope.generation < 0) fail('invalid-credential-scope');
   return { reference: scope.reference, authority: scope.authority, account: scope.account, generation: scope.generation };
 };
-const sameScope = (left: CredentialScope, right: CredentialScope): boolean => (
+export const sameCredentialScope = (left: CredentialScope, right: CredentialScope): boolean => (
   left.reference === right.reference && left.authority === right.authority
   && left.account === right.account && left.generation === right.generation
 );
@@ -101,7 +101,7 @@ export class ExistingHostCredentialOwner {
   /** Search only this retained dependency graph, never the current model catalog. */
   findRetained(identity: string, scope: CredentialScope, seen = new Set<ExistingHostCredentialOwner>()): ExistingHostCredentialOwner | undefined {
     if (this.#disposed || seen.has(this)) return undefined; seen.add(this);
-    if (this.bindingIdentity === identity && this.#bindingScope && sameScope(this.#bindingScope, scope)) return this.fork();
+    if (this.bindingIdentity === identity && this.#bindingScope && sameCredentialScope(this.#bindingScope, scope)) return this.fork();
     for (const owner of this.#dependencies.values()) { const found = owner.findRetained(identity, scope, seen); if (found) return found; }
     return this.#parent?.findRetained(identity, scope, seen);
   }
@@ -146,7 +146,7 @@ export class ExistingHostCredentialOwner {
   async #resolve(expected: CredentialScope, dispatch?: CredentialDispatch): Promise<PrivateCredentialResolution> {
     try {
       const before = validateScope(await this.#options.currentScope());
-      if (!sameScope(before, expected)) return fail('credential-scope-changed');
+      if (!sameCredentialScope(before, expected)) return fail('credential-scope-changed');
       if (dispatch && (dispatch.method !== 'POST' || registeredEndpoint(dispatch.endpoint).toString() !== this.#endpoint.toString())) {
         return fail('credential-request-target-changed');
       }
@@ -157,7 +157,7 @@ export class ExistingHostCredentialOwner {
         ? await this.#options.runtime.resolveRequest(this.#options.providerId, dispatch)
         : await this.#options.runtime.getAuth(this.#options.providerId);
       const after = validateScope(await this.#options.currentScope());
-      if (!sameScope(after, expected)) return fail('credential-scope-changed');
+      if (!sameCredentialScope(after, expected)) return fail('credential-scope-changed');
       if (!resolved) return fail('credential-missing');
       if (resolved.auth.baseUrl) {
         const base = registeredEndpoint(resolved.auth.baseUrl);
@@ -211,7 +211,7 @@ export class ExistingHostCredentialOwner {
       const values: Record<string, string> = Object.create(null);
       headers.forEach((value, name) => { values[name] = value; });
       const finalScope = validateScope(await this.#options.currentScope());
-      if (!sameScope(finalScope, expected)) return fail('credential-scope-changed');
+      if (!sameCredentialScope(finalScope, expected)) return fail('credential-scope-changed');
       return { scope: finalScope, headers: values };
     } catch (error) {
       if (error instanceof CredentialOwnerError) throw error;

@@ -70,7 +70,7 @@ per-file results, and lets clean files proceed. File-only recovery keeps the con
 
 Combined conversation/file recovery continues through the following navigation transaction:
 
-Conversation navigation reports the entry IDs that will leave the selected branch. Varin loads the
+The conversation owner captures the entries leaving the branch and the selected draft. The active recovery provider receives the same selection through its Host invocation. Varin loads the
 turn checkpoints bound to those entries and folds their path operations into:
 
 - the expected current state for each affected path;
@@ -88,8 +88,9 @@ The durable operation/file record is owned by the Rust kernel. If file applicati
 navigation rejection occurs, Varin compensates only paths already changed by that operation. A lost
 Thread navigation response is resolved using the original Catalog command receipt, not current-head
 equality and not automatic compensation. Startup discovery is separate from owner-ready resumption:
-planned operations remain inert, while interrupted operations continue or compensate from their exact
-stored phases. Reopened UI reads the original operation and revision. It never creates a new attempt
+a confirmed file restore resumes from its saved path phases. Paths already at their target keep
+their bytes, pending paths still at their pre-restore state are written, and later edits surface for
+review. The owner settles the editor surfaces and file participants before moving the branch head. Reopened UI reads the original operation and revision. It never creates a new attempt
 merely because an earlier response was lost. The former local SQLite recovery engine is test-fixture
 code only and is not a production fallback.
 

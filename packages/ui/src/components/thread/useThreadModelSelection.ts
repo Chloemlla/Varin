@@ -22,10 +22,10 @@ function availableThinking(model: ThreadModel | undefined, models: readonly Thre
 
 /** Run observations seed the next input once per transition. They never drive the active picker through a draft write. */
 export function useThreadModelSelection({ draftKey, draft, ready, active, delegated, runId, runModel, preferredModel,
-  inheritWorkbenchModel, preferenceReady, models }: {
+  preferenceReady, models }: {
   draftKey: string; draft: ThreadDraft; ready: boolean; active: boolean; delegated: boolean;
   runId?: string; runModel?: ThreadModel; preferredModel?: ThreadModel | null;
-  inheritWorkbenchModel: boolean; preferenceReady: boolean; models: readonly ThreadModelInfo[];
+  preferenceReady: boolean; models: readonly ThreadModelInfo[];
 }): ThreadModel {
   React.useEffect(() => {
     if (!ready) return;
@@ -46,16 +46,13 @@ export function useThreadModelSelection({ draftKey, draft, ready, active, delega
       model = runModel ?? model;
     }
     if (preferenceReady && preferredModel === undefined && previous?.preference) observation = { ...observation, preference: undefined };
-    if (preferenceReady && preferredModel !== undefined && (previous?.preference?.inheritWorkbench !== inheritWorkbenchModel
-      || !sameThreadModel(previous?.preference?.model, preferredModel))) {
-      observation = { ...observation, preference: { inheritWorkbench: inheritWorkbenchModel, model: preferredModel } };
-      // A configured Bot default is a change event. Workbench inheritance only seeds an
-      // empty draft, and neither default rewrites an accepted Run or a frozen first send.
-      if (!active && !current.firstSend && (!inheritWorkbenchModel || !model?.providerId && !model?.modelId)) model = preferredModel ?? EMPTY_MODEL;
+    if (preferenceReady && preferredModel !== undefined && (!previous?.preference || !sameThreadModel(previous.preference.model, preferredModel))) {
+      observation = { ...observation, preference: { model: preferredModel } };
+      if (!active && !current.firstSend) model = preferredModel ?? EMPTY_MODEL;
     }
     if (!active && !delegated && !current.firstSend) model = availableThinking(model, models);
     if (observation !== previous || !sameThreadModel(current.model, model)) store.patch(draftKey, { model, modelObservation: observation });
-  }, [draftKey, draft.model, draft.firstSend, ready, active, delegated, runId, runModel, preferredModel, inheritWorkbenchModel, preferenceReady, models]);
+  }, [draftKey, draft.model, draft.firstSend, ready, active, delegated, runId, runModel, preferredModel, preferenceReady, models]);
 
   return (active ? runModel ?? draft.model : !delegated && !draft.firstSend ? availableThinking(draft.model, models) : draft.model) ?? EMPTY_MODEL;
 }

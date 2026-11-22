@@ -3,7 +3,7 @@ import { isDeepStrictEqual } from 'node:util';
 import type { ChildModelBinding, SourceMcpChildBinding, McpBinding, ExtensionToolBinding } from './protocol.generated.js';
 import { modelCredentialBindingIdentity } from './model-binding-lifetime.js';
 /** Private Host/kernel rendezvous. Secret replies bypass public RPC, event buses and histories. */
-import { ExistingHostCredentialOwner, CredentialOwnerError, type CredentialScope, type CredentialDispatch } from './credential-owner.js';
+import { ExistingHostCredentialOwner, CredentialOwnerError, sameCredentialScope, type CredentialScope, type CredentialDispatch } from './credential-owner.js';
 export interface PrivateCredentialResponse {
   v: 1; kind: 'credential-response'; id: string; kernelEpoch: string; ok: boolean;
   result?: { scope: CredentialScope; headers: { name: string; value: string }[] };
@@ -13,14 +13,12 @@ interface Request { v: 1; kind: 'credential-request'; id: string; kernelEpoch: s
 export type ChildModelHandoffSelection = { mcp: McpBinding | null; extensions: ExtensionToolBinding[] };
 export type CredentialLifetime = { kind: 'run' } | { kind: 'operation'; operationId: string; assertLive?: () => Promise<void> }
   | { kind: 'child-operation'; binding: SourceMcpChildBinding; selection: ChildModelHandoffSelection };
-interface OwnerEntry { lifetime: CredentialLifetime; runId: string; owner: ExistingHostCredentialOwner; scope: CredentialScope; epoch: string; release: () => void; abort: AbortController; active: Set<string> }
+interface OwnerEntry { claims?: { pending: number; accepted: boolean }; lifetime: CredentialLifetime; runId: string; owner: ExistingHostCredentialOwner; scope: CredentialScope; epoch: string; release: () => void; abort: AbortController; active: Set<string> }
 const record = (value: unknown): value is Record<string, unknown> => Boolean(value && typeof value === 'object' && !Array.isArray(value));
 const scopeValid = (value: unknown): value is CredentialScope => record(value)
   && ['reference', 'authority', 'account'].every(key => typeof value[key] === 'string' && Boolean(value[key]))
   && Number.isSafeInteger(value.generation) && Number(value.generation) >= 0;
 const ownerKey = (runId: string, bindingId?: string | null) => JSON.stringify([runId, bindingId ?? null]);
-const same = (left: CredentialScope, right: CredentialScope) => left.reference === right.reference
-  && left.authority === right.authority && left.account === right.account && left.generation === right.generation;
 export class CredentialBridge {
   readonly #owners = new Map<string, OwnerEntry>();
   constructor(private readonly currentEpoch: () => string | null,
@@ -41,10 +39,42 @@ export class CredentialBridge {
       return { ...scope };
     } catch (error) { release(); throw error; }
   }
+  /** Selection and start share a run binding. A failed caller rolls back only
+   * when no other caller is using the lease or has committed it to the run. */
+  async withModelBinding<T>(runId: string, bindingId: string | undefined, owner: ExistingHostCredentialOwner,
+    signal: AbortSignal | undefined, use: (scope: CredentialScope) => Promise<T>): Promise<T> {
+    const epoch = this.currentEpoch();
+    const scope = await waitWithSignal(owner.scope(), signal);
+    signal?.throwIfAborted();
+    if (!epoch || epoch !== this.currentEpoch()) throw new CredentialOwnerError('credential-owner-registration-stale');
+    const key = ownerKey(runId, bindingId);
+    let entry = this.#owners.get(key);
+    if (entry) {
+      if (entry.epoch !== epoch || entry.lifetime.kind !== 'run' || !sameCredentialScope(entry.scope, scope)
+        || (entry.owner !== owner && (!owner.bindingIdentity || entry.owner.bindingIdentity !== owner.bindingIdentity))) {
+        throw new CredentialOwnerError('credential-scope-changed');
+      }
+    } else {
+      entry = { runId, owner, scope, epoch, lifetime: { kind: 'run' }, release: owner.retain(),
+        abort: new AbortController(), active: new Set(), claims: { pending: 0, accepted: false } };
+      this.#owners.set(key, entry);
+    }
+    const claims = entry.claims;
+    if (claims) claims.pending++;
+    try {
+      const result = await use({ ...scope });
+      if (claims) claims.accepted = true;
+      return result;
+    } finally {
+      if (claims && --claims.pending === 0 && !claims.accepted && this.#owners.get(key) === entry) {
+        this.unregister(runId, bindingId ?? null);
+      }
+    }
+  }
   findOwner(identity: string, scope: CredentialScope, runId?: string): ExistingHostCredentialOwner | undefined {
     for (const entry of this.#owners.values()) {
       if (entry.epoch !== this.currentEpoch() || (runId !== undefined && entry.runId !== runId)) continue;
-      if (entry.owner.bindingIdentity === identity && same(entry.scope, scope)) return entry.owner.fork();
+      if (entry.owner.bindingIdentity === identity && sameCredentialScope(entry.scope, scope)) return entry.owner.fork();
       const dependency = entry.owner.findRetained(identity, scope);
       if (dependency) {
         // Child admission inherits the complete frozen dispatch catalog. Retain its
@@ -67,7 +97,7 @@ export class CredentialBridge {
       return Boolean(entry && entry.epoch === this.currentEpoch() && entry.lifetime.kind === 'child-operation'
         && isDeepStrictEqual(entry.lifetime.binding, binding) && isDeepStrictEqual(entry.lifetime.selection, selection)
         && entry.owner.bindingIdentity === identity
-        && same(entry.scope, model.credential_scope!));
+        && sameCredentialScope(entry.scope, model.credential_scope!));
     };
     if (this.#owners.has(key)) return matches();
     const owner = this.findOwner(identity, model.credential_scope, binding.parentRunId);
@@ -91,7 +121,7 @@ export class CredentialBridge {
       const entry = this.#owners.get(key);
       return entry && entry.epoch === this.currentEpoch() && entry.lifetime.kind === 'child-operation'
         && isDeepStrictEqual(entry.lifetime.binding, binding) && isDeepStrictEqual(entry.lifetime.selection, selection)
-        && entry.owner.bindingIdentity === owner.bindingIdentity && same(entry.scope, scope) ? { ...entry.scope } : undefined;
+        && entry.owner.bindingIdentity === owner.bindingIdentity && sameCredentialScope(entry.scope, scope) ? { ...entry.scope } : undefined;
     };
     const retained = matchingScope();
     if (retained) return retained;
@@ -119,19 +149,7 @@ export class CredentialBridge {
     const identity = owner.bindingIdentity;
     if (!identity) throw new CredentialOwnerError('credential-model-identity-unavailable');
     const bindingId = `admission:model:${identity}`;
-    const key = ownerKey(runId, bindingId);
-    const scope = await owner.scope();
-    const retained = () => {
-      const entry = this.#owners.get(key);
-      return entry && entry.epoch === this.currentEpoch() && entry.owner.bindingIdentity === identity && same(entry.scope, scope);
-    };
-    if (retained()) return;
-    try { await this.register(runId, owner, undefined, bindingId); }
-    catch (error) {
-      // Concurrent observers can register the same admitted binding. register() releases
-      // its losing retain before rejecting; only the exact original binding is idempotent.
-      if (!retained()) throw error;
-    }
+    await this.withModelBinding(runId, bindingId, owner, undefined, async () => {});
   }
   releaseQueuedModel(runId: string, owner: ExistingHostCredentialOwner): void {
     if (owner.bindingIdentity) this.unregister(runId, `admission:model:${owner.bindingIdentity}`);
@@ -158,7 +176,7 @@ export class CredentialBridge {
       || Object.keys(value.dispatch).some(key => !['method', 'endpoint', 'payloadSha256'].includes(key)))) return true;
     const request = value as unknown as Request;
     const entry = this.#owners.get(ownerKey(request.runId, request.bindingId));
-    if (!entry || entry.epoch !== request.kernelEpoch || !same(entry.scope, request.scope)) {
+    if (!entry || entry.epoch !== request.kernelEpoch || !sameCredentialScope(entry.scope, request.scope)) {
       void this.#reject(request, 'credential-owner-unavailable');
       return true;
     }
@@ -179,7 +197,7 @@ export class CredentialBridge {
       const result = await entry.owner.resolve(entry.scope, entry.abort.signal, request.dispatch ?? undefined);
       if(entry.lifetime.kind === 'operation')await entry.lifetime.assertLive?.();
       if (this.currentEpoch() !== request.kernelEpoch || this.#owners.get(ownerKey(request.runId, request.bindingId)) !== entry || entry.abort.signal.aborted) return;
-      if (!same(result.scope, entry.scope)) { await this.#reject(request, 'credential-scope-changed'); return; }
+      if (!sameCredentialScope(result.scope, entry.scope)) { await this.#reject(request, 'credential-scope-changed'); return; }
       await this.send({ v: 1, kind: 'credential-response', id: request.id, kernelEpoch: request.kernelEpoch, ok: true,
         result: { scope: result.scope, headers: Object.entries(result.headers).map(([name, value]) => ({ name, value })) } });
     } catch {

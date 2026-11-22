@@ -531,6 +531,8 @@ impl Task {
                         prior["result"]["status"].as_str().unwrap_or("failed")
                     } else if prior["state"] == "started" {
                         "pending"
+                    } else if matches!(error, KernelError::ActiveProcessWriter(..)) {
+                        "busy"
                     } else if matches!(error, KernelError::Cancelled) {
                         "cancelled"
                     } else {

@@ -2,7 +2,7 @@ import { expect, it } from 'vitest';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { McpAuthority, type McpAuthorityScope } from '../mcp/authority.js';
+import { McpAuthority, McpCompositions, type McpAuthorityScope } from '../mcp/authority.js';
 import { createMcpLease } from './mcp-owner.js';
 import type { KernelClient } from './kernel-client.js';
 import type { HostToolCall } from './tool-bridge.js';
@@ -109,4 +109,39 @@ it('discovers offline metadata, pages exact selected-server contracts and calls 
         await authority.close();
         await rm(root, { recursive: true, force: true });
     }
+});
+
+it('reports a named server sign-in failure for discovery and direct preparation without exposing the challenge', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'varin-mcp-auth-'));
+  const scope: McpAuthorityScope = { resourceOwner: { kind: 'local' }, agentDir: root, configCwd: root, executionCwd: root,
+    executionScope: 'global', environmentId: 'fixture', sessionId: 'auth', projectTrusted: false };
+  await writeFile(join(root, 'mcp.json'), JSON.stringify({ mcpServers: { docs: { url: 'https://docs.test/mcp', exposure: 'direct' } } }));
+  const authority = new McpAuthority({ fetch: async () => new Response(null, { status: 401,
+    headers: { 'www-authenticate': 'Bearer realm="private-challenge"' } }) });
+  try {
+    const details = { server: 'docs', stage: 'connect', httpStatus: 401 };
+    const compositions = new McpCompositions(authority, () => {});
+    const observed = await compositions.observe(scope, () => {});
+    const lease = observed.snapshot();
+    const provenance = lease.binding.provenance;
+    const owner = createMcpLease({ lease, kernel: {} as KernelClient, currentPolicy: async () => ({ mode: 'bypass', rules: [] }) });
+    try {
+      const restored = observed.restore({ provenance, tools: [{ name: 'search', version: 'saved' }],
+        resources: { search: provenance.servers.docs!.resource_key }, routes: { search: { kind: 'direct' } } });
+      await expect(restored).rejects.toMatchObject({ code: 'mcp-server-needs-auth', details });
+      const call: HostToolCall = { runId: 'run', operationId: 'discovery', origin: { kind: 'model_step', request_id: 'req' },
+        callId: 'one', name: 'mcp_discover', schemaVersion: '1', arguments: { server: 'docs' } };
+      const signal = new AbortController().signal;
+      await owner.authorize(call, signal);
+      const { completion } = await owner.execute(call, signal, { kind: 'kernel' });
+      expect(completion).toMatchObject({ kind: 'result', outcome: 'failed', content: {
+        data: { error: { code: 'mcp-server-needs-auth', ...details } },
+        parts: [{ kind: 'text', text: expect.stringContaining('requires sign-in') }],
+      } });
+      expect(JSON.stringify(completion)).not.toContain('private-challenge');
+    } finally { owner.release(); await observed.releaseAndDrain(); compositions.close(); }
+  } finally {
+    await authority.close();
+    await rm(root, { recursive: true, force: true });
+  }
 });

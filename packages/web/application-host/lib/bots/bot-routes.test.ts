@@ -8,7 +8,7 @@ import { BotOrganizationConflict } from './bot-organization.js';
 
 const entry = { runtime: 'agent' as const, threadId: 'bot-thread', branchId: 'bot-branch' };
 const bot: BotSummary = { revision: 1, id: 'bot', name: 'Bot', instructions: null, model: null, coordinatorHostId: 'host', homeDir: '/bots/bot', entry, archived: false, createdAt: '', updatedAt: '' };
-function fixture() {
+function fixture(memory?: Parameters<typeof registerBotRoutes>[1]['memory']) {
   const organization = { read: vi.fn(async () => ({ revision: 0, groups: [], ungrouped: [] })), update: vi.fn() };
   const create = vi.fn(async () => bot); const update = vi.fn(async () => bot);
   const ensureEntry = vi.fn(async () => ({ bot, entry, model: null }));
@@ -24,7 +24,7 @@ function fixture() {
   ] }));
   const router = Router();
   const directRouter = router as unknown as { handle(request: Request, response: Response, next: NextFunction): void };
-  registerBotRoutes(router as unknown as Express, { bots: { organization, create, update, ensureEntry, get: async () => bot, listWork, listSessions, createSession } as unknown as BotService,
+  registerBotRoutes(router as unknown as Express, { ...(memory ? { memory } : {}), bots: { organization, create, update, ensureEntry, get: async () => bot, listWork, listSessions, createSession } as unknown as BotService,
     work: { botActivity, botScope, activeOperations: async () => [] } as unknown as NonNullable<Parameters<typeof registerBotRoutes>[1]['work']> });
   const call = (method: string, url: string, body?: unknown) => new Promise<{ status: number; body: unknown }>((resolve, reject) => {
     let status = 200;
@@ -139,6 +139,20 @@ describe('Bot routes without a network listener', () => {
     expect((await f.call('POST', '/api/harness/bots/bot/update', { entry })).status).toBe(400);
     expect(f.update).not.toHaveBeenCalled();
   });
+});
+
+it('opens and corrects the same shared row from a Bot receipt and global Settings', async () => {
+  const row = { id: 1, content: '7 copies', trigger: 'handouts', status: 'accepted', createdAt: 1 };
+  const user = { scope: 'user', ownerId: null };
+  const memory = { list: vi.fn(async owner => owner.scope === 'user' ? [row] : []),
+    get: vi.fn(async () => ({ item: row })), correct: vi.fn(async () => {}) };
+  const f = fixture(memory as unknown as Parameters<typeof registerBotRoutes>[1]['memory']);
+  const { body } = await f.call('GET', '/api/harness/bots/bot/memory?scope=user');
+  expect(body).toEqual((await f.call('GET', '/api/bot-memory/user')).body);
+  const { revision } = (body as { items: { revision: string }[] }).items[0]!;
+  expect((await f.call('POST', '/api/bot-memory/user/1', { action: 'correct', content: '11 copies', revision })).status).toBe(200);
+  expect(memory.correct).toHaveBeenCalledWith(user, 1, expect.objectContaining({ content: '11 copies' }));
+  expect((await f.call('GET', '/api/harness/bots/bot/memory?scope=session&threadId=unrelated')).status).toBe(404);
 });
 
 it('uses the authenticated Bot reader instead of a renderer-supplied principal selector', async () => {

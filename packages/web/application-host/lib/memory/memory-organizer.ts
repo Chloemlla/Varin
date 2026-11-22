@@ -57,6 +57,7 @@ const MEMORY_ORGANIZER_SYSTEM = [
   "Memory helps future conversations and work continue from an existing understanding. Decide what is worth keeping from these experiences and how to preserve its meaning and context alongside existing memories.",
   "Return a JSON object: {\"memories\":[{\"action\":\"new\",\"scope\":\"bot\",\"content\":\"...\",\"sources\":[{\"source\":\"u0\",\"quote\":\"...\"}]}]}. An empty memories array means nothing needs to be added. A memory may be a short observation or a connected account supported by several sources.",
   "action is new, supplement, or correct. supplement and correct require target (k:<id>) from the supplied existing memories in the source scope; correct replaces it and supplement adds related information.",
+  "For a user's preference or instruction, cite the user's own statement of it. A question about an existing preference and the assistant repeating an answer supply no new preference. Leave manually corrected memories in place.",
   "Choose scope from the available scopes in the input. content holds the durable information; optional trigger describes when to recall it. Optional nature is experience, decision, preference, judgment, or instruction; instruction denotes an explicit user directive.",
   "Each source identifies a fragment (u<index>); quote is an exact supporting passage within that fragment. A single source and quote on the memory itself is also accepted. Preserve the original scope, uncertainty and changes of understanding. Only user statements can establish user instructions.",
 ].join("\n");
@@ -382,7 +383,8 @@ export function createMemoryOrganizer(deps: MemoryOrganizerDeps) {
     if (existing.length > 0) {
       sections.push(`# Existing memories (${scope.sourceScope})`);
       for (const item of existing) {
-        sections.push(`- k:${item.id} [${item.status}${item.nature ? `/${item.nature}` : ""}] ${item.content}`);
+        const reference = item.scope === 'user' ? `shared user memory (reference only)` : `k:${item.id}`;
+        sections.push(`- ${reference} [${item.status}${item.nature ? `/${item.nature}` : ""}${item.source?.kind === 'user-correction' ? '/user-corrected' : ''}] ${item.content}`);
       }
     }
     return sections.join("\n\n");
@@ -518,7 +520,7 @@ export function createMemoryOrganizer(deps: MemoryOrganizerDeps) {
     }
     // Compare against the revision shown to the model, not a fresh read taken
     // after it answered (which would authorize overwriting intervening edits).
-    if (item.invalidAt !== undefined || item.status !== "accepted") return null;
+    if (item.invalidAt !== undefined || item.status !== "accepted" || item.source?.kind === 'user-correction') return null;
     const corrected = await deps.memory.correct(owner, item.id, {
       content: proposal.content,
       ...(proposal.trigger ? { trigger: proposal.trigger } : {}),
@@ -717,13 +719,14 @@ export function createMemoryOrganizer(deps: MemoryOrganizerDeps) {
         if (!ownerFor(proposal.scope, scopeId))
           throw new Error("Memory organizer referenced an unrelated owner scope");
         if (proposal.action !== "new" && (proposal.scope !== "bot"
-          || !recipe.presented.some((item) => item.id === proposal.target))) {
+          || !recipe.presented.some((item) => item.scope === 'bot' && item.id === proposal.target))) {
           throw new Error("Memory organizer referenced a target outside its presented candidates");
         }
         const list = byUnit.get(unit.key) ?? [];
         const target = proposal.target === undefined ? undefined
-          : recipe.presented.find((item) => item.id === proposal.target);
+          : recipe.presented.find((item) => item.scope === 'bot' && item.id === proposal.target);
         let userSource = false;
+        let assistantSource = false;
         const spans = proposal.sources.flatMap(citation => {
           const cited = judged[Number(citation.source.slice(1))];
           if (!cited) throw new Error('Memory organizer referenced an unknown source');
@@ -733,12 +736,14 @@ export function createMemoryOrganizer(deps: MemoryOrganizerDeps) {
             const offset = text.indexOf(citation.quote);
             if (offset < 0) return [];
             userSource ||= raw.startsWith('[user] ');
+            assistantSource ||= raw.startsWith('[assistant] ');
             return [{ ...span, start: span.start + offset, end: span.start + offset + citation.quote.length }];
           });
           if (matches.length !== 1) throw new Error('Memory organizer quote must identify one exact source passage');
           return matches;
         });
         if (proposal.nature === 'instruction' && !userSource) throw new Error('Only a user passage can establish an instruction');
+        if (assistantSource && (proposal.nature === 'preference' || proposal.nature === 'instruction')) continue;
         list.push({
           action: proposal.action,
           scope: proposal.scope,
@@ -892,9 +897,10 @@ export function createMemoryOrganizer(deps: MemoryOrganizerDeps) {
         }
         return;
       }
-      for (const hit of await deps.memory.search(ownerFor('bot', scopeId)!, freshUnits.flatMap(unit => unit.texts).join('\n'), Math.max(1, budget.inputTokens))) {
+      const userStore = await deps.memory.maintenanceStore({ scope: 'user', ownerId: null });
+      for (const hit of await deps.memory.search(ownerFor('bot', scopeId)!, freshUnits.flatMap(unit => unit.texts).join('\n'), Math.max(1, budget.inputTokens), { includeShared: true })) {
         if (hit.node.type !== 'knowledge') continue;
-        const row = await store.getKnowledge(hit.node.id);
+        const row = await (hit.node.payload.scope === 'user' ? userStore : store).getKnowledge(hit.node.id);
         if (row?.invalidAt === undefined && row?.status === 'accepted') planningMemories.push(row);
       }
       const selected = selectPrompt(freshUnits, planningMemories, budget.inputTokens, promptScope)!;
@@ -989,7 +995,26 @@ export function createMemoryOrganizer(deps: MemoryOrganizerDeps) {
     },
     async noteSharedKnowledge(ids: readonly number[]): Promise<void> {
       if (disposed) return;
-      await (await deps.memory.maintenanceStore({ scope: 'user', ownerId: null })).noteMemoryMaintenance(ids);
+      const shared = await deps.memory.maintenanceStore({ scope: 'user', ownerId: null });
+      await shared.noteMemoryMaintenance(ids);
+      for (const id of ids) {
+        const row = await shared.getKnowledge(id);
+        if (row?.invalidAt !== undefined || row?.source?.kind !== 'user-correction') continue;
+        const history = await shared.getSupersedeChain(id, 'user');
+        const threads = new Set(history?.predecessors.flatMap(previous => [
+          ...(previous.source?.threadId ? [previous.source.threadId] : []),
+          ...(previous.source?.spans ?? []).map(span => span.threadId),
+        ]));
+        const scopes = new Set(await Promise.all([...threads].map(thread => deps.scopeForThread(thread))));
+        for (const scope of scopes) {
+          if (!scope || !isBotScopeId(scope) || !await deps.hasStoreForScope(scope)) continue;
+          const store = await deps.storeForScopeId(scope);
+          const key = `maintenance:user-correction:${id}`;
+          if (!store || await store.getOrganizerProgress(key)) continue;
+          await store.putOrganizerProgress({ key, sourceKey: memoryVersion(row), status: 'pending', updatedAt: now(),
+            maintenance: { ids: [], mode: 'automatic', userCorrectionId: id, reason: 'Retire inferred copies contradicted by the user’s correction. Keep unrelated Bot memories. Return no outputs.' } });
+        }
+      }
       for (const scopeId of await deps.listScopeIds()) schedule(scopeId);
     },
     async maintain(scopeId: string, ids: number[], reason: string, key?: string, query?: string, owner?: MemoryOwner) {

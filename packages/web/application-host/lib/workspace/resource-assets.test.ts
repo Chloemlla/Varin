@@ -13,7 +13,7 @@ async function fixture(){
   const root=await fs.mkdtemp(path.join(os.tmpdir(),'varin-resource-assets-'));cleanup.push(()=>fs.rm(root,{recursive:true,force:true}));
   const documents={resolveWorkspace:async({path:requested}:{path:string})=>{expect(requested).toBe(root);return {workspaceId:'target'};},admitWorkspaceRegistration:async()=>({hostId:'host'}),inspectWorkspace:async()=>({root})};
   const render=vi.fn(async(_bytes:Buffer,_format:unknown,signal:AbortSignal)=>{signal.throwIfAborted();return {bytes:Buffer.from('%PDF-original-render'),engine:{name:'original-engine',version:'1'}};});
-  const files=createResourceFilesOwner(documents as never,{} as never,undefined,undefined,undefined,render);
+  const files=createResourceFilesOwner(documents as never,{} as never,{renderOffice:render});
   return {root,files,render,location:{resourceOwner:{kind:'local' as const},root,workspaceId:'target'}};
 }
 it('reads and finds the actual Office package, preserves revision conflicts and original preview failures',async()=>{

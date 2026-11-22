@@ -23,8 +23,14 @@
 </p>
 
 <p align="center">
-  <img src="assets/varin-at-work.gif" alt="Varin が読み、チームメイトと協力し、仕事の進行に反応する" width="600" />
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/varin-cast-dark.webp" />
+    <source media="(prefers-color-scheme: light)" srcset="assets/varin-cast-light.webp" />
+    <img src="assets/varin-cast-light.webp" alt="長いテーブルに集まった Varin と 15 体の内蔵 Bot キャラクターの集合イラスト" width="1100" />
+  </picture>
 </p>
+
+https://github.com/user-attachments/assets/a55fcac8-e198-4ca5-9c04-93239ae698f9
 
 ## Varin と話すところから
 
@@ -44,6 +50,8 @@ Varin は、ファイルやブラウザー、接続したコンピューター�
 指示、モデル、思考レベル、記憶、予定、外観をそれぞれ持つ複数の Bot を作成できます。Varin を含む 16 体のアニメーション付きキャラクターから選べるほか、作成時にランダムで決めることも、独自の画像やアニメーションパックを読み込むこともできます。
 
 Bot サイドバーからグループチャットを始めると、複数の Bot が同じタイムライン上で協力できます。メンションや返信で特定のメンバーに呼びかけたり、宛先なしの投稿に対する受信設定をメンバーごとに切り替えたりでき、ファイル共有、履歴検索、予定やフォローアップもそのまま利用できます。
+
+https://github.com/user-attachments/assets/5b8fa63d-fc6b-4ad6-95bd-ffbb96ad458c
 
 [アシスタントについて](../../docs/bot.md) · [外観とキャラクター](../../docs/bot-appearances.md) · [協働とタスクの再利用](../../docs/collaboration.md)
 
@@ -135,6 +143,10 @@ Monaco で編集し、プロジェクトや差分を調べ、会話の横でタ�
 **仕事に合った場所で動かす。** ローカル、自分のサーバー、ブラウザーやスマートフォンから利用できます。画面、Agent サービス、ファイルのワークスペース、PC 操作の対象は別々の機器に配置でき、1 つの会話の中で接続済みの複数機器をまたいでファイル操作やコマンド実行を進められます。ファイルへのリンクと復元記録も、変更が行われた機器とフォルダーに紐づきます。[デプロイ](../../docs/ops/cloud-deployment.md) · [リソース](../../docs/resources.md)
 
 **デスクトップにも仲間を。** 任意のデスクトップコンパニオンが、選択した Bot の活動に反応します。設定から外観をダウンロードし、起こしたり眠らせたりできます。
+
+<p align="center">
+  <img src="assets/varin-at-work.gif" alt="Varin が読み、チームメイトと協力し、仕事の進行に反応する" width="600" />
+</p>
 
 <a id="how-the-harness-works"></a>
 

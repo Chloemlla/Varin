@@ -422,7 +422,7 @@ export function createBotService(options: BotServiceOptions): BotService {
     try {
       const runtime = options.lifecycle?.();
       if (!runtime) throw new Error("Bot lifecycle runtime is unavailable");
-      if (!activity.planned) {
+      if (!waking && !activity.planned) {
         activity.work = await runtime.planWork(bot);
         activity.planned = true;
         bot = await checkpoint(botId, activity);
@@ -509,7 +509,7 @@ export function createBotService(options: BotServiceOptions): BotService {
       if (current.deletion) throw new HarnessServiceError('invalid-params', 'This Bot is being deleted');
       const state = current.activity?.state ?? "awake";
       if (state === (waking ? "awake" : "asleep") || state === (waking ? "waking" : "sleeping")) return current;
-      if (state === "sleeping" || state === "waking" || (waking && state === "sleep-failed")) {
+      if (state === "sleeping" || state === "waking") {
         throw new HarnessServiceError("invalid-params", "Finish the current Bot lifecycle operation before switching state");
       }
       const activity: BotActivity = (waking || state === "sleep-failed") && current.activity

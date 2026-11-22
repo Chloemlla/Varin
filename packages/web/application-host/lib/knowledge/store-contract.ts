@@ -198,7 +198,7 @@ export interface OrganizerProgress {
   preparedSource?: KnowledgeSource;
   updatedAt: number;
   lastError?: string;
-  maintenance?: { ids: number[]; reason: string; mode: 'automatic' | 'selection'; query?: string; cancelled?: boolean; sessionOwner?: string };
+  maintenance?: { ids: number[]; reason: string; mode: 'automatic' | 'selection'; query?: string; cancelled?: boolean; sessionOwner?: string; userCorrectionId?: number };
 }
 
 export interface KnowledgeMaintenanceInput {

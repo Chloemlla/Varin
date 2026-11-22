@@ -50,7 +50,7 @@ function fixture(prepareContext?: ContextPreparer) {
     context: vi.fn<AgentRuntimeClient['context']>(async () => null), refreshContext: vi.fn<AgentRuntimeClient['refreshContext']>(),
     retainQueuedModel: vi.fn<AgentRuntimeClient['retainQueuedModel']>(async () => {}), releaseQueuedModel: vi.fn(),
     retainedModelOwner: vi.fn<AgentRuntimeClient['retainedModelOwner']>(() => undefined),
-    releaseMainModelCredentials: vi.fn(), failLaunch: vi.fn(async () => launch),
+    failLaunch: vi.fn(async () => launch),
   };
   const models = { resolveModel: vi.fn(), rebindModel: vi.fn<ThreadModelAuthority['rebindModel']>(async () => credentialOwner()) };
   const errors: unknown[] = [];
@@ -60,15 +60,18 @@ function fixture(prepareContext?: ContextPreparer) {
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
 afterEach(() => vi.unstubAllGlobals());
 
-it('Bot continuation resolves the current profile before attempting any retired model binding', async () => {
+it.each([false, true])('Bot continuation resolves its current model before touching a retired binding (conversation override: %s)', async override => {
   const f = fixture(); f.launch.startable = true; f.launch.pause = null;
   f.run.configuration = { providerId: 'removed-provider', model: 'old' };
-  const current = { providerId: 'current-provider', modelId: 'current', thinkingLevel: 'off' as const };
-  const configuration = { providerId: current.providerId, model: current.modelId, thinkingLevel: 'off' } as ModelSessionConfiguration;
+  const profile = { providerId: 'current-provider', modelId: 'current', thinkingLevel: 'off' as const };
+  const preference = { providerId: 'choice', modelId: 'sol', thinkingLevel: 'high' as const };
+  const current = override ? preference : profile;
+  const configuration = { providerId: current.providerId, model: current.modelId, thinkingLevel: current.thinkingLevel } as ModelSessionConfiguration;
   const owner = credentialOwner();
   f.runtime.thread.mockImplementation(async () => ({ thread_id: identity.threadId, bot_id: 'bot', parent_thread_id: null,
+    ...(override ? { model_preference: preference } : {}),
     observer_project_ids: [], branches: [{ branch_id: identity.branchId, active_run_id: f.run.id, head: null, latest_run: f.run }] }));
-  f.adapter.bindBotWorkProfile(async () => ({ homeDir: '/bot', model: current }));
+  f.adapter.bindBotWorkModel(async (_id, _signal, saved) => saved ?? profile);
   f.models.resolveModel.mockResolvedValue({ configuration, credentialOwner: owner });
   let desired: RunModelSelection | null = null;
   f.runtime.modelSelections.mockImplementation(async () => ({ desired, active: null, exchange_closed: true }));
@@ -91,7 +94,9 @@ it('Bot continuation resolves the current profile before attempting any retired 
 
 it('profile propagation leaves finished history alone and accepts completion racing with a live update', async () => {
   const f = fixture(); f.run.state = 'completed';
-  const input = { ...identity, runId: f.run.id, key: 'profile', model: { providerId: 'provider', modelId: 'new' } };
+  const originalThread = await f.runtime.thread();
+  f.runtime.thread.mockResolvedValue({ ...originalThread, bot_id: 'bot' } as typeof originalThread);
+  const input = { ...identity, runId: f.run.id, model: { providerId: 'provider', modelId: 'new' } };
   await f.adapter.refreshBotModel(input);
   expect(f.models.resolveModel).not.toHaveBeenCalled();
   f.run.state = 'runnable';
@@ -123,7 +128,6 @@ it('queued input, startup discovery and generic continuation leave an explicit P
   expect(f.runtime.resumeRun).not.toHaveBeenCalled();
   expect(f.runtime.rebindLaunch).not.toHaveBeenCalled();
   expect(f.models.rebindModel).not.toHaveBeenCalled();
-  expect(f.runtime.releaseMainModelCredentials).not.toHaveBeenCalled();
   await expect(f.adapter.retryPreparation(f.run.id)).rejects.toThrow('not eligible');
 });
 
@@ -137,21 +141,18 @@ it('resume returns its durable receipt before cold assembly and all callers shar
   expect(await f.adapter.resume(f.run.id, 'wait:one')).toEqual(f.receipt);
   const joined = f.adapter.continueLaunch(f.run.id);
   await f.adapter.recover();
-  expect(f.runtime.releaseMainModelCredentials).toHaveBeenCalledOnce();
   release(); await joined;
   // Start ack leaves assembly owned in the supervisor although its launch still requires rebind.
   f.launch.requires_rebind = true;
   expect(await f.adapter.resume(f.run.id, 'wait:one')).toEqual(f.receipt);
   await f.adapter.recover(); await tick();
   expect(f.runtime.rebindLaunch).toHaveBeenCalledOnce();
-  expect(f.runtime.releaseMainModelCredentials).toHaveBeenCalledOnce();
   // A later Pause has a different Wait; an old receipt retry cannot clear or relaunch it.
   f.run.state = 'waiting'; f.run.waiting_on = 'wait:two';
   f.launch.pause = { action_id: 'pause:two', wait_id: 'wait:two', reason: 'Second review' };
   expect(await f.adapter.resume(f.run.id, 'wait:one')).toEqual(f.receipt);
   await tick();
   expect(f.run.waiting_on).toBe('wait:two');
-  expect(f.runtime.releaseMainModelCredentials).toHaveBeenCalledOnce();
   expect(f.errors).toEqual([]);
 });
 
@@ -301,7 +302,6 @@ it('Run or epoch cancellation detaches cold credential preparation before it can
   await f.adapter.continueLaunch(f.run.id);
   resolve(credentialOwner()); await tick();
   expect(f.runtime.rebindLaunch).toHaveBeenCalledOnce();
-  expect(f.runtime.releaseMainModelCredentials).toHaveBeenCalledOnce();
   expect(f.runtime.failLaunch).not.toHaveBeenCalled();
   expect(f.errors).toEqual([]);
 });
@@ -432,7 +432,6 @@ it('cancelled launch context refresh cannot publish its late proposal or bind th
   resolve({ effectiveSystemPrompt: 'Late old-owner context', instructionSources: [], memoryCheckpoint: null });
   await tick();
   expect(f.runtime.refreshContext).not.toHaveBeenCalled();
-  expect(f.runtime.releaseMainModelCredentials).not.toHaveBeenCalled();
   expect(f.runtime.rebindLaunch).not.toHaveBeenCalled();
   expect(f.runtime.failLaunch).not.toHaveBeenCalled();
 });
@@ -469,7 +468,6 @@ it('resume during a delayed previous start acknowledgement schedules one fresh c
   releaseCancelledOwner(credentialOwner());
   expect(f.models.rebindModel).toHaveBeenCalledTimes(3);
   expect(notificationSettled).toBe(false);
-  expect(f.runtime.releaseMainModelCredentials).toHaveBeenCalledTimes(2);
   releaseSecond(); await Promise.all([first, notification]);
   expect(notificationSettled).toBe(true);
   expect(starts).toBe(2);
@@ -822,10 +820,9 @@ it('a retained fork preserves original child implementations across credential r
   f.runtime.retainedModelOwner.mockImplementation((configuration, scope) => bridge.findOwner(modelCredentialBindingIdentity(configuration), scope));
   f.runtime.retainQueuedModel.mockImplementation((runId, owner) => bridge.retainQueuedModel(runId, owner));
   f.runtime.releaseQueuedModel.mockImplementation((runId, owner) => bridge.releaseQueuedModel(runId, owner));
-  f.runtime.releaseMainModelCredentials.mockImplementation(() => bridge.unregister(f.run.id, null));
   f.runtime.rebindLaunch.mockImplementation(async (_runId, input) => {
     expect(mainReleased).not.toHaveBeenCalled(); expect(childReleased).not.toHaveBeenCalled();
-    await bridge.register(f.run.id, input!.credentialOwner!);
+    await bridge.withModelBinding(f.run.id, undefined, input!.credentialOwner!, undefined, async () => {});
     return { runId: f.run.id, epoch: 1 };
   });
   try {
@@ -861,9 +858,8 @@ it('an unstartable queued successor retains its original child implementation un
     .mockImplementation(async () => structuredClone(next));
   f.runtime.launch.mockImplementationOnce(async () => structuredClone(f.launch)).mockImplementation(async () => structuredClone(nextLaunch));
   f.runtime.enqueue.mockResolvedValue({ input_id: 'queued-input', run_id: next.id, mode: 'boundary', cursor: 6 });
-  f.runtime.releaseMainModelCredentials.mockImplementation(() => bridge.unregister(next.id, null));
   f.runtime.rebindLaunch.mockImplementation(async (_runId, input) => {
-    await bridge.register(next.id, input!.credentialOwner!); nextLaunch.startable = false;
+    await bridge.withModelBinding(next.id, undefined, input!.credentialOwner!, undefined, async () => {}); nextLaunch.startable = false;
     return { runId: next.id, epoch: 1 };
   });
   try {

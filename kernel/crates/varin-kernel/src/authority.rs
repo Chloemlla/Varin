@@ -3,6 +3,7 @@ use crate::model::Grant;
 
 pub(crate) fn required_capability(method: &str) -> &'static str {
     match method {
+        "recovery.operation.branch" => "recovery.maintenance",
         "workspace.backend.settings" => "storage.admin",
         "compute.grammar.register" => "compute.grammar",
         method if method.starts_with("compute.") => "storage.read",
@@ -84,7 +85,7 @@ pub(crate) fn required_capability(method: &str) -> &'static str {
         | "working.result.release"
         | "working.draft.put"
         | "working.draft.release" => "storage.write",
-        "storage.record.workspaces" | "branch.objects"
+        "storage.record.workspaces" | "storage.experiment.recovery" | "branch.objects"
         | "file.materializedView.prepare" | "file.materializedView.release"
         | "file.objectView.prepare" | "file.objectView.release" => "storage.maintenance",
         "file.childEnvironment.settle" => "storage.write",

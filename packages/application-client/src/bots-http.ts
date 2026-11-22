@@ -202,19 +202,36 @@ const decodeMatter = (value: unknown): import('@varin/protocol').BotMatter => {
   return matter as unknown as import('@varin/protocol').BotMatter;
 };
 
+const request = async (path: string, method = 'GET', body?: unknown, signal?: AbortSignal): Promise<Record<string, unknown>> => {
+  const generation = getRuntimeEndpointGeneration();
+  const current = () => { signal?.throwIfAborted(); if (generation !== getRuntimeEndpointGeneration()) throw new BotRequestError(409, 'host-changed', 'Application Host changed. Reload Bots.'); };
+  current();
+  const response = await runtimeFetch(path, { method, ...(signal ? { signal } : {}), headers: { Accept: 'application/json', ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+  current(); const result: unknown = await response.json().catch(() => null); current();
+  if (!response.ok) {
+    const error = result && typeof result === 'object' ? result as Record<string, unknown> : {};
+    throw new BotRequestError(response.status, typeof error.code === 'string' ? error.code : 'bot-request-failed', typeof error.error === 'string' ? error.error : `Bot request failed (${response.status}).`, error.retryDisposition === 'observe' || error.retryDisposition === 'new_attempt' || error.retryDisposition === 'none' ? error.retryDisposition : undefined, error.saved === true ? decodeBot(error.bot) : undefined);
+  }
+  return record(result);
+};
+
+export const sharedUserMemory = {
+  list: async (signal?: AbortSignal) => array((await request('/api/bot-memory/user', 'GET', undefined, signal)).items, memoryItem),
+  edit: async (item: BotMemoryItem, content: string | null) => {
+    await request('/api/bot-memory/user/' + item.id, 'POST', {
+      action: content === null ? 'forget' : 'correct', revision: item.revision, content,
+    });
+  },
+};
+
 /** Runtime-independent Bot transport. Host replacement never publishes an old Bot view. */
 export function createBotsHttpAPI(): BotsAPI {
-  const request = async (path: string, method = 'GET', body?: unknown, signal?: AbortSignal): Promise<Record<string, unknown>> => {
-    const generation = getRuntimeEndpointGeneration();
-    const current = () => { signal?.throwIfAborted(); if (generation !== getRuntimeEndpointGeneration()) throw new BotRequestError(409, 'host-changed', 'Application Host changed. Reload Bots.'); };
-    current();
-    const response = await runtimeFetch(path, { method, ...(signal ? { signal } : {}), headers: { Accept: 'application/json', ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
-    current(); const result: unknown = await response.json().catch(() => null); current();
-    if (!response.ok) {
-      const error = result && typeof result === 'object' ? result as Record<string, unknown> : {};
-      throw new BotRequestError(response.status, typeof error.code === 'string' ? error.code : 'bot-request-failed', typeof error.error === 'string' ? error.error : `Bot request failed (${response.status}).`, error.retryDisposition === 'observe' || error.retryDisposition === 'new_attempt' || error.retryDisposition === 'none' ? error.retryDisposition : undefined, error.saved === true ? decodeBot(error.bot) : undefined);
-    }
-    return record(result);
+  const memoryQuery = (owner?: import('./bots.js').BotMemoryOwner, includeInactive?: boolean) => {
+    const params = new URLSearchParams();
+    if (owner === 'user') params.set('scope', 'user');
+    else if (typeof owner === 'object') { params.set('scope', 'session'); params.set('threadId', owner.threadId); }
+    if (includeInactive) params.set('includeInactive', 'true');
+    return params.size ? '?' + params : '';
   };
   const path = (id: string) => `/api/harness/bots/${encodeURIComponent(id)}`;
   return {
@@ -269,15 +286,15 @@ export function createBotsHttpAPI(): BotsAPI {
       create: async (id, options) => decodeBotSession((await request(`${path(id)}/sessions`, 'POST', { key: crypto.randomUUID(), ...options })).session),
     },
     memory: {
-      clearHistory: async (id, ids) => { await request(`${path(id)}/memory/history/clear`, 'POST', { ids }); },
+      clearHistory: async (id, ids, owner) => { await request(`${path(id)}/memory/history/clear${memoryQuery(owner)}`, 'POST', { ids }); },
       organize: async (id, input) => maintenanceJob((await request(`${path(id)}/memory-maintenance`, 'POST', input)).job),
       maintenance: async (id, signal) => array((await request(`${path(id)}/memory-maintenance`, 'GET', undefined, signal)).jobs, maintenanceJob),
       cancelMaintenance: async (id, key) => { await request(`${path(id)}/memory-maintenance/cancel`, 'POST', { key }); },
-      restore: async (id, current, previous) => { await request(`${path(id)}/memory/${current.id}`, 'POST', { action: 'restore', previousId: previous.id, previousRevision: previous.revision, revision: current.revision }); },
-      list: async (id, signal, includeInactive) => array((await request(`${path(id)}/memory${includeInactive ? '?includeInactive=true' : ''}`, 'GET', undefined, signal)).items, memoryItem),
-      history: async (id, memoryId, signal) => array((await request(`${path(id)}/memory/${memoryId}/history`, 'GET', undefined, signal)).items, memoryItem),
-      source: async (id, memoryId, signal) => array((await request(`${path(id)}/memory/${memoryId}/source`, 'GET', undefined, signal)).sources, sourceExcerpt),
-      update: async (id, item, action, content) => { await request(`${path(id)}/memory/${item.id}`, 'POST', { action, revision: item.revision, content }); },
+      restore: async (id, current, previous, owner) => { await request(`${path(id)}/memory/${current.id}${memoryQuery(owner)}`, 'POST', { action: 'restore', previousId: previous.id, previousRevision: previous.revision, revision: current.revision }); },
+      list: async (id, signal, includeInactive, owner) => array((await request(`${path(id)}/memory${memoryQuery(owner, includeInactive)}`, 'GET', undefined, signal)).items, memoryItem),
+      history: async (id, memoryId, signal, owner) => array((await request(`${path(id)}/memory/${memoryId}/history${memoryQuery(owner)}`, 'GET', undefined, signal)).items, memoryItem),
+      source: async (id, memoryId, signal, owner) => array((await request(`${path(id)}/memory/${memoryId}/source${memoryQuery(owner)}`, 'GET', undefined, signal)).sources, sourceExcerpt),
+      update: async (id, item, action, content, owner) => { await request(`${path(id)}/memory/${item.id}${memoryQuery(owner)}`, 'POST', { action, revision: item.revision, content }); },
     },
   };
 }

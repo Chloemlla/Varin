@@ -11,6 +11,9 @@ import { createLocalExperimentBackend, type ExperimentBackend, type ResolvedExpe
 import type { ResourceService } from "./resources.js";
 import { nativeResearchCaller, createResearchSourceFixture } from './native-research.fixture.js';
 import { createSourceService } from "./sources.js";
+import { createResearchRuntime } from "../kernel/research-runtime.js";
+import type { AgentRuntimeClient } from "../kernel/agent-runtime-client.js";
+import type { HostJobPending } from "../kernel/protocol.generated.js";
 
 const deferred = <T = void>() => {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -128,7 +131,11 @@ async function fixture() {
     },
     async releaseBlob() {},
   } as unknown as KernelScopedClient;
-  const client = { start: async () => ({}), issueGrant: async (grant:object) => grant, retireGrant: async () => ({}), retireOperationGrants: async (operationId:string) => {events.push(`authority-retired:${operationId}`);return {};}, scoped: () => scoped } as unknown as KernelClient;
+  const client = { start: async () => ({}), issueGrant: async (grant:object) => grant, revokeGrant: async () => {},
+    experimentRecovery: async ({ workspaceId }: { workspaceId?: string }) => [...records.values()]
+      .filter(record => record.recordType === "experiment.attempt" && (!workspaceId || record.workspaceId === workspaceId))
+      .map(record => ({ workspaceId: record.workspaceId, attemptId: JSON.parse(record.payloadJson).id })),
+    retireGrant: async () => ({}), retireOperationGrants: async (operationId:string) => {events.push(`authority-retired:${operationId}`);return {};}, scoped: () => scoped } as unknown as KernelClient;
   const resources = {
     // This controlled resource port has no metric definitions or sample producer.
     subscribeSamples() { return () => {}; },
@@ -190,6 +197,54 @@ async function until(check: () => boolean) {
 }
 
 const intent = { requestId: "request", command: "fixture-command", args: ["first", "second"] };
+
+it("leaves an uncertain admission idle after restart until the resource owner confirms it", async () => {
+  const f = await fixture();
+  f.admit(async () => { throw new Error("admission reply lost"); });
+  const { attempt } = await f.service.submit(f.caller, { requestId: "uncertain", specId: "seed" });
+  await until(() => f.errors.some(error => error.message === "admission reply lost"));
+  f.service.detachObservers();
+  const restored = f.makeService();
+  const receipt = await restored.nativeReceipt("ws", attempt.attemptId);
+  assert.ok(receipt);
+  const binding = { operationId: receipt.owner.operationId, executionOwner: receipt.owner.executionOwner,
+    domain: "research.experiment", domainVersion: 1, subject: { kind: "workspace" as const, workspaceId: "ws", subjectId: attempt.attemptId } };
+  const original: HostJobPending = { binding, accepted: true, executorStopped: false, cancelRequested: false, phase: "running",
+    runId: receipt.owner.runId, origin: { kind: "user", key: "uncertain" }, mcpHolderReleased: true };
+  const missing = { ...original, binding: { ...binding, operationId: "missing-job", subject: { ...binding.subject, subjectId: "missing" } } };
+  const errors: Error[] = [];
+  let scans = 0;
+  const research = createResearchRuntime({ experiments: restored, resources: f.resources, sources: f.sources,
+    kernel: { agentRuntimeRequest: async (method: string) => {
+      // Yield like the real IPC boundary, including on the buggy self-wake path.
+      await turn();
+      if (method === "runtime.host_job.pending") { scans++; return [original, missing]; }
+      return { works: [], nextCursor: null };
+    } } as unknown as KernelClient,
+    runtime: { onReady: () => () => {}, onEvent: () => () => {} } as unknown as AgentRuntimeClient,
+    onError: error => errors.push(error),
+  });
+  try {
+    research.start();
+    await until(() => f.records.get(`experiment.attempt:${attempt.attemptId}`)!.payloadJson.includes("Previous resource admission has no confirmed outcome"));
+    await turn();
+    const writes = f.events.length;
+    for (let i = 0; i < 8; i++) {
+      await restored.nativeReceipt("ws", attempt.attemptId);
+      await restored.get(f.caller, attempt.attemptId);
+      await turn();
+    }
+    assert.equal(f.events.length, writes);
+    assert.ok(scans <= 2, `Unexpected idle scans: ${scans}`);
+    assert.deepEqual(errors.map(error => error.message), ["Reconcile experiment missing-job: Accepted original experiment subject is unavailable"]);
+    assert.equal(f.counters().spawnCalls, 0);
+    f.recoverAdmission("confirmed");
+    await restored.ensureReconciled("ws");
+    await until(() => f.counters().spawnCalls === 1);
+    assert.equal(f.counters().admissionCalls, 1);
+    assert.equal((await restored.nativeReceipt("ws", attempt.attemptId))?.owner.operationId, binding.operationId);
+  } finally { await research.dispose(); }
+});
 
 describe("durable experiment admission with explicit Storage/backend fixtures", () => {
   it("returns its persisted receipt while capture is blocked and resolves duplicate receipts before live source access", async () => {
@@ -523,8 +578,8 @@ it('installed ordinary research tools hand original model and policy invocations
   let activeCall:Call|undefined;
   let loseBindAck=false;
   let bound=0;
-  const hints=new Set<()=>void>();
-  const notify=()=>{for(const hint of hints)hint();};
+  const hints=new Set<(event: { stream: 'durable' })=>void>();
+  const notify=()=>{for(const hint of hints)hint({stream:'durable'});};
   const kernel={agentRuntimeRequest:async(method:string,params:Record<string,unknown>)=>{
     if (method === "runtime.followup.research" || method === "runtime.followup.metrics") return { works: [], nextCursor: null };
     if(method==='runtime.run.inspect')return {id:'run',thread_id:'thread',branch_id:'branch',cancel_requested:false,state:'executing'};
@@ -558,7 +613,7 @@ it('installed ordinary research tools hand original model and policy invocations
   const runtime={
     run:async()=>({id:'run',thread_id:'thread',branch_id:'branch'}),
     launch:async()=>({run_id:'run',selection:{source}}),
-    onEvent:(fn:()=>void)=>{hints.add(fn);return()=>hints.delete(fn);},onReady:()=>()=>{},
+    onEvent:(fn:(event: { stream: 'durable' })=>void)=>{hints.add(fn);return()=>hints.delete(fn);},onReady:()=>()=>{},
     cancelOperation:async(id:string)=>{ops.get(id)!.link!.cancelRequested=true;notify();},reconcileObservations:async()=>[],
   } as unknown as import('../kernel/agent-runtime-client.js').AgentRuntimeClient;
   let research=createResearchRuntime({kernel,runtime,experiments,sources:f.sources,resources:f.resources,onError:error=>f.errors.push(error)});

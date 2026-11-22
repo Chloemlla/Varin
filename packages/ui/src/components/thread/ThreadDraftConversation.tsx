@@ -39,6 +39,7 @@ import { projectEditorContextAttachments } from '@/lib/agent-editor/projection';
 import { appendInlineComments } from '@/lib/messages/inlineComments';
 import { sendThreadDraft } from '@/lib/agent-runtime/sendThreadDraft';
 import { subscribeVarinEvents } from '@/lib/varinEvents';
+import { setThreadComposerModel } from '@/lib/agent-runtime/threadComposerModel';
 import { threadHostKey } from '@/stores/useThreadStore';
 import { EMPTY_THREAD_DRAFT, useThreadDraftStore, type DraftSourceSelection, type ThreadFirstSend } from '@/stores/useThreadDraftStore';
 import { useInlineCommentDraftStore } from '@/stores/useInlineCommentDraftStore';
@@ -57,6 +58,7 @@ import { tapHaptic } from '@/lib/motion/haptics';
 /** Native composition stays local until send; external preparation binds a session without model input. */
 export function ThreadDraftConversation({ api, draftKey, handoff }: { api: ThreadsAPI; draftKey: string; handoff: MessageHandoff }) {
   const localExternalSettings = useExternalAgents();
+  const [savingBotModel, setSavingBotModel] = React.useState(false);
   const [externalBusy, setExternalBusy] = React.useState(false);
   const externalSending = React.useRef(false);
   const [externalFailure, setExternalFailure] = React.useState<unknown>();
@@ -84,10 +86,6 @@ export function ThreadDraftConversation({ api, draftKey, handoff }: { api: Threa
     const bot = conversationBot.bot;
     patch(current => ({
       ...(!current.model && bot.model ? { model: bot.model } : {}),
-      ...(!current.sourceDisabled && !current.sourceSelection && !current.workspacePath && !current.firstSend ? { sourceSelection: {
-        resourceOwner: { kind: 'local' as const }, path: bot.homeDir, mode: 'live_root' as const,
-        contentMode: 'saved-files' as const, captureScopes: [],
-      } } : {}),
       ...(current.harnessId !== null ? { harnessId: null } : {}),
     }));
   }, [draft.botId, conversationBot.bot, patch]);
@@ -189,7 +187,7 @@ export function ThreadDraftConversation({ api, draftKey, handoff }: { api: Threa
   const hasInput = Boolean(draft.text.trim() || draft.images.length || draft.files?.length || draft.selectedAttachments?.length || editorContext.length || inlineDrafts.length || draft.markerObjects?.length);
   const acceptsImages = draft.harnessId ? capabilities?.images : models.find(item => item.providerId === model?.providerId && item.modelId === model?.modelId)?.acceptsImages;
   const sending = externalBusy || draft.firstSend?.status === 'sending';
-  const locked = externalBusy || Boolean(draft.firstSend) || Boolean(draft.externalInput);
+  const locked = savingBotModel || externalBusy || Boolean(draft.firstSend) || Boolean(draft.externalInput);
   const changeHarness = (harnessId: string | null) => {
     if (harnessId === draft.harnessId || externalSending.current) return;
     setError(undefined); setExternalFailure(undefined);
@@ -223,7 +221,7 @@ export function ThreadDraftConversation({ api, draftKey, handoff }: { api: Threa
   };
   const ignorePrepared = React.useCallback(() => {}, []);
   const unsupportedReferences = Boolean(draft.harnessId && (draft.selectedAttachments?.length || draft.references?.some(reference => reference.target.kind !== 'draft-file' && reference.target.kind !== 'quote' && reference.target.kind !== 'image' && !(reference.target.kind === 'backend-command' && reference.target.backend === backendIdentity) && draft.text.slice(reference.from, reference.to) === reference.text)));
-  const sendDisabled = Boolean(draft.botId && (conversationBot.loading || !conversationBot.bot || conversationBot.bot.archived || conversationBot.bot.deletion)) || sending || readingFiles || unsupportedReferences || !hasInput || (draft.harnessId ? !external?.enabled || externalSourceUnsupported : !model?.providerId || !model.modelId) || acceptsImages === false && hasDraftInlineImages(draft);
+  const sendDisabled = savingBotModel || Boolean(draft.botId && (conversationBot.loading || !conversationBot.bot || conversationBot.bot.archived || conversationBot.bot.deletion)) || sending || readingFiles || unsupportedReferences || !hasInput || (draft.harnessId ? !external?.enabled || externalSourceUnsupported : !model?.providerId || !model.modelId) || acceptsImages === false && hasDraftInlineImages(draft);
   return <section ref={handoff.setRoot} className="regular-chat-view relative flex h-full min-h-0 min-w-0 [container-type:inline-size]" aria-label="Conversation draft">
     <div className="thread-conversation-layout relative flex min-h-0 min-w-0 flex-1">
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
@@ -323,7 +321,14 @@ export function ThreadDraftConversation({ api, draftKey, handoff }: { api: Threa
           backendCommands={capabilities?.commands}
           backendControls={draft.harnessId ? <HarnessSelector {...harnessSelector} value={draft.harnessId} disabled={locked} onChange={changeHarness} /> : undefined}
           models={models} providerId={model?.providerId ?? ''} modelId={model?.modelId ?? ''} thinkingLevel={model?.thinkingLevel ?? 'off'}
-          onModelChange={(providerId, modelId, thinkingLevel) => patch({ model: { providerId, modelId, thinkingLevel } })}
+          onModelChange={async (providerId, modelId, thinkingLevel) => {
+            const model = { providerId, modelId, thinkingLevel };
+            if (draft.botId) {
+              setSavingBotModel(true);
+              try { await setThreadComposerModel(api, draftKey, null, model); }
+              finally { setSavingBotModel(false); }
+            } else patch({ model });
+          }}
           modelDisabled={locked} attachmentDisabled={locked || readingFiles} imageDisabled={draft.harnessId ? !capabilities?.images : acceptsImages === false}
           sendDisabled={sendDisabled} pending={sending} active={false} retrying={locked} hasInput={hasInput}
           onFiles={files => void addFiles(files)} onAttachImages={() => fileInput.current?.click()} onAttachPdfs={() => pdfInput.current?.click()}

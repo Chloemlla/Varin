@@ -1,5 +1,6 @@
 /** Transient observer of the original ResourceService. Catalog alone evaluates and retains edges. */
 import { isDeepStrictEqual } from 'node:util';
+import { createResearchScan } from './research-scan.js';
 import type { ResourceService, ResourceSample, ResourceMachineObservation } from '../harness/resources.js';
 import type { KernelClient } from './kernel-client.js';
 import type { FollowupMetricWork, FollowupMetricWorksResult, FollowupMetricSnapshot, FollowupMetricState, MetricMachineIdentity } from './protocol.generated.js';
@@ -39,9 +40,7 @@ export function createMetricObserver(options: { kernel: KernelClient; resources:
   const readers = new Map<string, AbortController>();
   const queues = new Map<string, Pending>();
   const request = options.kernel.agentRuntimeRequest.bind(options.kernel);
-  let dirty = false, started = false, discoveryDirty = false;
-  let discovery: Promise<void> | undefined;
-  let flight: Promise<void> | undefined;
+  let started = false;
   let unsubscribe: (() => void) | undefined;
   const key = (work: FollowupMetricWork) => JSON.stringify([work.key.ownerEpoch, work.key.followupId, work.key.generation, work.key.sourceIndex, work.key.definitionRevision]);
   const publish = async (pending: Pending, snapshot: FollowupMetricSnapshot): Promise<boolean> => {
@@ -87,14 +86,6 @@ export function createMetricObserver(options: { kernel: KernelClient; resources:
     for (const [machine, release] of demand) if (!machines.has(machine)) { release(); demand.delete(machine); readers.get(machine)?.abort(); }
     for (const machine of machines) if (!demand.has(machine)) demand.set(machine, options.resources.retainSampling(machine));
   };
-  const refresh = (): Promise<void> => {
-    if (controller.signal.aborted) return Promise.resolve();
-    discoveryDirty = true;
-    if (discovery) return discovery;
-    discovery = (async () => { while (discoveryDirty && !controller.signal.aborted) { discoveryDirty = false; await discover(); } })()
-      .finally(() => { discovery = undefined; if (discoveryDirty && !controller.signal.aborted) void refresh().then(observe).catch(options.onError); });
-    return discovery;
-  };
   const scan = async () => {
     const machines = [...demand.keys()];
     for (const machine of machines) {
@@ -120,7 +111,7 @@ export function createMetricObserver(options: { kernel: KernelClient; resources:
           const snapshot = candidate.snapshot;
           if (pending.controller.signal.aborted) { stopped = true; break; }
           if ((snapshot.sample_revision ?? 0) > (work.metric.sample_revision ?? 0)) {
-            if (!await publish(pending, snapshot)) { await refresh(); dirty = true; stopped = true; break; }
+            if (!await publish(pending, snapshot)) { await discovery.request(); stopped = true; break; }
           }
           // Only remove this leaf's exact callback after the original cursor/receipt
           // confirmed it. An exception or lost reply preserves every later sample.
@@ -141,16 +132,15 @@ export function createMetricObserver(options: { kernel: KernelClient; resources:
       }
     }
   };
-  const observe = (): Promise<void> => {
-    if (controller.signal.aborted) return Promise.resolve();
-    dirty = true;
-    if (flight) return flight;
-    flight = (async () => { while (dirty && !controller.signal.aborted) { dirty = false; await scan(); } })()
-      .finally(() => { flight = undefined; if (dirty && !controller.signal.aborted) void observe().catch(options.onError); });
-    return flight;
-  };
-  const reconcile = async () => { await refresh(); await observe(); };
-  return { reconcile,
+  const stopped = () => controller.signal.aborted;
+  const observations = createResearchScan(scan, stopped, options.onError);
+  const discovery = createResearchScan(async () => {
+    await discover();
+    void observations.request();
+  }, stopped, options.onError);
+  return {
+    wake: discovery.request,
+    async reconcile() { await discovery.request(); await observations.flight; },
     start() {
       if (started || controller.signal.aborted) return; started = true;
       unsubscribe = options.resources.subscribeSamples(sample => {
@@ -160,14 +150,14 @@ export function createMetricObserver(options: { kernel: KernelClient; resources:
         for (const pending of queues.values()) {
           if (pending.work.source.kind === 'metric' && pending.work.source.machine_id === sample.machineId) pending.samples.push(metricSnapshot(pending.work.source, observed));
         }
-        void observe().catch(error => { if (!controller.signal.aborted) options.onError(error); });
+        void observations.request();
       });
     },
     async dispose() {
       controller.abort(); unsubscribe?.(); for (const release of demand.values()) release(); demand.clear();
       for (const pending of queues.values()) pending.controller.abort();
       for (const reading of readers.values()) reading.abort();
-      await Promise.allSettled([...(flight ? [flight] : []), ...(discovery ? [discovery] : [])]); queues.clear();
+      await Promise.allSettled([observations.flight, discovery.flight]); queues.clear();
     },
   };
 }

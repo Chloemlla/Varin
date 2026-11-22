@@ -29,13 +29,7 @@ impl ModelProvider for Provider {
         emit: &mut dyn FnMut(ProviderEvent) -> Result<(), ExecutionError>,
     ) -> Result<FinishReason, ModelFailure> {
         self.requests.lock().unwrap().push(request.clone());
-        let failure = |e: ExecutionError| ModelFailure {
-            tool_name: None,
-            code: e.code,
-            message: e.message,
-            retry_after_ms: None,
-            provider_request_id: None,
-        };
+        let failure = |e: ExecutionError| ModelFailure::new(e.code, e.message);
         emit(ProviderEvent::ItemCompleted {
             item: ProviderItem {
                 id: "signed".into(),

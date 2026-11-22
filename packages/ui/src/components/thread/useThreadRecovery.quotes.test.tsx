@@ -63,7 +63,7 @@ it('keeps frozen relations and image numbers when combined recovery completes be
     applyCombinedRecovery: vi.fn(async () => ({ status: 'ok', operation: { ...plan, state: 'complete', fileState: 'restored', conversationState: 'navigated', appliedPathCount: 0, affectedPathCount: 0,
       editorText: frozen.editorText, editorImages: [{ mimeType: 'image/png', data: 'original' }], updatedAt: '' } })),
   } as unknown as WorkspaceRecoveryAPI;
-  const api = { prepareNavigation: async () => ({ expectedHeadId: 'current', targetHeadId: 'before', removedEntryIds: ['user-message'], ...frozen }),
+  const api = { prepareNavigation: async () => ({ expectedHeadId: 'current', targetHeadId: 'before', removedEntryIds: ['user-message'], fileRecovery: { status: 'ready', plan }, ...frozen }),
     recoverySource: async () => ({ workspaceId: 'workspace', mode: 'live' }),
   } as unknown as ThreadsAPI;
   const onRecovered = vi.fn(async () => {});

@@ -136,13 +136,7 @@ impl CredentialBridge {
     }
 }
 fn failed(code: &str) -> ModelFailure {
-    ModelFailure {
-        tool_name: None,
-        code: code.into(),
-        message: "private Host credential channel unavailable".into(),
-        retry_after_ms: None,
-        provider_request_id: None,
-    }
+    ModelFailure::new(code, "private Host credential channel unavailable")
 }
 // These types are private transport data, never public method DTOs or catalog serialization.
 #[derive(Deserialize)]

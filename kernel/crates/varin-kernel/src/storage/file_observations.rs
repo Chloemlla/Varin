@@ -107,6 +107,9 @@ fn denied(message: &str) -> KernelError {
 }
 impl Storage {
     pub(super) fn observation_process_idle(&mut self, target: &Path) -> Result<bool, KernelError> {
+        Ok(self.active_process_writer(target)?.is_none())
+    }
+    pub(super) fn active_process_writer(&mut self, target: &Path) -> Result<Option<String>, KernelError> {
         self.ensure_recovered_process_receipt_wake();
         let rows = {
             let mut query = self
@@ -145,9 +148,11 @@ impl Storage {
                     )));
                 }
             }
-            return Ok(false);
+            let kind = if record["mode"] == "pty" { "Terminal" } else { "Process" };
+            let cwd = record["cwd"].as_str().unwrap_or(root);
+            return Ok(Some(format!("{kind} {id} in {cwd}")));
         }
-        Ok(true)
+        Ok(None)
     }
     pub(super) fn is_file_observation_read_lease(&self, id: &str) -> bool {
         self.observation_reads

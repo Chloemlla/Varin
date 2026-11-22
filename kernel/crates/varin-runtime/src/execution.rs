@@ -607,6 +607,12 @@ pub struct ProviderItem {
 pub(crate) fn model_history_id(request_id: &str, item_id: &str) -> String {
     format!("model-item:{}:{}:{}", request_id.len(), request_id, item_id)
 }
+pub(crate) fn model_request_from_history_id(id: &str) -> Option<&str> {
+    let (length, rest) = id.strip_prefix("model-item:")?.split_once(':')?;
+    let end = length.parse::<usize>().ok()?;
+    rest.get(end..)?.strip_prefix(':')?;
+    rest.get(..end)
+}
 pub(crate) fn model_history_item(request_id: &str, item: &ProviderItem) -> ConversationItem {
     ConversationItem {
         resource_activation: None,
@@ -646,16 +652,31 @@ pub enum FinishReason {
 pub struct ModelFailure {
     pub code: String,
     pub message: String,
+    /// Per-attempt transport evidence. Retry rules continue to match the stable message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_cause: Option<String>,
     pub retry_after_ms: Option<u64>,
     pub provider_request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
 }
 
+impl ModelFailure {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            transport_cause: None,
+            retry_after_ms: None,
+            provider_request_id: None,
+            tool_name: None,
+        }
+    }
+}
+
 impl From<ExecutionError> for ModelFailure {
     fn from(error: ExecutionError) -> Self {
-        Self { code: error.code, message: error.message, tool_name: error.tool_name,
-            retry_after_ms: None, provider_request_id: None }
+        Self { tool_name: error.tool_name, ..Self::new(error.code, error.message) }
     }
 }
 impl From<ModelFailure> for ExecutionError {
@@ -2129,6 +2150,7 @@ impl<
             recovered_decision = None;
         }
         let mut steps = input.completed_model_steps;
+        let mut tool_correction: Option<Arc<ConversationItem>> = None;
         let mut interrupted_generation = false;
         macro_rules! finish {
             ($label:lifetime,$next:expr,$waiting:expr,$failure:expr $(,$rollback:expr)?)=>{{
@@ -2701,6 +2723,7 @@ impl<
                         let prefix = request_history.iter().take_while(|item| item.provenance.is_system()).count();
                         request_history.splice(prefix..prefix,
                             binding_context.iter().cloned().chain(goal.as_ref().and_then(|g| g.item.clone()).map(Arc::new)));
+                        request_history.extend(tool_correction.iter().cloned());
                         request_history
                     };
                     let request_history = project_request(&history, Some(&mut history_projection_reuse));
@@ -2942,6 +2965,23 @@ impl<
                     let reason = match result {
                         Ok(reason) => reason,
                         Err(failure) => {
+                            // No tool from a rejected exchange was dispatched. Give the model the
+                            // real invocation contract in a fresh, normally prepared request.
+                            if failure.code == "tool_not_declared" && tool_correction.is_none() {
+                                if let Some(name) = failure.tool_name.as_ref().filter(|name|
+                                    snapshot.view.binding.tools.iter().any(|tool| &tool.name == *name)) {
+                                    let id = format!("{}:tool-correction", snapshot.view.request_id);
+                                    tool_correction = Some(Arc::new(ConversationItem {
+                                        resource_activation: None, id: id.clone(),
+                                        provenance: Provenance::EnvironmentFact { event_id: id },
+                                        content: Content::Text { text: format!(
+                                            "No tool in the previous response ran. {name} is available through tool_invoke, with name and arguments. Submit the intended calls again using the declared interfaces.") },
+                                        opaque: None,
+                                    }));
+                                    policy_state = previous_policy_state;
+                                    continue 'agent;
+                                }
+                            }
                             let decision = retry_policy.decide(&(&failure).into(), retries_used);
                             if decision.retry {
                                 self.persistence.observe_retry(&input.run_id, input.owner_generation, &snapshot.view.request_id, Some((retries_used + 1, decision.delay_ms)));
@@ -2965,6 +3005,7 @@ impl<
                     };
                     break (snapshot, items, calls, reason);
                     };
+                    tool_correction = None;
                     let committed: Vec<_> = items
                         .iter()
                         .map(|item| model_history_item(&snapshot.view.request_id, item))
@@ -3482,54 +3523,83 @@ fn normalize_completion(
     }
 }
 
-pub(crate) fn validate_history_pairs(history: &[Arc<ConversationItem>]) -> Result<(), ExecutionError> {
-    let mut pending = BTreeSet::new();
-    let mut returning_results = false;
-    for item in history {
-        match &item.content {
-            Content::ToolCall { call } => {
-                if returning_results
-                    || !matches!(item.provenance, Provenance::Assistant)
-                    || !pending.insert(call.call_id.clone())
-                {
-                    return Err(ExecutionError::new(
-                        "invalid_history_pairing",
-                        "tool calls must form one assistant batch",
-                    ));
-                }
+/// Only the open tool batch crosses an immutable history boundary.
+#[derive(Default)]
+pub(crate) struct HistoryPairing {
+    pending: BTreeSet<String>,
+    returning_results: bool,
+}
+pub(crate) enum HistoryPart<'a> {
+    Call(&'a str),
+    Result(&'a str),
+    Assistant,
+    Other,
+    Invalid,
+}
+impl<'a> HistoryPart<'a> {
+    pub(crate) fn from_content<M>(content: &'a Content<M>, provenance: &Provenance) -> Self {
+        match content {
+            Content::ToolCall { call } if matches!(provenance, Provenance::Assistant) => {
+                Self::Call(&call.call_id)
             }
-            Content::ToolResult { result } => {
-                if !matches!(&item.provenance, Provenance::ToolData { call_id } if call_id == &result.call_id)
-                    || !pending.remove(&result.call_id)
-                {
+            Content::ToolResult { result } if matches!(provenance, Provenance::ToolData { call_id } if call_id == &result.call_id) => {
+                Self::Result(&result.call_id)
+            }
+            Content::ToolCall { .. } | Content::ToolResult { .. } => Self::Invalid,
+            _ if matches!(provenance, Provenance::Assistant) => Self::Assistant,
+            _ => Self::Other,
+        }
+    }
+}
+impl HistoryPairing {
+    pub(crate) fn observe(&mut self, part: HistoryPart<'_>) -> Result<(), ExecutionError> {
+        let message = match part {
+            HistoryPart::Call(id)
+                if self.returning_results || !self.pending.insert(id.to_owned()) =>
+            {
+                "tool calls must form one assistant batch"
+            }
+            HistoryPart::Result(id) => {
+                if !self.pending.remove(id) {
                     return Err(ExecutionError::new(
                         "invalid_history_pairing",
                         "tool result lacks a matching call and provenance",
                     ));
                 }
-                returning_results = !pending.is_empty();
+                self.returning_results = !self.pending.is_empty();
+                return Ok(());
             }
-            _ if !pending.is_empty()
-                && (returning_results || !matches!(item.provenance, Provenance::Assistant)) =>
-            {
-                return Err(ExecutionError::new(
-                    "invalid_history_pairing",
-                    "content interrupts an unclosed tool exchange",
-                ));
+            HistoryPart::Invalid => "tool item lacks matching provenance",
+            HistoryPart::Other if !self.pending.is_empty() => {
+                "content interrupts an unclosed tool exchange"
             }
-            _ => {}
+            HistoryPart::Assistant if self.returning_results => {
+                "content interrupts an unclosed tool exchange"
+            }
+            _ => return Ok(()),
+        };
+        Err(ExecutionError::new("invalid_history_pairing", message))
+    }
+    pub(crate) fn finish(&self) -> Result<(), ExecutionError> {
+        if self.pending.is_empty() {
+            Ok(())
+        } else {
+            Err(ExecutionError::new(
+                "invalid_history_pairing",
+                "history ends in an unclosed tool exchange",
+            ))
         }
     }
-    if pending.is_empty() {
-        Ok(())
-    } else {
-        Err(ExecutionError::new(
-            "invalid_history_pairing",
-            "history ends in an unclosed tool exchange",
-        ))
-    }
 }
-
+pub(crate) fn validate_history_pairs(
+    history: &[Arc<ConversationItem>],
+) -> Result<(), ExecutionError> {
+    let mut pairing = HistoryPairing::default();
+    for item in history {
+        pairing.observe(HistoryPart::from_content(&item.content, &item.provenance))?;
+    }
+    pairing.finish()
+}
 #[cfg(test)]
 #[path = "execution_tests.rs"]
 mod tests;
@@ -3586,13 +3656,7 @@ pub(crate) fn generate_model<P: Persistence + ?Sized, M: ModelProvider + ?Sized>
             }
         }))
         .unwrap_or_else(|_| {
-            Err(ModelFailure {
-                tool_name: None,
-                code: "provider_panicked".into(),
-                message: "provider worker panicked after dispatch".into(),
-                retry_after_ms: None,
-                provider_request_id: None,
-            })
+            Err(ModelFailure::new("provider_panicked", "provider worker panicked after dispatch"))
         });
         // Covers normal completion, transport failure, cooperative cancellation and panic.
         if phase.is_some() {

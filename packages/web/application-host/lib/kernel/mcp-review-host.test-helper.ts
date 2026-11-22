@@ -28,6 +28,7 @@ const credentials = new CredentialBridge(() => epoch || null, async frame => { w
   () => write({ kind: 'fixture-failed', code: 'original-credential-bridge-send-failed' }));
 const kernel = {
   get kernelEpoch() { return epoch || null; },
+  withModelCredential: credentials.withModelBinding.bind(credentials),
   registerCredentialOwner(...args: Parameters<CredentialBridge['register']>) { return credentials.register(...args); },
   unregisterCredentialOwner(...args: Parameters<CredentialBridge['unregister']>) { return credentials.unregister(...args); },
   cancelRunPreparation() {}, // This fixture admits no deferred Thread source preparation.

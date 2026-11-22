@@ -339,6 +339,7 @@ mod tests {
             expected_revision: revision,
             title: title.map(Into::into),
             title_mode: mode,
+            model: None,
             pinned: None,
             archived: None,
         })

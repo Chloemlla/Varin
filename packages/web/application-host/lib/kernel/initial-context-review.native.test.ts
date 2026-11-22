@@ -2,13 +2,7 @@ import { bindDocumentTextCodec } from '../documents/inspect.js';
 import { guardProviderReply } from './provider-response.test-helper.js';
 import { isSummaryRequest } from './summary-request.test-helper.js';
 import { resourceScopeFixture } from './resource-scope.test-helper.js';
-import { createMemoryOwner } from './memory-owner.js';
-import { createBotMemoryOwner } from './bot-memory-owner.js';
-import { createBotHistory } from '../memory/bot-history.js';
-import { createMemoryService } from '../memory/memory-service.js';
-import { openWorkspaceKnowledge, type KnowledgeStore } from '../knowledge/store.js';
-import { createKnowledgeContextRuntime } from '../knowledge/context-runtime.js';
-import { knowledgeStoreKeyForScope, scopeOfScopeId, threadScopeId } from '../harness/owner-scope.js';
+import { bindFixtureMemory } from './bot-memory-fixture.test-helper.js';
 import { createThreadContext } from './thread-context.js';
 import { createAgentPersonalization } from '../memory/agent-personalization.js';
 import { createThreadSourcePreparer } from './thread-sources.js';
@@ -79,29 +73,10 @@ async function fixture(reply: (body: Record<string, unknown>, response: ServerRe
   const prepareContext = createThreadContext({ personalization, resources, projectForWorkspace: async () => 'selected-project',
     botForThread: async threadId => (await runtime.thread(threadId)).bot_id
       ? { id: 'recovery-bot', name: 'Recovery Bot', instructions: null, revision: 1 } : null });
-  // Actual Bot Runs synchronize their original knowledge owners before the
-  // first provider request. The ordinary-note owner cannot stand in for them.
-  const knowledgeStores = new Map<string, Promise<KnowledgeStore>>();
-  const store = (scope:string):Promise<KnowledgeStore> => {
-    let pending=knowledgeStores.get(scope);
-    if(!pending){pending=openWorkspaceKnowledge({dataDir:root,hostId:'http-review',workspaceId:knowledgeStoreKeyForScope(scope),scope:scopeOfScopeId(scope),embedding:null});knowledgeStores.set(scope,pending);}
-    return pending;
-  };
-  const ownerForThread=async(id:string)=>{
-    const thread=await runtime.thread(id);if(!thread.bot_id)throw new Error('Expected original Bot thread');
-    return {scope:'bot' as const,ownerId:thread.bot_id};
-  };
-  const history=createBotHistory(runtime);
-  const memory=createMemoryService({storeForScopeId:store,userStore:()=>store('user'),ownerForThread,
-    threadStoreIfPresent:id=>store(threadScopeId(id)),associationForThread:async id=>({threadIds:[id]}),
-    readHistorySource:async(botId,span)=>(await history.read(botId,span)).text});
-  const knowledge=createKnowledgeContextRuntime({getStore:store,getUserStore:()=>store('user'),getThreadStore:id=>store(threadScopeId(id)),
-    recallForThread:async({threadId,query})=>memory.search(await ownerForThread(threadId),query,8,{threadId,includeShared:true})});
-  kernel.setMemoryOwner(createMemoryOwner({ personalization, prepareContext,
-    bot:createBotMemoryOwner({runtime,history,memory,prepareContext,knowledge:knowledge.knowledgeForThread}) }));
+  const closeMemory = bindFixtureMemory(kernel, runtime, root, 'http-review', { personalization, prepareContext });
   let closed = false;
   const close = async () => { if (closed) return; closed = true;
-    try { for(const pending of knowledgeStores.values())await (await pending).close(); await storage.dispose(); await documents.dispose(); }
+    try { await closeMemory(); await storage.dispose(); await documents.dispose(); }
     finally { releaseCodec(); await kernel.close(); }
   };
   cleanups.push(close);

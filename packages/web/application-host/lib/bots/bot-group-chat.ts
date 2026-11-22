@@ -259,7 +259,7 @@ export function createBotGroupChats(options: Options) {
               const thread = await runtime.thread(identity.threadId);
               const branch = thread.branches.find(value => value.branch_id === identity.branchId)!;
               if (branch.active_run_id && current.expectedHead === undefined) return;
-              const model = current.model ?? await options.model(bot);
+              const model = current.model ?? thread.model_preference ?? await options.model(bot);
               if (!model) throw invalid('This Bot needs a model');
               if (current.expectedHead === undefined) {
                 current.expectedHead = branch.head;
@@ -498,13 +498,16 @@ export function createBotGroupChats(options: Options) {
       await save(room);
       return summary(room);
     },
-    async page(principal: string | null, id: string, before?: string, query?: string, botId?: string) {
+    async page(principal: string | null, id: string, before?: string, query?: string, botId?: string, view: 'messages' | 'activity' = 'messages') {
       const { room } = await read(id, principal);
       if (botId && !room.members.some(member => member.botId === botId)) throw missing();
       const end = before ? room.posts.findIndex(value => value.id === before) : room.posts.length;
       if (end < 0) throw invalid('Invalid history position');
       const needle = query?.toLocaleLowerCase();
-      const matches = room.posts.slice(0, end).filter(value => !needle || value.text.toLocaleLowerCase().includes(needle) || value.files?.some(file => file.filename.toLocaleLowerCase().includes(needle)));
+      const pagePosts = room.posts.slice(0, end);
+      const visible = view === 'activity' ? pagePosts.filter(post => post.author.kind === 'bot' || post.fact || post.work ||
+        post.scheduleName || post.watchName || post.informs || post.delivery.some(item => !['answered', 'informed', 'removed'].includes(item.state))) : pagePosts;
+      const matches = visible.filter(value => !needle || value.text.toLocaleLowerCase().includes(needle) || value.files?.some(file => file.filename.toLocaleLowerCase().includes(needle)));
       const posts = matches.slice(-40).map(({ origin: _origin, ...post }) => {
         const quoted = post.quoteId ? room.posts.find(value => value.id === post.quoteId) : undefined;
         return {

@@ -20,7 +20,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { parseHTML } from 'linkedom';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { ThreadRequestError } from '@varin/application-client';
-import type { ContextCheckpoint, ThreadIdentity, ThreadModel, ThreadModelInfo, ThreadSnapshot, ThreadSubmit, ThreadsAPI } from '@varin/application-client';
+import type { ContextCheckpoint, ThreadIdentity, ThreadModel, ThreadSnapshot, ThreadSubmit, ThreadsAPI } from '@varin/application-client';
 import type { ChildTask, DelegatedExecution, StoredMedia, McpInteractionView, Attachment } from '@varin/protocol';
 import { ThreadConversation } from './ThreadConversation';
 import { BotWorkDetail } from '@/workbenches/bot/BotWorkDetail';
@@ -457,28 +457,15 @@ it('keeps a Bot conversation’s explicit source across Shells without inheritin
   expect(f.api.prepareSource).not.toHaveBeenCalled();
 });
 
-it('inherits the workbench model and thinking for an unconfigured Bot and sends that exact selection', async () => {
+it('uses the Host model default until a Bot conversation has its own selection', async () => {
   const f = fixture();
   f.view.thread.bot_id = 'bot';
-  const ordinary: ThreadIdentity = { runtime: 'agent', threadId: 'ordinary-work', branchId: 'main' };
-  const originalNavigation = useThreadStore.getState();
-  const inherited = { providerId: 'other-channel', modelId: 'strong', thinkingLevel: 'high' as const };
-  useThreadStore.setState({ hostKey: threadHostKey(), selectedIdentity: ordinary, selectedDraftKey: null });
-  useThreadDraftStore.getState().patch(threadComposerKey(threadHostKey(), ordinary), { model: inherited, text: 'Unrelated workbench draft' });
-  f.api.listModels = async () => [
-    { providerId: 'fixture-provider', modelId: 'fixture-model', thinkingLevels: ['off'] },
-    { ...inherited, thinkingLevels: ['off', 'high'] },
-  ];
-  try {
-    await act(async () => root.render(<ThreadConversation surface="bot" api={f.api} identity={identity} inheritWorkbenchModel
-      preferredModel={{ providerId: 'fixture-provider', modelId: 'fixture-model', thinkingLevel: 'off' }} />));
-    expect(useThreadDraftStore.getState().drafts[threadComposerKey(threadHostKey(), identity)]?.model).toEqual(inherited);
-    await edit('[aria-label="Message thread"]', 'Hello from Varin');
-    await submitForm(composerForm());
-    expect(f.submit).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ model: inherited, text: 'Hello from Varin' }));
-  } finally {
-    useThreadStore.setState({ hostKey: originalNavigation.hostKey, selectedIdentity: originalNavigation.selectedIdentity, selectedDraftKey: originalNavigation.selectedDraftKey });
-  }
+  const model: ThreadModel = { providerId: 'channel', modelId: 'strong', thinkingLevel: 'high' };
+  f.api.listModels = async () => [model];
+  await act(async () => root.render(<ThreadConversation surface="bot" api={f.api} identity={identity} preferredModel={model} />));
+  await edit('[aria-label="Message thread"]', 'Hello from Varin');
+  await submitForm(composerForm());
+  expect(f.submit).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ model }));
 });
 
 it('keeps an existing physical conversation on its source without automatically requiring a mount backend', async () => {
@@ -3897,7 +3884,7 @@ function combinedFixture(f: ReturnType<typeof navigationFixture>, patch: Partial
   const operation: WorkspaceCombinedRecoveryOperation = { id: plan.id, revision: plan.revision, workspaceId: plan.workspaceId, conversation: plan.conversation,
     entryId: plan.entryId, expectedLeafId: plan.expectedLeafId, targetLeafId: plan.targetLeafId, state: 'complete', fileState: 'restored', conversationState: 'navigated',
     affectedPathCount: 1, appliedPathCount: 1, createdAt: plan.createdAt, updatedAt: plan.createdAt, editorText: f.user.content.text, editorImages: [] };
-  const prepareCombinedRecovery = vi.fn<WorkspaceRecoveryAPI['prepareCombinedRecovery']>(async () => ({ status: 'ready', plan }));
+  const fileReview = vi.fn<() => Promise<Awaited<ReturnType<WorkspaceRecoveryAPI['prepareCombinedRecovery']>> | null>>(async () => ({ status: 'ready', plan }));
   const applyCombinedRecovery = vi.fn<WorkspaceRecoveryAPI['applyCombinedRecovery']>(async input => {
     f.view.history = [f.assistant]; f.view.historyPage.head = plan.targetLeafId; f.view.thread.branches[0]!.head = plan.targetLeafId;
     return { status: 'ready', operation: { ...operation, id: input.operationId } };
@@ -3905,8 +3892,13 @@ function combinedFixture(f: ReturnType<typeof navigationFixture>, patch: Partial
   const getCombinedOperation = vi.fn<WorkspaceRecoveryAPI['getCombinedOperation']>(async () => ({ status: 'ready', operation }));
   const cancelCombinedOperation = vi.fn<WorkspaceRecoveryAPI['cancelCombinedOperation']>(async () => ({ status: 'ready', operation: { ...operation, state: 'aborted', fileState: 'unchanged', conversationState: 'unchanged' } }));
   const prepareCombinedUndo = vi.fn<WorkspaceRecoveryAPI['prepareCombinedUndo']>(async () => ({ status: 'ready', plan: { ...plan, id: 'undo-recovery', undoOf: plan.id } }));
-  recoveryService.api = { prepareCombinedRecovery, applyCombinedRecovery, getCombinedOperation, cancelCombinedOperation, prepareCombinedUndo } as unknown as WorkspaceRecoveryAPI;
-  return { plan, operation, prepareCombinedRecovery, applyCombinedRecovery, getCombinedOperation, cancelCombinedOperation, prepareCombinedUndo };
+  const selection = f.prepareNavigation.getMockImplementation()!;
+  f.prepareNavigation.mockImplementation(async input => {
+    const draft = await selection(input);
+    return input.withFiles ? { ...draft, fileRecovery: await fileReview() } : draft;
+  });
+  recoveryService.api = { applyCombinedRecovery, getCombinedOperation, cancelCombinedOperation, prepareCombinedUndo } as unknown as WorkspaceRecoveryAPI;
+  return { plan, operation, fileReview, applyCombinedRecovery, getCombinedOperation, cancelCombinedOperation, prepareCombinedUndo };
 }
 
 it('thread recovery restores the owner-selected head and original image draft, then undoes the same branch without running work', async () => {
@@ -3994,13 +3986,12 @@ it.each(['thread', 'host'] as const)('thread recovery cannot submit a late prepa
   expect(container.querySelector<HTMLTextAreaElement>('[aria-label="Message thread"]')!.value).not.toBe('Old conversation');
 });
 
-it.each(['local', 'managed_host'] as const)('thread recovery uses the actual %s materialized source owner for combined restore and operation-based undo', async kind => {
+it('thread recovery applies and undoes the owner-prepared plan for the selected conversation', async () => {
   const f = navigationFixture(); const recovery = combinedFixture(f); useUIStore.setState({ recoveryPreference: 'both' });
-  if (kind === 'managed_host') f.recoverySource.mockResolvedValue({ resourceOwner: { kind, hostId: 'resource-host', connectionId: 'paired-resource', endpointIdentity: 'https://resource-host.test' }, workspaceId: 'actual-source-owner', mode: 'materialized', runId: 'finished-run' });
   await act(async () => root.render(<ThreadConversation api={f.api} identity={identity} initialWorkspacePath="/unrelated-sidebar" />));
   await openOverview('recovery');
   await act(async () => button('Restore before this message').click());
-  expect(recovery.prepareCombinedRecovery).toHaveBeenCalledWith({ workspaceId: 'actual-source-owner', conversation: { kind: 'thread', threadId: identity.threadId, branchId: identity.branchId }, entryId: f.user.id });
+  expect(f.prepareNavigation).toHaveBeenCalledExactlyOnceWith({ ...identity, entryId: f.user.id, withFiles: true });
   expect(recovery.applyCombinedRecovery).toHaveBeenCalledWith({ operationId: recovery.plan.id, expectedRevision: recovery.plan.revision, conflictPolicy: 'abort', confirmedConflicts: [] });
   expect(container.querySelector('[role="dialog"]')).toBeNull(); expect(f.navigate).not.toHaveBeenCalled();
   expect(container.querySelectorAll('article')).toHaveLength(1);
@@ -4011,11 +4002,11 @@ it.each(['local', 'managed_host'] as const)('thread recovery uses the actual %s 
 
 it('thread recovery keeps fixed-branch sources conversation-only even when combined recovery is preferred', async () => {
   const f = navigationFixture(); const recovery = combinedFixture(f); useUIStore.setState({ recoveryPreference: 'both' });
-  f.recoverySource.mockResolvedValue({ resourceOwner: { kind: 'local' }, workspaceId: 'read-only-source', mode: 'fixed_branch', runId: 'finished-run' });
+  recovery.fileReview.mockResolvedValueOnce(null);
   await act(async () => root.render(<ThreadConversation api={f.api} identity={identity} />));
   await openOverview('recovery');
   await act(async () => button('Restore before this message').click());
-  expect(f.navigate).toHaveBeenCalledOnce(); expect(recovery.prepareCombinedRecovery).not.toHaveBeenCalled();
+  expect(f.navigate).toHaveBeenCalledOnce(); expect(recovery.applyCombinedRecovery).not.toHaveBeenCalled();
 });
 
 it('thread recovery observes the original combined operation after uncertain file and history commits', async () => {
@@ -4030,7 +4021,7 @@ it('thread recovery observes the original combined operation after uncertain fil
   f.view.history = [f.assistant]; f.view.historyPage.head = f.assistant.id;
   await act(async () => button('Check recovery status').click());
   expect(recovery.getCombinedOperation).toHaveBeenLastCalledWith('original-recovery');
-  expect(recovery.prepareCombinedRecovery).toHaveBeenCalledOnce(); expect(recovery.applyCombinedRecovery).toHaveBeenCalledOnce();
+  expect(recovery.fileReview).toHaveBeenCalledOnce(); expect(recovery.applyCombinedRecovery).toHaveBeenCalledOnce();
   expect(f.navigate).not.toHaveBeenCalled(); expect(container.querySelectorAll('article')).toHaveLength(1);
   expect(container.querySelector<HTMLTextAreaElement>('[aria-label="Message thread"]')!.value).toBe('Original user instruction');
 });
@@ -4098,7 +4089,7 @@ it('thread recovery freezes a confirmed conflict acknowledgement and observes th
   expect(container.querySelector('[role="dialog"]')).toBeNull();
   recovery.getCombinedOperation.mockResolvedValueOnce({ status: 'ready', operation: { ...recovery.operation, state: 'planned', conversationState: 'unchanged', fileState: 'unchanged' } });
   await act(async () => button('Check recovery status').click());
-  expect(recovery.prepareCombinedRecovery).toHaveBeenCalledOnce();
+  expect(recovery.fileReview).toHaveBeenCalledOnce();
   expect(recovery.applyCombinedRecovery.mock.calls[1]![0]).toEqual(recovery.applyCombinedRecovery.mock.calls[0]![0]);
 });
 
@@ -4182,7 +4173,7 @@ it('thread recovery resumes a stopped nonterminal combined operation using its o
   await act(async () => button('Restore before this message').click());
   expect(container.querySelectorAll('article')).toHaveLength(2);
   await act(async () => button('Check recovery status').click());
-  expect(recovery.prepareCombinedRecovery).toHaveBeenCalledOnce();
+  expect(recovery.fileReview).toHaveBeenCalledOnce();
   expect(recovery.applyCombinedRecovery.mock.calls[1]![0]).toEqual(recovery.applyCombinedRecovery.mock.calls[0]![0]);
   expect(f.navigate).not.toHaveBeenCalled(); expect(container.querySelectorAll('article')).toHaveLength(1);
 });
@@ -4264,7 +4255,7 @@ it('Bot thread recovery reveals interrupted operations on demand without replayi
   expect(recovery.applyCombinedRecovery).not.toHaveBeenCalled();
   await act(async () => button('Resume saved recovery').click());
   expect(recovery.applyCombinedRecovery).toHaveBeenCalledWith({ operationId: interrupted.id, expectedRevision: interrupted.revision, conflictPolicy: 'abort', confirmedConflicts: [] });
-  expect(recovery.prepareCombinedRecovery).not.toHaveBeenCalled(); expect(f.navigate).not.toHaveBeenCalled();
+  expect(recovery.fileReview).not.toHaveBeenCalled(); expect(f.navigate).not.toHaveBeenCalled();
   expect(container.querySelectorAll('article')).toHaveLength(1);
   expect(container.querySelector<HTMLTextAreaElement>('[aria-label="Message thread"]')!.value).toBe('New draft while reviewing recovery');
 });
@@ -4286,6 +4277,8 @@ it('thread recovery never applies a rediscovered inert file plan without its con
 it('thread recovery offers an explicit conversation-only choice when file preparation is unavailable', async () => {
   const f = navigationFixture(); useUIStore.setState({ recoveryPreference: 'both' });
   await act(async () => root.render(<ThreadConversation api={f.api} identity={identity} />));
+  const original = f.prepareNavigation.getMockImplementation()!;
+  f.prepareNavigation.mockImplementationOnce(async input => ({ ...await original(input), fileRecovery: { status: 'failed', failure: { code: 'unavailable', message: 'Recovery unavailable', retryable: true } } }));
   await openOverview('recovery');
   await act(async () => button('Restore before this message').click());
   expect(f.navigate).not.toHaveBeenCalled(); expect(container.textContent).toContain('Recovery unavailable');
@@ -4297,17 +4290,15 @@ it('thread recovery offers an explicit conversation-only choice when file prepar
 
 it('keeps an unavailable managed file owner explicit and preserves conversation-only navigation', async () => {
   const f = navigationFixture(); const recovery = combinedFixture(f); useUIStore.setState({ recoveryPreference: 'both' });
-  f.recoverySource.mockResolvedValue({ resourceOwner: { kind: 'managed_host', hostId: 'host-b', connectionId: 'b', endpointIdentity: 'sha256-b' },
-    workspaceId: 'same-path-on-b', mode: 'materialized', runId: 'finished-run' });
-  recovery.prepareCombinedRecovery.mockRejectedValueOnce(new Error('Original file Host is offline'));
+  recovery.fileReview.mockResolvedValueOnce({ status: 'failed', failure: { code: 'unavailable', message: 'Original file Host is offline', retryable: true } });
   await act(async () => root.render(<ThreadConversation api={f.api} identity={identity} />));
   await act(async () => button('Restore before this message').click());
-  expect(recovery.prepareCombinedRecovery).toHaveBeenCalledWith({ workspaceId: 'same-path-on-b', conversation: { kind: 'thread', threadId: identity.threadId, branchId: identity.branchId }, entryId: f.user.id }); expect(f.navigate).not.toHaveBeenCalled();
+  expect(f.navigate).not.toHaveBeenCalled();
   expect(container.textContent).toContain('Original file Host is offline');
   const conversation = [...document.querySelectorAll<HTMLButtonElement>('button')].find(item => item.textContent?.includes('Restore conversation only'));
   expect(conversation).toBeDefined();
   await act(async () => conversation!.click());
-  expect(f.navigate).toHaveBeenCalledOnce(); expect(recovery.prepareCombinedRecovery).toHaveBeenCalledOnce(); expect(recovery.applyCombinedRecovery).not.toHaveBeenCalled();
+  expect(f.navigate).toHaveBeenCalledOnce(); expect(recovery.fileReview).toHaveBeenCalledOnce(); expect(recovery.applyCombinedRecovery).not.toHaveBeenCalled();
 });
 
 
@@ -4568,7 +4559,7 @@ it.each([false, true])('projects an active Bot model without feeding inherited d
     if (state.drafts[key]?.model !== previous.drafts[key]?.model) modelChanges.push(state.drafts[key]?.model);
   });
   const render = () => <React.StrictMode><ThreadConversation surface="bot" api={f.api} identity={identity}
-    inheritWorkbenchModel preferredModel={{ ...inherited }} /></React.StrictMode>;
+    preferredModel={{ ...inherited }} /></React.StrictMode>;
   try {
     await act(async () => root.render(render()));
     expect(container.querySelector<HTMLSelectElement>('[aria-label="Registered model"]')!.value).toBe(JSON.stringify([running.providerId, running.modelId]));
@@ -4587,37 +4578,30 @@ it.each([false, true])('projects an active Bot model without feeding inherited d
   }
 });
 
-it('waits for the Bot model catalog, uses the entry capture once, and preserves a user choice through catalog changes', async () => {
+it('saves an idle Bot model and thinking change before sending and restores it over a changed profile', async () => {
   const f = fixture();
   f.view.thread.bot_id = 'bot';
-  const ordinary: ThreadIdentity = { runtime: 'agent', threadId: 'ordinary-work', branchId: 'main' };
-  const originalNavigation = useThreadStore.getState();
-  const captured: ThreadModel = { providerId: 'captured-provider', modelId: 'captured-model', thinkingLevel: 'high', temperature: 0 };
-  const fallback: ThreadModel = { providerId: 'fixture-provider', modelId: 'fixture-model', thinkingLevel: 'off' };
-  const chosen: ThreadModel = { providerId: 'chosen-provider', modelId: 'chosen-model', thinkingLevel: 'high', temperature: 0 };
-  useThreadStore.setState({ hostKey: threadHostKey(), selectedIdentity: ordinary, selectedDraftKey: null });
-  const ordinaryKey = threadComposerKey(threadHostKey(), ordinary);
-  useThreadDraftStore.getState().patch(ordinaryKey, { model: captured });
-  let resolveModels!: (models: ThreadModelInfo[]) => void;
-  f.api.listModels = () => new Promise(resolve => { resolveModels = resolve; });
-  const key = threadComposerKey(threadHostKey(), identity);
-  try {
-    await act(async () => root.render(<ThreadConversation surface="bot" api={f.api} identity={identity} inheritWorkbenchModel preferredModel={fallback} />));
-    expect(useThreadDraftStore.getState().drafts[key]?.model?.providerId).toBeFalsy();
-    await act(async () => useThreadDraftStore.getState().patch(ordinaryKey, { model: fallback }));
-    await act(async () => resolveModels([{ ...captured, thinkingLevels: ['off', 'high'] }, fallback, { ...chosen, thinkingLevels: ['off', 'high'] }]));
-    expect(useThreadDraftStore.getState().drafts[key]?.model).toEqual(captured);
-    await edit('[aria-label="Registered model"]', JSON.stringify([chosen.providerId, chosen.modelId]), 'change');
-    expect(useThreadDraftStore.getState().drafts[key]?.model).toEqual(chosen);
-    f.api.listModels = async () => [fallback, { ...chosen, thinkingLevels: ['off'] }];
-    await act(async () => { for (const listener of varinEventListeners) listener({ type: 'settings-changed', owner: 'agent-settings', ids: ['model-channels'], scope: 'host', revision: 'catalog-2' }); });
-    expect(useThreadDraftStore.getState().drafts[key]?.model).toEqual({ ...chosen, thinkingLevel: 'off' });
-    await edit('[aria-label="Message thread"]', 'Use my chosen model');
-    await submitForm(composerForm());
-    expect(f.submit).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ model: { ...chosen, thinkingLevel: 'off' } }));
-  } finally {
-    useThreadStore.setState({ hostKey: originalNavigation.hostKey, selectedIdentity: originalNavigation.selectedIdentity, selectedDraftKey: originalNavigation.selectedDraftKey });
-  }
+  const profile: ThreadModel = { providerId: 'profile', modelId: 'original', thinkingLevel: 'off' };
+  const chosen: ThreadModel = { providerId: 'other', modelId: 'sol', thinkingLevel: 'high' };
+  f.api.listModels = async () => [profile, { ...chosen, thinkingLevels: ['off', 'high'] }];
+  f.api.update = vi.fn(async command => {
+    expect(command.expectedRevision).toBe(f.view.thread.revision);
+    f.view.thread.model_preference = command.model;
+    f.view.thread.revision++;
+    return f.view.thread;
+  });
+  const render = (model: ThreadModel) => <ThreadConversation surface="bot" api={f.api} identity={identity} preferredModel={model} />;
+  await act(async () => root.render(render(profile)));
+  await edit('[aria-label="Registered model"]', JSON.stringify([chosen.providerId, chosen.modelId]), 'change');
+  await edit('[aria-label="Thinking level"]', 'high', 'change');
+  expect(f.view.thread.model_preference).toEqual(chosen);
+  expect(f.submit).not.toHaveBeenCalled();
+  await act(async () => root.render(null));
+  useThreadDraftStore.getState().remove(threadComposerKey(threadHostKey(), identity));
+  await act(async () => root.render(render({ ...profile, modelId: 'new-default' })));
+  await edit('[aria-label="Message thread"]', 'Continue');
+  await submitForm(composerForm());
+  expect(f.submit).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ model: chosen }));
 });
 
 it('applies changed Bot defaults atomically without replaying the same preference over idle edits or reopening', async () => {

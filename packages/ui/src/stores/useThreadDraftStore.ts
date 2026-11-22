@@ -128,7 +128,7 @@ export interface ThreadDraft {
   model?: ThreadModel;
   /** Consumed model transitions survive closing/reopening this in-memory draft. */
   modelObservation?: {
-    preference?: { inheritWorkbench: boolean; model: ThreadModel | null };
+    preference?: { model: ThreadModel | null };
     run?: { id: string; active: boolean; model: ThreadModel };
   };
   workFocus?: import('@varin/protocol').WorkFocusId;

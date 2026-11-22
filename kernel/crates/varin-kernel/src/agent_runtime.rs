@@ -1401,9 +1401,9 @@ pub(crate) fn spawn(
                                         return Ok(serde_json::to_value(read.load().map_err(domain)?)?);
                                     }
                                     if method == "runtime.branch.recovery.range" {
-                                        let p: NavigationSelectParams = serde_json::from_value(params)?;
+                                        let p: RecoveryRangeParams = serde_json::from_value(params)?;
                                         let read = catalog.lock().map_err(|_| KernelError::Storage("catalog owner failed".into()))?.capture_recovery_range(&p.thread_id, &p.branch_id, &p.entry_id).map_err(domain)?;
-                                        return Ok(serde_json::to_value(read.load().map_err(domain)?)?);
+                                        return Ok(serde_json::to_value(read.load_at_head(p.expected_head_id.as_deref()).map_err(domain)?)?);
                                     }
                                     if method == "runtime.branch.navigation.prepare" {
                                         let p: NavigationSelectParams = serde_json::from_value(params)?;

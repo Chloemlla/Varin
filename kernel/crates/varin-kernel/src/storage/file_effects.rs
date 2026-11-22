@@ -612,6 +612,16 @@ impl Storage {
             None
         };
         let input = journalled.as_ref().unwrap_or(&task.params);
+        if task.method == "file.apply" && grant.capabilities.contains("recovery.maintenance") {
+            if let Some(writer) = self.active_process_writer(&physical[0])? {
+                // Replaying a completed receipt needs no writer admission. A new
+                // refusal must not create a started intent or a pending checkpoint.
+                if let Some(value) = self.committed_file_operation(task.operation(), task.method, input, task.workspace())? {
+                    return Ok(Plan { ready: Some(value), resuming: false, _content: None, reservations: None });
+                }
+                return Err(KernelError::ActiveProcessWriter(writer));
+            }
+        }
         let (_, ready, resuming) =
             self.begin_file_operation(task.operation(), task.method, input)?;
         let mut plan = Plan {
@@ -667,13 +677,6 @@ impl Storage {
                 plan._content = Some(self.blob_read_roots.retain(object_hash));
             }
             if grant.capabilities.contains("recovery.maintenance") {
-                // Only the process/receipt owner is consulted here. Physical
-                // reservation paths are resolved by the worker below.
-                if !self.observation_process_idle(&physical[0])? {
-                    return Err(KernelError::Operation(
-                        "affected resource still has an active process writer".into(),
-                    ));
-                }
                 plan.reservations = Some(self.recovery_file_reservations(
                     task.workspace(),
                     task.params["reservationOperationId"].as_str(),

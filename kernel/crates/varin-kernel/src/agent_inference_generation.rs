@@ -132,13 +132,7 @@ fn settle_preparation_failure(
     } else {
         "Auxiliary inference could not start; inspect its retained evidence".into()
     };
-    let failed = ModelFailure {
-        tool_name: None,
-        code: error.code,
-        message,
-        retry_after_ms: None,
-        provider_request_id: None,
-    };
+    let failed = ModelFailure::new(error.code, message);
     publish(
         runtime,
         id,
@@ -214,13 +208,7 @@ fn run(
         })
     }))
     .unwrap_or_else(|_| {
-        Err(ModelFailure {
-            tool_name: None,
-            code: "provider_panicked".into(),
-            message: "Auxiliary provider failed after dispatch".into(),
-            retry_after_ms: None,
-            provider_request_id: None,
-        })
+        Err(ModelFailure::new("provider_panicked", "Auxiliary provider failed after dispatch"))
     });
     let Some(failed) = generated.as_ref().err() else { break generated; };
     let decision = policy.decide(&failed.into(), retries_used);

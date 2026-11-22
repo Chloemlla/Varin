@@ -343,13 +343,7 @@ fn execute_node(
         engine.generate(&input.run_id, input.owner_generation, &snapshot, cancel, None);
     if result.is_ok() {
         if let Err(error) = validate_model_items(&items, &snapshot) {
-            result = Err(ModelFailure {
-                tool_name: None,
-                code: error.code,
-                message: error.message,
-                retry_after_ms: None,
-                provider_request_id: None,
-            });
+            result = Err(ModelFailure::new(error.code, error.message));
         }
     }
     let suspended = cancel.is_cancelled()

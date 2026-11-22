@@ -1,6 +1,7 @@
 import type {
   DocumentsAPI,
   VarinDirtyBufferPublication,
+  VarinDirtyStateBarrierEvent,
   VarinDocumentDeleteRequest,
   VarinDocumentDeleteResult,
   VarinDocumentWatchEvent,
@@ -91,7 +92,8 @@ const parseWorkspaceFileEvent = (value: unknown): VarinWorkspaceFileEvent => {
   ) {
     throw new DocumentsError('Document watch returned an invalid event', { reason: 'failed' });
   }
-  if (event.kind === 'reset') {
+  const kind = event.kind as VarinWorkspaceFileEvent['kind'];
+  if (kind === 'reset') {
     if (!['overflow', 'reconnected', 'authority-changed', 'gap'].includes(String(event.reason))) {
       throw new DocumentsError('Document watch returned an invalid reset event', { reason: 'failed' });
     }
@@ -103,14 +105,23 @@ const parseWorkspaceFileEvent = (value: unknown): VarinWorkspaceFileEvent => {
   if ((event.operationId !== undefined && (typeof event.operationId !== 'string' || !event.operationId)) || (event.revision !== undefined && typeof event.revision !== 'string')) {
     throw new DocumentsError('Document watch returned an invalid revision', { reason: 'failed' });
   }
-  if (event.kind === 'moved') {
-    if (!isResource(event.from)) {
-      throw new DocumentsError('Document watch returned an invalid move event', { reason: 'failed' });
-    }
-    return event as VarinWorkspaceFileEvent;
-  }
-  if (!['created', 'changed', 'deleted'].includes(event.kind)) {
-    throw new DocumentsError('Document watch returned an unknown event', { reason: 'failed' });
+  switch (kind) {
+    case 'created':
+    case 'changed':
+    case 'deleted':
+      break;
+    case 'moved':
+      if (!isResource(event.from)) {
+        throw new DocumentsError('Document watch returned an invalid move event', { reason: 'failed' });
+      }
+      break;
+    case 'invalidated':
+      if (event.reason !== 'entry-changed') {
+        throw new DocumentsError('Document watch returned an invalid entry invalidation', { reason: 'failed' });
+      }
+      break;
+    default:
+      throw new DocumentsError(`Document watch returned an unknown event: ${kind satisfies never}`, { reason: 'failed' });
   }
   return event as VarinWorkspaceFileEvent;
 };
@@ -161,6 +172,9 @@ const readSseEvents = async (
 ): Promise<void> => {
   const reader = response.body?.getReader();
   if (!reader) throw new DocumentsError('Document watch stream is unavailable', { reason: 'failed' });
+  // The Host registers a dirty surface for the lifetime of this stream. Its
+  // holds end with that registration even if the last release was lost in transit.
+  const held = new Map<string, VarinDirtyStateBarrierEvent>();
   const abortReader = () => { void reader.cancel(signal.reason).catch(() => undefined); };
   signal.addEventListener('abort', abortReader, { once: true });
   try {
@@ -176,6 +190,10 @@ const readSseEvents = async (
         const line = chunk.split('\n').find((entry) => entry.startsWith('data: '));
         if (!line) continue;
         const event = parseDocumentWatchEvent(JSON.parse(line.slice(6)));
+        if (event.kind === 'dirty-state-barrier') {
+          if (event.action === 'acquire') held.set(event.barrierId, event);
+          else held.delete(event.barrierId);
+        }
         listener(event);
       }
     }
@@ -183,6 +201,7 @@ const readSseEvents = async (
     signal.removeEventListener('abort', abortReader);
     await reader.cancel().catch(() => undefined);
     reader.releaseLock();
+    for (const barrier of held.values()) listener({ ...barrier, action: 'release' });
   }
 };
 

@@ -86,7 +86,7 @@ fn followed_native_report_is_bounded_stable_and_reads_its_original_answer() {
     assert!(original.text.contains("original ending"));
     let update = db.inspect_thread("work").unwrap();
     db.update_thread(&threads::ThreadUpdate {thread_id:"work".into(),key:"rename".into(),expected_revision:update["revision"].as_u64().unwrap(),
-        title:Some("Changed title".into()),pinned:None,archived:None,title_mode:None}).unwrap();
+        title:Some("Changed title".into()),pinned:None,archived:None,title_mode:None, model: None}).unwrap();
     let owner = std::sync::Mutex::new(db);
     deliver(&owner).unwrap();
     let db = owner.into_inner().unwrap();

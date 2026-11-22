@@ -3,14 +3,16 @@ import { toolOperationId } from './protocol.generated.js';
 import { guardProviderReply } from './provider-response.test-helper.js';
 import { responsesMetadataText } from './responses-wire.test-helper.js';
 import { resourceScopeFixture } from './resource-scope.test-helper.js';
-import { createMemoryOwner } from './memory-owner.js';
+import { bindFixtureMemory } from './bot-memory-fixture.test-helper.js';
 import { createLiveSourceOwner } from './live-source.js';
 import { createThreadContext } from './thread-context.js';
 import { createAgentPersonalization } from '../memory/agent-personalization.js';
 import { createModelWorkLocations } from './model-work-locations.js';
-import { listWorkLocations } from './default-work-location.js';
+import { createBotWorkingDirectoryResolver, createConversationWorkLocation, listWorkLocations } from './default-work-location.js';
 import { createThreadSourceDirectory, createThreadSourcePreparer } from './thread-sources.js';
 import { createDocumentAuthority } from '../documents/authority.js';
+import { createDocumentRootGuard } from '../documents/allowed-roots.js';
+import { createWorkspaceConfig } from '../workspace/workspace-config.js';
 import { bindDocumentTextCodec } from '../documents/inspect.js';
 import { KernelStorageAdapter, createKernelWorkspaceWorkingStateAccess } from './storage-adapter.js';
 import express from 'express';
@@ -42,7 +44,8 @@ async function listen(server: Server) {
   cleanups.push(async () => { server.closeAllConnections(); await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); });
   return `http://127.0.0.1:${address.port}`;
 }
-async function fixture(reply: (body: Record<string, unknown>, response: ServerResponse) => void | Promise<void>, existingRoot?: string, existingEndpoint?: string) {
+async function fixture(reply: (body: Record<string, unknown>, response: ServerResponse) => void | Promise<void>,
+  { existingRoot, existingEndpoint, restricted = false }: { existingRoot?: string; existingEndpoint?: string; restricted?: boolean } = {}) {
   await fs.access(kernelPath);
   const root = existingRoot ?? await fs.mkdtemp(path.join(os.tmpdir(), 'varin-live-source-review-'));
   const kernel = createKernelClient({ hostId: 'live-source-review', storageRoot: root, buildVersion, kernelPath, allowCargoDevRunner: false });
@@ -66,23 +69,30 @@ async function fixture(reply: (body: Record<string, unknown>, response: ServerRe
   const configuration = { providerFamily: 'openai-responses', model: 'fixture-model', endpoint, credentialEnvironment: null, allowAnonymous: false, configurationGeneration: 1, maxOutputTokens: 64 };
   const launchErrors: unknown[] = [];
   const workspace = path.join(root, 'workspace'); await fs.mkdir(workspace, { recursive: true });
-  const documents = createDocumentAuthority({ hostId: 'live-source-review', dataDir: path.join(root, 'documents'), isAllowedRoot: async () => true, isTrusted: async () => true });
+  const workspaceConfig = createWorkspaceConfig({ env: restricted ? { VARIN_WORKSPACE_ROOT: workspace } : {} });
+  const guard = createDocumentRootGuard({ fsPromises: fs, pathModule: path, workspace: workspaceConfig });
+  const documents = createDocumentAuthority({ hostId: 'live-source-review', dataDir: path.join(root, 'documents'), isAllowedRoot: guard, isTrusted: guard });
   const storage = new KernelStorageAdapter({ client: kernel, hostId: 'live-source-review', storageRoot: root, resolveWorkspaceRoot: async id => (await documents.inspectWorkspace(id)).root });
   const workingStates = createKernelWorkspaceWorkingStateAccess(storage);
   const liveSources = createLiveSourceOwner({ documents, kernel });
   const resources = resourceScopeFixture(root, workingStates, documents, liveSources.validate, (input, consume) => storage.withResourceRead(input, consume));
   const prepare = createThreadSourcePreparer({ inspectInventory: async () => ({ kind: 'directory' }), sourceTools: mode => kernel.agentRuntimeRequest('runtime.source.tools', { mode }),  documents, workingStates, liveSources, prepareResources: resources.prepareSourceCapture });
   const personalization = createAgentPersonalization({ client: kernel, context: async () => ({ bot: false, projectId: 'selected-project' }) });
-  const prepareContext = createThreadContext({ personalization, resources, projectForWorkspace: async () => 'selected-project' });
-  kernel.setMemoryOwner(createMemoryOwner({ personalization, prepareContext }));
+  const runtime = new AgentRuntimeClient(kernel, undefined, undefined, undefined, liveSources.validate);
+  const prepareContext = createThreadContext({ personalization, resources, projectForWorkspace: async () => 'selected-project',
+    botForThread: async id => {
+      const { bot_id } = await runtime.thread(id);
+      return bot_id ? { id: bot_id, name: 'QA Bot', instructions: null, revision: 1 } : null;
+    } });
+  const closeMemory = bindFixtureMemory(kernel, runtime, root, 'live-source-review', { personalization, prepareContext });
   let closed = false;
   const close = async () => { if (closed) return; closed = true;
-    try { await storage.dispose(); await documents.dispose(); }
+    try { await closeMemory(); await storage.dispose(); await documents.dispose(); }
     finally { releaseCodec(); await kernel.close(); }
   };
   cleanups.push(close);
 
-  const adapter = new ThreadAdapter(new AgentRuntimeClient(kernel, undefined, undefined, undefined, liveSources.validate), {
+  const adapter = new ThreadAdapter(runtime, {
     resolveModel: async selection => {
       if (selection.providerId !== 'fixture-provider' || selection.modelId !== 'fixture-model') throw new Error('unselected model');
       return { configuration, credentialOwner: owner };
@@ -101,7 +111,7 @@ async function fixture(reply: (body: Record<string, unknown>, response: ServerRe
   const hostUrl = await listen(createServer(app));
   configureRuntimeUrlResolver({ apiBaseUrl: hostUrl, realtimeBaseUrl: hostUrl });
   setRuntimeExtraHeaders({ 'x-fixture-auth': 'fixture-client' });
-  return { liveSources, adapter, storage, prepare, prepareContext, submissionErrors, endpoint, personalization, workspace, documents, workingStates, close, kernel, api: createThreadsHttpAPI(), runtime: adapter.runtime, hostUrl, secret, requests, launchErrors, root, closeKernel: () => kernel.close() };
+  return { liveSources, adapter, storage, prepare, prepareContext, submissionErrors, endpoint, personalization, workspace, workspaceConfig, guard, documents, workingStates, close, kernel, api: createThreadsHttpAPI(), runtime: adapter.runtime, hostUrl, secret, requests, launchErrors, root, closeKernel: () => kernel.close() };
 }
 
 const model = { providerId: 'fixture-provider', modelId: 'fixture-model' };
@@ -117,6 +127,52 @@ function done(response: ServerResponse) {
   response.end(`data: ${JSON.stringify({ type: 'response.completed', response: { output: [{ id: `answer-${++answerSerial}`, type: 'message', content: [{ type: 'output_text', text: 'live source completed' }] }] } })}\n\n`);
 }
 const lastOutput = (body: Record<string, unknown>) => (body.input as Array<Record<string, unknown>>).findLast(item => item.type === 'function_call_output');
+
+it('accepts a Bot greeting and uses the restricted Host workspace for file and process tools on its next turn', async () => {
+  let turn = 0, processId = '';
+  const f = await fixture((body, response) => {
+    const output = lastOutput(body);
+    if (++turn === 1) return done(response);
+    if (!output) return tool(response, 'file_read', { path: 'expense-handoff/receipts.csv' }, turn);
+    const result = JSON.parse(responsesMetadataText(output.output));
+    const call = String(output.call_id);
+    if (call.startsWith('file_read-')) {
+      expect(JSON.stringify(result.content)).toContain('train,18');
+      return tool(response, 'file_write', { path: 'expense-handoff/summary.csv', content: 'category,total\ntrain,18\n' }, turn);
+    }
+    if (call.startsWith('file_write-')) return tool(response, 'process_spawn', { cwd: '', command: process.execPath,
+      args: ['-e', 'const fs=require("node:fs"); fs.copyFileSync("expense-handoff/summary.csv","expense-handoff/checked.csv")'], mode: 'pipe' }, turn);
+    if (call.startsWith('process_spawn-')) processId = result.operation_id;
+    else if (!result.content.writerActive) return done(response);
+    return tool(response, 'process_inspect', { processId }, turn);
+  }, { restricted: true });
+  const botId = 'qa', home = path.join(f.root, 'data', 'bots', botId);
+  const project = path.join(f.workspace, 'expense-handoff');
+  await fs.mkdir(home, { recursive: true });
+  await fs.mkdir(project);
+  await fs.writeFile(path.join(project, 'receipts.csv'), 'category,amount\ntrain,18\n');
+  await f.documents.resolveWorkspace({ path: project });
+  const directory = createThreadSourceDirectory({ documents: f.documents });
+  const botDirectory = createBotWorkingDirectoryResolver(f.workspaceConfig, f.guard);
+  f.runtime.deviceFileAccess = !f.workspaceConfig.lockdown;
+  f.runtime.principalCanUseHostResources = async () => true;
+  f.adapter.bindSourceDirectory(directory);
+  f.adapter.bindDefaultDeviceSource(createConversationWorkLocation({ agentRuntime: f.runtime, sourceDirectory: directory,
+    prepare: f.prepare, servicePath: f.workspace, botWorkingDirectory: () => botDirectory(home), readWorkspaceSettings: async () => ({ projects: [] }) }));
+  await f.kernel.agentRuntimeRequest('runtime.bot.gate.publish', { botId, profileRevision: 1, activityOperationId: null, permitted: true });
+  const identity = { runtime: 'agent' as const, ...await f.runtime.createBotThread(botId, 'thread:bot:qa', 'branch:bot:qa') };
+  await expect(f.api.sources.resolve(identity, { resourceOwner: { kind: 'local' }, path: home })).rejects.toMatchObject({
+    code: 'path-escape', status: 403, message: expect.stringContaining('outside the workspace') });
+  await expect(f.api.sources.resolve(identity, { resourceOwner: { kind: 'local' }, path: path.join(project, 'missing') })).rejects.toMatchObject({
+    status: 404, message: expect.stringContaining('does not exist') });
+  const first = await f.api.submit({ ...identity, key: 'hello', expectedHead: null, text: 'Hello', model });
+  await expect.poll(async () => (await f.api.run(first.run_id)).state, { timeout: 15_000 }).toBe('completed');
+  const head = (await f.runtime.thread(identity.threadId)).branches[0]!.head;
+  const next = await f.api.submit({ ...identity, key: 'expenses', expectedHead: head, text: 'Summarize the receipts', model });
+  await expect.poll(async () => (await f.api.run(next.run_id)).state, { timeout: 15_000 }).toBe('completed');
+  expect(await fs.readFile(path.join(project, 'checked.csv'), 'utf8')).toBe('category,total\ntrain,18\n');
+  expect(await fs.readdir(home)).toEqual([]);
+}, 45_000);
 
 it('explicit live source reads current disk and shares actual root with list, search, conditional edits and processes', async () => {
   const outputs: string[] = []; let serial = 0; let processId = '';
@@ -335,7 +391,7 @@ it('queued live selection reopens with fresh authority and reads changed disk wi
   const epoch = f.kernel.kernelEpoch;
   await f.close();
   await fs.writeFile(path.join(f.workspace, 'source.txt'), 'changed while Host was closed');
-  const reopened = await fixture(reply, f.root, f.endpoint);
+  const reopened = await fixture(reply, { existingRoot: f.root, existingEndpoint: f.endpoint });
   const grants = vi.spyOn(reopened.kernel, 'issueGrant');
   await reopened.adapter.retryPreparation(next.run_id);
   expect(reopened.kernel.kernelEpoch).not.toBe(epoch);

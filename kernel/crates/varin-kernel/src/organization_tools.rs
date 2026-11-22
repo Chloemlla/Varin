@@ -973,6 +973,7 @@ impl Tools {
                                     _ => None,
                                 },
                                 title_mode: None,
+                                model: None,
                             })
                         }
                         .map_err(error)?;

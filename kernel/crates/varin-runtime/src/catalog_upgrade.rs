@@ -9,6 +9,7 @@ struct Upgrade {
 }
 
 const UPGRADES: &[Upgrade] = &[
+    Upgrade { from: 101, to: 102, convert: |tx, _| threads::initialize_model_preferences(tx) },
     Upgrade { from: 100, to: 101, convert: |tx, _| branch_workspace::initialize(tx) },
     Upgrade { from: 99, to: 100, convert: |tx, _| external::upgrade_availability(tx) },
     Upgrade { from: 98, to: 99, convert: |tx, _| event_scope::upgrade(tx) },

@@ -105,8 +105,14 @@ export const createRecoveryJournalFixture = (
       return { operationId: input.operationId, workspaceId: input.workspaceId, state: operation.state, revision: operation.revision };
     },
     async getOperation(workspaceId, operationId) { return get(workspaceId, operationId); },
-    async listOperations(workspaceId, kind) {
-      return [...operations.values()].filter((operation) => operation.workspaceId === workspaceId && (!kind || operation.kind === kind)).map(clone);
+    async listOperations(workspaceId, kind, _signal, options) {
+      return [...operations.values()].filter(operation => {
+        if (operation.workspaceId !== workspaceId || (kind && operation.kind !== kind)) return false;
+        if (!options?.resumableOnly) return true;
+        const data = operation.result ?? operation.data;
+        return !operation.data.fileParticipant && !["complete", "aborted", "compensated", "needs-attention"].includes(operation.state)
+          && (operation.state !== 'planned' || data.cancelRequested === true || Boolean(data.managedPreparation));
+      }).map(clone);
     },
     async listOperationConflicts() { return []; },
     async releaseOperation(workspaceId, operationId) {

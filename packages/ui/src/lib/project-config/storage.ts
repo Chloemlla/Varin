@@ -1,3 +1,4 @@
+import { runtimeFetch, getRuntimeEndpointGeneration } from '@varin/application-client';
 import type {
   DocumentsAPI,
   FilesAPI,
@@ -30,11 +31,6 @@ export interface VarinProjectConfigRuntime {
   currentDirectory: string;
 }
 
-interface ProjectPaths {
-  canonicalConfig: string;
-  canonicalDirectory: string;
-}
-
 interface TextSnapshot {
   path: string;
   resource: VarinResourceReference;
@@ -48,11 +44,6 @@ const mutationToken = (snapshot: TextSnapshot, project: VarinProjectRef) => ({
   owner: { kind: 'project-config', id: project.id },
 });
 
-interface LoadedConfig {
-  config: VarinProjectConfig;
-  revision: string | null;
-}
-
 const normalizePath = (value: string): string => {
   const replaced = value.replace(/\\/g, '/').replace(/\/+$/, '');
   return replaced || '/';
@@ -65,21 +56,6 @@ const joinPath = (base: string, ...segments: string[]): string => {
 };
 
 const parentPath = (value: string): string => value.slice(0, value.lastIndexOf('/')) || '/';
-
-const parseConfig = (raw: string, path: string): VarinProjectConfig => {
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      throw new Error('root must be an object');
-    }
-    return parsed as VarinProjectConfig;
-  } catch (error) {
-    throw new VarinProjectConfigError(
-      `Project configuration is malformed: ${error instanceof Error ? error.message : String(error)}`,
-      { path, reason: 'malformed' },
-    );
-  }
-};
 
 const defaultRuntime = (): VarinProjectConfigRuntime | null => {
   const apis = getRegisteredRuntimeAPIs();
@@ -114,7 +90,7 @@ export const createVarinProjectConfigStore = (
     return runtime;
   };
 
-  const resolvePaths = async (project: VarinProjectRef): Promise<ProjectPaths> => {
+  const planDirectory = async (project: VarinProjectRef): Promise<string> => {
     const runtime = requireRuntime();
     const rawHome = (await runtime.files.getHomeDirectory()).trim();
     if (!rawHome) {
@@ -125,12 +101,7 @@ export const createVarinProjectConfigStore = (
     if (!/^[a-zA-Z0-9_-]+$/.test(pathId)) {
       throw new VarinProjectConfigError('Project identity is unavailable', { reason: 'unavailable' });
     }
-    const varinProjects = joinPath(home, '.config', 'varin', 'projects');
-    const canonicalConfig = joinPath(varinProjects, `${pathId}.json`);
-    return {
-      canonicalConfig,
-      canonicalDirectory: joinPath(varinProjects, pathId),
-    };
+    return joinPath(home, '.config', 'varin', 'projects', pathId, 'plans');
   };
 
   const resolveTextSnapshot = async (path: string, project?: VarinProjectRef): Promise<TextSnapshot> => {
@@ -159,93 +130,38 @@ export const createVarinProjectConfigStore = (
     };
   };
 
-  const configFromSnapshot = (snapshot: TextSnapshot): LoadedConfig | null => {
-    if (snapshot.result.status === 'missing') return null;
-    if (snapshot.result.status !== 'ready') {
-      throw new VarinProjectConfigError('Project configuration must be a UTF text file', {
-        path: snapshot.path,
-        reason: 'unsupported',
-      });
-    }
-    return {
-      config: parseConfig(snapshot.result.content, snapshot.path),
-      revision: snapshot.result.revision,
+  const endpoint = (project: VarinProjectRef) => '/api/projects/' + encodeURIComponent(project.id) + '/preferences';
+  const fetchPreferences = async (project: VarinProjectRef): Promise<VarinProjectConfig> => {
+    const response = await runtimeFetch(endpoint(project));
+    if (!response.ok) throw new VarinProjectConfigError('Unable to read project preferences', { reason: 'unavailable' });
+    return (await response.json()).preferences;
+  };
+
+  const write = async (project: VarinProjectRef, patch: Partial<VarinProjectConfig>, expected?: VarinProjectConfig) => {
+    const response = await runtimeFetch(endpoint(project), { method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      keepalive: typeof patch.projectNotes === 'string' && Object.keys(patch).length === 1 && !expected,
+      body: JSON.stringify({ patch: Object.fromEntries(Object.entries(patch).map(([key, value]) => [key, value ?? null])), expected }) });
+    if (response.status === 409) return false;
+    if (!response.ok) throw new VarinProjectConfigError('Unable to save project preferences', { reason: 'write-failed' });
+    return true;
+  };
+  const inProject = <T>(project: VarinProjectRef, operation: (checkHost: () => void) => Promise<T>) => {
+    const generation = getRuntimeEndpointGeneration();
+    const checkHost = () => {
+      if (generation !== getRuntimeEndpointGeneration()) throw new VarinProjectConfigError('Project Host changed', { reason: 'unavailable' });
     };
+    return runSerialized(generation + ':' + project.id, async () => { checkHost(); const value = await operation(checkHost); checkHost(); return value; });
   };
-
-  const writeConfigSnapshot = async (
-    project: VarinProjectRef,
-    path: string,
-    config: VarinProjectConfig,
-    expectedRevision: string | null,
-  ): Promise<{ status: 'written'; revision: string } | { status: 'conflict' }> => {
-    const runtime = requireRuntime();
-    const directory = parentPath(path);
-    const created = await runtime.files.createDirectory(directory);
-    if (created.success === false) {
-      throw new VarinProjectConfigError('Failed to create the project configuration directory', {
-        path: directory,
-        reason: 'write-failed',
-      });
-    }
-    const snapshot = await resolveTextSnapshot(path, project);
-    const encoding = snapshot.result.status === 'ready' ? snapshot.result.encoding : snapshot.result.status === 'missing' ? snapshot.result.format?.encoding ?? 'utf-8' : 'utf-8';
-    const bom = snapshot.result.status === 'ready' ? snapshot.result.bom : snapshot.result.status === 'missing' ? snapshot.result.format?.bom ?? false : false;
-    const result = await snapshot.documents.write({
-      token: mutationToken(snapshot, project),
-      resource: snapshot.resource,
-      content: `${JSON.stringify(config, null, 2)}\n`,
-      encoding,
-      bom,
-      ...(snapshot.result.status === 'ready' && snapshot.result.format ? { sourceFormat: snapshot.result.format } : {}),
-      expectedRevision,
-      operationId: crypto.randomUUID(),
-    });
-    return result.status === 'written'
-      ? { status: 'written', revision: result.revision }
-      : { status: 'conflict' };
-  };
-
-  const loadCanonical = async (
-    project: VarinProjectRef,
-    paths: ProjectPaths,
-  ): Promise<LoadedConfig> => {
-    const canonicalSnapshot = await resolveTextSnapshot(paths.canonicalConfig, project);
-    const canonical = configFromSnapshot(canonicalSnapshot);
-    if (canonical) return canonical;
-    return { config: {}, revision: null };
-  };
-
-  const read = async (project: VarinProjectRef): Promise<VarinProjectConfig> => {
-    const paths = await resolvePaths(project);
-    return runSerialized(paths.canonicalConfig, async () => (
-      (await loadCanonical(project, paths)).config
-    ));
-  };
-
-  const mutate = async (
-    project: VarinProjectRef,
-    createPatch: (current: Readonly<VarinProjectConfig>) => Partial<VarinProjectConfig> | null,
-  ): Promise<boolean> => {
-    const paths = await resolvePaths(project);
-    return runSerialized(paths.canonicalConfig, async () => {
-      const current = await loadCanonical(project, paths);
-      const patch = createPatch(current.config);
-      if (patch === null) return false;
-      const next: VarinProjectConfig = {
-        ...current.config,
-        ...patch,
-        projectPath: normalizePath(project.path),
-      };
-      const written = await writeConfigSnapshot(project, paths.canonicalConfig, next, current.revision);
-      return written.status === 'written';
+  const read = (project: VarinProjectRef) => inProject(project, () => fetchPreferences(project));
+  const mutate = (project: VarinProjectRef, createPatch: (current: Readonly<VarinProjectConfig>) => Partial<VarinProjectConfig> | null) => {
+    return inProject(project, async checkHost => {
+      const current = await fetchPreferences(project);
+      checkHost();
+      const patch = createPatch(current);
+      return patch !== null && write(project, patch, current);
     });
   };
-
-  const update = async (
-    project: VarinProjectRef,
-    patch: Partial<VarinProjectConfig>,
-  ): Promise<boolean> => mutate(project, () => patch);
+  const update = (project: VarinProjectRef, patch: Partial<VarinProjectConfig>) => inProject(project, () => write(project, patch));
 
   const readText = async (project: VarinProjectRef, path: string): Promise<string | null> => {
     const snapshot = await resolveTextSnapshot(path, project);
@@ -289,7 +205,7 @@ export const createVarinProjectConfigStore = (
 
   return {
     deleteText,
-    getPaths: resolvePaths,
+    planDirectory,
     mutate,
     read,
     readText,

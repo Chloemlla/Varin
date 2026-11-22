@@ -58,5 +58,8 @@ export class DocumentPathError extends DocumentAuthorityError {
   }
 }
 
+/** A directory selection failed before registration. Messages are safe to show to the caller. */
+export class WorkspaceDirectoryError extends DocumentAuthorityError {}
+
 export const isDocumentAuthorityError = (error: unknown): error is DocumentAuthorityError =>
   error instanceof DocumentAuthorityError;

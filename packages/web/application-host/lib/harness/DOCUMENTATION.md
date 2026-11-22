@@ -121,6 +121,11 @@ collected artifact and published log high-water remain distinct. Stored chunks b
 are not delivered output. Collection failure cannot become successful empty artifacts; explicit collect
 retries collection, not execution. Read locators are provenance, not proof of downloaded bytes.
 
+On startup the Host asks Storage for attempt identities with unfinished execution or cleanup. This
+includes output collection after Catalog has already accepted the terminal receipt. Capacity changes
+and target reconnects repeat discovery in the affected workspace. Reading a receipt, log, artifact
+or attempt is side-effect free. A repeated observation of an unchanged attempt keeps its revision.
+
 Native research adapters bind real Catalog invocations to these records and use Catalog Wait for
 observation. User submission is a User Operation. Tree cancellation reaches the original attempt and
 reconciles its late receipt; normal Run settlement/archive does not terminate independent experiments.

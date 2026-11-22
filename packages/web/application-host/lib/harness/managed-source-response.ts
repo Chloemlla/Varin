@@ -1,3 +1,4 @@
+import { egressErrorKinds } from './egress.js';
 import { decodeProjectCommandResult } from '@varin/application-client';
 import type { ManagedSourceReceiptRelease, ManagedSourceServiceCancelReceipt, SourceServiceOperation, SourceServiceResponse } from './managed-remote-types.js';
 import { parseExtensionSourceSnapshot } from '../kernel/extension-source.js';
@@ -10,6 +11,10 @@ const strings = (value: unknown): value is string[] => Array.isArray(value) && v
 const source = (value: unknown): boolean => record(value) && record(value.resource_owner) && text(value.workspace_id)
   && text(value.execution_workspace_id) && ['live_root', 'fixed_branch', 'materialized','native_workspace'].includes(String(value.mode));
 const pin = (value: unknown): boolean => record(value) && text(value.pin_id) && text(value.root) && source(value.source);
+const mcpPreparation = (value: unknown) => record(value) && text(value.server)
+  && (value.stage === 'connect' || value.stage === 'tools/list')
+  && (value.httpStatus === undefined || Number.isInteger(value.httpStatus) && Number(value.httpStatus) >= 300 && Number(value.httpStatus) <= 599)
+  && (value.network === undefined || egressErrorKinds.some(kind => kind === value.network));
 const unhandledOperation = (operation: never): never => {
   void operation;
   throw new Error('Unknown managed source response operation');
@@ -51,6 +56,7 @@ export function decodeManagedSourceResponse<Operation extends SourceServiceOpera
     case 'mcp': valid = record(value) && typeof value.executorStopped === 'boolean'
       && (value.ok === true && value.executorStopped === true && Object.hasOwn(value, 'value')
         || value.ok === false && record(value.error) && text(value.error.code) && typeof value.error.dispatched === 'boolean'
+        && (value.error.preparation === undefined || value.error.dispatched === false && value.error.settlement === 'unknown' && mcpPreparation(value.error.preparation))
         && ['unknown', 'session_expired', 'rpc_response'].includes(String(value.error.settlement))
         && value.executorStopped === (!value.error.dispatched || value.error.settlement !== 'unknown')); break;
     case 'validate': valid = record(value) && strings(value.pathScopes); break;

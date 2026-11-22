@@ -256,7 +256,9 @@ it('uses the saved original Host on first native admission, retains inherited/ch
   let preferred = '1', workspaceId = 'same', principalAllowed = true, botId: string | null = null;
   let checkpoint: {resources: {source: ReturnType<typeof resourceSource>}} | null = null;
   const readWorkspaceSettings = vi.fn(async () => ({ projects: [], workspaceLocations: rows, defaultWorkspaceLocationId: preferred }));
-  const runtime = { thread: async () => ({ branches: [], principal_id: 'owner', bot_id: botId }), context: async () => checkpoint,
+  f.runtime.thread.mockImplementation(async () => ({ thread_id: identity.threadId, branches: [{ branch_id: identity.branchId, latest_run: null }],
+    principal_id: 'owner', bot_id: botId }) as never);
+  const runtime = { context: async () => checkpoint,
     launch: async () => null, sourceTools: async () => ['file_read'], principalCanUseHostResources: async () => principalAllowed,
     organizationCreationDefaults: async () => null } as unknown as Parameters<typeof createConversationWorkLocation>[0]['agentRuntime'];
   const resolve = vi.fn<Parameters<typeof createConversationWorkLocation>[0]['sourceDirectory']['resolve']>(async input => ({ ...input, workspaceId }));
@@ -266,7 +268,7 @@ it('uses the saved original Host on first native admission, retains inherited/ch
         rootId: 'original-root', canonicalRoot: '/project' }, tools: ['file_read'] },
   }));
   f.adapter.bindDefaultDeviceSource(createConversationWorkLocation({ agentRuntime: runtime, readWorkspaceSettings,
-    prepare, sourceDirectory: { resolve }, getBot: async () => ({ homeDir: '/bots/home' }), servicePath: '/service' }));
+    prepare, sourceDirectory: { resolve }, botWorkingDirectory: async () => '/bots/home', servicePath: '/service' }));
   await f.adapter.submit(input);
   expect(f.runtime.submit).toHaveBeenLastCalledWith(expect.objectContaining({ launch: expect.objectContaining({
     inheritSource: true, source: expect.objectContaining({ resourceOwner: b, workspaceId: 'same' }), enabledTools: ['file_read'],

@@ -1,3 +1,4 @@
+import { recoveryFailure } from '../recovery/errors.js';
 import { calendarPreparationError, type CalendarPreparationStage } from '../scheduled-tasks/preparation-error.js';
 import { prepareQuoteSelections } from './thread-quotes.js';
 import { parseContentReferenceInput, type ContentReferenceInput } from '@varin/application-client';
@@ -30,7 +31,7 @@ import type { ThreadIdentity, ThreadModel, ThreadModelInfo, ThreadSubmit, Thread
 import type { InputMode, InitialContext, InputSubmitParams, InputEnqueueParams, InputResourcePreparation, ContextResources, PreparedExplicitSkill, ModelSessionConfiguration, CredentialScope, PolicyResumeReceipt } from './protocol.generated.js';
 import type { ExistingHostCredentialOwner } from './credential-owner.js';
 import { isAbortError, waitWithSignal } from '../cancellation.js';
-import { modelCredentialBindingIdentity, waitForModelBinding } from './model-binding-lifetime.js';
+import { launchModelSelection, modelCredentialBindingIdentity, waitForModelBinding } from './model-binding-lifetime.js';
 import { botModelMatches } from '../bots/bot-model.js';
 import type { AgentRuntimeClient } from './agent-runtime-client.js';
 import type { ContextPreparer } from './thread-context.js';
@@ -77,6 +78,13 @@ async function admitThreadInput<T>(method: string, submit: () => Promise<T>, rec
     }
     throw error;
   }
+}
+
+export function recoveryRangeSource(range: Awaited<ReturnType<AgentRuntimeClient['recoveryRange']>>) {
+  const selected = range.find(turn => turn.source?.resource_owner.kind === 'managed_host' && turn.source.mode !== 'fixed_branch')
+    ?? range.find(turn => turn.source && turn.source.mode !== 'fixed_branch') ?? range.find(turn => turn.source);
+  if (!selected?.source) return null;
+  return { resourceOwner: selected.source.resource_owner, workspaceId: selected.source.workspace_id, mode: selected.source.mode, runId: selected.anchor.runId };
 }
 
 /** Projection and admission only: Rust owns all conversation, queue and execution facts. */
@@ -195,17 +203,17 @@ export class ThreadAdapter {
     return this.sourceFiles.files(identity, source, options, signal, sourceRunId);
   }
   private sourceDirectory?: SourceDirectory;
-  private botWorkProfile?: (botId: string, signal: AbortSignal) => Promise<{ homeDir: string; model: ThreadModel } | null>;
+  private botWorkModel?: (botId: string, signal: AbortSignal | undefined, preference?: ThreadModel) => Promise<ThreadModel | null>;
   private conversationWorkModel?: (identity: ThreadIdentity, signal: AbortSignal) => Promise<ThreadModel | null>;
   private readonly coldWorkPreparations = new Set<string>();
-  bindBotWorkProfile(resolve: NonNullable<ThreadAdapter['botWorkProfile']>): void { this.botWorkProfile = resolve; }
+  bindBotWorkModel(resolve: NonNullable<ThreadAdapter['botWorkModel']>): void { this.botWorkModel = resolve; }
   bindConversationWorkModel(resolve: NonNullable<ThreadAdapter['conversationWorkModel']>): void { this.conversationWorkModel = resolve; }
   /** Prepare the existing durable ingress; the process that requested work does not own this launch. */
   private botInactivityMinutes: () => Promise<number> = async () => 20;
   bindBotInactivityMinutes(read: () => Promise<number>): void { this.botInactivityMinutes = read; }
   async recoverBotWork(signal: AbortSignal): Promise<void> {
     const prepareContext = this.prepareContext;
-    if (!prepareContext || (!this.botWorkProfile && !this.conversationWorkModel)) return;
+    if (!prepareContext || (!this.botWorkModel && !this.conversationWorkModel)) return;
     for (const work of await this.runtime.pendingBotWork(signal, await this.botInactivityMinutes())) {
       if (this.coldWorkPreparations.has(work.inputId)) continue;
       this.coldWorkPreparations.add(work.inputId);
@@ -215,11 +223,12 @@ export class ThreadAdapter {
           signal.throwIfAborted();
           await this.runtime.holdColdWork({ inputId: work.inputId, revision: work.revision, reason }, signal);
         };
-        let bot: { homeDir: string; model: ThreadModel } | null | undefined;
+        let botThread: Awaited<ReturnType<ThreadAdapter['requireIdentity']>> | undefined;
         let model: Awaited<ReturnType<ThreadModelAuthority['resolveModel']>> | undefined;
         try {
-          bot = work.botId ? await this.botWorkProfile?.(work.botId, signal) : null;
-          const selection = work.botId ? bot?.model : await this.conversationWorkModel?.(identity, signal);
+          if (work.botId) botThread = await this.requireIdentity(identity, signal);
+          const selection = work.botId ? await this.botWorkModel?.(work.botId, signal, botThread?.model_preference)
+            : await this.conversationWorkModel?.(identity, signal);
           if (selection) model = await waitForModelBinding(this.models.resolveModel(selection), model => model.credentialOwner.release(), signal);
         } catch (error) {
           if (!signal.aborted) await hold('model_unavailable');
@@ -230,18 +239,14 @@ export class ThreadAdapter {
           let source: ThreadSource | null = null;
           let initialContext: InitialContext;
           try {
-            const thread = await this.requireIdentity(identity, signal);
+            const thread = botThread ?? await this.requireIdentity(identity, signal);
             const workspace = thread.branches.find(b => b.branch_id === identity.branchId)?.workspace_default;
             if (workspace) {
               if (!await this.runtime.principalCanUseHostResources?.(thread.principal_id)) throw new Error('Host source access is unavailable');
               source = await this.workspaceSource(workspace, signal);
-            } else if (bot) {
-              const location = await this.resolveSource(identity, { resourceOwner: { kind: 'local' }, path: bot.homeDir }, signal);
-              source = (await this.prepareSource({ ...identity, key: work.inputId, resourceOwner: location.resourceOwner,
-                workspaceId: location.workspaceId, mode: 'live_root', content: { mode: 'saved-files' }, captureScopes: [] }, signal)).source;
             } else {
               const canUseHostSources = await this.runtime.principalCanUseHostResources?.(thread.principal_id) ?? true;
-              if (canUseHostSources) source = await this.defaultDeviceSource?.(identity) ?? null;
+              if (canUseHostSources) source = await this.defaultDeviceSource?.(identity, thread, signal) ?? null;
             }
             if (source) await this.admitSource(source, identity, undefined, signal);
             initialContext = work.botId
@@ -291,8 +296,8 @@ export class ThreadAdapter {
   bindCreationDefaults(read: NonNullable<ThreadAdapter['creationDefaults']>): void { this.creationDefaults = read; }
   private organizationCreation?: (identity: ThreadIdentity, placement: import('@varin/application-client').ConversationOrganizationPlacement) => Promise<import('@varin/application-client').ConversationCreationDefaults | null>;
   bindOrganizationCreation(prepare: NonNullable<ThreadAdapter['organizationCreation']>): void { this.organizationCreation = prepare; }
-  private defaultDeviceSource?: (identity: ThreadIdentity) => Promise<ThreadSource | null>;
-  bindDefaultDeviceSource(prepare: (identity: ThreadIdentity) => Promise<ThreadSource | null>): void { this.defaultDeviceSource = prepare; }
+  private defaultDeviceSource?: (identity: ThreadIdentity, thread: ThreadSnapshot['thread'], signal?: AbortSignal) => Promise<ThreadSource | null>;
+  bindDefaultDeviceSource(prepare: NonNullable<ThreadAdapter['defaultDeviceSource']>): void { this.defaultDeviceSource = prepare; }
   private fileResolver?: import('./thread-file-target.js').ThreadFileTargetResolver;
   private codeExchangeReader?: import('./thread-code-exchange.js').ThreadCodeExchangeReader;
   private exchangeQueue?: ReturnType<typeof import('./code-exchange-queue.js').createCodeExchangeQueue>;
@@ -347,6 +352,19 @@ export class ThreadAdapter {
     await this.requireIdentity(identity);
     if (!this.sourceDirectory) throw new Error('Source directory is unavailable');
     return this.sourceDirectory.resolve(request, signal);
+  }
+
+  private prepareRecoveryFiles?: (input: ThreadIdentity & { entryId: string }, selection: Awaited<ReturnType<ThreadAdapter['prepareNavigation']>>, signal?: AbortSignal) => Promise<import('@varin/extension-contract').WorkspaceCombinedRecoveryPrepareResult | null>;
+  bindRecoveryPlanner(planner: NonNullable<ThreadAdapter['prepareRecoveryFiles']>) { this.prepareRecoveryFiles = planner; }
+  async prepareRecovery(input: ThreadIdentity & { entryId: string }, signal?: AbortSignal) {
+    const selection = await this.prepareNavigation(input, signal);
+    try {
+      if (!this.prepareRecoveryFiles) throw new Error('File recovery is unavailable');
+      return { ...selection, fileRecovery: await this.prepareRecoveryFiles(input, selection, signal) };
+    } catch (error) {
+      signal?.throwIfAborted();
+      return { ...selection, fileRecovery: { status: 'failed' as const, failure: recoveryFailure(error) } };
+    }
   }
 
   private recoveryReader?: (identity: ThreadIdentity, signal?: AbortSignal) => Promise<NonNullable<ThreadSnapshot['recovery']>>;
@@ -513,8 +531,14 @@ export class ThreadAdapter {
     if (!this.prepareContext?.refresh) return;
     const selected = identities ?? (await this.runtime.threads()).filter(thread => thread.thread_id.startsWith('thread:'))
       .flatMap(thread => thread.branches.map(branch => ({ runtime: 'agent' as const, threadId: thread.thread_id, branchId: branch.branch_id })));
-    const results = await Promise.allSettled(selected.map(identity => this.refreshContext(identity)));
-    if (results.some(result => result.status === 'rejected')) throw new Error('Personalization refresh requires attention');
+    // Each refresh holds the branch checkpoint while the Host prepares its extension context.
+    // Release it before visiting another branch during a settings change.
+    let failed = false;
+    for (const identity of selected) {
+      try { await this.refreshContext(identity); }
+      catch { failed = true; }
+    }
+    if (failed) throw new Error('Personalization refresh requires attention');
   }
 
   async openProcessTerminal(input: ThreadIdentity & { operationId: string }) {
@@ -833,9 +857,20 @@ export class ThreadAdapter {
     const principalId = currentRequestPrincipal();
     return this.runtime.threadCatalog({ ...options, ...(principalId !== undefined ? { principalId } : {}) }, signal);
   }
-  update(input: import('@varin/application-client').ThreadUpdate) {
+  async update(input: import('@varin/application-client').ThreadUpdate) {
     const { runtime: _runtime, ...command } = input;
-    return this.runtime.updateThread(command);
+    if (command.model) {
+      const thread = await this.runtime.thread(command.threadId);
+      if (!thread.bot_id || thread.parent_thread_id) throw new Error('Conversation model settings require a Bot conversation');
+    }
+    const updated = await this.runtime.updateThread(command);
+    if (command.model && updated.model_preference) {
+      for (const branch of updated.branches) {
+        if (branch.active_run_id) await this.refreshBotModel({ runtime: 'agent', threadId: updated.thread_id,
+          branchId: branch.branch_id, runId: branch.active_run_id });
+      }
+    }
+    return updated;
   }
   async delete(input: import('@varin/application-client').ThreadDelete) {
     const { runtime: _runtime, ...command } = input;
@@ -884,21 +919,21 @@ export class ThreadAdapter {
   async recoverySource(input: ThreadIdentity & { entryId: string }, signal?: AbortSignal) {
     await this.requireIdentity(input);
     const range = await this.runtime.recoveryRange({ threadId: input.threadId, branchId: input.branchId, entryId: input.entryId }, signal);
-    const selected = range.find(turn => turn.source?.resource_owner.kind === 'managed_host' && turn.source.mode !== 'fixed_branch')
-      ?? range.find(turn => turn.source && turn.source.mode !== 'fixed_branch') ?? range.find(turn => turn.source);
-    if (!selected?.source) return null;
-    return { resourceOwner: selected.source.resource_owner, workspaceId: selected.source.workspace_id, mode: selected.source.mode, runId: selected.anchor.runId };
+    return recoveryRangeSource(range);
   }
-  async prepareNavigation(input: ThreadIdentity & { entryId: string }, signal?: AbortSignal) {
+  async prepareNavigation(input: ThreadIdentity & { entryId: string }, signal?: AbortSignal): ReturnType<import('@varin/application-client').ThreadsAPI['prepareNavigation']> {
     await this.requireIdentity(input);
     const selection = await this.runtime.prepareNavigation({ threadId: input.threadId, branchId: input.branchId, entryId: input.entryId }, signal);
-    const reference = await this.recoveryEntry(input, signal);
-    if (reference.source !== 'user') return selection;
+    const { editorEntry: reference, ...navigation } = selection;
+    if (!reference) return navigation;
     const selected = await this.runtime.historyItem(reference, signal);
     const attachments = (selected.content as { attachments?: import('@varin/protocol').StoredMedia[] }).attachments;
     const imageReferences = (selected.content as { imageReferences?: number[] }).imageReferences;
     const quoteContent = selected.content as ContentReferenceInput & { fileAttachments?: import('@varin/protocol').Attachment[]; attachmentImageReferences?: Record<string, number> };
-    const quoteSelection = { ...selection,
+    const textFields = selected.content as { userText?: unknown; text?: unknown } | null;
+    const editorText = typeof selected.content === 'string' ? selected.content : textFields?.userText ?? textFields?.text;
+    const quoteSelection = { ...navigation,
+      ...(typeof editorText === 'string' ? { editorText } : {}),
       ...(quoteContent.contentReferences === undefined ? {} : { editorContentReferences: quoteContent.contentReferences }),
       ...(quoteContent.contentReferenceOccurrences === undefined ? {} : { editorContentReferenceOccurrences: quoteContent.contentReferenceOccurrences }),
       ...(quoteContent.fileAttachments === undefined ? {} : { editorAttachments: quoteContent.fileAttachments }),
@@ -1160,7 +1195,7 @@ export class ThreadAdapter {
         // Existing branch source wins; a fresh source-less conversation uses its creation default.
         const workspace = thread.branches.find(b => b.branch_id === input.branchId)?.workspace_default;
         const candidateSource = input.source !== undefined ? input.source
-          : workspace ? await this.workspaceSource(workspace) : await this.defaultDeviceSource?.(input) ?? null;
+          : workspace ? await this.workspaceSource(workspace) : await this.defaultDeviceSource?.(input, thread) ?? null;
         const command: InputSubmitParams = { key: input.key, threadId: input.threadId, branchId: input.branchId,
           ...(workspace ? { expectedWorkspaceRevision: workspace.revision } : {}),
           expectedHead: input.expectedHead, input: preparedInput, configuration: model.configuration,
@@ -1465,19 +1500,34 @@ export class ThreadAdapter {
     } finally { model.credentialOwner.release(); }
   }
 
-  /** Profile updates affect live work; finished Runs keep their historical configuration. */
-  async refreshBotModel(input: ThreadIdentity & { runId: string; key: string; model: ThreadModel }, signal?: AbortSignal): Promise<void> {
-    const run = await this.requireRun(input.runId, signal);
-    if (run.cancel_requested || ['completed', 'failed', 'cancelled'].includes(run.state)) return;
-    const selected = await this.runtime.modelSelections(run.id, signal);
-    if (botModelMatches(selected.desired?.configuration ?? run.configuration as ModelSessionConfiguration, input.model)) return;
-    try {
-      await this.selectModel({ ...input, key: `${input.key}:${selected.desired?.revision ?? 0}` }, signal);
-    } catch (error) {
+  private readonly botModelUpdates = new Map<string, Promise<void>>();
+
+  /** Read the current conversation preference at the point of applying it. A slow
+   * profile refresh and a newer composer edit must finish in the same order. */
+  refreshBotModel(input: ThreadIdentity & { runId: string; model?: ThreadModel }, signal?: AbortSignal): Promise<void> {
+    const previous = this.botModelUpdates.get(input.runId);
+    const next = (previous ?? Promise.resolve()).catch(() => {}).then(async () => {
       signal?.throwIfAborted();
-      const current = await this.runtime.run(run.id, signal);
-      if (!current.cancel_requested && !['completed', 'failed', 'cancelled'].includes(current.state)) throw error;
-    }
+      const thread = await this.runtime.thread(input.threadId, signal);
+      if (!thread.bot_id || thread.parent_thread_id) return;
+      const run = await this.requireRun(input.runId, signal);
+      if (run.cancel_requested || ['completed', 'failed', 'cancelled'].includes(run.state)) return;
+      const model = input.model ? thread.model_preference ?? input.model
+        : await this.botWorkModel?.(thread.bot_id, signal, thread.model_preference);
+      if (!model) throw new Error('Bot model is unavailable. Select an available model in this conversation or in Bot settings.');
+      const selected = await this.runtime.modelSelections(run.id, signal);
+      if (botModelMatches(selected.desired?.configuration ?? run.configuration as ModelSessionConfiguration, model)) return;
+      const digest = createHash('sha256').update(JSON.stringify(model)).digest('hex');
+      const key = ['bot-model', run.id, digest, selected.desired?.revision ?? 0].join(':');
+      try { await this.selectModel({ ...input, model, key }, signal); }
+      catch (error) {
+        signal?.throwIfAborted();
+        const current = await this.runtime.run(run.id, signal);
+        if (!current.cancel_requested && !['completed', 'failed', 'cancelled'].includes(current.state)) throw error;
+      }
+    });
+    this.botModelUpdates.set(input.runId, next);
+    return next.finally(() => { if (this.botModelUpdates.get(input.runId) === next) this.botModelUpdates.delete(input.runId); });
   }
 
   assertImagesSupported(images: readonly unknown[] | undefined, configuration: unknown): void {
@@ -1700,21 +1750,15 @@ export class ThreadAdapter {
           await waitWithSignal(admission, signal);
         }
         // live_root is validated by rebindLaunch's existing LiveSource owner.
-        if (this.botWorkProfile && run.thread_id.startsWith('thread:')) {
-          const thread = await this.runtime.thread(run.thread_id, signal);
-          if (thread.bot_id && !thread.parent_thread_id) {
-            const profile = await this.botWorkProfile(thread.bot_id, signal);
-            if (!profile) throw new Error('Bot model is unavailable. Select an available model in Bot settings.');
-            const key = `bot-profile:${createHash('sha256').update(JSON.stringify(profile.model)).digest('hex')}`;
-            await this.refreshBotModel({ ...identity, runId, key, model: profile.model }, signal);
-          }
+        if (this.botWorkModel && run.thread_id.startsWith('thread:')) {
+          await this.refreshBotModel({ ...identity, runId }, signal);
         }
         let owner: ExistingHostCredentialOwner | undefined;
         let desiredOwner: ExistingHostCredentialOwner | undefined;
         try {
           const selected = await this.runtime.modelSelections(runId, signal);
           const desired = selected.desired;
-          const initial = selected.exchange_closed ? desired : selected.active;
+          const initial = launchModelSelection(selected);
           if (initial?.status === 'failed') throw new Error(`Selected model preparation failed: ${initial.failure ?? 'model unavailable'}`);
           const configuration = initial?.configuration ?? run.configuration as ModelSessionConfiguration;
           const scope = initial ? initial.credential_scope : launch.selection.credential_scope;
@@ -1745,7 +1789,6 @@ export class ThreadAdapter {
             if (['completed', 'failed', 'cancelled'].includes(retainedRun.state)) return;
           }
           signal.throwIfAborted();
-          this.runtime.releaseMainModelCredentials(runId, selected);
           const selectedOwner = desiredOwner ?? (initial?.id === desired?.id ? owner : undefined);
           if (desired && selectedOwner) {
             // Reattach the original selection, including its frozen child catalog.

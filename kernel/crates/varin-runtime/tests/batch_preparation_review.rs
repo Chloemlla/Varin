@@ -129,13 +129,7 @@ impl ModelProvider for Provider {
             }]
         };
         for item in items {
-            emit(ProviderEvent::ItemCompleted { item }).map_err(|e| ModelFailure {
-                tool_name: None,
-                code: e.code,
-                message: e.message,
-                retry_after_ms: None,
-                provider_request_id: None,
-            })?;
+            emit(ProviderEvent::ItemCompleted { item }).map_err(|e| ModelFailure::new(e.code, e.message))?;
         }
         Ok(if first {
             FinishReason::ToolCalls

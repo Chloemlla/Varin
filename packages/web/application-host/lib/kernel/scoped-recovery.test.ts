@@ -64,8 +64,12 @@ it('uses a device grant for outside recovery paths and includes standalone dirty
   await withFileRecoveryEditors(documents, selected, [address], async blocked => {
     expect(blocked[address]).toContain('unsaved editor changes');
   });
-  expect(barrier).toHaveBeenCalledWith('outside-editor', [''], expect.anything());
+  expect(barrier).toHaveBeenCalledWith('outside-editor', ['.'], expect.anything());
   expect(settle).toHaveBeenCalledOnce(); expect(release).toHaveBeenCalledOnce();
+  const invalidate = vi.fn();
+  await withFileRecoveryEditors({ ...documents, inspectDirtyBuffers: async () => [], invalidateRestoredFile: invalidate },
+    selected, [address], async () => [address], result => result);
+  expect(invalidate).toHaveBeenCalledWith({ workspaceId: 'outside-editor', resourceId: '' });
   expect(h.adapter.fileAuthorityContext).not.toHaveBeenCalled();
 });
 

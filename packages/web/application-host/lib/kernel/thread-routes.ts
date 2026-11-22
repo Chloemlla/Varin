@@ -10,6 +10,7 @@ import { parseThreadMaterials } from './thread-material-input.js';
 import { normalizeThreadSourcePreparation, parseSourceResourceOwner } from './thread-sources.js';
 import { parseContentReferenceInput, type ContentReferenceInput, threadSourceFailureMessage } from '@varin/application-client';
 import { sourceFailureCode } from './source-admission-error.js';
+import { WorkspaceDirectoryError } from '../documents/errors.js';
 import type { McpElicitationResponse, McpSamplingRequestAction, McpSamplingOutputAction } from '@varin/protocol';
 import type { OutputMediaHolder } from '@varin/protocol';
 import { parseComputerWorkRef, parseComputerExecutionRef } from '@varin/protocol';
@@ -252,6 +253,7 @@ export function registerThreadRoutes(app: Express, adapter: ThreadAdapter, requi
     'plan/update': ['runtime', 'threadId', 'branchId', 'key', 'expectedHeadId', 'expectedRef', 'content'],
     'recovery/source': ['runtime', 'threadId', 'branchId', 'entryId'],
     'navigation/prepare': ['runtime', 'threadId', 'branchId', 'entryId'],
+    'navigation/prepare-files': ['runtime', 'threadId', 'branchId', 'entryId'],
     navigate: ['runtime', 'threadId', 'branchId', 'key', 'expectedHeadId', 'targetHeadId', 'undoOf'],
     'navigation/receipt': ['runtime', 'threadId', 'branchId', 'key'],
     fork: ['runtime', 'threadId', 'branchId', 'key', 'headId'],
@@ -310,6 +312,10 @@ export function registerThreadRoutes(app: Express, adapter: ThreadAdapter, requi
           const status = reason.failure.status === 'denied' ? 403 : reason.failure.status === 'stale' ? 409
             : reason.failure.status === 'missing' ? 404 : reason.failure.status === 'unavailable' ? 503 : 400;
           response.status(status).json({ code: reason.code, error: reason.message, ...(error instanceof ThreadPreAdmissionError ? { admission: 'not_started' } : {}) }); return;
+        }
+        if (reason instanceof WorkspaceDirectoryError) {
+          response.status(reason.statusCode).json({ code: reason.code === 'failed' ? 'resource-directory-unavailable' : reason.code,
+            error: reason.message, ...(error instanceof ThreadPreAdmissionError ? { admission: 'not_started' } : {}) }); return;
         }
         if (reason instanceof WorkspaceBackendUnavailableError) {
           response.status(503).json({ code: reason.code, error: reason.message, admission: 'not_started' }); return;
@@ -647,6 +653,7 @@ export function registerThreadRoutes(app: Express, adapter: ThreadAdapter, requi
     for (const field of ['pinned', 'archived']) if (body[field] !== undefined && typeof body[field] !== 'boolean') throw new Error('Thread flag must be boolean');
     if (body.titleMode !== undefined && body.titleMode !== 'automatic' && body.titleMode !== 'manual') throw new Error('Invalid title mode');
     return adapter.update({ ...catalogIdentity(body), key: text(body.key), expectedRevision: revision(body.expectedRevision),
+      ...(body.model === undefined ? {} : { model: modelSelection(body.model) }),
       ...(body.titleMode === undefined ? {} : { titleMode: body.titleMode }),
       ...(body.title === undefined ? {} : { title: text(body.title) }),
       ...(body.pinned === undefined ? {} : { pinned: body.pinned as boolean }),
@@ -656,6 +663,7 @@ export function registerThreadRoutes(app: Express, adapter: ThreadAdapter, requi
   post('read', 'write', body => adapter.markRead({ ...catalogIdentity(body), key: text(body.key), throughCursor: revision(body.throughCursor) }));
   post('create', 'write', body => adapter.create(text(body.key), body.organization === undefined ? undefined : { organization: parseConversationOrganizationPlacement(body.organization) }));
   post('recovery/source', 'read', (body, signal) => adapter.recoverySource({ ...identity(body), entryId: text(body.entryId) }, signal));
+  post('navigation/prepare-files', 'write', (body, signal) => adapter.prepareRecovery({ ...identity(body), entryId: text(body.entryId) }, signal));
   post('navigation/prepare', 'read', (body, signal) => adapter.prepareNavigation({ ...identity(body), entryId: text(body.entryId) }, signal));
   post('tree', 'read', (body, signal) => adapter.conversationTree(identity(body), signal));
   post('tree/preview', 'read', (body, signal) => adapter.treePreview(identity(body), { firstItemId: text(body.firstItemId), lastItemId: text(body.lastItemId), ...(body.query === undefined ? {} : { query: text(body.query) }) }, signal));

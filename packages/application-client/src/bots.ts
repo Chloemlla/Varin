@@ -147,6 +147,7 @@ export interface BotPresence {
   replying: string[];
 }
 
+export type BotMemoryOwner = 'bot' | 'user' | { threadId: string };
 export interface BotMemoryItem {
   id: number;
   content: string;
@@ -191,14 +192,14 @@ export interface BotsAPI {
     create(botId: string, options?: { key?: string; organization?: import('./conversation-organization.js').ConversationOrganizationPlacement }): Promise<BotSession>;
   };
   memory: {
-    list(botId: string, signal?: AbortSignal, includeInactive?: boolean): Promise<BotMemoryItem[]>;
-    history(botId: string, id: number, signal?: AbortSignal): Promise<BotMemoryItem[]>;
-    source(botId: string, id: number, signal?: AbortSignal): Promise<MemorySourceExcerpt[]>;
-    update(botId: string, item: BotMemoryItem, action: 'correct' | 'forget' | 'archive', content?: string): Promise<void>;
+    list(botId: string, signal?: AbortSignal, includeInactive?: boolean, owner?: BotMemoryOwner): Promise<BotMemoryItem[]>;
+    history(botId: string, id: number, signal?: AbortSignal, owner?: BotMemoryOwner): Promise<BotMemoryItem[]>;
+    source(botId: string, id: number, signal?: AbortSignal, owner?: BotMemoryOwner): Promise<MemorySourceExcerpt[]>;
+    update(botId: string, item: BotMemoryItem, action: 'correct' | 'forget' | 'archive', content?: string, owner?: BotMemoryOwner): Promise<void>;
     organize?(botId: string, input: { ids?: number[]; reason?: string; query?: string }): Promise<BotMemoryMaintenance>;
     maintenance?(botId: string, signal?: AbortSignal): Promise<BotMemoryMaintenance[]>;
     cancelMaintenance?(botId: string, key: string): Promise<void>;
-    restore?(botId: string, current: BotMemoryItem, previous: BotMemoryItem): Promise<void>;
-    clearHistory?(botId: string, ids: number[]): Promise<void>;
+    restore?(botId: string, current: BotMemoryItem, previous: BotMemoryItem, owner?: BotMemoryOwner): Promise<void>;
+    clearHistory?(botId: string, ids: number[], owner?: BotMemoryOwner): Promise<void>;
   };
 }

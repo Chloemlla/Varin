@@ -9,6 +9,7 @@ import {
   createDocumentAuthorityHarness,
   type DocumentAuthorityHarness,
 } from '../documents/contract-fixtures.js';
+import { ThreadRecoverySelection } from './thread-navigation.js';
 import { createWorkspaceRecoveryCapabilityHandler } from './capability.js';
 import { createWorkspaceRecoveryEngine } from './journal-engine.js';
 import { createRecoveryFileStore } from './file-store.test-helper.js';
@@ -68,13 +69,7 @@ describe('Web Application Host workspace recovery service', () => {
       sessionNavigation: {
         commit: async () => ({ alreadyApplied: false, markerId: 'service-marker', snapshot: {} }),
         commitLeaf: async () => ({ alreadyApplied: false, markerId: 'service-undo', snapshot: {} }),
-        prepare: async () => ({
-          currentLeafId: 'service-current-leaf',
-          expectedLeafId: 'service-current-leaf',
-          removedEntryIds: ['service-user-1', 'service-assistant-1'],
-          targetId: 'service-assistant-1',
-          targetLeafId: 'service-before-leaf',
-        }),
+        prepare: async () => { throw new Error('the native selection was already captured'); },
         prepareLeaf: async ({ targetLeafId }) => ({
           currentLeafId: 'service-before-leaf',
           expectedLeafId: 'service-before-leaf',
@@ -93,11 +88,11 @@ describe('Web Application Host workspace recovery service', () => {
     expect(await api.status(activeHarness.identity.workspaceId)).toMatchObject({
       status: 'ready', capabilities: { combined: true, journal: true },
     });
-    const combined = await api.prepareCombinedRecovery({
-      entryId: 'service-user-1',
-      conversation: { kind: 'thread', threadId: 'service-session-1', branchId: 'branch-1' },
+    const selected = new ThreadRecoverySelection({
+      entryId: 'service-user-1', conversation: { kind: 'thread', threadId: 'service-session-1', branchId: 'branch-1' },
       workspaceId: activeHarness.identity.workspaceId,
-    });
+    }, async () => ({ expectedLeafId: 'service-current-leaf', removedEntryIds: ['service-user-1', 'service-assistant-1'], targetLeafId: 'service-before-leaf' }));
+    const combined = await selected.prepare(activeRuntime);
     expect(combined).toMatchObject({
       status: 'ready',
       plan: {

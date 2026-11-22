@@ -33,7 +33,7 @@ pub struct NavigationSelection {
     pub target_head_id: Option<String>,
     pub removed_entry_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub editor_text: Option<String>,
+    pub editor_entry: Option<history_views::HistoryReference>,
 }
 pub struct NavigationRead {
     thread: String,
@@ -131,26 +131,96 @@ pub(super) fn idle(db: &Connection, thread: &str, branch: &str) -> Result<Option
     }
     Ok(head)
 }
-fn ancestry(
+fn removed_entries(
     db: &Connection,
     thread: &str,
-    head: Option<String>,
+    mut head: Option<String>,
     stop: Option<&str>,
-) -> Result<Vec<HistoryItem>> {
-    let mut cursor = head;
-    let mut result = Vec::new();
-    while cursor.as_deref() != stop {
-        let key = cursor.ok_or_else(|| {
+) -> Result<Vec<String>> {
+    let mut parent = db.prepare("SELECT parent FROM history WHERE id=?1 AND thread_id=?2")?;
+    let mut removed = Vec::new();
+    while head.as_deref() != stop {
+        let id = head.ok_or_else(|| {
             RuntimeError::Conflict("navigation target is not on the selected ancestry".into())
         })?;
-        let item: HistoryItem = record(db, "history", &key)?;
+        head = parent.query_row(params![id, thread], |row| row.get(0))?;
+        removed.push(id);
+    }
+    Ok(removed)
+}
+/// A tool batch starts in one model response. Its outputs are appended together
+/// after admitting the request; only this exchange can straddle the chosen cut.
+/// The catalog already records call ids on assistant entries and writes tool
+/// results under the original request/call tuple, including on older databases.
+fn validate_cut(
+    db: &Connection,
+    content: &crate::content::ContentStore,
+    thread: &str,
+    head: Option<&str>,
+) -> Result<()> {
+    use crate::execution::{HistoryPairing, HistoryPart, model_request_from_history_id};
+    let mut cursor = head.map(str::to_owned);
+    let mut request = None;
+    let mut tail = Vec::new();
+    while let Some(id) = cursor {
+        if let Some(request_id) = request.as_deref() {
+            if model_request_from_history_id(&id) != Some(request_id) {
+                break;
+            }
+        }
+        let item: HistoryItem = record(db, "history", &id)?;
         if item.thread_id != thread {
             return Err(RuntimeError::Conflict("history owner changed".into()));
         }
+        if item.source == HistorySource::Assistant {
+            if let Some(request_id) = model_request_from_history_id(&id) {
+                request = Some(request_id.to_owned());
+            }
+        }
         cursor = item.parent.clone();
-        result.push(item);
+        tail.push(item);
     }
-    Ok(result)
+    let result_prefix = request.as_ref().map(|id| format!("{id}:result:"));
+    let mut pairing = HistoryPairing::default();
+    let invalid = |err: crate::execution::ExecutionError| RuntimeError::Invalid(err.to_string());
+    for item in tail.into_iter().rev() {
+        let result_id = result_prefix
+            .as_deref()
+            .and_then(|prefix| item.id.strip_prefix(prefix));
+        let part = match (item.source, result_id) {
+            (HistorySource::User, _) => HistoryPart::Other,
+            (HistorySource::Assistant, _)
+                if model_request_from_history_id(&item.id).is_some()
+                    && item.content.get("history_text").is_some() =>
+            {
+                item.content["history_call_id"]
+                    .as_str()
+                    .map_or(HistoryPart::Assistant, HistoryPart::Call)
+            }
+            (HistorySource::Tool, Some(call_id)) => HistoryPart::Result(call_id),
+            _ => {
+                let item = content.load_stored_history_item(item, &|| false)?;
+                if item.source == HistorySource::Environment
+                    && item.content["kind"] == "calendar_input"
+                {
+                    pairing.observe(HistoryPart::Other).map_err(invalid)?;
+                } else {
+                    // Stored media holders are sufficient; pairing never needs their bytes.
+                    let original: crate::execution::ConversationItem<Value> =
+                        serde_json::from_value(item.content)?;
+                    pairing
+                        .observe(HistoryPart::from_content(
+                            &original.content,
+                            &original.provenance,
+                        ))
+                        .map_err(invalid)?;
+                }
+                continue;
+            }
+        };
+        pairing.observe(part).map_err(invalid)?;
+    }
+    pairing.finish().map_err(invalid)
 }
 impl Catalog {
     pub fn capture_navigation(
@@ -356,14 +426,13 @@ impl Catalog {
 impl NavigationRead {
     pub fn load(self) -> Result<NavigationSelection> {
         let db = history_views::current_history_owner(&self.database, self.epoch)?;
-        let mut removed = ancestry(&db, &self.thread, self.head.clone(), Some(&self.entry))?;
+        let mut removed = removed_entries(&db, &self.thread, self.head.clone(), Some(&self.entry))?;
         let selected: HistoryItem = record(&db, "history", &self.entry)?;
         if selected.thread_id != self.thread {
             return Err(RuntimeError::Conflict(
                 "selected history owner differs".into(),
             ));
         }
-        let selected = self.content.hydrate_history(selected)?;
         let before = selected.source == HistorySource::User;
         let target = if before {
             selected.parent.clone()
@@ -371,29 +440,18 @@ impl NavigationRead {
             Some(selected.id.clone())
         };
         if before {
-            removed.push(selected.clone());
+            removed.push(selected.id.clone());
         }
-        let mut remaining = ancestry(&db, &self.thread, target.clone(), None)?;
-        remaining.reverse();
-        crate::execution::validate_history_pairs(&context_jobs::hydrate_source(
-            &self.content,
-            remaining,
-        )?)
-        .map_err(|e| RuntimeError::Invalid(e.to_string()))?;
+        validate_cut(&db, &self.content, &self.thread, target.as_deref())?;
+        let editor_entry = before
+            .then(|| history_views::HistoryReference::try_from(selected))
+            .transpose()?;
         history_views::current_history_owner(&self.database, self.epoch)?;
         Ok(NavigationSelection {
             expected_head_id: self.head,
             target_head_id: target,
-            removed_entry_ids: removed.into_iter().map(|item| item.id).collect(),
-            editor_text: if before {
-                selected
-                    .content
-                    .get("userText").or_else(|| selected.content.get("text"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            } else {
-                None
-            },
+            removed_entry_ids: removed,
+            editor_entry,
         })
     }
 }
@@ -420,7 +478,7 @@ impl NavigationPreparation {
         }
         let db = history_views::current_history_owner(&database, epoch)?;
         content.save(&intent(&command)?)?;
-        if let Some(undo) = &command.undo_of {
+        let removed = if let Some(undo) = &command.undo_of {
             let (_, original) = receipt(&db, &command.branch_id, undo)?
                 .ok_or_else(|| RuntimeError::NotFound("original navigation receipt".into()))?;
             if original.head_id != command.expected_head_id
@@ -430,29 +488,16 @@ impl NavigationPreparation {
                     "undo no longer matches the original navigation".into(),
                 ));
             }
+            Vec::new()
         } else {
-            ancestry(
+            removed_entries(
                 &db,
                 &command.thread_id,
                 command.expected_head_id.clone(),
                 command.target_head_id.as_deref(),
-            )?;
-        }
-        let mut remaining = ancestry(
-            &db,
-            &command.thread_id,
-            command.target_head_id.clone(),
-            None,
-        )?;
-        let ids = remaining
-            .iter()
-            .map(|item| item.id.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        remaining.reverse();
-        crate::execution::validate_history_pairs(&context_jobs::hydrate_source(
-            &content, remaining,
-        )?)
-        .map_err(|e| RuntimeError::Invalid(e.to_string()))?;
+            )?
+        };
+        validate_cut(&db, &content, &command.thread_id, command.target_head_id.as_deref())?;
         let mut preserved_checkpoint = None;
         let checkpoint = checkpoint
             .map(|read| -> Result<_> {
@@ -480,7 +525,7 @@ impl NavigationPreparation {
                     .proposal
                     .through_id
                     .as_ref()
-                    .is_some_and(|id| !ids.contains(id))
+                    .is_some_and(|id| removed.contains(id))
                 {
                     value.proposal.through_id = None;
                     value.proposal.summary.clear();
@@ -508,5 +553,160 @@ impl NavigationPreparation {
             previous,
             _publication,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_submission::InputAdmission;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn navigation_last_three_turns_reads_only_the_selected_input_and_rejects_half_a_tool_batch() {
+        let root = std::env::temp_dir().join(format!("navigation-cut-{}", id()));
+        let mut db = Catalog::open(&root).unwrap();
+        db.create_thread("thread", "main").unwrap();
+        let run = db
+            .submit(&SubmitInput {
+                key: "start".into(),
+                thread_id: "thread".into(),
+                branch_id: "main".into(),
+                expected_head: None,
+                input: json!({"text":"draft"}),
+                configuration: json!({}),
+            })
+            .unwrap();
+        let first: HistoryItem = record(&db.db, "history", &run.input_id).unwrap();
+        let ordinary = db
+            .content
+            .save_history(
+                &json!({"content":{"kind":"text","text":"ok"},"provenance":{"kind":"assistant"}}),
+                &None,
+            )
+            .unwrap();
+        let call = |id: &str| {
+            db.content.save_history(&json!({"content":{"kind":"tool_call","call":{"call_id":id}},"provenance":{"kind":"assistant"}}), &None).unwrap()
+        };
+        let calls = [call("one"), call("two")];
+        let results = ["one", "two"].map(|id| db.content.save_history(
+            &json!({"provenance":{"kind":"tool_data","call_id":id},"content":{"kind":"tool_result","result":{"call_id":id,"completion":{"kind":"not_dispatched","reason":"cancelled"}}}}), &None).unwrap());
+        let tx = db.db.transaction().unwrap();
+        let mut head = first.id.clone();
+        let mut append = |id: String, source: HistorySource, content: &Value| {
+            let item = HistoryItem {
+                id,
+                source,
+                parent: Some(head.clone()),
+                content: content.clone(),
+                ..first.clone()
+            };
+            tx.execute(
+                "INSERT INTO history(id,thread_id,parent,body,run_id) VALUES(?1,?2,?3,?4,?5)",
+                params![
+                    item.id,
+                    item.thread_id,
+                    item.parent,
+                    encode(&item).unwrap(),
+                    item.run_id
+                ],
+            )
+            .unwrap();
+            head = item.id;
+        };
+        for turn in 0..500 {
+            if turn != 0 {
+                append(format!("input-{turn}"), HistorySource::User, &first.content);
+            }
+            let request = format!("request:{turn}");
+            if turn == 495 {
+                for (i, reference) in calls.iter().enumerate() {
+                    append(
+                        crate::execution::model_history_id(&request, &i.to_string()),
+                        HistorySource::Assistant,
+                        reference,
+                    );
+                }
+                for (id, reference) in ["one", "two"].into_iter().zip(&results) {
+                    append(
+                        format!("{request}:result:{id}"),
+                        HistorySource::Tool,
+                        reference,
+                    );
+                }
+            } else {
+                append(
+                    crate::execution::model_history_id(&request, "answer"),
+                    HistorySource::Assistant,
+                    &ordinary,
+                );
+            }
+        }
+        tx.execute("UPDATE branches SET head=?1 WHERE id='main'", [&head])
+            .unwrap();
+        tx.commit().unwrap();
+        let active = db.run(&run.run_id).unwrap();
+        let active = db
+            .transition_run(&active.id, db.epoch(), active.revision, RunState::Runnable)
+            .unwrap();
+        db.transition_run(&active.id, db.epoch(), active.revision, RunState::Completed)
+            .unwrap();
+
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&reads);
+        db.content.set_history_read_hook(Some(Arc::new(move |id| {
+            observed.lock().unwrap().push(id.to_string())
+        })));
+        assert!(
+            db.capture_navigation("thread", "main", "request:495:result:one")
+                .unwrap()
+                .load()
+                .is_err()
+        );
+        db.capture_navigation("thread", "main", "request:495:result:two")
+            .unwrap()
+            .load()
+            .unwrap();
+        let preview = db
+            .capture_navigation("thread", "main", "input-497")
+            .unwrap()
+            .load()
+            .unwrap();
+        assert_eq!(preview.removed_entry_ids.len(), 6);
+        let editor = preview.editor_entry.as_ref().unwrap();
+        assert_eq!(editor.id, "input-497");
+        assert!(reads.lock().unwrap().is_empty());
+        let draft = db.content.load_stored_history_item(record(&db.db, "history", &editor.id).unwrap(), &|| false).unwrap();
+        assert_eq!(draft.content["text"], "draft");
+        let command = NavigationCommand {
+            key: "rewind".into(),
+            thread_id: "thread".into(),
+            branch_id: "main".into(),
+            expected_head_id: preview.expected_head_id,
+            target_head_id: preview.target_head_id,
+            undo_of: None,
+            preserved_plan: None,
+        };
+        let prepared = db
+            .prepare_navigation(command.clone())
+            .unwrap()
+            .load()
+            .unwrap();
+        let receipt = db.commit_navigation(prepared).unwrap();
+        let undo = NavigationCommand {
+            key: "undo".into(),
+            expected_head_id: receipt.head_id,
+            target_head_id: receipt.previous_head_id,
+            undo_of: Some("rewind".into()),
+            ..command
+        };
+        let prepared = db.prepare_navigation(undo).unwrap().load().unwrap();
+        assert_eq!(
+            db.commit_navigation(prepared).unwrap().head_id.as_ref(),
+            Some(&head)
+        );
+        assert_eq!(*reads.lock().unwrap(), ["input-497"]);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

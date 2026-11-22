@@ -13,6 +13,7 @@ import {
   type JsonValue,
 } from '@varin/extension-contract';
 import type { HostCapabilityCallContext, HostCapabilityHandler } from '@varin/extension-host';
+import { ThreadRecoverySelection } from './thread-navigation.js';
 import type { WorkspaceRecoveryEngine } from './engine.js';
 
 const asRecord = (value: unknown, label: string): Record<string, unknown> => {
@@ -56,7 +57,9 @@ export const createWorkspaceRecoveryCapabilityHandler =
     }
     if (method === 'resolveEntry') return engine.resolveEntry(parseWorkspaceRecoveryEntryTarget(params));
     if (method === 'prepareCombinedRecovery') {
-      return engine.prepareCombinedRecovery(parseWorkspaceCombinedRecoveryPrepareInput(params));
+      const input = parseWorkspaceCombinedRecoveryPrepareInput(params);
+      const selection = context.invocation?.value;
+      return engine.prepareCombinedRecovery(input, selection instanceof ThreadRecoverySelection ? await selection.navigationFor(input) : undefined);
     }
     if (method === 'prepareCombinedUndo') {
       const input = asRecord(params, 'workspace.recovery-primitives.prepareCombinedUndo');

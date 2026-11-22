@@ -589,6 +589,54 @@ fn http_schema_failure_retains_diagnostic_without_credentials_or_other_response_
     assert_eq!(error.message, "HTTP 400: Invalid schema for function 'follow_up': type must be object. [redacted]");
 }
 #[test]
+fn http_failures_retain_the_transport_cause_for_each_stage() {
+    let transport = ReqwestTransport::new(|| reqwest::Client::builder().no_proxy());
+    let attempt = |response: &[u8]| {
+        let (endpoint, server) = loopback_response(response.to_vec());
+        let endpoint = format!("{endpoint}?key=private-url");
+        let request = json!({"input": "private-prompt"}).into();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("authorization", "Bearer private-header".parse().unwrap());
+        let error = transport.stream(
+            HttpRequest { endpoint: &endpoint, headers, body: &request },
+            &CancellationToken::default(), &mut |_| Ok(false),
+        ).unwrap_err();
+        server.join().unwrap();
+        assert!(!serde_json::to_string(&error).unwrap().contains("private-"));
+        error
+    };
+    let send = attempt(b"HTTP/1.1 abc private-status\r\n\r\n");
+    assert_eq!(send.code, "transport_error");
+    assert_eq!(send.transport_cause.as_deref(), Some("invalid HTTP status-code parsed"));
+    assert!(send.provider_request_id.is_none());
+
+    let read = attempt(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 200\r\nX-Request-Id: fixture-id\r\n\r\nprivate-partial-output");
+    assert_eq!(read.code, "stream_interrupted");
+    assert_eq!(read.message, "model stream interrupted");
+    assert_eq!(read.provider_request_id.as_deref(), Some("fixture-id"));
+    assert!(read.transport_cause.unwrap().contains(&std::io::ErrorKind::UnexpectedEof.to_string()));
+
+    let eof = attempt(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\n\r\n");
+    assert_eq!(eof.message, "model stream ended before a terminal event");
+    assert!(eof.transport_cause.is_none());
+}
+
+#[test]
+fn http_proxy_failure_records_the_tunnel_cause_without_its_challenge() {
+    let (proxy, server) = loopback_response(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"private-realm\"\r\n\r\n".to_vec());
+    let proxy = reqwest::Proxy::https(proxy).unwrap().basic_auth("user", "private-password");
+    let transport = ReqwestTransport::new(move || reqwest::Client::builder().no_proxy().proxy(proxy.clone()));
+    let error = transport.stream(
+        HttpRequest { endpoint: "https://model.invalid/?key=private-key", headers: Default::default(), body: &json!({}).into() },
+        &CancellationToken::default(), &mut |_| Ok(false),
+    ).unwrap_err();
+    server.join().unwrap();
+    assert_eq!(error.code, "transport_error");
+    assert!(error.transport_cause.as_deref().unwrap().contains("proxy authentication required"));
+    assert!(!serde_json::to_string(&error).unwrap().contains("private-"));
+}
+
+#[test]
 fn http_cancellation_interrupts_stalled_headers_and_body() {
     use std::io::{Read, Write};
     for send_headers in [false, true] {

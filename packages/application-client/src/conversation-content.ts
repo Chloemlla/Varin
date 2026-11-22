@@ -74,7 +74,7 @@ export function normalizeConversationUi(value: unknown, fallbackKey = 'root'): C
   throw new Error('Unknown interaction type');
 }
 
-/** Only unindented, top-level assistant fences are executable. Outer examples stay opaque. */
+/** Only unindented, top-level assistant interaction blocks activate. Outer examples stay opaque. */
 export function parseConversationContent(text: string, options: { role: string; streaming?: boolean }): ConversationContentPart[] {
   if (options.role !== 'assistant') return [{ kind: 'markdown', text, start: 0, end: text.length }];
   const parts: ConversationContentPart[] = [];
@@ -91,6 +91,33 @@ export function parseConversationContent(text: string, options: { role: string; 
       if (end) { if (!end.test(body)) htmlEnd = end; continue; }
     }
     if (outer) { if (new RegExp(`^ {0,3}${outer.char}{${outer.length},}\\s*$`).test(body)) outer = undefined; continue; }
+    // Some providers return the dedicated block as a tag. Parse only the
+    // standalone assistant block; quoted examples and ordinary HTML stay text.
+    const tag = /^<varin-ui(?:\s+ref="(ui:[\w-]+@[1-9]\d*)"\s*\/>|>(.*))\s*$/.exec(body);
+    if (tag) {
+      let last = i;
+      let payload = '';
+      if (!tag[1]) {
+        while (!lines[last]![0].trimEnd().endsWith('</varin-ui>')) {
+          const next = lines[last + 1]?.[0];
+          if (!next || /^(?:<varin-ui|\x60{3,}|~{3,})/.test(next)) break;
+          last++;
+        }
+        if (!lines[last]![0].trimEnd().endsWith('</varin-ui>')) continue;
+        const block = text.slice(start + '<varin-ui>'.length, lines[last]!.index! + lines[last]![0].length);
+        payload = block.trimEnd().slice(0, -'</varin-ui>'.length).trim();
+      }
+      try {
+        const definition: unknown = tag[1] || /^ui:[\w-]+@[1-9]\d*$/.test(payload)
+          ? { type: 'embed', ref: tag[1] || payload } : JSON.parse(payload);
+        const node = normalizeConversationUi(definition);
+        const end = lines[last]!.index! + lines[last]![0].length;
+        if (start > markdownStart) parts.push({ kind: 'markdown', text: text.slice(markdownStart, start), start: markdownStart, end: start });
+        parts.push({ kind: 'ui', node, definition, raw: text.slice(start, end), start, end, fragmentKey: 'offset:' + start });
+        markdownStart = end; i = last;
+      } catch { /* Preserve unsupported markup verbatim. */ }
+      continue;
+    }
     const opening = /^( {0,3})(`{3,}|~{3,})(.*)$/.exec(body);
     if (!opening) continue;
     const marker = opening[2]!, info = opening[3]!.trim();

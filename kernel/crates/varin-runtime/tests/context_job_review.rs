@@ -97,13 +97,7 @@ impl ModelProvider for Provider {
             }
         }
         if matches!(self.mode, Mode::Fail | Mode::Cancel) {
-            return Err(ModelFailure {
-                tool_name: None,
-                code: "fixture_failure".into(),
-                message: "fixture failure".into(),
-                retry_after_ms: None,
-                provider_request_id: None,
-            });
+            return Err(ModelFailure::new("fixture_failure", "fixture failure"));
         }
         let querying=matches!(self.mode,Mode::Read) && !request.view.history.iter().any(|item|matches!(item.content,Content::ToolResult{..}));
         let content = if matches!(self.mode, Mode::Tool) || querying {
@@ -1534,11 +1528,10 @@ fn nonlinear_summary_tree_uses_explicit_original_model_steps_and_exact_final_out
         fn generate(&self, request: &RequestSnapshot, cancel: &CancellationToken, emit: &mut dyn FnMut(ProviderEvent) -> Result<(), ExecutionError>) -> Result<FinishReason, ModelFailure> {
             if let RequestOrigin::Conversation { compaction: Some(node), .. } = &request.view.origin {
                 if node.node_id == "d" {
-                    self.release.lock().unwrap().recv_timeout(std::time::Duration::from_secs(10)).map_err(|_| ModelFailure {
-                        tool_name: None,
-                        code: "branch_blocked".into(), message: "ready merge could not progress while an unrelated leaf was running".into(),
-                        retry_after_ms: None, provider_request_id: None,
-                    })?;
+                    self.release.lock().unwrap().recv_timeout(std::time::Duration::from_secs(10)).map_err(|_| ModelFailure::new(
+                        "branch_blocked",
+                        "ready merge could not progress while an unrelated leaf was running",
+                    ))?;
                 } else if node.node_id == "ab" { self.merged.send(()).unwrap(); }
             }
             self.inner.generate(request, cancel, emit)

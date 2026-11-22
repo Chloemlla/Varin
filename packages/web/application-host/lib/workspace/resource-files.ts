@@ -10,7 +10,7 @@ import os from 'node:os';
 import type { ResourceFileCommand, ResourceFileResult, ResourceFileEntry } from '@varin/application-client';
 import type { DocumentAuthority } from '../documents/authority.js';
 import type { KernelFileResourceBackend } from '../kernel/file-resource-backend.js';
-import { resolveWorkspacePath, normalizePathIdentity, normalizeWorkspaceRelativePath } from './path-safety.js';
+import { canonicalizePathIdentity, isPathWithinRoot, resolveWorkspacePath, normalizePathIdentity, normalizeWorkspaceRelativePath } from './path-safety.js';
 import type { RecoveryIdentity } from '../recovery/journal-files.js';
 
 export interface ResourceWorkspaceRequest { selection?: ProjectSourceSelection; root?: string; workspaceId?: string; command: ResourceFileCommand; taskSource?: { runId: string; source: import('../kernel/protocol.generated.js').LaunchSource } }
@@ -18,17 +18,53 @@ export interface ResourceWorkspaceUpload { selection?: ProjectSourceSelection; r
 export type ResourceWorkspaceAsset = Omit<import('@varin/application-client').ResourceAssetRequest,'resourceOwner' | 'task'>;
 export interface ResourceFilesOwner {
   asset(input:ResourceWorkspaceAsset,signal?:AbortSignal):Promise<Response>;
-  request(input: ResourceWorkspaceRequest, signal?: AbortSignal): Promise<ResourceFileResult>;
+  request(input: ResourceWorkspaceRequest, signal?: AbortSignal, allowedDirectories?: readonly string[]): Promise<ResourceFileResult>;
   upload(input: ResourceWorkspaceUpload, body: AsyncIterable<Uint8Array>, signal?: AbortSignal): Promise<{ kind: 'done' }>;
 }
 const checked = (value: unknown): string => { if (typeof value !== 'string' || value.includes('\0')) throw new Error('Invalid file path'); return value; };
 
+interface ResourceFilesOptions {
+  restrictedRoot?: string | null;
+  fileTarget?: import('../kernel/thread-file-target.js').ThreadFileTargetResolver;
+  prepareProjectSelection?: (selection: Extract<ProjectSourceSelection,{mode:'native_workspace'}>, signal?: AbortSignal) => Promise<{path:string;originalRoot:string}>;
+  search?: { files: Pick<ReturnType<typeof import('../fs/search.js').createFsSearchRuntime>, 'searchFilesystemFiles'>; content: ReturnType<typeof import('../search/content.js').createWorkspaceContentSearch> };
+  renderOffice?: OfficeFilesystemRenderer;
+}
+
+/** A paired directory can contain the deployment root, be inside it, or be disjoint. */
+async function restrictedFileLocations(restrictedRoot: string | null | undefined, grants?: readonly string[]): Promise<string[] | undefined> {
+  const boundary = restrictedRoot ? await canonicalizePathIdentity(restrictedRoot) : undefined;
+  if (!grants?.length) return boundary ? [boundary] : undefined;
+  const roots = new Map<string, string>();
+  for (const directory of grants) {
+    let candidate: string;
+    try {
+      candidate = await canonicalizePathIdentity(directory);
+      if (boundary && isPathWithinRoot(boundary, candidate)) candidate = boundary;
+      else if (boundary && !isPathWithinRoot(candidate, boundary)) continue;
+      if (!(await fs.stat(candidate)).isDirectory()) continue;
+      await fs.access(candidate, fs.constants.R_OK | fs.constants.X_OK);
+    } catch { continue; } // A removed or offline grant is not a usable shortcut.
+    roots.set(normalizePathIdentity(candidate), candidate);
+  }
+  if (boundary && roots.delete(normalizePathIdentity(boundary))) return [boundary, ...roots.values()];
+  return [...roots.values()];
+}
+
+/** Opening a directory needs only its volume. Enumerate other drives when the user refreshes locations. */
+async function systemFileLocations(openedRoot?: string): Promise<string[]> {
+  const home = os.homedir();
+  if (openedRoot || process.platform !== 'win32') return [...new Set([home, path.parse(openedRoot ?? home).root])];
+  const drives = await Promise.all([...'ABCDEFGHIJKLMNOPQRSTUVWXYZ'].map(async letter => {
+    const root = letter + ':' + path.sep;
+    try { return (await fs.stat(root)).isDirectory() ? root : null; } catch { return null; }
+  }));
+  return [...new Set([home, ...drives.filter((drive): drive is string => drive !== null)])];
+}
+
 /** User operations share Documents admission and native file transactions with the editor. */
 export function createResourceFilesOwner(documents: DocumentAuthority, files: KernelFileResourceBackend,
-  fileTarget?: import('../kernel/thread-file-target.js').ThreadFileTargetResolver,
-  prepareProjectSelection?: (selection: Extract<ProjectSourceSelection,{mode:'native_workspace'}>, signal?: AbortSignal) => Promise<{path:string;originalRoot:string}>,
-  search?: { files: Pick<ReturnType<typeof import('../fs/search.js').createFsSearchRuntime>, 'searchFilesystemFiles'>; content: ReturnType<typeof import('../search/content.js').createWorkspaceContentSearch> },
-  renderOffice?:OfficeFilesystemRenderer): ResourceFilesOwner {
+  { restrictedRoot, fileTarget, prepareProjectSelection, search, renderOffice }: ResourceFilesOptions = {}): ResourceFilesOwner {
   const resolve = async (root: string, workspaceId?: string, signal?: AbortSignal, rawSelection?: ProjectSourceSelection) => {
     const selection = rawSelection === undefined ? undefined : parseProjectSourceSelection(rawSelection);
     const adopted = selection?.mode === 'native_workspace' ? await (async () => {
@@ -76,22 +112,23 @@ export function createResourceFilesOwner(documents: DocumentAuthority, files: Ke
       const stream=createReadStream(file.absolutePath,{...(signal?{signal}:{})});
       return new Response(Readable.toWeb(stream) as ReadableStream<Uint8Array>,{headers:{'Content-Type':mime[path.extname(file.absolutePath).toLowerCase()]??attachmentMimeType(file.absolutePath),'Content-Length':String(stats.size),'Cache-Control':'no-store','Referrer-Policy':'no-referrer','X-Content-Type-Options':'nosniff'}});
     },
-    async request(input, signal) {
+    async request(input, signal, allowedDirectories) {
       signal?.throwIfAborted();
       const command = input.command;
       if (!command || typeof command.kind !== 'string') throw new Error('File operation is required');
       if (command.kind === 'locations') {
-        const locations = process.platform === 'win32'
-          ? (await Promise.all('ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('').map(async drive => { const root = `${drive}:/`; try { return (await fs.stat(root)).isDirectory() ? root : null; } catch { return null; } }))).filter((item): item is string => item !== null) : ['/'];
-        return { kind: 'locations', locations: [...new Set([os.homedir(), ...locations])] };
+        return { kind: 'locations', locations: await restrictedFileLocations(restrictedRoot, allowedDirectories) ?? await systemFileLocations() };
       }
       if (command.kind === 'open') {
         const original = input.taskSource;
         const task = original && fileTarget ? await fileTarget(original.runId, { ...original.source, resource_owner: { kind: 'local' } }, '.', signal) : null;
         if (original && task?.kind !== 'document') throw new Error('This task has no available writable file view yet');
         if (input.selection && original) throw new Error('Choose a project source or task source, not both');
-        const { root, displayRoot, identity } = await resolve(task?.kind === 'document' ? task.root : command.path?.trim() || os.homedir(), undefined, signal, input.selection);
-        return { kind: 'opened', root: displayRoot, workspaceId: identity.workspaceId, locations: [...new Set([os.homedir(), path.parse(root).root])] };
+        const shortcuts = await restrictedFileLocations(restrictedRoot, allowedDirectories);
+        const start = task?.kind === 'document' ? task.root : command.path?.trim() || (shortcuts ? shortcuts[0] : os.homedir());
+        if (!start && input.selection?.mode !== 'native_workspace') throw new Error('No permitted directory is available on this Host.');
+        const { displayRoot, identity } = await resolve(start ?? '', undefined, signal, input.selection);
+        return { kind: 'opened', root: displayRoot, workspaceId: identity.workspaceId, locations: shortcuts ?? await systemFileLocations(displayRoot) };
       }
       if (!input.root || !input.workspaceId) throw new Error('Choose a file location first');
       const { root, identity } = await resolve(input.root, input.workspaceId, signal, input.selection);

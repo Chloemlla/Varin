@@ -92,13 +92,7 @@ fn fail(runtime: &RunSupervisor, id: &str, error: ExecutionError) -> Result<(), 
     // Preparation failures retain any evidence already owned by this operation.
     let receipt = SamplingReceipt {
         finish_reason: None,
-        failure: Some(ModelFailure {
-            tool_name: None,
-            code: error.code,
-            message: "Sampling could not finish; review its retained evidence".into(),
-            retry_after_ms: None,
-            provider_request_id: None,
-        }),
+        failure: Some(ModelFailure::new(error.code, "Sampling could not finish; review its retained evidence")),
         usage: work.output.usage.clone(),
         provider_completed: false,
         local_executor_stopped: true,

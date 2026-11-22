@@ -33,6 +33,7 @@ fn patch(key: &str, revision: u64) -> ThreadUpdate {
         expected_revision: revision,
         title: None,
         title_mode: None,
+        model: None,
         pinned: None,
         archived: None,
     }
@@ -50,6 +51,27 @@ fn read(key: &str, cursor: u64) -> ThreadRead {
         key: key.into(),
         through_cursor: cursor,
     }
+}
+
+#[test]
+fn an_existing_catalog_starts_with_inherited_models_and_keeps_each_choice_on_reopen() {
+    let fixture = Fixture::new();
+    {
+        let mut db = fixture.open();
+        db.create_thread("thread", "main").unwrap();
+        db.create_thread("other", "second").unwrap();
+        db.db.execute_batch("DROP TABLE thread_model_preferences; PRAGMA user_version=101").unwrap();
+    }
+    let mut db = fixture.open();
+    assert!(db.inspect_thread("thread").unwrap().get("model_preference").is_none());
+    let mut change = patch("choose-model", 1);
+    let preference = json!({"providerId":"personal","modelId":"sol","thinkingLevel":"high"});
+    change.model = Some(serde_json::from_value(preference.clone()).unwrap());
+    db.update_thread(&change).unwrap();
+    drop(db);
+    let db = fixture.open();
+    assert_eq!(db.inspect_thread("thread").unwrap()["model_preference"], preference);
+    assert!(db.inspect_thread("other").unwrap().get("model_preference").is_none());
 }
 
 #[test]

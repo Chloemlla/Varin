@@ -123,21 +123,22 @@ export function useThreadRecovery({ api, identity, host, disabled, snapshot, onR
   const recover = (entryId: string) => execute(async () => {
     if (navigation || combined) return;
     setConversationAlternative(undefined);
-    const selection = await api.prepareNavigation({ ...identity, entryId });
-    if (!current()) return;
+    const withFiles = preference !== 'conversation';
+    const { fileRecovery, ...selection } = await api.prepareNavigation({ ...identity, entryId, ...(withFiles ? { withFiles } : {}) });
+    if (!current()) {
+      if (fileRecovery?.status === 'ready' && host === getRuntimeEndpointGeneration()) {
+        void getWorkspaceRecoveryAPI().cancelCombinedOperation(fileRecovery.plan.id).catch(() => undefined);
+      }
+      return;
+    }
     const intent: Navigation = { input: { ...identity, key: crypto.randomUUID(), expectedHeadId: selection.expectedHeadId, targetHeadId: selection.targetHeadId }, editor: selection };
     recoveryEditor.current = selection;
-    if (preference === 'conversation') { setNavigation(intent); await navigate(intent); return; }
+    if (!withFiles || fileRecovery === null) { setNavigation(intent); await navigate(intent); return; }
     let planned = false;
     try {
-      const source = await api.recoverySource({ ...identity, entryId });
-      if (!current()) return;
-      if (!source || source.mode === 'fixed_branch') { setNavigation(intent); await navigate(intent); return; }
+      if (!fileRecovery) throw new Error(t('chat.recovery.failed'));
+      const { plan } = requireWorkspaceRecoveryResult(fileRecovery);
       const recovery = getWorkspaceRecoveryAPI();
-      const { plan } = requireWorkspaceRecoveryResult(await recovery.prepareCombinedRecovery({
-        workspaceId: source.workspaceId, conversation: { kind: 'thread', threadId: identity.threadId, branchId: identity.branchId }, entryId,
-      }));
-      if (!current()) { if (host === getRuntimeEndpointGeneration()) void recovery.cancelCombinedOperation(plan.id).catch(() => undefined); return; }
       planned = true;
       const prepared = { api: recovery, plan };
       setNavigation(intent); setCombined(prepared); setOperation(undefined);

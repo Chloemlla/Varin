@@ -216,6 +216,13 @@ export function createThreadSourcePreparer({ documents, workingStates, liveSourc
       return bindRegistration({path,source:{resourceOwner:input.resourceOwner,workspaceId:owningWorkspace,executionWorkspaceId:selected.execution_workspace_id,
         branchId,mode,...(mode==='fixed_branch'?{revision:0}:{}),tools:await sourceTools(mode)},provenance} as ThreadPreparedSource, nativeReference(registration.nativeSource));
     };
+    const physicalPrepared = async (branchId: string, provenance: import('./protocol.generated.js').ChildSourceProvenance, path: string): Promise<ThreadPreparedSource> => {
+      if (input.mode === 'materialized' && nativeWorkspaces && (await nativeWorkspaces.hostBackend(signal)).dependenciesReady) {
+        return nativePrepared(branchId, provenance, path);
+      }
+      return { path, source: { resourceOwner: input.resourceOwner, workspaceId, executionWorkspaceId: workspaceId,
+        branchId, revision: 0, mode: input.mode, tools }, provenance } as ThreadPreparedSource;
+    };
     return workingStates.withBranchStore(owningWorkspace, 'source-prepare', async store => {
       const branchId = `source:${key}`;
       await nativeWorkspaces?.retainPrepared({workspace_id:owningWorkspace,execution_workspace_id:owningWorkspace,branch_id:branchId},input.threadId,false,signal);
@@ -231,9 +238,8 @@ export function createThreadSourcePreparer({ documents, workingStates, liveSourc
             throw new SourceAdmissionError('source_changed');
           }
         } finally { await pin.release(); }
-        if(selection||input.mode==='materialized'&&nativeWorkspaces)return nativePrepared(branchId,restored.provenance,registration.canonicalPath);
-        return { path: registration.canonicalPath, source: { resourceOwner: input.resourceOwner, workspaceId, executionWorkspaceId: workspaceId,
-          branchId, revision: 0, mode: input.mode, tools }, provenance: restored.provenance } as ThreadPreparedSource;
+        return selection ? nativePrepared(branchId, restored.provenance, registration.canonicalPath)
+          : physicalPrepared(branchId, restored.provenance, registration.canonicalPath);
       }
       if (await store.getBranchRoot(branchId, { signal })) throw new Error('Source preparation has no original receipt');
       const native=await selectedNative();
@@ -269,9 +275,7 @@ export function createThreadSourcePreparer({ documents, workingStates, liveSourc
           editorDrafts: capturedDraft.editorDrafts, signal,
           content: input.content.mode === 'saved-files' ? { mode: 'saved-files' } : { mode: 'fixed-draft-baseline' } },
         { documents, inspectInventory, ...(prepareResources ? { prepareResources } : {}) });
-        if(input.mode==='materialized'&&nativeWorkspaces)return nativePrepared(branchId,captured.provenance,root);
-        return { path: root, source: { resourceOwner: input.resourceOwner, workspaceId, executionWorkspaceId: workspaceId,
-          branchId: captured.branch.branchId, revision: 0, mode: input.mode, tools }, provenance: captured.provenance } as ThreadPreparedSource;
+        return physicalPrepared(captured.branch.branchId, captured.provenance, root);
     }, 'shared', { threadId: input.threadId });
   };
   const prepareSelected=async (value: ThreadPrepareSource, signal?: AbortSignal): Promise<ThreadPreparedSource> => {

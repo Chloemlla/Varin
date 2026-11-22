@@ -24,6 +24,9 @@ are durable; live clients, OAuth tokens and permission grants are not.
 
 Direct tools remain directly exposed. `mcp_discover` without a server lists configured metadata
 without connecting; naming a server performs that dependency's preparation as a durable Operation.
+Connection and tool-list failures identify the configured server, preparation stage and available HTTP
+status or Host network error category. Named discovery returns these details in its tool result. A launch
+that requires a saved direct tool can report the same failure. OAuth challenges stay with the credential owner.
 Configured deferred/codemode tools are reached through `mcp_call` with the discovered server, tool and
 exact schema version. Scripts use the same selected tools through their ordinary nested invocation;
 there is no separate MCP-only script registry. The

@@ -22,6 +22,7 @@ pub mod responses;
 mod sse;
 mod tool_schema;
 pub mod request_profile;
+mod transport_diagnostic;
 #[cfg(test)]
 mod tests;
 
@@ -288,7 +289,10 @@ impl ReqwestTransport {
             let mut response = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(failure("cancelled", "generation cancelled")),
-                response = send => response.map_err(|_| failure("transport_error", "model connection failed"))?,
+                response = send => response.map_err(|error| ModelFailure {
+                    transport_cause: Some(transport_diagnostic::cause(error)),
+                    ..failure("transport_error", "model connection failed")
+                })?,
             };
             let request_id = response.headers().get("x-request-id").or_else(|| response.headers().get("request-id")).or_else(|| response.headers().get("x-amzn-requestid"))
                 .and_then(|v| v.to_str().ok()).map(str::to_owned);
@@ -312,7 +316,7 @@ impl ReqwestTransport {
                     None => format!("Model endpoint rejected the request (HTTP {status})."),
                 };
                 for credential in credentials { message = message.replace(&credential, "[redacted]"); }
-                return Err(ModelFailure { tool_name: None, code: format!("http_{status}"), message, retry_after_ms, provider_request_id: request_id });
+                return Err(ModelFailure { tool_name: None, code: format!("http_{status}"), message, retry_after_ms, transport_cause: None, provider_request_id: request_id });
             }
             if !response.headers().get("content-type").and_then(|v|v.to_str().ok())
                 .is_some_and(|v| v.split(';').next().is_some_and(|t|t.trim().eq_ignore_ascii_case(content_type))) {
@@ -323,8 +327,11 @@ impl ReqwestTransport {
                     biased;
                     _ = cancel.cancelled() => return Err(ModelFailure {
                         provider_request_id: request_id.clone(), ..failure("cancelled", "generation cancelled") }),
-                    chunk = response.chunk() => chunk.map_err(|_| ModelFailure {
-                        provider_request_id: request_id.clone(), ..failure("stream_interrupted", "model stream interrupted") })?,
+                    chunk = response.chunk() => chunk.map_err(|error| ModelFailure {
+                        transport_cause: Some(transport_diagnostic::cause(error)),
+                        provider_request_id: request_id.clone(),
+                        ..failure("stream_interrupted", "model stream interrupted")
+                    })?,
                 };
                 match chunk {
                     Some(bytes) => {
@@ -474,13 +481,7 @@ impl Connection {
     }
 }
 pub(super) fn failure(code: &str, message: &str) -> ModelFailure {
-    ModelFailure {
-        tool_name: None,
-        code: code.into(),
-        message: message.into(),
-        retry_after_ms: None,
-        provider_request_id: None,
-    }
+    ModelFailure::new(code, message)
 }
 pub(super) fn emit_event(
     emit: &mut dyn FnMut(ProviderEvent) -> Result<(), ExecutionError>,

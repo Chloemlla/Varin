@@ -41,7 +41,7 @@ export interface WorkspaceWatcher {
   readonly generation: number;
   readonly position: WatchPosition;
   readonly coverage: WatchCoverage;
-  publishMutation(event: ({ kind: 'created' | 'changed' | 'deleted'; resource: DocumentResource } | { kind: 'moved'; resource: DocumentResource; from: DocumentResource }) & { operationId?: string }): void;
+  publishMutation(event: ({ kind: 'created' | 'changed' | 'deleted'; resource: DocumentResource } | { kind: 'invalidated'; resource: DocumentResource; reason: 'entry-changed' } | { kind: 'moved'; resource: DocumentResource; from: DocumentResource }) & { operationId?: string }): void;
   overflow(): void;
   reconnect(): void;
   authorityChanged(): void;

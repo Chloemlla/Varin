@@ -1,5 +1,6 @@
 import { THINKING_LEVELS as thinkingLevels } from '@varin/protocol';
 import crypto from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { DateTime, IANAZone } from 'luxon';
 import { CronExpressionParser } from 'cron-parser';
 import type fsPromisesModule from 'node:fs/promises';
@@ -32,6 +33,7 @@ interface ProjectConfigRuntimeOptions {
   fsPromises: typeof fsPromisesModule;
   path: typeof pathModule;
   projectsDirPath: string;
+  legacyProjectsDirPath?: string;
 }
 
 interface NormalizeTaskOptions {
@@ -527,6 +529,43 @@ export const createProjectConfigRuntime = (deps: ProjectConfigRuntimeOptions) =>
     }
   };
 
+  const preferenceKeys = new Set(['setupWorktree', 'waitForWorktreeSetup', 'projectNotes', 'projectTodos',
+    'projectPlanFiles', 'projectActions', 'projectActionsPrimaryId', 'draftStarters']);
+  const preferencesOf = (raw: Record<string, unknown>) =>
+    Object.fromEntries(Object.entries(raw).filter(([key]) => preferenceKeys.has(key)));
+  const projectPreferences = async (id: string, projectPath: string, mutation?: { patch: unknown; expected?: unknown }) =>
+    withProjectWriteLock(id, async () => {
+      const raw = await readRawProjectConfigFromDisk(id);
+      if (raw.version !== undefined && raw.version !== PROJECT_CONFIG_VERSION) throw new Error('Unsupported project configuration version');
+      const prior = deps.legacyProjectsDirPath;
+      let imported = false;
+      if (prior && path.resolve(prior) !== path.resolve(projectsDirPath) && raw.preferencesImported !== true) {
+        try {
+          const legacy = asRecord(JSON.parse(await fsPromises.readFile(path.join(prior, sanitizeProjectID(id) + '.json'), 'utf8')));
+          if (!legacy || (legacy.version !== undefined && legacy.version !== PROJECT_CONFIG_VERSION)) throw new Error('Unsupported legacy project configuration');
+          // The registration ID survives a folder move. Copy only the UI-owned
+          // fields; keep the previous file and unrelated destination state intact.
+          for (const [key, value] of Object.entries(preferencesOf(legacy))) {
+            if (!(key in raw)) raw[key] = value;
+            imported = true;
+          }
+        } catch (error) { if (errorCode(error) !== 'ENOENT') throw error; }
+        if (imported || mutation) raw.preferencesImported = true;
+      }
+      const current = preferencesOf(raw);
+      if (mutation) {
+        const patch = asRecord(mutation.patch);
+        if (!patch || Object.keys(patch).some(key => !preferenceKeys.has(key))) throw new Error('Invalid project preference');
+        if (mutation.expected !== undefined && !isDeepStrictEqual(current, mutation.expected)) return { conflict: true };
+        for (const [key, value] of Object.entries(patch)) {
+          if (value === null) delete raw[key]; else raw[key] = value;
+        }
+        raw.projectPath = projectPath;
+      }
+      if (imported || mutation) await writeRawProjectConfigToDisk(id, raw);
+      return { preferences: preferencesOf(raw) };
+    });
+
   const listScheduledTasks = async (projectID: unknown): Promise<ScheduledTask[]> => {
     const config = await readProjectConfigFromDisk(projectID);
     return config.scheduledTasks;
@@ -873,6 +912,7 @@ export const createProjectConfigRuntime = (deps: ProjectConfigRuntimeOptions) =>
     deleteScheduledTask,
     reconcileLoopTasks,
     resolveProjectConfigPath,
+    projectPreferences,
     readTextEncoding,
     rememberTextEncoding,
     reconcileTextEncoding,

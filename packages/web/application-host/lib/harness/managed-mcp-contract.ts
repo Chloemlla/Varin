@@ -102,4 +102,4 @@ export interface ManagedMcpSnapshot {
 }
 export type ManagedMcpReply =
   | { ok: true; value: unknown; executorStopped: true }
-  | { ok: false; error: { code: string; dispatched: boolean; settlement: 'unknown' | 'session_expired' | 'rpc_response'; protocolError?: Record<string, unknown>; interactionProblem?: string; taskKind?: 'protocol' | 'transport' | 'unsupported' | 'owner'; rpcCode?: number }; executorStopped: boolean };
+  | { ok: false; error: { code: string; dispatched: boolean; settlement: 'unknown' | 'session_expired' | 'rpc_response'; preparation?: import('../mcp/errors.js').McpPreparationDetails; protocolError?: Record<string, unknown>; interactionProblem?: string; taskKind?: 'protocol' | 'transport' | 'unsupported' | 'owner'; rpcCode?: number }; executorStopped: boolean };

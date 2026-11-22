@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import os from 'os';
 import path from 'path';
-import { mkdtemp, rm, readFile, writeFile } from 'fs/promises';
+import { mkdir, mkdtemp, rm, readFile, writeFile } from 'fs/promises';
 import { createProjectConfigRuntime, normalizeCalendarTarget } from './project-config.js';
 import type { ScheduledTask } from './project-config.js';
 
@@ -29,6 +29,38 @@ const createRuntime = async () => {
 };
 
 describe('project-config runtime', () => {
+  it('imports the original UI preferences once when the Host data directory differs from home', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'varin-project-preferences-'));
+    try {
+      const oldDir = path.join(root, 'legacy'), newDir = path.join(root, 'host');
+      await mkdir(oldDir);
+      const oldPath = path.join(oldDir, 'qa.json');
+      const original = JSON.stringify({ projectPath: '/old-location', projectNotes: 'old note', scheduledTasks: ['unrelated'] });
+      await writeFile(oldPath, original);
+      const runtime = createProjectConfigRuntime({ fsPromises: await import('fs/promises'), path, projectsDirPath: newDir, legacyProjectsDirPath: oldDir });
+      expect(await runtime.projectPreferences('qa', '/relocated')).toEqual({ preferences: { projectNotes: 'old note' } });
+      await runtime.projectPreferences('qa', '/relocated', { patch: { projectNotes: null } });
+      expect(await runtime.projectPreferences('qa', '/relocated')).toEqual({ preferences: {} });
+      expect(await readFile(oldPath, 'utf8')).toBe(original);
+      expect(await runtime.listScheduledTasks('qa')).toEqual([]);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it('merges UI preferences under the project lock and preserves other owners and external edits', async () => {
+    const { runtime, cleanup } = await createRuntime();
+    const id = 'qa', root = '/workspace', file = runtime.resolveProjectConfigPath(id);
+    try {
+      await writeFile(file, JSON.stringify({ futureField: true, scheduledTasks: [] }));
+      await Promise.all([{ projectNotes: 'note' }, { projectTodos: ['one'] }].map(patch => runtime.projectPreferences(id, root, { patch })));
+      expect(await runtime.projectPreferences(id, root)).toEqual({ preferences: { projectNotes: 'note', projectTodos: ['one'] } });
+      expect(await runtime.projectPreferences(id, root, { patch: { projectNotes: 'stale' }, expected: {} })).toEqual({ conflict: true });
+      expect(JSON.parse(await readFile(file, 'utf8'))).toMatchObject({ futureField: true, scheduledTasks: [], projectNotes: 'note' });
+      await writeFile(file, '{broken');
+      await expect(runtime.projectPreferences(id, root, { patch: { projectNotes: 'overwrite' } })).rejects.toThrow();
+      expect(await readFile(file, 'utf8')).toBe('{broken');
+    } finally { await cleanup(); }
+  });
+
   it('creates and persists a scheduled task', async () => {
     const { runtime, cleanup } = await createRuntime();
     try {

@@ -1330,6 +1330,42 @@ impl Storage {
         Ok(json!({"records":records,"nextOffset":if ids.len()>128 { next_offset } else { None }}))
     }
 
+    pub(super) fn experiment_recovery(
+        &self,
+        input: &Value,
+        grant_id: &str,
+    ) -> Result<Value, KernelError> {
+        let workspace = input.get("workspaceId").and_then(Value::as_str);
+        let grant = self.load_grant(grant_id)?;
+        if grant.session_id.is_some() || grant.thread_id.is_some() || grant.run_id.is_some()
+            || grant.operation_id.is_some() || (grant.owning_workspace.is_some() && grant.owning_workspace.as_deref() != workspace)
+        {
+            return Err(KernelError::Authorization("experiment recovery requires a matching Host maintenance grant".into()));
+        }
+        // A Catalog Job may already be terminal while its Host still has to
+        // collect outputs or release the execution backend. Return identities,
+        // never historical attempt bodies, log chunks, or artifact contents.
+        let mut query = self.conn.prepare(
+            "SELECT workspace_id,json_extract(payload_json,'$.id') FROM domain_records
+             WHERE record_type='experiment.attempt' AND (?1 IS NULL OR workspace_id=?1)
+               AND (state IN ('submitted','queued','running','stopping')
+                 OR (state IN ('completed','failed','cancelled') AND
+                    (json_extract(payload_json,'$.collection')='pending'
+                     OR (json_extract(payload_json,'$.commitmentId') IS NOT NULL AND coalesce(json_extract(payload_json,'$.commitmentReleased'),0)=0)
+                     OR (coalesce(json_extract(payload_json,'$.spawnDispatched'),0)=0 AND json_extract(payload_json,'$.collectionCompletion') IS NULL))))
+             UNION
+             SELECT workspace_id,json_extract(payload_json,'$.attemptId') FROM domain_records
+             WHERE record_type='experiment.job' AND (?1 IS NULL OR workspace_id=?1)
+               AND state!='released' AND json_extract(payload_json,'$.executorStopped')=1
+               AND EXISTS (SELECT 1 FROM domain_records a WHERE a.workspace_id=domain_records.workspace_id
+                   AND a.record_id='experiment.attempt:'||json_extract(domain_records.payload_json,'$.attemptId')
+                   AND json_extract(a.payload_json,'$.collection')='done')")?;
+        let rows = query.query_map([workspace], |row| {
+            Ok(json!({"workspaceId":row.get::<_, String>(0)?, "attemptId":row.get::<_, String>(1)?}))
+        })?;
+        Ok(Value::Array(rows.collect::<Result<Vec<_>, _>>()?))
+    }
+
     /// Concrete original-domain index. Keyset identity is unaffected by record updates.
     pub(super) fn experiment_artifact_page(
         &self,

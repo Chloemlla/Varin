@@ -97,7 +97,7 @@ export interface ThreadAttentionSnapshot {
   counts: { actionRequired: number; affectedBranches: number; unknownEffects: number };
 }
 export type ThreadThinkingLevel = import('@varin/protocol').ThinkingLevel;
-export interface ThreadModel { providerId: string; modelId: string; thinkingLevel?: ThreadThinkingLevel; temperature?: number }
+export type ThreadModel = import('@varin/protocol').ThreadModelPreference;
 export interface ThreadModelInfo extends ThreadModel { name?: string; acceptsImages?: boolean; contextWindowTokens?: number; thinkingLevels?: ThreadThinkingLevel[] }
 export interface ThreadAgentChoice { profileId: string | null; workFocus: import('@varin/protocol').WorkFocusId }
 /** A public model selection resolves only through the Host's existing model/credential authority. */
@@ -647,7 +647,7 @@ export interface ThreadsAPI {
   sources: ThreadSourcesAPI;
   prepareSource(input: ThreadPrepareSource, signal?: AbortSignal): Promise<ThreadPreparedSource>;
   /** Fork immutable conversation ancestry; live runs and resource grants are not copied. */
-  prepareNavigation(input: ThreadIdentity & { entryId: string }): Promise<import("@varin/protocol").NavigationSelection & { editorImages?: ImageAttachment[]; editorContentReferences?: import('./content-reference.js').ContentReference[]; editorContentReferenceOccurrences?: import('./content-reference.js').ContentReferenceOccurrence[]; editorAttachments?: import('@varin/protocol').Attachment[]; editorAttachmentImageReferences?: Record<string, number> }>;
+  prepareNavigation(input: ThreadIdentity & { entryId: string; withFiles?: boolean }): Promise<Omit<import("@varin/protocol").NavigationSelection, "editorEntry"> & { editorText?: string; fileRecovery?: import("@varin/extension-contract").WorkspaceCombinedRecoveryPrepareResult | null; editorImages?: ImageAttachment[]; editorContentReferences?: import('./content-reference.js').ContentReference[]; editorContentReferenceOccurrences?: import('./content-reference.js').ContentReferenceOccurrence[]; editorAttachments?: import('@varin/protocol').Attachment[]; editorAttachmentImageReferences?: Record<string, number> }>;
   recoverySource(input: ThreadIdentity & { entryId: string }): Promise<{ resourceOwner: SourceResourceOwner; workspaceId: string; mode: ThreadSource['mode']; runId: string } | null>;
   navigate(input: ThreadIdentity & { key: string; expectedHeadId: string | null; targetHeadId: string | null; undoOf?: string }): Promise<import("@varin/protocol").NavigationReceipt>;
   navigationReceipt(input: ThreadIdentity & { key: string }): Promise<import("@varin/protocol").NavigationReceipt | null>;

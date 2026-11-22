@@ -41,7 +41,7 @@ import { useInlineCommentDraftStore } from '@/stores/useInlineCommentDraftStore'
 import { appendInlineComments } from '@/lib/messages/inlineComments';
 import { useProjectsStore } from '@/stores/useProjectsStore';
 import { projectModelSettingsId } from '@/lib/projectResolution';
-import { useThreadStore, threadHostKey, threadComposerKey, selectedComposerKey } from '@/stores/useThreadStore';
+import { useThreadStore, threadHostKey, threadComposerKey } from '@/stores/useThreadStore';
 import { useThreadDraftStore, EMPTY_THREAD_DRAFT, type ThreadPendingInput, type ThreadMaterialAttachment } from '@/stores/useThreadDraftStore';
 import { useMessageQueueStore } from '@/stores/messageQueueStore';
 import { ThreadMaterials } from './ThreadMaterials';
@@ -81,6 +81,7 @@ import type { ThreadIdentity, ThreadModel, ThreadModelInfo, ThreadThinkingLevel,
 import { Button } from '@/components/ui/button';
 import { ThreadComposer } from './ThreadComposer';
 import { useThreadNextStep } from './useThreadNextStep';
+import { setThreadComposerModel } from '@/lib/agent-runtime/threadComposerModel';
 import { threadConfigurationModel, useThreadModelSelection } from './useThreadModelSelection';
 import { ThreadAgentControls } from './ThreadAgentControls';
 import { useThreadWorkFocus } from './useThreadWorkFocus';
@@ -110,10 +111,10 @@ const resourceErrorMessages = new Map([
   ['resource-cancelled', 'Skill or resource preparation was cancelled. Try again when ready.'],
 ]);
 
-export function ThreadConversation({ api, identity, onBranchCreated, initialWorkspacePath, preferredModel: configuredPreferredModel, inheritWorkbenchModel = false, configurationReady = true, onWorkChanged, onActivity, readOnly = false, messageHandoff, emptyHero, surface = 'workbench' }: { surface?: 'workbench' | 'bot'; emptyHero?: { visual: React.ReactNode; title: string }; messageHandoff?: MessageHandoff; onWorkChanged?: () => void;
+export function ThreadConversation({ api, identity, onBranchCreated, initialWorkspacePath, preferredModel, configurationReady = true, onWorkChanged, onActivity, readOnly = false, messageHandoff, emptyHero, surface = 'workbench' }: { surface?: 'workbench' | 'bot'; emptyHero?: { visual: React.ReactNode; title: string }; messageHandoff?: MessageHandoff; onWorkChanged?: () => void;
   /** Peripheral observers (the Bot figure) follow what the current Run visibly does; null once unmounted. */
   onActivity?: (activity: ThreadLiveActivity | null) => void;
-  preferredModel?: ThreadModel | null; inheritWorkbenchModel?: boolean; configurationReady?: boolean; readOnly?: boolean; api: ThreadsAPI; identity: ThreadIdentity; onBranchCreated?: (identity: ThreadIdentity) => void; initialWorkspacePath?: string }) {
+  preferredModel?: ThreadModel | null; configurationReady?: boolean; readOnly?: boolean; api: ThreadsAPI; identity: ThreadIdentity; onBranchCreated?: (identity: ThreadIdentity) => void; initialWorkspacePath?: string }) {
   const botSurface = surface === 'bot';
   const conversationTools = React.useContext(ConversationToolsContext);
   const memoryNavigation = React.useContext(MemoryNavigationContext);
@@ -175,20 +176,6 @@ export function ThreadConversation({ api, identity, onBranchCreated, initialWork
   const [modelCatalog, setModelCatalog] = React.useState<{ api: ThreadsAPI; host: number; models: ThreadModelInfo[] }>();
   const modelsReady = modelCatalog?.api === api && modelCatalog.host === host;
   const models = modelsReady ? modelCatalog.models : EMPTY_MODELS;
-  // Capture the ordinary workbench/IDE selection when entering an unconfigured
-  // Bot conversation. Do not turn another conversation's later edits into a binding.
-  const workbenchModel = React.useMemo(() => {
-    if (!inheritWorkbenchModel || host !== getRuntimeEndpointGeneration()) return null;
-    const navigation = useThreadStore.getState();
-    if (navigation.hostKey !== threadHostKey()) return null;
-    const key = selectedComposerKey(navigation);
-    if (!key || key === draftKey) return null;
-    return useThreadDraftStore.getState().drafts[key]?.model ?? null;
-  }, [inheritWorkbenchModel, draftKey, host]);
-  const inheritedModel = workbenchModel && models.some(model => model.providerId === workbenchModel.providerId && model.modelId === workbenchModel.modelId)
-    ? { ...defaultConversationModel({ defaultProvider: workbenchModel.providerId, defaultModel: workbenchModel.modelId, defaultThinkingLevel: workbenchModel.thinkingLevel }, models)!,
-      ...(workbenchModel.temperature === undefined ? {} : { temperature: workbenchModel.temperature }) } : null;
-  const preferredModel = inheritedModel ?? configuredPreferredModel;
   const [modelError, setModelError] = React.useState<string>();
   const [defaultsVersion, refreshDefaults] = React.useReducer(version => version + 1, 0);
   React.useEffect(() => {
@@ -290,9 +277,12 @@ export function ThreadConversation({ api, identity, onBranchCreated, initialWork
   const stopping = active && Boolean(run?.cancel_requested
     || stopRequest?.scope === viewScope && stopRequest.runId === branch?.active_run_id);
   const delegated = Boolean(snapshot?.delegatedExecutions?.length);
-  const selectedModel = useThreadModelSelection({ draftKey, draft, ready: Boolean(snapshot), active, delegated,
+  const savedModel = snapshot?.thread.model_preference;
+  const fallbackModel = useThreadModelSelection({ draftKey, draft, ready: Boolean(snapshot && !savedModel), active, delegated,
     runId: run?.id, runModel: threadConfigurationModel(snapshot?.modelSelection.desired?.configuration ?? snapshot?.modelSelection.active?.configuration ?? run?.configuration),
-    preferredModel, inheritWorkbenchModel, preferenceReady: configurationReady && (!inheritWorkbenchModel || modelsReady), models });
+    preferredModel, preferenceReady: configurationReady, models });
+  const botConversation = Boolean(snapshot?.thread.bot_id && !snapshot.thread.parent_thread_id);
+  const selectedModel = savedModel ?? (!active && botConversation ? preferredModel : undefined) ?? fallbackModel;
   const { providerId, modelId, temperature } = selectedModel;
   const thinkingLevel = selectedModel.thinkingLevel ?? 'off';
   // A run that finishes in the conversation on screen taps once (§3.14); a failed one says so instead.
@@ -385,9 +375,9 @@ export function ThreadConversation({ api, identity, onBranchCreated, initialWork
     selectThreadFiles(draftKey, files);
   };
   const selectModel = (provider: string, model: string, thinking: ThreadThinkingLevel) => {
-    if (active && run) {
-      return act(()=>api.selectModel({...identity,runId:run.id,key:crypto.randomUUID(),model:{...selectedModel,providerId:provider,modelId:model,thinkingLevel:thinking}}), false, true);
-    } else useThreadDraftStore.getState().patch(draftKey, { model: { ...selectedModel, providerId: provider, modelId: model, thinkingLevel: thinking } });
+    const choice = { ...selectedModel, providerId: provider, modelId: model, thinkingLevel: thinking };
+    const apply = () => setThreadComposerModel(api, draftKey, snapshot, choice);
+    return (botConversation || active) ? act(apply, false, true) : apply();
   };
   const returnToLatest = () => {
     const store = useTimelineViewStore.getState();
@@ -740,7 +730,9 @@ export function ThreadConversation({ api, identity, onBranchCreated, initialWork
       {policy?.preparation && <p role="status" aria-label="Strategy preparation" className="text-sm text-muted-foreground">{policy.preparation.status === 'preparing' ? 'The Host is preparing a strategy candidate.' : `The Host could not prepare the strategy candidate: ${policy.preparation.code ?? 'preparation failed'}`}</p>}
       {policyUpdatePending && <p role="status" aria-label="Policy update" className="text-sm text-muted-foreground">{policyUpdate?.status === 'preparing' ? 'Preparing the selected strategy. The current strategy remains active.' : 'Strategy prepared for the next closed decision boundary.'}{pause ? ' This run remains paused until you resume it.' : ''}</p>}
       {policyUpdate?.status === 'failed' && <p role="status" aria-label="Policy update failed" className="text-sm text-muted-foreground">{policyIncompatible ? 'The selected strategy cannot preserve this private checkpoint. The current strategy remains active. Restarting strategy state keeps conversation history and independent tasks.' : `Strategy update was not applied: ${policyUpdate.failure ?? 'preparation failed'}`}</p>}
-      {snapshot?.launch?.preparation_failure && <p role="alert" className="text-sm text-destructive">{t('chat.run.preparationFailed', { reason: snapshot.launch.preparation_failure_detail ?? threadSourceFailureMessage(snapshot.launch.preparation_failure) ?? snapshot.launch.preparation_failure })}</p>}
+      {snapshot?.launch?.preparation_failure && <p role="alert" className="text-sm text-destructive">{t('chat.run.preparationFailed', { reason: (snapshot.launch.preparation_failure === 'credentials_unavailable' || snapshot.launch.preparation_failure === 'binding_changed')
+        ? t(snapshot.launch.preparation_failure === 'binding_changed' ? 'calendar.failure.reason.binding_changed' : 'calendar.failure.reason.credentials_unavailable')
+        : snapshot.launch.preparation_failure_detail ?? threadSourceFailureMessage(snapshot.launch.preparation_failure) ?? snapshot.launch.preparation_failure })}</p>}
       {draft.pendingInput?.status === 'unknown' && <p role="status" className="text-sm text-muted-foreground">{draft.pendingInput.kind === 'submit' && draft.pendingInput.acceptedRunId ? t('chat.send.goalPending') : t('chat.send.unconfirmed')}</p>}
       {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
       {draft.firstSend?.error && <p role="alert" className="text-sm text-destructive">{draft.firstSend.error}</p>}

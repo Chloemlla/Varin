@@ -147,7 +147,7 @@ export async function startResourceNode(options: NodeOptions) {
       onError: () => console.error('[ResourceNode] Managed resource observation unavailable') });
     cleanup.push(() => target.dispose());
     target.attachSources({ documents, deviceFileAccess: false, validateLiveSource: liveSources.validate,
-      workspaceFiles: createResourceFilesOwner(documents, storage.kernelRecoveryFileResources),
+      workspaceFiles: createResourceFilesOwner(documents, storage.kernelRecoveryFileResources, { restrictedRoot: workspaceRoot }),
       async prepareSource(input, signal) {
         if (input.mode !== 'live_root' || input.resourceOwner.kind !== 'local' || input.selection?.mode === 'native_workspace')
           throw new SourceAdmissionError('source_unavailable');

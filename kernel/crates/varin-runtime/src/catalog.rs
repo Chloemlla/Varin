@@ -53,7 +53,7 @@ pub enum RuntimeError {
     },
 }
 type Result<T> = std::result::Result<T, RuntimeError>;
-pub(crate) const FORMAT: i64 = 101;
+pub(crate) const FORMAT: i64 = 102;
 fn sql_number(value: u64) -> Result<i64> {
     i64::try_from(value).map_err(|_| RuntimeError::Invalid("integer exceeds catalog range".into()))
 }
@@ -150,6 +150,7 @@ fn inspect_catalog_format(db: &Connection) -> Result<i64> {
 
 fn check_catalog_schema(db: &Connection, version: i64) -> Result<()> {
     threads::check_format(db)?;
+    if version >= 102 { db.prepare("SELECT thread_id,model FROM thread_model_preferences")?; }
     if version >= 101 { branch_workspace::check_format(db)?; }
     if version >= 99 { event_scope::check_format(db)?; }
     if version >= 98 { threads::check_hidden_format(db)?; }
@@ -240,6 +241,7 @@ fn initialize_metadata(
     tx.execute_batch("CREATE INDEX IF NOT EXISTS attention_open_runs ON runs(branch_id) WHERE json_extract(body,'$.state') NOT IN ('completed','failed','cancelled');
         CREATE INDEX IF NOT EXISTS attention_open_operations ON operations(run_id) WHERE (json_extract(body,'$.phase')!='terminal' OR json_extract(body,'$.effect')='unknown' OR json_extract(body,'$.outcome')='indeterminate' OR (json_extract(body,'$.mcp_resource_subscription') IS NOT NULL AND (json_extract(body,'$.cancel_requested')=0 OR json_extract(body,'$.mcp_resource_subscription.localReleased')=0)))")?;
     // Product discovery and Bot ancestry need only memory-work owners, not every retained tool.
+    tx.execute_batch(&format!("CREATE INDEX IF NOT EXISTS pending_host_jobs ON operations(run_id) WHERE {}", host_jobs::PENDING_JOB))?;
     tx.execute_batch("CREATE INDEX IF NOT EXISTS thread_memory_operations ON operations(run_id) WHERE json_extract(body,'$.intent.kind')='memory_work_v1'")?;
     tx.execute_batch("CREATE INDEX IF NOT EXISTS pending_code_exchange_jobs ON operations(run_id) WHERE json_extract(body,'$.host_job.binding.domain')='collaboration.code' AND (coalesce(json_extract(body,'$.external_receipt.executor_stopped'),0)=0 OR json_extract(body,'$.phase')!='terminal')")?;
     tx.execute_batch(&format!("CREATE INDEX IF NOT EXISTS pending_waits_by_event ON waits(json_extract(body,'$.subject'),json_extract(body,'$.kind')) WHERE {PENDING_WAIT}"))?;
@@ -261,6 +263,7 @@ fn initialize_metadata(
         model_references::initialize(&tx)?;
         organization::initialize(&tx)?;
         branch_workspace::initialize(&tx)?;
+        threads::initialize_model_preferences(&tx)?;
     }
     collaboration::initialize_recovery_indexes(&tx)?;
     titles::initialize(&tx)?;
@@ -1155,6 +1158,7 @@ impl Catalog {
             return Err(RuntimeError::Conflict("model step identity reused".into()));
         }
         let mut step = ModelStep {
+            history_range: None,
             generation: None,
             goal: None,
             superseded_by_input: None,
@@ -1616,7 +1620,7 @@ impl Catalog {
                         .unwrap_or_default();
                     goals::measured(&tx, result.goal.as_ref(), &output.usage)?;
                     result.dispatch = crate::execution::PolicyModelDispatch::Interrupted;
-                    result.receipt=Some(crate::execution::PolicyModelReceipt{dispatch:crate::execution::PolicyModelDispatch::Interrupted,outcome:Outcome::Indeterminate,output:None,usage:output.usage,finish_reason:None,failure:Some(crate::execution::ModelFailure{tool_name: None,code:"planning_interrupted".into(),message:"dispatch intent was durable; completion is unknown and request will not replay".into(),retry_after_ms:None,provider_request_id:None}),usable:false});
+                    result.receipt=Some(crate::execution::PolicyModelReceipt{dispatch:crate::execution::PolicyModelDispatch::Interrupted,outcome:Outcome::Indeterminate,output:None,usage:output.usage,finish_reason:None,failure:Some(crate::execution::ModelFailure::new("planning_interrupted", "dispatch intent was durable; completion is unknown and request will not replay")),usable:false});
                     policy_model::record_usage(&tx, &op, &result)?;
                     op.phase = OperationPhase::Terminal;
                     op.outcome = Some(Outcome::Indeterminate);

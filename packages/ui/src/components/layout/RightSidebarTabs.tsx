@@ -2,20 +2,14 @@ import React from 'react';
 
 import { ProjectNotesTodoPanel } from '@/components/session/ProjectNotesTodoPanel';
 import { useGitStore } from '@/stores/useGitStore';
-import { useProjectsStore } from '@/stores/useProjectsStore';
+import { useSelectedThreadWorkspace } from '@/hooks/useSelectedThreadWorkspace';
 import { useDirectoryStore } from '@/stores/useDirectoryStore';
 import { formatDirectoryName } from '@/lib/utils';
 
 export const ProjectContextPanel: React.FC = () => {
-  const activeProjectId = useProjectsStore((state) => state.activeProjectId);
-  const projects = useProjectsStore((state) => state.projects);
+  const { project: activeProject } = useSelectedThreadWorkspace();
   const homeDirectory = useDirectoryStore((state) => state.homeDirectory);
   const gitDirectories = useGitStore((state) => state.directories);
-
-  const activeProject = React.useMemo(() => {
-    if (!activeProjectId) return null;
-    return projects.find((project) => project.id === activeProjectId) ?? null;
-  }, [activeProjectId, projects]);
 
   const projectRef = React.useMemo(() => {
     if (!activeProject) {
@@ -24,6 +18,9 @@ export const ProjectContextPanel: React.FC = () => {
     return {
       id: activeProject.id,
       path: activeProject.path,
+      source: activeProject.source,
+      resourceOwner: activeProject.source?.resourceOwner,
+      versionedWorkspace: activeProject.versionedWorkspace,
     };
   }, [activeProject]);
 

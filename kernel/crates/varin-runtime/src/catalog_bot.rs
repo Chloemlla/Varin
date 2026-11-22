@@ -406,6 +406,7 @@ impl Catalog {
             format!("DELETE FROM active_contexts WHERE branch_id {b}"),
             format!("DELETE FROM context_checkpoints WHERE branch_id {b}"),
             format!("DELETE FROM thread_title_progress WHERE branch_id {b}"),
+            "DELETE FROM thread_model_preferences WHERE thread_id IN (SELECT value FROM json_each(?2))".into(),
             "DELETE FROM thread_title_state WHERE thread_id IN (SELECT value FROM json_each(?2))".into(),
             // Identity/principal/Bot evidence must outlive a deleted profile too.
             // Keep no execution bodies or history heads through these small rows.

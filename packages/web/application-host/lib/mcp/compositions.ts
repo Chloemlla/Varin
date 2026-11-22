@@ -1,6 +1,7 @@
 /** Ready MCP contributions over the sole connection/configuration authority. A scope prepares
  * each direct dependency independently; snapshots retain only their concrete selected leases. */
 import { createHash, randomUUID } from 'node:crypto';
+import { McpPreparationError } from './errors.js';
 import { createMcpToolName } from './configuration.js';
 import { isDeepStrictEqual } from 'node:util';
 import type { McpProvenance, McpRoute } from '@varin/protocol';
@@ -19,6 +20,7 @@ interface ServerSlot {
   version: string;
   current?: Generation;
   preparation?: AbortController;
+  failure?: McpPreparationError;
 }
 const retain = (generation: Generation) => { generation.references++; return generation; };
 const release = (generation: Generation) => {
@@ -186,6 +188,7 @@ class Scope {
       if (slot.version === selection.configurationVersion && !credentials && !changedTools.has(server.name)) continue;
       slot.version = selection.configurationVersion;
       slot.preparation?.abort();
+      delete slot.failure;
       const controller = new AbortController(); slot.preparation = controller;
       const selected = slot;
       const signal = AbortSignal.any([controller.signal, this.lifetime.signal]);
@@ -202,7 +205,11 @@ class Scope {
         this.notify();
       }, error => {
         if (failedDrain(error)) throw error;
-        if (!this.closed && !signal.aborted && selected.preparation === controller) { delete selected.preparation; this.notify(); }
+        if (!this.closed && !signal.aborted && selected.preparation === controller) {
+          delete selected.preparation;
+          if (error instanceof McpPreparationError) selected.failure = error;
+          this.notify();
+        }
       }));
     }
   }
@@ -231,7 +238,7 @@ class Scope {
         if (!slot) throw new Error('mcp_saved_dependency_unavailable');
         if (slot.current) continue;
         if (slot.preparation) { preparing = true; continue; }
-        throw new Error('mcp_saved_dependency_failed');
+        throw slot.failure ?? new Error('mcp_saved_dependency_failed');
       }
       if (!preparing) {
         const result = this.snapshot(selection);

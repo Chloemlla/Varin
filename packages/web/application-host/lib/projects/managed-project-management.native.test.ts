@@ -70,10 +70,10 @@ it('manages the real target Git workspace and joins its original adoption intent
   cleanups.push(() => compute.dispose());
   // Production Files and Documents share this exact backend and its original
   // mutation lease. A second backend would compete with the enclosing writer.
-  const resourceFiles = createResourceFilesOwner(target.documents,target.backend,undefined,async(selection,signal)=>{
+  const resourceFiles = createResourceFilesOwner(target.documents,target.backend,{prepareProjectSelection:async(selection,signal)=>{
     const registration=await target.documents.admitWorkspaceRegistration(selection.workspaceId,signal);
     return {path:(await preparedNative.prepareSelection(selection,'project-files',signal)).path,originalRoot:registration.canonicalPath};
-  }, {files:createFsSearchRuntime({compute}),content:createWorkspaceContentSearch({documents:target.documents,compute})});
+  }, search:{files:createFsSearchRuntime({compute}),content:createWorkspaceContentSearch({documents:target.documents,compute})}});
   const sources = createManagedSourceService({ kernel: target.client, hostId: 'management-target', documents: target.documents,
     projectManagement: management, workspaceFiles:resourceFiles, validateLiveSource: async () => { throw new Error('Project management uses registered Documents, not a conversation Source'); }, prepareSource: prepare });
   const app = express(); app.use(express.json());

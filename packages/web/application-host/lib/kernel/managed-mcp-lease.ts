@@ -1,3 +1,4 @@
+import { McpPreparationError } from '../mcp/errors.js';
 /** Coordinator projection of one target-owned MCP view; all dispatch stays on that view. */
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
@@ -56,8 +57,10 @@ export async function createManagedMcpLease(input: {
     const reply = await access.client.service({ coordinatorHostId: input.coordinatorHostId,
       authorityId: access.binding.authorityId, resourceEpoch: access.binding.resourceEpoch,
       requestId: action.kind === 'snapshot' || action.kind === 'derive' ? creationRequestId : `mcp-request:${randomUUID()}`, operation: { kind: 'mcp', action } }, action.kind === 'release' ? signal : AbortSignal.any([input.lifetime, ...(signal ? [signal] : [])]));
-    if (!reply.ok) throw new McpAuthorityError(reply.error.code, reply.error.dispatched, reply.error.settlement,
-      reply.error.protocolError, reply.error.interactionProblem);
+    if (!reply.ok) {
+      if (reply.error.preparation) throw new McpPreparationError(reply.error.preparation, reply.error.code === 'mcp-server-needs-auth');
+      throw new McpAuthorityError(reply.error.code, reply.error.dispatched, reply.error.settlement, reply.error.protocolError, reply.error.interactionProblem);
+    }
     return reply.value as T;
   };
   let snapshot: ManagedMcpSnapshot;

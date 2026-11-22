@@ -13,11 +13,8 @@ The Host coordinates room membership and publication through a revisioned kernel
 ## Profile, Model Resolution & Sessions
 
 - **Settings**: The Bot directory uses the same groups and order as the conversation sidebar. Each Bot has a Profile and Memory page. One save applies changed profile fields, including appearance. Bot work and its results are accessible from the conversation side panel under **All work**. Settings → Memory owns service-wide memory automation, and **Model roles** owns the memory organizer model.
-- **Model & thinking precedence** for a new Bot conversation:
-  1. Bot profile's dedicated model/thinking (if set; omitted thinking falls back to conversation default → model's first supported level).
-  2. Current Workbench/IDE selection on the same Host.
-  3. Shared conversation default → first enabled chat-capable model.
-- Updating a Bot's model/thinking updates active direct sessions at the next model-request boundary; in-flight requests and dispatched tasks keep their frozen configs. Idle wake/resume re-reads the current Bot profile when the last exchange is closed.
+- **Model and thinking.** Choosing either in a Bot conversation saves the pair to that Thread immediately, including an empty conversation. Its branches share the choice. Direct messages, queued turns and background wakes use it after reopening or restarting the Host.
+- Conversations without a saved choice inherit the Bot profile, then the shared conversation default. Changes take effect at the next model-request boundary. An already dispatched request and its tool results finish with their original model.
 - **Sessions & branches**: A Bot owns multiple independent native Threads (`thread:bot:<botId>:<uuid>`, created via `POST /api/harness/bots/:botId/sessions` while awake) sharing identity, profile, home dir, memory, and schedules. `POST /api/harness/bots/:botId/entry` resolves the actual active entry Thread atomically in Catalog.
 - **Sidebar organization**: Bot folders live in Rust Storage (`bot.organization:sidebar`, CAS-checked, pushed via `varin:bot-organization-changed`), separate from shared conversation organization (`organization` tool / Catalog).
 - **Direct follow-up default**: Bot direct sessions use `botFollowUpBehavior` (default `steer`), determined by `bot_id` + parent relation (shell-independent). `Alt+Enter` / button action queues after the current turn.

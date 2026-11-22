@@ -301,6 +301,45 @@ describe("memory organizer (BC2)", () => {
   const owner: MemoryOwner = { scope: 'bot', ownerId: 'ws-1' };
   const settled = (store: KnowledgeStore) => wait(async () => (await store.listOrganizerProgress()).some(row => ['formed', 'reviewed-empty', 'failed'].includes(row.status)));
 
+  it('keeps a user correction current when a later conversation repeats the old answer', async () => {
+    const store = await setup('纸质讲义每桌放几份？');
+    materials.push({ ...material('h2', '每桌放 7 份。'), role: 'assistant' });
+    const service = memory();
+    const shared = { scope: 'user', ownerId: null } as const;
+    const old = await service.remember(shared, { content: '纸质讲义每桌放 7 份。', nature: 'preference' });
+    const correction = await service.correct(shared, old.item.id, {
+      content: '纸质讲义每桌放 11 份。', source: { kind: 'user-correction' },
+    });
+    await userStore.noteMemoryMaintenance([old.item.id, correction.id]);
+    expect((await userStore.listOrganizerProgress()).filter(job => job.status === 'pending')).toEqual([]);
+    organizeText = JSON.stringify({ memories: [{ action: 'new', scope: 'bot', nature: 'preference',
+      content: '纸质讲义仍然每桌 7 份。', sources: [{ source: 'u0', quote: materials[0]!.text }, { source: 'u1', quote: materials[1]!.text }] }] });
+    const org = organizer(service);
+    org.noteScope('bot:ws-1');
+    await settled(store);
+    expect((await store.listOrganizerProgress()).some(job => job.status === 'reviewed-empty')).toBe(true);
+    const hits = await service.search(owner, '纸质讲义每桌放几份？', 5, { threadId: 'new-thread', includeShared: true });
+    expect(hits.map(hit => hit.node.payload.content)).toEqual(['纸质讲义每桌放 11 份。']);
+  });
+
+  it('reviews an existing Bot inference against a shared correction without retiring independent user entries', async () => {
+    const store = await setup();
+    materials = [];
+    const service = memory();
+    const shared = { scope: 'user', ownerId: null } as const;
+    const original = await service.remember(shared, { content: '每桌放 7 份讲义', source: { kind: 'agent-memory', threadId: 'original' } });
+    const copy = await service.remember(owner, { content: '讲义每桌发七份', source: { kind: 'memory-organizer' } });
+    const other = await service.remember(owner, { content: '讲义用 A4 纸', source: { kind: 'user-mark' } });
+    const correction = await service.correct(shared, original.item.id, { content: '每桌放 11 份讲义', source: { kind: 'user-correction' } });
+    organizeText = JSON.stringify({ retire: [copy.item.id], outputs: [], reason: 'The earlier count was superseded' });
+    const org = organizer(service);
+    await org.noteSharedKnowledge([original.item.id, correction.id]);
+    await wait(async () => (await store.getKnowledge(copy.item.id))?.invalidAt !== undefined);
+    expect(calls.filter(c => c.method === 'generate').some(c => String(c.params.prompt).includes('每桌放 11 份讲义'))).toBe(true);
+    expect((await store.getKnowledge(other.item.id))?.invalidAt).toBeUndefined();
+    expect((await userStore.getKnowledge(correction.id))?.invalidAt).toBeUndefined();
+  });
+
   it('organizes with an omitted maximum output, budgeting against the known context window', async () => {
     maxTokens = 0;
     const store = await setup();

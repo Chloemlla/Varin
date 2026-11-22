@@ -16,7 +16,7 @@ import { isDeepStrictEqual } from 'node:util';
 import type { LiveSourceResolver } from './live-source.js';
 import type { PolicyModelPreparer } from './policy-models.js';
 import { waitWithSignal } from '../cancellation.js';
-import { modelCredentialBindingIdentity, waitForModelBinding } from './model-binding-lifetime.js';
+import { launchModelSelection, modelCredentialBindingIdentity, waitForModelBinding } from './model-binding-lifetime.js';
 import type { AgentPolicyLease, AgentPolicyBinding, AgentPolicyArtifactBinding } from './agent-policy.js';
 import type { AgentDriverLease, AgentDriverPreparer } from './agent-driver.js';
 import type { DriverBinding, DriverSelection } from './protocol.generated.js';
@@ -41,7 +41,7 @@ import {
   sourceToolSchemas,
   type SourceLaunch,
 } from './source-launch.js';
-import type { ExistingHostCredentialOwner } from './credential-owner.js';
+import { CredentialOwnerError, sameCredentialScope, type ExistingHostCredentialOwner } from './credential-owner.js';
 import type { KernelClient } from './kernel-client.js';
 import type { ManagedSourceClient, ManagedRemoteTargetRegistry } from '../harness/managed-remote-client.js';
 import type { ManagedHostSourceOwner, ManagedSourceBinding } from '../harness/managed-remote-types.js';
@@ -1127,7 +1127,7 @@ export class AgentRuntimeClient {
   recoverySources(input: { threadId: string; branchId: string }, signal?: AbortSignal): Promise<Array<{ runId: string; source: import('./protocol.generated.js').LaunchSource }>> {
     return this.kernel.agentRuntimeRequest('runtime.branch.recovery.sources', { threadId: input.threadId, branchId: input.branchId }, signal);
   }
-  recoveryRange(input: import('./protocol.generated.js').NavigationSelectParams, signal?: AbortSignal): Promise<import('./protocol.generated.js').RecoveryRangeTurn[]> {
+  recoveryRange(input: import('./protocol.generated.js').RecoveryRangeParams, signal?: AbortSignal): Promise<import('./protocol.generated.js').RecoveryRangeTurn[]> {
     return this.kernel.agentRuntimeRequest('runtime.branch.recovery.range', input, signal);
   }
   recoveryRun(runId: string, signal?: AbortSignal): Promise<import('./protocol.generated.js').RecoveryRangeTurn[]> {
@@ -2078,50 +2078,47 @@ export class AgentRuntimeClient {
       await this.admitStartingSource(runId, signal);
       const delegatedChild = await this.childExecutionForRun(runId, signal);
       const selected = await this.modelSelections(runId, signal);
-      const modelBinding = selected.desired && owner.bindingIdentity === modelCredentialBindingIdentity(selected.desired.configuration)
-        ? selected.desired.binding_id : selected.active?.binding_id;
-      const credentialScope = await this.kernel.registerCredentialOwner(
-        runId,
-        owner,
-        signal,
-        modelBinding,
-      );
-      const credentialEpoch = this.kernel.kernelEpoch;
-      try {
-        const driverBinding = await this.prepareDriver(runId, signal, credentialScope);
-        const policyBinding = driverBinding ? undefined : await this.preparePolicy(runId, signal, credentialScope);
-        const mcpBinding = this.kernel.mcpLiveBinding(runId);
-        const extensionBindings = await this.prepareExtensions(runId, signal);
-        await this.reconcileMemory(runId, signal);
-        await this.reconcilePlan(runId, signal);
-        await this.admitStartingSource(runId, signal);
-        const receipt = await this.kernel.agentRuntimeRequest<
-          RunStartReceipt,
-          'runtime.run.start'
-        >(
-          'runtime.run.start',
-          {
-            runId,
-            extensionBindings,
-            credentialScope,
-            ...(policyBinding ? { policyBinding } : {}),
-            ...(driverBinding ? { driverBinding } : {}),
-            ...(mcpBinding ? { mcpBinding } : {}),
-            ...(toolBinding === undefined ? {} : { toolBinding }),
-          },
-          signal,
-          // The caller may stop observing after native admission. Keep original owners
-          // until the start acknowledgement settles; abort is not a failed admission.
-          { settleCancellation: true },
-        );
-        this.startedTools(runId);
-        if (delegatedChild?.trigger.kind === 'dispatch') this.kernel.releaseChildToolHandoff(delegatedChild.parent_run_id, delegatedChild.child_operation_id);
-        return receipt;
-      } catch (error) {
-        this.releaseToolComposition(runId);
-        if (this.kernel.kernelEpoch === credentialEpoch) this.kernel.unregisterCredentialOwner(runId, modelBinding ?? null);
-        throw error;
-      }
+      const initial = launchModelSelection(selected);
+      return this.kernel.withModelCredential(runId, initial?.binding_id, owner, signal, async credentialScope => {
+        try {
+          if (initial && ((owner.bindingIdentity && owner.bindingIdentity !== modelCredentialBindingIdentity(initial.configuration))
+            || (initial.credential_scope && !sameCredentialScope(initial.credential_scope, credentialScope)))) {
+            throw new CredentialOwnerError('credential-scope-changed');
+          }
+          const driverBinding = await this.prepareDriver(runId, signal, credentialScope);
+          const policyBinding = driverBinding ? undefined : await this.preparePolicy(runId, signal, credentialScope);
+          const mcpBinding = this.kernel.mcpLiveBinding(runId);
+          const extensionBindings = await this.prepareExtensions(runId, signal);
+          await this.reconcileMemory(runId, signal);
+          await this.reconcilePlan(runId, signal);
+          await this.admitStartingSource(runId, signal);
+          const receipt = await this.kernel.agentRuntimeRequest<
+            RunStartReceipt,
+            'runtime.run.start'
+          >(
+            'runtime.run.start',
+            {
+              runId,
+              extensionBindings,
+              credentialScope,
+              ...(policyBinding ? { policyBinding } : {}),
+              ...(driverBinding ? { driverBinding } : {}),
+              ...(mcpBinding ? { mcpBinding } : {}),
+              ...(toolBinding === undefined ? {} : { toolBinding }),
+            },
+            signal,
+            // The caller may stop observing after native admission. Keep original owners
+            // until the start acknowledgement settles; abort is not a failed admission.
+            { settleCancellation: true },
+          );
+          this.startedTools(runId);
+          if (delegatedChild?.trigger.kind === 'dispatch') this.kernel.releaseChildToolHandoff(delegatedChild.parent_run_id, delegatedChild.child_operation_id);
+          return receipt;
+        } catch (error) {
+          this.releaseToolComposition(runId);
+          throw error;
+        }
+      });
     });
   }
   /** Borrow a fresh base lease from the exact live model binding, including its child dependencies. */
@@ -2130,11 +2127,6 @@ export class AgentRuntimeClient {
   }
   retainQueuedModel(runId: string, owner: ExistingHostCredentialOwner): Promise<void> { return this.kernel.retainQueuedModelCredentialOwner(runId, owner); }
   releaseQueuedModel(runId: string, owner: ExistingHostCredentialOwner): void { this.kernel.releaseQueuedModelCredentialOwner(runId, owner); }
-  releaseMainModelCredentials(runId: string, selected: RunModelSelections): void {
-    // Main model rebind must not discard a retired-but-pinned policy or its planning credentials.
-    this.kernel.unregisterCredentialOwner(runId, null);
-    for (const binding of [selected.active, selected.desired]) if (binding) this.kernel.unregisterCredentialOwner(runId, binding.binding_id);
-  }
   modelSelections(
     runId: string,
     signal?: AbortSignal,
@@ -2154,23 +2146,13 @@ export class AgentRuntimeClient {
     childDispatch?: ChildDispatchCatalog,
   ): Promise<RunModelSelection> {
     const bindingId = `model:${key}`;
-    const credentialScope = await this.kernel.registerCredentialOwner(
-      runId,
-      owner,
-      signal,
-      bindingId,
-    );
-    try {
-      return await this.kernel.agentRuntimeRequest(
+    return this.kernel.withModelCredential(runId, bindingId, owner, signal, credentialScope =>
+      this.kernel.agentRuntimeRequest(
         'runtime.model.select',
         { runId, key, configuration, credentialScope, ...(childDispatch ? { childDispatch } : {}) },
         signal,
         { settleCancellation: true },
-      );
-    } catch (error) {
-      this.kernel.unregisterCredentialOwner(runId, bindingId);
-      throw error;
-    }
+      ));
   }
   async run(runId: string, signal?: AbortSignal): Promise<Run> {
     const run = await this.kernel.agentRuntimeRequest<
