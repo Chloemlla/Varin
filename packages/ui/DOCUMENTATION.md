@@ -70,6 +70,7 @@ Cross-cutting architecture docs:
 - **LegendList patches**: `bun-patches/@legendapp%2Flist@3.7.2.patch` skips deferred 1-frame shrink inside lists marked `data-legend-immediate-shrink` (`src/components/conversation/ChatTimeline.tsx`) and skips `0x0` hidden-ancestor collapses while microtask-coalescing container measurements to avoid nested layout-depth overflows (tested in `src/components/conversation/LegendListMeasurement.behavior.test.tsx`; re-check on LegendList upgrades).
 
 ### Chat modes, tools, and composer
+- **Completed work**: Chat settings fold successful native and external turns by default. The terminal receipt triggers folding. Earlier commentary and tool steps reopen in order, while the final response, user inputs and standalone interaction cards stay visible. Manual choices are scoped to the conversation in session storage.
 - **Layout modes**: Chronological, grouped-answer, and conversation-first (`dialogue`, default for unset/reset). Conversation-first keeps every spoken message in arrival order and folds multi-tool/public-thinking runs between messages into one initially collapsed activity row, while keeping dispatches, questions, context notices, agent messages (`src/components/conversation/ChatAgentMessageBubble.tsx`), and usable UI/image outputs independent in all modes. Redacted thinking never enters preview text.
 - **Tool cards, links & media**:
   - Tool cards require an Operation ID before exposing read/cancel actions; an absent Operation is never an identity match.

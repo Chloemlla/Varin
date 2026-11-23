@@ -1,12 +1,15 @@
 import { create } from 'zustand';
-import { ChangeSet, type EditorState } from '@codemirror/state';
-import { mapComposerReferences } from '@/components/chat/composer/editor/references';
+import { ChangeSet, Text, type EditorState } from '@codemirror/state';
+import { composerMarkerObjectId, mapComposerReferences, type ComposerReference } from '@/components/chat/composer/editor/references';
 import type { ComposerMarkerObject } from '@/components/chat/composer/editor/markers';
 import { mapInteractionRanges, type InteractionRange } from '@/components/chat/composer/editor/interactionRanges';
 import type { EditorContextAttachment } from '@/lib/agent-editor/types';
 import type { InlineCommentDraft } from './useInlineCommentDraftStore';
 import type { Attachment, ImageAttachment } from '@varin/protocol';
 import type { ContentReference, ContentReferenceInput, ThreadAgentChoice, ThreadIdentity, ThreadModel, ThreadPrepareSource, ThreadPreparedSource, ThreadsAPI } from '@varin/application-client';
+import { getRuntimeEndpointGeneration } from '@varin/application-client';
+import { useUIStore } from './useUIStore';
+import { readUnsentComposer, writeUnsentComposer } from './utils/unsentComposerStorage';
 
 export type ThreadPendingInput = {
   fingerprint: string;
@@ -162,7 +165,61 @@ export function sameThreadModel(left: ThreadModel | null | undefined, right: Thr
     && left.thinkingLevel === right.thinkingLevel && Object.is(left.temperature, right.temperature));
 }
 export const EMPTY_THREAD_DRAFT: ThreadDraft = Object.freeze({ text: '', images: [], materials: [], preparedSource: null });
-/** Composer state only; accepted execution and history remain with the native Catalog. Never persisted. */
+type SavedComposer = Pick<ThreadDraft, 'text' | 'references' | 'markerObjects' | 'interactions'>;
+
+function savedComposerKey(key: string, identity?: ThreadIdentity): string | undefined {
+  // The live draft store also accepts workflow keys built by appending a suffix.
+  if (!key.startsWith('["') || !key.endsWith('"]')) return;
+  let parts: unknown;
+  try { parts = JSON.parse(key); } catch { return; }
+  if (!Array.isArray(parts) || parts.length !== 3) return;
+  const [host, thread, branch] = parts;
+  if (typeof host !== 'string' || typeof thread !== 'string' || typeof branch !== 'string') return;
+  // A materialized Thread keeps its live composer key but saves under its actual identity.
+  if (identity) return JSON.stringify([host, identity.threadId, identity.branchId]);
+  if (thread !== 'draft' && branch) return key;
+}
+
+function readSavedComposer(key: string): SavedComposer | undefined {
+  if (!useUIStore.getState().persistChatDraft) return;
+  const storageKey = savedComposerKey(key);
+  if (!storageKey) return;
+  const json = readUnsentComposer(storageKey);
+  if (!json) return;
+  try {
+    const saved = JSON.parse(json) as SavedComposer;
+    if (typeof saved.text !== 'string') throw new Error('Invalid saved draft');
+    const host = getRuntimeEndpointGeneration();
+    return { text: saved.text, interactions: saved.interactions, references: saved.references?.map(reference => ({ ...reference, host })),
+      markerObjects: saved.markerObjects?.map(object => ({ ...object, host })) };
+  } catch {
+    writeUnsentComposer(storageKey, null);
+  }
+}
+
+function saveComposer(key: string, next: ThreadDraft, previous: ThreadDraft) {
+  if (!useUIStore.getState().persistChatDraft || (next.text === previous.text && next.references === previous.references
+    && next.markerObjects === previous.markerObjects && next.interactions === previous.interactions && next.identity === previous.identity)) return;
+  const storageKey = savedComposerKey(key, next.identity);
+  if (!storageKey) return;
+  // Save text and structured text quotes. Uploads, image bytes, undo history and send attempts live with the live composer.
+  const markerObjects = next.markerObjects?.filter(object => object.payload.kind === 'quote' && !object.payload.reference.image);
+  const savedIds = new Set(markerObjects?.map(object => object.id));
+  const references: ComposerReference[] = [], removed: { from: number; to: number }[] = [];
+  for (const ref of next.references ?? []) {
+    const objectId = composerMarkerObjectId(ref);
+    if (objectId && !savedIds.has(objectId)) removed.push({ from: ref.from, to: ref.to });
+    else if (!['attachment', 'draft-file', 'backend-command'].includes(ref.target.kind)) references.push(ref);
+  }
+  const changes = removed.length ? ChangeSet.of(removed, next.text.length) : undefined;
+  const text = changes ? changes.apply(Text.of(next.text.split('\n'))).toString() : next.text;
+  if (!text.trim()) { writeUnsentComposer(storageKey, null); return; }
+  const saved: SavedComposer = { text, references: changes ? mapComposerReferences(references, changes) : references, markerObjects,
+    interactions: changes && next.interactions ? mapInteractionRanges(next.interactions, changes) : next.interactions };
+  writeUnsentComposer(storageKey, JSON.stringify(saved));
+}
+
+/** Durable composer content is separate from execution receipts and the editor's live state. */
 export const useThreadDraftStore = create<{
   drafts: Record<string, ThreadDraft>;
   patch(key: string, patch: Partial<ThreadDraft> | ((draft: ThreadDraft) => Partial<ThreadDraft>)): void;
@@ -170,7 +227,7 @@ export const useThreadDraftStore = create<{
 }>((set) => ({
   drafts: {},
   patch: (key, patch) => set(state => {
-    const draft = state.drafts[key] ?? EMPTY_THREAD_DRAFT;
+    const draft = state.drafts[key] ?? { ...EMPTY_THREAD_DRAFT, ...readSavedComposer(key) };
     const change = typeof patch === 'function' ? patch(draft) : patch;
     const next = { ...draft, ...change };
     if (typeof change.text === 'string' && change.text !== draft.text) {
@@ -196,7 +253,12 @@ export const useThreadDraftStore = create<{
     if (sameThreadModel(draft.model, next.model)) next.model = draft.model;
     // Empty/unchanged updates are observations, not new draft generations.
     if (state.drafts[key] && Object.keys(next).every(key => Object.is(draft[key as keyof ThreadDraft], next[key as keyof ThreadDraft]))) return state;
+    saveComposer(key, next, draft);
     return { drafts: { ...state.drafts, [key]: next } };
   }),
-  remove: key => set(state => { const drafts = { ...state.drafts }; delete drafts[key]; return { drafts }; }),
+  remove: key => set(state => {
+    const storageKey = savedComposerKey(key, state.drafts[key]?.identity);
+    if (storageKey) writeUnsentComposer(storageKey, null);
+    const drafts = { ...state.drafts }; delete drafts[key]; return { drafts };
+  }),
 }));

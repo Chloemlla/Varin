@@ -1,4 +1,5 @@
 export const settingsDict = {
+  'settings.chat.collapseCompletedWork': '완료된 작업 과정 자동 접기',
   "settings.view.nav.group.models": "모델",
   "settings.view.nav.group.capabilities": "기능",
   "settings.view.nav.group.data": "데이터",

@@ -116,6 +116,7 @@ export interface ChatTimelineProps {
   };
   header?: React.ReactNode;
   footer?: React.ReactNode;
+  inlineViews?: React.ReactNode;
   compactionStatus?: 'requested' | 'running' | 'retrying' | 'ready' | 'applying' | 'failed';
   assistantWaiting?: ChatAssistantWaitingPresentation;
   activeRunId?: string;
@@ -1036,6 +1037,7 @@ export const ChatTimelineEntryList: React.FC<Omit<
   liveGeneration?: import('@/lib/agent-runtime/thread-projection').ProgressActivity;
   projectedResultByCallId?: ReadonlyMap<string, ChatToolResultMessage>;
   part?: 'body' | 'footer';
+  answerText?: string;
   turnActive?: boolean;
   /** A physical body row uses its logical Run's sorted projection. Activity
    * has its own virtual rows; it must not be mounted again inside the body. */
@@ -1059,6 +1061,7 @@ export const ChatTimelineEntryList: React.FC<Omit<
   threadBusyEntryId,
   toolExecutions,
   part,
+  answerText,
   turnActive = liveAssistant?.stopReason === 'pending',
   sortedPresentation,
   presentationMode,
@@ -1114,7 +1117,7 @@ export const ChatTimelineEntryList: React.FC<Omit<
   // The row owns the whole turn, independent of live/sorted presentation.
   // Only assistant prose belongs in copy/memory; thinking and tool output do
   // not. Native discussion/fork actions still need a persisted text message.
-  const turnText = assistantMessagesForTurn(builtInEntries, projection.liveAssistant)
+  const turnText = answerText ?? assistantMessagesForTurn(builtInEntries, projection.liveAssistant)
     .map((message) => message.content.filter((content) => content.type === 'text')
       .map((content) => content.text).join('\n').trim())
     .filter(Boolean).join('\n\n');

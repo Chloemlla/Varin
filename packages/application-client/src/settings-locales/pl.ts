@@ -1,4 +1,5 @@
 export const settingsDict = {
+  'settings.chat.collapseCompletedWork': 'Automatycznie zwijaj przebieg zakończonej pracy',
   "settings.view.nav.group.models": "Modele",
   "settings.view.nav.group.capabilities": "Możliwości",
   "settings.view.nav.group.data": "Dane",

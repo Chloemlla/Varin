@@ -10,6 +10,7 @@ Assistant responses support two interactive tiers alongside normal Markdown/math
 - Only top-level `varin-ui` fences in assistant messages execute (user messages, tool raw outputs, quotes, and nested code examples stay plain text). Incomplete streaming blocks show placeholders; invalid JSON shows readable errors + raw text without auto-calling the model.
 - Supported `type`s: `choice` (`multiple`, `allowOther`), `input` (`text` | `textarea` | `number` | `range` | `date`), `form` (`fields`), `disclosure`, `tabs`, `embed` (`ref: "ui:<id>@<rev>"`), and `object` (`ref: "<nativeRef>"`).
 - **Actions**: String `action` fills an editable draft in the composer; object `action` supports `compose | reference | copy | open | send`. Selections never auto-send — explicit `send` runs through a platform-owned button outside the widget using the normal thread input/queue owner.
+- A selectable draft stores each option's full Markdown body in `{key, label, content}`. The card shows the selected body and the compose action includes it in the draft.
 - Detailed model examples live in `render_ui`'s on-demand metadata (`tool_describe({ name: "render_ui", detail: "full", path: "/examples" })`), not permanently stuffed into system prompts.
 - **Copy & Export**: Turn copy and Markdown export convert valid declarative blocks to readable text from the original assistant message; JSON export preserves raw definitions; HTML download produces a standalone snapshot with embedded media/state (no host save/send channel).
 

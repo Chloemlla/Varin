@@ -243,6 +243,8 @@ export type ExternalItem = ContentReferenceInput & {
   id: string;
   turnId: string;
   kind: 'user' | 'assistant' | 'reasoning' | 'tool' | 'notice' | 'plan';
+  responseId?: string;
+  phase?: 'commentary' | 'final_answer';
   text: string;
   complete?: boolean;
   images?: Array<{ data: string; mimeType: string; reference?: number }>;

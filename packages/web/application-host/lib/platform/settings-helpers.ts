@@ -549,6 +549,7 @@ export const createSettingsHelpers = (dependencies: SettingsHelpersDependencies)
     if (typeof candidate.showTurnChangedFiles === 'boolean') {
       result.showTurnChangedFiles = candidate.showTurnChangedFiles;
     }
+    if (typeof candidate.collapseCompletedWork === 'boolean') result.collapseCompletedWork = candidate.collapseCompletedWork;
     if (typeof candidate.showExpandedBashTools === 'boolean') {
       result.showExpandedBashTools = candidate.showExpandedBashTools;
     }

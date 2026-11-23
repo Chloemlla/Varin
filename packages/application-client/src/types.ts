@@ -750,6 +750,7 @@ export interface SettingsPayload {
   showToolFileIcons?: boolean;
   codeBlockLineWrap?: boolean;
   showTurnChangedFiles?: boolean;
+  collapseCompletedWork?: boolean;
   showExpandedBashTools?: boolean;
   showExpandedEditTools?: boolean;
   chatContentWidth?: number;

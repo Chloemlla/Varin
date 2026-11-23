@@ -1,4 +1,5 @@
 export const settingsDict = {
+  'settings.chat.collapseCompletedWork': 'Recolher automaticamente as etapas concluídas',
   "settings.view.nav.group.models": "Modelos",
   "settings.view.nav.group.capabilities": "Recursos",
   "settings.view.nav.group.data": "Dados",

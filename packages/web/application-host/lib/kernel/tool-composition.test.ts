@@ -203,7 +203,7 @@ function setup(initial: ExtensionToolLease[] = [], failRegistration = 0, withExt
     mcpLiveBinding: () => mcp,
     mcpImplementationIdentity: () => undefined,
     withModelCredential: async (_run: string, _binding: unknown, _owner: unknown, _signal: unknown,
-      use: (scope: unknown) => Promise<unknown>) => use({}),
+      invoke: (scope: unknown) => Promise<unknown>) => invoke({}),
     unregisterCredentialOwner() {},
     releaseRunPolicyOwners() {}, releaseRunDriverOwner() {}, isRunDriverInvoking() { return false; },
     cancelRunPreparation() {},

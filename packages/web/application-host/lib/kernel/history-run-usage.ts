@@ -24,8 +24,9 @@ export class HistoryRunUsageReader {
   async read(branchId: string, page: UsagePage, presentations: readonly ModelPresentation[] = [], signal?: AbortSignal): Promise<ThreadRunUsage[]> {
     const runIds = [...new Set(page.items.map(item => item.run_id))];
     const runs = await Promise.all(runIds.map(id => this.runtime.run(id, signal)));
-    const ended = new Set(runs.filter(run => ['completed', 'failed', 'cancelled'].includes(run.state)).map(run => run.id));
-    const requests = new Map([...ended].map(id => [id, new Set<string>()]));
+    const ended = new Map(runs.flatMap(({ id, state }) =>
+      state === 'completed' || state === 'failed' || state === 'cancelled' ? [[id, state] as const] : []));
+    const requests = new Map([...ended.keys()].map(id => [id, new Set<string>()]));
     // Usage needs request identities from ended assistant messages only. Do not
     // reread user text, large tool outputs or active Run bodies just to show a footer.
     const assistants = page.items.filter(item => item.source === 'assistant' && ended.has(item.run_id));
@@ -48,7 +49,7 @@ export class HistoryRunUsageReader {
     const missing = [...new Set([...requests.values()].flatMap(ids => [...ids]))].filter(id => !metadata.has(id));
     if (missing.length) for (const view of await this.runtime.modelPresentations(missing, signal)) metadata.set(view.requestId, view);
     const through = new Map(page.items.map(item => [item.run_id, item.id]));
-    return [...requests].map(([runId, ids]) => ({ runId, throughId: through.get(runId)!, requests: [...ids].map(requestId => {
+    return [...requests].map(([runId, ids]) => ({ runId, outcome: ended.get(runId)!, throughId: through.get(runId)!, requests: [...ids].map(requestId => {
       const view = metadata.get(requestId);
       if (!view) throw new Error('Original history usage is unavailable');
       return { requestId, usage: view.usage, ...(view.generation ? { generation: view.generation } : {}), ...(view.completeInputTokens !== undefined ? { completeInputTokens: view.completeInputTokens } : {}) };

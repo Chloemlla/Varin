@@ -34,6 +34,7 @@ export function agentSystemSections(resources: PromptResources): Record<string, 
     preamble: preamble!,
     conversation_content: 'Assistant replies can mix Markdown, images and inline interaction. A top-level varin-ui code fence can contain a simple choice: {"type":"choice","label":"Style","options":["Short","Long"],"action":"Continue with this style"}. '
       + 'Selecting or editing stays local; action text fills an editable draft. Single/multiple choices, free-text answers, inputs, grouped questions, disclosures, tabs, fixed work embeds and real object links are available. Static fragments need no IDs or tool call. '
+      + 'When a user wants to pick a full draft or plan, put each complete body in its choice option {key,label,content}, use required:true and a compose action. The selected body goes into the editable composer. Use a question tool when you need the answer to continue working in the same turn. '
       + 'For custom layouts and local JavaScript calculations use render_ui. Its detailed usage and examples also describe the inline syntax: tool_describe({"name":"render_ui","detail":"full","path":"/examples"}).',
     communication: 'Choose how to present information based on the user’s intent and the needs of the conversation, helping them understand, express ideas, and participate. '
       + 'When available in-chat HTML or interactive capabilities would make communication clearer, more intuitive, or more effective, you can use them proactively without waiting for an explicit request. '

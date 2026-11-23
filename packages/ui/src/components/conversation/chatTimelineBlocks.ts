@@ -2,6 +2,7 @@ import { CHAT_SORTED_LIVE_ASSISTANT_ID, projectChatSortedTurn, type ChatSortedTu
 import { resolveChatTimelineItem, type ChatTimelineEntry, type ChatTimelineProjection, type ChatTimelineTurn } from './chatTimelineProjection';
 import type { ChatAssistantMessage, ChatToolExecutionState, ChatToolResultMessage } from './types';
 import { projectChatDialogue, type DialogueItem } from './chatDialogueProjection';
+import { completedWorkSteps, type WorkPartRole } from './completedWork';
 
 export interface ChatTimelineBlockGroup {
   id: string;
@@ -17,10 +18,13 @@ export type ChatTimelineBlock = {
   ownerId: string;
 } & (
   | { kind: 'user'; turn: ChatTimelineTurn }
-  | { kind: 'chrome' | 'footer' | 'activity-header' | 'live-assistant'; group: ChatTimelineBlockGroup }
+  | { kind: 'chrome' | 'activity-header' | 'live-assistant'; group: ChatTimelineBlockGroup }
+  | { kind: 'footer'; group: ChatTimelineBlockGroup; answerText?: string }
   | { kind: 'entry'; entry: ChatTimelineEntry; group: ChatTimelineBlockGroup }
   | { kind: 'activity'; activityId: string; sourceId: string; group: ChatTimelineBlockGroup }
   | { kind: 'dialogue'; itemId: string; group: ChatTimelineBlockGroup }
+  | { kind: 'work-header'; group: ChatTimelineBlockGroup; work: CompletedWork }
+  | { kind: 'work-part'; group: ChatTimelineBlockGroup; item: DialogueItem }
 );
 export interface ChatTimelineBlocks {
   items: readonly ChatTimelineBlock[];
@@ -31,7 +35,61 @@ type ToolResults = ReadonlyMap<string, ChatToolResultMessage>;
 const sortedLive = new WeakMap<ChatTimelineBlockGroup, { live?: ChatAssistantMessage; executions?: Record<string, ChatToolExecutionState>; results?: ToolResults; value: ChatSortedTurnProjection }>();
 const EMPTY_CUSTOM_IDS: ReadonlySet<string> = new Set();
 const dialogues = new WeakMap<ChatTimelineBlockGroup, { live?: ChatAssistantMessage; showThinking: boolean; executions?: Record<string, ChatToolExecutionState>; results?: ToolResults; items: DialogueItem[] }>();
-const sameEntries = (a: readonly ChatTimelineEntry[], b: readonly ChatTimelineEntry[]) => a.length === b.length && a.every((entry, i) => entry === b[i]);
+const sameEntries = (a: readonly ChatTimelineEntry[], b: readonly ChatTimelineEntry[]) => a === b || a.length === b.length && a.every((entry, i) => entry === b[i]);
+
+type WorkItem = Exclude<DialogueItem, { kind: 'process' }>;
+interface CompletedWork {
+  items: WorkItem[];
+  steps: Set<WorkItem>;
+  bySource: Map<string, WorkItem[]>;
+  firstStep: WorkItem;
+  answerText: string;
+  durationMs?: number;
+}
+
+// The same Run may span multiple user rows when a user steers it. Its receipt
+// settles all those segments together. Only durable history changes this index.
+const receiptIndex = new WeakMap<readonly ChatTimelineEntry[], Map<string, ChatTimelineEntry[]>>();
+function completedRuns(entries: readonly ChatTimelineEntry[]) {
+  let runs = receiptIndex.get(entries);
+  if (runs) return runs;
+  runs = new Map<string, ChatTimelineEntry[]>();
+  for (const entry of entries) if (entry.type === 'run_usage' && entry.outcome === 'completed') runs.set(entry.runId, []);
+  for (const entry of entries) if (entry.runId && !(entry.type === 'message' && entry.message.role === 'user')) runs.get(entry.runId)?.push(entry);
+  receiptIndex.set(entries, runs);
+  return runs;
+}
+const completed = new WeakMap<ChatTimelineEntry, { entries: readonly ChatTimelineEntry[]; customIds: ReadonlySet<string>; showThinking: boolean; executions?: Record<string, ChatToolExecutionState>; results: ToolResults; work?: CompletedWork }>();
+
+export function projectCompletedWork(entries: readonly ChatTimelineEntry[], showThinking: boolean, customIds: ReadonlySet<string>,
+  executions: Record<string, ChatToolExecutionState> | undefined, results: ToolResults): CompletedWork | undefined {
+  const last = entries.at(-1);
+  const receipt = last?.type === 'run_usage' ? last : entries.find(entry => entry.type === 'run_usage');
+  if (receipt?.outcome !== 'completed') return;
+  const cached = completed.get(receipt);
+  if (cached && cached.showThinking === showThinking && cached.customIds === customIds && cached.executions === executions && cached.results === results && sameEntries(cached.entries, entries)) return cached.work;
+  const messages = new Map(entries.flatMap(entry => entry.type === 'message' && entry.message.role === 'assistant' ? [[entry.id, entry.message] as const] : []));
+  const items = projectChatDialogue(entries, undefined, { groupActivity: false, showThinking, customIds, executions, results }).filter((item): item is WorkItem => item.kind !== 'process');
+  const role = (item: WorkItem): WorkPartRole => {
+    if (item.kind === 'text') return messages.get(item.sourceId)?.phase ?? 'reply';
+    if (item.kind === 'tool') return item.inProcess ? 'tool' : 'kept-tool';
+    return item.inProcess ? 'step' : 'keep';
+  };
+  const steps = completedWorkSteps(items, role, item => item.kind === 'text' ? messages.get(item.sourceId)?.requestId ?? item.sourceId : item.id);
+  const firstStep = items.find(item => steps.has(item));
+  const bySource = new Map<string, WorkItem[]>();
+  if (firstStep) for (const item of items) {
+    const siblings = bySource.get(item.sourceId);
+    if (siblings) siblings.push(item); else bySource.set(item.sourceId, [item]);
+  }
+  const timings = receipt.usages.map(usage => usage.generation);
+  const durationMs = timings.length && timings.every(g => g?.finished)
+    ? Math.max(...timings.map(g => g!.startedAtMs + g!.elapsedMs)) - Math.min(...timings.map(g => g!.startedAtMs)) : undefined;
+  const answerText = items.flatMap(item => item.kind === 'text' && !steps.has(item) ? [item.content.text] : []).join('\n\n');
+  const work = firstStep ? { items, steps, firstStep, bySource, durationMs, answerText } : undefined;
+  completed.set(receipt, { entries, customIds, showThinking, executions, results, work });
+  return work;
+}
 
 export function blockGroupLive(group: ChatTimelineBlockGroup, projection: Pick<ChatTimelineProjection, 'liveAssistant'>): ChatAssistantMessage | undefined {
   return group.liveId === projection.liveAssistant?.id ? projection.liveAssistant : undefined;
@@ -58,8 +116,10 @@ export function blockGroupDialogue(group: ChatTimelineBlockGroup, projection: Pi
  * blocks are measured and mounted; loading a missing prompt cannot rename them. */
 export function projectChatTimelineBlocks(
   projection: ChatTimelineProjection,
-  { sorted, dialogue = false, expanded, previous, customIds = EMPTY_CUSTOM_IDS, showThinking = true, aliases = new Map(), executions }: {
+  { sorted, dialogue = false, expanded, previous, customIds = EMPTY_CUSTOM_IDS, showThinking = true, aliases = new Map(), executions, collapseCompletedWork = false, activeRunId }: {
     sorted: boolean;
+    collapseCompletedWork?: boolean;
+    activeRunId?: string;
     dialogue?: boolean;
     executions?: Record<string, ChatToolExecutionState>;
     expanded(groupId: string): boolean;
@@ -71,6 +131,7 @@ export function projectChatTimelineBlocks(
 ): ChatTimelineBlocks {
   const items: ChatTimelineBlock[] = [];
   const groups = new Map<string, ChatTimelineBlockGroup>();
+  const settledRuns = collapseCompletedWork ? completedRuns(projection.visibleEntries) : undefined;
   const priorItems = new Map(previous?.items.map(item => [item.id, item]));
   const priorByEntry = new Map<string, ChatTimelineBlockGroup>();
   const priorByOwner = new Map<string, ChatTimelineBlockGroup>();
@@ -99,6 +160,24 @@ export function projectChatTimelineBlocks(
     const base = { ownerId, group };
     const hasAssistant = entries.some(entry => entry.type === 'message' && entry.message.role === 'assistant') || liveId || !entries.length;
     if (hasAssistant) add({ ...base, kind: 'chrome', id: `chrome:${id}` });
+    const settled = settledRuns?.get(runId);
+    if (settled && !liveId && runId !== activeRunId && runId !== projection.liveAssistant?.runId) {
+      const work = projectCompletedWork(settled, showThinking, customIds, executions, projection.resultByCallId);
+      if (work) {
+        const headerId = `work:${runId}`;
+        const open = expanded(headerId);
+        for (const entry of entries) for (const item of work.bySource.get(entry.id) ?? []) {
+          if (work.steps.has(item)) {
+            if (item === work.firstStep) add({ ...base, kind: 'work-header', id: headerId, work });
+            if (!open) continue;
+          }
+          add({ ...base, kind: 'work-part', id: `dialogue:${item.id}`, item });
+        }
+        const answerText = entries.some(entry => entry.type === 'run_usage') ? work.answerText : '';
+        add({ ...base, kind: 'footer', id: `footer:${id}`, answerText });
+        return;
+      }
+    }
     if (dialogue) {
       for (const item of blockGroupDialogue(group, projection, showThinking, executions)) {
         const sourceId = item.kind === 'process' ? item.activities[0]?.sourceId : item.sourceId;

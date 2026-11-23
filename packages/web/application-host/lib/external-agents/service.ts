@@ -1412,6 +1412,7 @@ export class ExternalAgentsService {
         if (
           previous &&
           previous.kind === value.kind &&
+          previous.phase === value.phase && previous.responseId === value.responseId &&
           (value.kind === 'assistant' || value.kind === 'reasoning') &&
           value.text.startsWith(previous.text)
         )

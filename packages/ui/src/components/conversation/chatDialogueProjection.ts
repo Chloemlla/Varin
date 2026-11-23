@@ -4,7 +4,7 @@ import type { ChatTimelineEntry } from './chatTimelineProjection';
 import { presentInvocation } from './toolInvocation';
 import { isStandaloneTool, standaloneDescendants } from './standaloneTools';
 
-type Source = { id: string; sourceId: string; streaming: boolean; extrasId?: string };
+type Source = { id: string; sourceId: string; streaming: boolean; extrasId?: string; inProcess?: boolean };
 export type DialogueActivity = Source & (
   | { kind: 'thinking'; content: ChatThinkingContent }
   | { kind: 'tool'; call: ChatToolCall }
@@ -15,18 +15,16 @@ export type DialogueProcess = {
   /** A later spoken message seals this segment, even while the Run continues. */
   tail: boolean;
 };
-export type DialogueItem = DialogueProcess | (Source & (
+export type DialogueItem = DialogueProcess | DialogueActivity | (Source & (
   | { kind: 'text'; content: ChatTextContent; contentIndex: number; offset: number }
-  | { kind: 'tool'; call: ChatToolCall }
-  | { kind: 'entry'; entry: ChatTimelineEntry }
   | { kind: 'error'; text: string }
 ));
 
 /** Presentation only: public prose stays in place; ordinary activity between
  * spoken messages has one disclosure. Delegations and questions keep their own row. */
 export function projectChatDialogue(entries: readonly ChatTimelineEntry[], live?: ChatAssistantMessage,
-  { showThinking = true, customIds = new Set<string>(), executions, results }: {
-    showThinking?: boolean; customIds?: ReadonlySet<string>; executions?: Record<string, ChatToolExecutionState>; results?: ReadonlyMap<string, ChatToolResultMessage>;
+  { showThinking = true, groupActivity = true, customIds = new Set<string>(), executions, results }: {
+    showThinking?: boolean; groupActivity?: boolean; customIds?: ReadonlySet<string>; executions?: Record<string, ChatToolExecutionState>; results?: ReadonlyMap<string, ChatToolResultMessage>;
   } = {}): DialogueItem[] {
   const items: DialogueItem[] = [];
   const seen = new Set<string>();
@@ -35,6 +33,7 @@ export function projectChatDialogue(entries: readonly ChatTimelineEntry[], live?
   const delegated = standaloneDescendants(executions);
   const seal = () => { if (process) process.tail = false; process = undefined; };
   const append = (activity: DialogueActivity) => {
+    if (!groupActivity) { items.push({ ...activity, inProcess: true }); return; }
     if (!process) { process = { kind: 'process', id: `process:${activity.id}`, activities: [], tail: true }; items.push(process); }
     process.activities.push(activity);
   };

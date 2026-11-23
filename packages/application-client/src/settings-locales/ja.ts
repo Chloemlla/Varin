@@ -2,6 +2,7 @@ import { settingsDict as englishSettingsDict } from './en.js';
 
 export const settingsDict = {
   ...englishSettingsDict,
+  'settings.chat.collapseCompletedWork': '完了した作業過程を自動で折りたたむ',
   "settings.view.nav.group.models": "モデル",
   "settings.view.nav.group.capabilities": "機能",
   "settings.view.nav.group.data": "データ",

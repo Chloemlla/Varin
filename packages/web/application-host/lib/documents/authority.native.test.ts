@@ -43,8 +43,7 @@ describe('document authority native observation', () => {
       if (!isWatchEvent(event)) return;
       events.push(event);
     });
-    await waitUntil(() => harness.authority.hasWatch(harness.identity.workspaceId));
-    await wait(150);
+    expect(await subscription.ready).toBe(true);
     const filePath = path.join(harness.workspaceRoot, 'watched.txt');
     await fs.promises.writeFile(filePath, 'one');
     await waitUntil(() => events.some((event) => event.kind === 'created' && event.resource?.resourceId === 'watched.txt'));

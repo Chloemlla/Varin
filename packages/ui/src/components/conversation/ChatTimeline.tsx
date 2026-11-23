@@ -49,6 +49,7 @@ import { ChatTimelineBlockView } from './ChatTimelineBlockView';
 import { projectChatTimelineBlocks, blockGroupDialogue, type ChatTimelineBlock, type ChatTimelineBlocks, type ChatTimelineBlockAliases } from './chatTimelineBlocks';
 import { dialogueContains } from './chatDialogueProjection';
 import { timelinePresentationCache } from './timelinePresentationCache';
+import { completedWorkDisclosure } from './completedWorkDisclosure';
 import { ToolTargetScope } from './ToolTargetScope';
 import { ChatContextMenu } from './ChatContextMenu';
 import { ChatTurnNavigator, type ChatTurnNavigatorHandle } from './ChatTurnNavigator';
@@ -113,6 +114,7 @@ export const ChatTimeline: React.FC<ChatTimelineProps> = (props) => {
   const dialogueMessages = renderMode === 'dialogue';
   const stickyUserHeader = useUIStore(state => state.stickyUserHeader);
   const activityRenderMode = useUIStore(state => state.activityRenderMode);
+  const collapseCompletedWork = useUIStore(state => state.collapseCompletedWork);
   const showThinking = useUIStore(state => state.showReasoningTraces);
   const isMobile = useUIStore((state) => state.isMobile);
   const onScrollContainerChange = props.onScrollContainerChange;
@@ -171,11 +173,20 @@ export const ChatTimeline: React.FC<ChatTimelineProps> = (props) => {
   const activityState = React.useMemo(() => timelinePresentationCache(props.sessionId, 'activity', () => ({ mode: activityRenderMode, choices: new Map<string, boolean>() })), [props.sessionId, activityRenderMode]);
   if (activityState.mode !== activityRenderMode) { activityState.mode = activityRenderMode; activityState.choices.clear(); }
   const dialogueChoices = React.useMemo(() => timelinePresentationCache(props.sessionId, 'dialogue-disclosure', () => new Map<string, boolean>()), [props.sessionId]);
-  const isActivityExpanded = React.useCallback((id: string) => id.startsWith('dialogue:')
-    ? dialogueChoices.get(id) ?? false : activityState.choices.get(id) ?? activityRenderMode === 'summary', [activityState, activityRenderMode, dialogueChoices]);
+  const workDisclosure = React.useMemo(() => completedWorkDisclosure(props.sessionId), [props.sessionId]);
+  const isActivityExpanded = React.useCallback((id: string) => {
+    if (id.startsWith('work:')) return workDisclosure.isOpen(id);
+    if (id.startsWith('dialogue:')) return dialogueChoices.get(id) ?? false;
+    return activityState.choices.get(id) ?? activityRenderMode === 'summary';
+  }, [activityState, activityRenderMode, dialogueChoices, workDisclosure]);
   const activityTransitions = React.useMemo(() => new Map<string, { phase: 'opening' | 'closing'; timer: ReturnType<typeof setTimeout> }>(), [props.sessionId, renderMode, activityRenderMode]);
   React.useEffect(() => () => { for (const item of activityTransitions.values()) clearTimeout(item.timer); activityTransitions.clear(); }, [activityTransitions]);
   const setActivityExpanded = React.useCallback((id: string, expanded: boolean) => {
+    if (id.startsWith('work:')) {
+      workDisclosure.setOpen(id, expanded);
+      updateActivity();
+      return;
+    }
     (id.startsWith('dialogue:') ? dialogueChoices : activityState.choices).set(id, expanded);
     const previous = activityTransitions.get(id);
     if (previous) clearTimeout(previous.timer);
@@ -186,10 +197,10 @@ export const ChatTimeline: React.FC<ChatTimelineProps> = (props) => {
       activityTransitions.set(id, { phase: expanded ? 'opening' : 'closing', timer: setTimeout(() => { activityTransitions.delete(id); updateActivity(); }, 220) });
     }
     updateActivity();
-  }, [activityState, dialogueChoices, activityTransitions]);
+  }, [activityState, dialogueChoices, activityTransitions, workDisclosure]);
   const blocksRef = React.useRef<ChatTimelineBlocks | undefined>(undefined);
   const blockAliases = React.useMemo(() => timelinePresentationCache(props.sessionId, 'block-identities', () => new Map() as ChatTimelineBlockAliases), [props.sessionId]);
-  const blocks = projectChatTimelineBlocks(projection, { sorted: sortedMessages, dialogue: dialogueMessages, expanded: id => isActivityExpanded(id) || activityTransitions.get(id)?.phase === 'closing', previous: blocksRef.current, customIds, showThinking, aliases: blockAliases, executions: props.toolExecutions });
+  const blocks = projectChatTimelineBlocks(projection, { sorted: sortedMessages, dialogue: dialogueMessages, collapseCompletedWork, activeRunId: props.activeRunId, expanded: id => isActivityExpanded(id) || activityTransitions.get(id)?.phase === 'closing', previous: blocksRef.current, customIds, showThinking, aliases: blockAliases, executions: props.toolExecutions });
   blocksRef.current = blocks;
   const stickyHeaders = React.useMemo(() => !isMobile && stickyUserHeader ? blocks.items.flatMap((block, index) => block.kind === 'user' ? [index] : []) : [], [blocks.items, isMobile, stickyUserHeader]);
   const latestGroups = [...blocks.groups.values()].reverse();
@@ -798,7 +809,7 @@ export const ChatTimeline: React.FC<ChatTimelineProps> = (props) => {
       block={block} projection={projection} sorted={sortedMessages}
       activityTransition={'group' in block ? activityTransitions.get(block.group.id)?.phase : undefined}
       extensionPresentation={extensionPresentation}
-      expanded={block.kind === 'dialogue' ? isActivityExpanded(block.id) : 'group' in block && isActivityExpanded(block.group.id)} onExpandedChange={setActivityExpanded}
+      expanded={block.kind === 'dialogue' || block.kind === 'work-header' ? isActivityExpanded(block.id) : 'group' in block && isActivityExpanded(block.group.id)} onExpandedChange={setActivityExpanded}
       liveUserStatus={props.liveUserStatus}
       onFork={props.onFork}
       onOpenThread={props.onOpenThread}
@@ -850,7 +861,7 @@ export const ChatTimeline: React.FC<ChatTimelineProps> = (props) => {
           </div>
         </div>
       ) : null}
-      {props.footer}
+      {props.footer && <div className="relative z-10">{props.footer}</div>}
       <div
         ref={endSpaceRef}
         aria-hidden="true"
@@ -1002,13 +1013,22 @@ export const ChatTimeline: React.FC<ChatTimelineProps> = (props) => {
             ? chatContentText(typeof source.message.content === 'string' ? source.message.content : source.message.content.filter(part => part.type === 'text')) : undefined;
           if (text === undefined || target.start === undefined || text.slice(target.start, target.end) !== target.text) throw new Error(t('chat.quote.sourceUnavailable'));
         }
-        const dialogueBlock = dialogueMessages ? blocks.items.find(block => block.kind === 'dialogue'
+        const matchesWorkPart = (item: import('./chatDialogueProjection').DialogueItem) => toolCallId
+          ? item.kind === 'tool' && item.call.id === toolCallId
+          : item.kind !== 'process' && item.sourceId === entryId && (target?.text === undefined || item.kind === 'text' && target.start !== undefined && target.start >= item.offset && target.start < item.offset + item.content.text.length);
+        const workHeader = blocks.items.find(block => block.kind === 'work-header' && [...block.work.steps].some(matchesWorkPart));
+        if (workHeader && !isActivityExpanded(workHeader.id)) {
+          setActivityExpanded(workHeader.id, true);
+          await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+        }
+        const workIndex = blocksRef.current?.items.findIndex(block => block.kind === 'work-part' && matchesWorkPart(block.item)) ?? -1;
+        const dialogueBlock = workIndex < 0 && dialogueMessages ? blocks.items.find(block => block.kind === 'dialogue'
           && blockGroupDialogue(block.group, projection, showThinking, props.toolExecutions).some(item => item.id === block.itemId && dialogueContains(item, entryId, toolCallId))) : undefined;
         if (dialogueBlock && !isActivityExpanded(dialogueBlock.id)) {
           setActivityExpanded(dialogueBlock.id, true);
           await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
         }
-        const activityGroup = sortedMessages ? [...blocks.groups.values()].find(group => !group.sorted.answersBySourceId.has(entryId) && group.sorted.activity.some(activity => activity.sourceId === entryId || activity.kind === 'tool' && activity.call.id === toolCallId)) : undefined;
+        const activityGroup = workIndex < 0 && sortedMessages ? [...blocks.groups.values()].find(group => !group.sorted.answersBySourceId.has(entryId) && group.sorted.activity.some(activity => activity.sourceId === entryId || activity.kind === 'tool' && activity.call.id === toolCallId)) : undefined;
         if (activityGroup && !isActivityExpanded(activityGroup.id)) {
           setActivityExpanded(activityGroup.id, true);
           await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
@@ -1016,7 +1036,7 @@ export const ChatTimeline: React.FC<ChatTimelineProps> = (props) => {
         const currentBlocks = blocksRef.current?.items ?? [];
         const activityIndex = activityGroup ? currentBlocks.findIndex(block => block.kind === 'activity' && block.group.id === activityGroup.id
           && activityGroup.sorted.activity.some(activity => activity.id === block.activityId && (activity.sourceId === entryId || activity.kind === 'tool' && activity.call.id === toolCallId))) : -1;
-        const index = dialogueBlock ? currentBlocks.findIndex(block => block.id === dialogueBlock.id) : activityIndex >= 0 ? activityIndex : currentBlocks.findIndex(block => block.kind === 'user' ? block.turn.userEntry?.id === entryId
+        const index = workIndex >= 0 ? workIndex : dialogueBlock ? currentBlocks.findIndex(block => block.id === dialogueBlock.id) : activityIndex >= 0 ? activityIndex : currentBlocks.findIndex(block => block.kind === 'user' ? block.turn.userEntry?.id === entryId
           : block.kind === 'entry' && (block.entry.id === entryId || toolCallId !== undefined && block.entry.type === 'message' && block.entry.message.role === 'assistant'
             && block.entry.message.content.some(part => part.type === 'toolCall' && part.id === toolCallId)));
         if (index < 0) throw new Error(t('chat.context.sourceUnavailable'));
@@ -1127,7 +1147,7 @@ export const ChatTimeline: React.FC<ChatTimelineProps> = (props) => {
   return (
     <ToolTargetScope entries={props.entries} executions={props.toolExecutions}>
     <ChatToolDisclosureScope key={props.sessionId} sessionId={props.sessionId}><ChatContextMenu {...props} projection={projection} onRevealEntry={revealEntry}>
-    <div ref={surfaceRef} className="conversation-timeline-surface relative flex min-h-0 flex-1">
+    <div ref={surfaceRef} className="conversation-timeline-surface relative isolate flex min-h-0 flex-1">
       {promptNavigatorEnabled && props.navigation ? <ChatTurnNavigator ref={turnNavigatorRef} runs={props.navigation.runs}
         initialRunId={props.navigation.runs.at(-1)?.runId} readPreview={readRunPreview} onSelect={selectRun} /> : null}
       {promptNavigatorEnabled && props.navigation?.error && <button type="button" className="absolute left-2 top-2 z-20 text-muted-foreground"
@@ -1203,6 +1223,7 @@ export const ChatTimeline: React.FC<ChatTimelineProps> = (props) => {
         data-conversation-timeline="true"
         tabIndex={0}
       />
+      {props.inlineViews}
       <AnimatePresence initial={false}>
         {timelineView.scrollMode === 'free-scrolling' ? (
           <motion.button

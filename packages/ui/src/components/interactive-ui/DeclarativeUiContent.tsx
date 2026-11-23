@@ -1,7 +1,7 @@
 import React from 'react';
 import { beginContentReferenceInsertion } from '@/lib/agent-editor/attachments';
 import { declarativeDiscussionText } from '@/lib/interactive-ui/discussion';
-import { conversationUiFields, conversationUiText, type ConversationUiField } from '@varin/application-client';
+import { conversationUiFields, conversationUiText, selectedConversationUiOptions, type ConversationUiField } from '@varin/application-client';
 import { useDeclarativeUi, type DeclarativeUiSource } from '@/lib/interactive-ui/useDeclarativeUi';
 import { composeUiResult, sendUiResult, beginUiComposeInsertion, type UiComposeInput } from '@/lib/interactive-ui/compose';
 import { copyTextToClipboard } from '@/lib/clipboard';
@@ -85,6 +85,10 @@ export const DeclarativeUiContent = React.memo(function DeclarativeUiContent(pro
       <QuestionChoices name={fieldId} labelledBy={`${fieldId}:label`} options={field.options.map(option => ({ id: option.key, label: option.label }))}
         selected={Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : typeof value === 'string' ? [value] : []} multiple={field.multiple}
         onChange={selected => { view.setValue(field.key, field.multiple ? selected : selected[0] ?? ''); setStatus(''); }} />
+      {selectedConversationUiOptions(field, value).map(option => option.content && <div key={option.key} className="mt-2 min-w-0">
+        {field.multiple && <p className="text-sm font-medium">{option.label}</p>}
+        <SimpleMarkdownRenderer content={option.content} />
+      </div>)}
       {field.allowOther && <QuestionSupplement value={String(view.values[`${field.key}:other`] ?? '')}
         onChange={value => { view.setValue(`${field.key}:other`, value); setStatus(''); }} />}
     </fieldset>;

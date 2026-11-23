@@ -324,14 +324,15 @@ export function registerThreadRoutes(app: Express, adapter: ThreadAdapter, requi
         const admission = error instanceof ThreadPreAdmissionError ? { admission: 'not_started' as const } : {};
         if (sourceCode) { response.status(sourceCode === 'source_authority_denied' ? 403 : sourceCode === 'source_registration_missing' ? 404 : 409).json({ code: sourceCode, error: threadSourceFailureMessage(sourceCode), ...admission }); return; }
         const conflict = reason instanceof PlanConflict || reason instanceof KernelClientError && reason.code === 'operation-error' && reason.message.startsWith('operation error: conflict:');
-        if (conflict) console.warn('[Threads] Request state conflict', { method,
-          admission: error instanceof ThreadPreAdmissionError ? 'not_started' : 'unknown' });
         if (error instanceof ComputerError) { response.status(error.computerCode === 'computer-work-not-found' ? 404 : error.computerCode === 'computer-execution-stale' ? 409 : error.computerCode === 'computer-request-invalid' ? 400 : 503).json({ code: error.computerCode, error: error.message }); return; }
         const suppliedCode = conflict ? 'thread-conflict' : error instanceof HarnessServiceError ? error.harnessCode
           : error && typeof error === 'object' && 'code' in error && typeof error.code === 'string' ? error.code : 'thread-request-failed';
         const code = threadSourceFailureMessage(suppliedCode) ? 'thread-request-failed' : suppliedCode;
         const status = code.includes('conflict') ? 409 : code === 'denied' || code === 'forbidden' ? 403
           : code === 'not-found' ? 404 : code === 'unavailable' || code === 'timeout' || code === 'extension-host-unavailable' ? 503 : 400;
+        if (status === 400 || conflict) console.warn('[Threads] Request rejected', {
+          method, status, code, admission: admission.admission ?? 'unknown',
+        });
         response.status(status).json({ code, error: code === 'extension-host-unavailable' ? 'The local extension process is unavailable. Restart Varin; if it persists, reinstall the application.'
           : code === 'agent-profile-unavailable' ? 'The selected Agent is unavailable. Choose an enabled Agent for this work focus.' : 'Thread request could not be completed',
           ...admission });

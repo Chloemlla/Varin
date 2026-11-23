@@ -3,11 +3,14 @@ import type { editor, IDisposable } from 'monaco-editor/editor';
 
 import { DEFAULT_FILE_EDITOR_SETTINGS } from '@/lib/file-editor-settings';
 import { getWorkbenchContextKey } from '@/lib/workbench/editors/context-keys';
+import { openWorkbenchEditor, resetEditorWorkbenchForTests } from '@/lib/workbench/editors/session';
+import { activeEditorTab } from '@/lib/workbench/editors/groups';
 import {
   executeActiveFileEditorCommand,
   FILE_EDITOR_COMMAND_IDS,
   hasActiveFileEditorCommandTarget,
   registerFileEditorCommandTarget,
+  requestFileEditorFocus,
   requestFileEditorNavigation,
   resetFileEditorCommandServiceForTests,
 } from './editor-command-service';
@@ -56,7 +59,7 @@ class FakeEditor {
     } as unknown as editor.IEditorAction;
   }
   getDomNode(): HTMLElement { return this.domNode as unknown as HTMLElement; }
-  focus(): void {}
+  readonly focus = vi.fn();
   onDidFocusEditorText(): IDisposable { return { dispose() {} }; }
   onDidBlurEditorText(): IDisposable { return { dispose() {} }; }
   onDidChangeCursorSelection(): IDisposable { return { dispose() {} }; }
@@ -77,7 +80,7 @@ const keyboardEvent = (overrides: Partial<KeyboardEvent> = {}): KeyboardEvent =>
   ...overrides,
 }) as unknown as KeyboardEvent;
 
-afterEach(() => resetFileEditorCommandServiceForTests());
+afterEach(() => { resetFileEditorCommandServiceForTests(); resetEditorWorkbenchForTests(); });
 
 describe('file editor command service', () => {
   test('projects the active editor into commands and context without owning the model', async () => {
@@ -211,6 +214,20 @@ describe('file editor command service', () => {
 
     expect(editorInstance.setPosition).toHaveBeenCalledWith({ lineNumber: 7, column: 12 });
     expect(editorInstance.revealPositionInCenter).toHaveBeenCalledWith({ lineNumber: 7, column: 12 });
+  });
+
+  test('a file opened from the palette receives focus when its editor is ready without moving its caret', async () => {
+    const identity = { workspaceId: 'focus-workspace', resourceId: 'guide.txt' };
+    const state = openWorkbenchEditor(identity.workspaceId, identity.resourceId);
+    const { viewId } = activeEditorTab(state)!;
+    requestFileEditorFocus(identity, viewId);
+    const editorInstance = new FakeEditor();
+    registerFileEditorCommandTarget({ editor: editorInstance as unknown as editor.IStandaloneCodeEditor,
+      identity, viewId, ownerId: 'palette-file', getSettings: () => DEFAULT_FILE_EDITOR_SETTINGS,
+      getShortcutOverrides: () => ({}), updateSettings: vi.fn() });
+    await Promise.resolve();
+    expect(editorInstance.focus).toHaveBeenCalledOnce();
+    expect(editorInstance.setPosition).not.toHaveBeenCalled();
   });
 
   test('keeps pending navigation scoped to the requested view of a split resource', async () => {

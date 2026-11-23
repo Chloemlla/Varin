@@ -1,11 +1,42 @@
 import { expect, it } from 'vitest';
 import { projectChatTimeline } from './chatTimelineProjection';
+import { HistoryPresentation } from './historyPresentation';
+import type { ThreadHistoryItem, ThreadRunUsage } from '@varin/application-client';
 import { projectChatTimelineBlocks, type ChatTimelineBlockAliases } from './chatTimelineBlocks';
 import type { ChatAssistantMessage, ChatSessionEntry, ChatSessionMessageEntry } from './types';
 
 const user: ChatSessionMessageEntry = { id: 'prompt', parentId: null, runId: 'run', timestamp: '', type: 'message', message: { role: 'user', content: 'Question', timestamp: 0 } };
 const answer = (id: string, content: ChatAssistantMessage['content']): ChatSessionMessageEntry => ({ id, parentId: user.id, runId: 'run', timestamp: '', type: 'message',
   message: { id, role: 'assistant', model: 'model', provider: '', api: '', stopReason: 'stop', timestamp: 0, content } });
+
+it.each(['dialogue', 'live', 'sorted'])('folds one successful Run across supplementary user inputs in %s layout', mode => {
+  const history: ThreadHistoryItem[] = [];
+  const add = (id: string, source: 'user' | 'assistant', content: unknown) => history.push({
+    id, parent: history.at(-1)?.id ?? null, run_id: 'run', thread_id: 'thread', provider: null, source, content,
+  } as ThreadHistoryItem);
+  add('question', 'user', { text: 'Review this' });
+  add('comment', 'assistant', { id: 'model-item:2:r1:a', content: { kind: 'text', text: 'Checking now' } });
+  add('tool', 'assistant', { id: 'model-item:2:r1:b', content: { kind: 'tool_call', call: { call_id: 'read', name: 'file_read', arguments: {} } } });
+  add('supplement', 'user', { text: 'Also check the footer' });
+  add('thought', 'assistant', { id: 'model-item:2:r2:a', content: { kind: 'reasoning_summary', text: 'Inspect the result' } });
+  add('aside', 'assistant', { id: 'model-item:2:r2:b', content: { kind: 'text', text: 'Finishing up' }, opaque: { value: { phase: 'commentary' } } });
+  add('result', 'assistant', { id: 'model-item:2:r2:c', content: { kind: 'text', text: 'First paragraph' } });
+  add('conclusion', 'assistant', { id: 'model-item:2:r2:d', content: { kind: 'text', text: 'Second paragraph' } });
+  const presenter = new HistoryPresentation('thread');
+  const rows = (outcome?: ThreadRunUsage['outcome'], open = false, enabled = true) => {
+    const view = presenter.project(history, undefined, outcome ? [{ runId: 'run', throughId: 'conclusion', requests: [], outcome }] : []);
+    return projectChatTimelineBlocks(projectChatTimeline(view.entries), { dialogue: mode === 'dialogue', sorted: mode === 'sorted',
+      collapseCompletedWork: enabled, expanded: () => open }).items;
+  };
+  for (const state of [undefined, 'failed', 'cancelled'] as const) expect(rows(state).some(row => row.kind === 'work-header')).toBe(false);
+  const folded = rows('completed');
+  expect(folded.filter(row => row.kind === 'work-header')).toHaveLength(1);
+  expect(folded.filter(row => row.kind === 'user')).toHaveLength(2);
+  const sources = (blocks: typeof folded) => blocks.flatMap(row => row.kind === 'work-part' && row.item.kind !== 'process' ? [row.item.sourceId] : []);
+  expect(sources(folded)).toEqual(['result', 'conclusion']);
+  expect(sources(rows('completed', true))).toEqual(['comment', 'tool', 'thought', 'aside', 'result', 'conclusion']);
+  expect(rows('completed', false, false).some(row => row.kind === 'work-header')).toBe(false);
+});
 
 it('lifts a newly received image out of a cached folded process without loading its bytes', () => {
   const call = answer('images-call', [{ type: 'thinking', thinking: 'Inspect the image' },
@@ -21,6 +52,17 @@ it('lifts a newly received image out of a cached folded process without loading 
   expect(after.items.some(item => item.kind === 'dialogue' && item.itemId === 'tool:image-call')).toBe(true);
   const sorted = projectChatTimelineBlocks(complete, { sorted: true, expanded: () => false });
   expect(sorted.items.some(item => item.kind === 'activity' && item.activityId === 'tool:image-call')).toBe(true);
+});
+
+it('keeps direct answers and usable output visible without an empty disclosure', () => {
+  const result = answer('result', [{ type: 'thinking', thinking: 'Private preview' }, { type: 'text', text: 'Result' }]);
+  const image = answer('image', [{ type: 'toolCall', id: 'generate', name: 'image_generate', arguments: {} }]);
+  const receipt: ChatSessionEntry = { id: 'end', parentId: result.id, runId: 'run', timestamp: '', type: 'run_usage', outcome: 'completed', usages: [] };
+  const projection = projectChatTimeline([user, image, result, receipt]);
+  const options = { sorted: false, dialogue: true, collapseCompletedWork: true, expanded: () => false };
+  const shown = projectChatTimelineBlocks(projection, options).items;
+  expect(shown.filter(item => item.kind === 'work-part').map(item => item.item.kind)).toEqual(['tool', 'text']);
+  expect(projectChatTimelineBlocks(projection, { ...options, showThinking: false }).items.some(item => item.kind === 'work-header')).toBe(false);
 });
 
 it('keeps native message keys when an earlier prompt is discovered and virtualizes a long Run into small rows', () => {

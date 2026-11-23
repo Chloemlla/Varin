@@ -218,8 +218,7 @@ function Timeline({ api, identity, snapshot, history, runUsage, historyReady, hi
     entries={entries} toolExecutions={view.toolExecutions} liveAssistant={liveAssistant} liveUser={liveUser} liveUserStatus={liveUserStatus} leafId={head}
     activeRunId={working ? snapshot?.activeRun?.id : undefined}
     assistantWaiting={working ? presentAssistantWaiting(snapshot) : undefined} onFork={onFork ? forkEntry : undefined}
-    onRecover={onRecover ? recoverEntry : undefined} header={header} footer={footer} />}
-    <InlineUiViews prefix={`${key}:`} />
+    onRecover={onRecover ? recoverEntry : undefined} header={header} footer={footer} inlineViews={<InlineUiViews prefix={`${key}:`} />} />}
   </ConversationContext.Provider>;
 }
 

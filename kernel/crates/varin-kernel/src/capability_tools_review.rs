@@ -209,9 +209,24 @@ impl ModelProvider for Provider {
                 };
                 Content::ToolCall { call }
             }
+            2 if self.mode.starts_with("direct_") => {
+                assert!(request.view.history.iter().any(|item| matches!(&item.content,
+                    Content::Text { text } if text.contains("fixture_effect is available through tool_invoke"))));
+                Content::ToolCall { call: ToolCall {
+                    call_id: "invoke-again".into(),
+                    name: "fixture_effect".into(),
+                    schema_version: "original".into(),
+                    arguments: json!({"mode": "success"}),
+                } }
+            }
             _ => Content::Text {
                 text: "done".into(),
             },
+        };
+        let finish = if matches!(&content, Content::ToolCall { .. }) {
+            FinishReason::ToolCalls
+        } else {
+            FinishReason::Stop
         };
         emit(ProviderEvent::ItemCompleted {
             item: ProviderItem {
@@ -221,11 +236,7 @@ impl ModelProvider for Provider {
             },
         })
         .map_err(|e| ModelFailure::new(e.code, e.message))?;
-        Ok(if step < 2 {
-            FinishReason::ToolCalls
-        } else {
-            FinishReason::Stop
-        })
+        Ok(finish)
     }
 }
 struct Target {

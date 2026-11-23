@@ -124,6 +124,7 @@ export function ThreadConversation({ api, identity, onBranchCreated, initialWork
   const openThreadContext = useOpenThreadContext();
   const host = React.useSyncExternalStore(subscribeRuntimeEndpointChanged, getRuntimeEndpointGeneration, getRuntimeEndpointGeneration);
   const draftKey = threadComposerKey(threadHostKey(), identity);
+  React.useLayoutEffect(() => { if (!readOnly) useThreadDraftStore.getState().patch(draftKey, {}); }, [draftKey, readOnly]);
   const viewScope = React.useMemo(() => ({ api, host, draftKey, readOnly }), [api, host, draftKey, readOnly]);
   const referenceNavigation = React.useMemo<ReferenceNavigation>(() => ({ identity: { runtime: identity.runtime, threadId: identity.threadId, branchId: identity.branchId } }), [identity.runtime, identity.threadId, identity.branchId]);
   const currentViewScope = React.useRef(viewScope);

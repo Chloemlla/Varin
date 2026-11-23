@@ -108,6 +108,7 @@ export class PiContent {
       this.publish({
         id,
         kind: type === 'text' ? 'assistant' : 'reasoning',
+        responseId: this.current,
         text: content,
         complete,
       });

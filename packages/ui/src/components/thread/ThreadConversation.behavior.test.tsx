@@ -257,7 +257,7 @@ beforeEach(() => {
   recoveryService.api = undefined;
   // Recovery assertions count individual messages independently of the default
   // dialogue grouping. Presentation-specific cases choose their mode below.
-  useUIStore.setState({ isScheduledTasksDialogOpen: false, scheduledTasksConversation: null, recoveryPreference: 'conversation', chatRenderMode: 'live', contextPanelByDirectory: {} });
+  useUIStore.setState({ isScheduledTasksDialogOpen: false, scheduledTasksConversation: null, recoveryPreference: 'conversation', chatRenderMode: 'live', contextPanelByDirectory: {}, persistChatDraft: false });
   runtimeState.api = undefined; vi.mocked(attachProcessTerminal).mockClear();
   const documents: Pick<DocumentsAPI, 'resolveWorkspace'> = { resolveWorkspace: async () => ({ workspaceId: 'canonical-source-workspace', hostId: 'fixture-host', epoch: 1 }) };
   registerRuntimeAPIs({ documents } as RuntimeAPIs);
@@ -1987,6 +1987,40 @@ it('does not silently discard a prepared workspace when a live run appears befor
   await act(async () => { button('Remove prepared workspace').click(); });
   await submitForm(container.querySelector('form')!);
   expect(f.enqueue).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ text: 'run on prepared workspace' }));
+});
+
+it('recovers unsent text and its bound quote on reload, then clears the accepted draft', async () => {
+  const f = fixture();
+  const savedIdentity = { ...identity, threadId: 'draft-reload' };
+  f.view.identity = savedIdentity; f.view.thread.thread_id = savedIdentity.threadId;
+  const key = threadComposerKey(threadHostKey(), savedIdentity);
+  const selector = '[aria-label="Message thread"]';
+  const mount = () => act(async () => root.render(<ThreadConversation api={f.api} identity={savedIdentity} />));
+  const reload = async () => {
+    await act(async () => root.render(null));
+    useThreadDraftStore.setState({ drafts: {} });
+    await mount();
+  };
+  useUIStore.getState().setPersistChatDraft(true);
+  try {
+    await mount();
+    const text = 'An unsent notice [Quote 1]', label = '[Quote 1]';
+    await edit(selector, text);
+    await act(async () => useThreadDraftStore.getState().patch(key, {
+      markerObjects: [{ id: 'quote', kind: 'quote', label, number: 1, host: endpoint.generation,
+        payload: { kind: 'quote', reference: { ref: 'quote', title: 'Earlier message', text: 'Meet in Room 1', source: { kind: 'chat', thread: savedIdentity, passages: [] } } } }],
+      references: [{ id: 'quote-occurrence', from: text.indexOf(label), to: text.length, text: label,
+        host: endpoint.generation, target: { kind: 'quote', quoteId: 'quote' } }],
+    }));
+    await reload();
+    expect(container.querySelector<HTMLTextAreaElement>(selector)?.value).toBe(text);
+    expect(f.submit).not.toHaveBeenCalled();
+    await edit('[aria-label="Registered model"]', JSON.stringify(['fixture-provider', 'fixture-model']), 'change');
+    await submitForm(composerForm());
+    expect(f.submit).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ text, contentReferences: [expect.objectContaining({ text: 'Meet in Room 1' })] }));
+    await reload();
+    expect(container.querySelector<HTMLTextAreaElement>(selector)?.value).toBe('');
+  } finally { await act(async () => { useThreadDraftStore.getState().remove(key); }); }
 });
 
 it('restores a cached question before its fresh snapshot and preserves both unsent drafts', async () => {

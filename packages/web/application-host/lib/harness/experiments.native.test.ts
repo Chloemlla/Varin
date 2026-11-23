@@ -690,16 +690,20 @@ describe("experiment service on the real kernel", () => {
     const collected = await experiments.collect(f.caller, submitted.attempt.attemptId);
     assert.equal(collected.attempt.collection, "done");
     assert.equal(releases, 1);
-    let retriedRelease = await experiments.get(f.caller, submitted.attempt.attemptId);
-    while (retriedRelease.job?.state !== "released") { await pause(); retriedRelease = await experiments.get(f.caller, submitted.attempt.attemptId); }
+    const pending = await experiments.get(f.caller, submitted.attempt.attemptId);
+    assert.equal(pending.job?.state, "exited");
+    assert.match(pending.job?.reason ?? "", /release bookkeeping unavailable/);
+    await experiments.ensureReconciled(f.caller.workspaceId);
+    await eventually(() => experiments.get(f.caller, submitted.attempt.attemptId), value => {
+      assert.equal(value.job?.state, "released");
+    });
     assert.equal(releases, 2);
-    assert.equal(retriedRelease.job?.state, "released");
     const persistedLog = await experiments.logs(f.caller, { attemptId: submitted.attempt.attemptId });
     assert.equal(persistedLog.origin, "artifact");
     assert.equal(persistedLog.text, output.toString());
   });
 
-  it("retries a failed terminal commitment release before collecting and releasing the stopped backend job", async () => {
+  it("recovers a failed terminal commitment release after the backend stops", async () => {
     const f = await fixture();
     let releaseUnavailable = true;
     let markReleaseFailure!: () => void;
@@ -707,8 +711,7 @@ describe("experiment service on the real kernel", () => {
     const flakyResources = {
       ...f.resources,
       release: async (workspaceId: string, commitmentId: string, reason: string) => {
-        // Keep the outage observable even if wait/get reconciles the terminal
-        // attempt again before the test reads its retained commitment.
+        // Keep the outage observable until the resource owner is reachable again.
         if (releaseUnavailable) {
           markReleaseFailure();
           throw new Error("temporary commitment persistence failure");
@@ -731,24 +734,19 @@ describe("experiment service on the real kernel", () => {
     const waited = await experiments.wait(f.caller, submitted.attempt.attemptId, 15_000);
     assert.equal(waited.attempt.state, "completed", JSON.stringify({ waited, errors: f.errors.map(String) }));
     await releaseFailed;
-    const pending = await experiments.get(f.caller, submitted.attempt.attemptId);
-    assert.equal(pending.job?.state, "exited");
     assert.equal(
       (await f.resources.list(f.caller.workspaceId)).machines.find((machine) => machine.machineId === "local")?.commitments.length,
       1,
     );
 
     releaseUnavailable = false;
-    const reconciled = await eventually(() => experiments.get(f.caller, submitted.attempt.attemptId), value => {
+    await experiments.ensureReconciled(f.caller.workspaceId);
+    await eventually(() => experiments.get(f.caller, submitted.attempt.attemptId), value => {
       assert.equal(value.job?.state, 'released');
     });
-    const releaseDeadline = Date.now() + 15_000;
-    while ((await f.resources.list(f.caller.workspaceId)).machines.find((machine) => machine.machineId === "local")?.commitments.length && Date.now() < releaseDeadline) await pause();
-    assert.equal(reconciled.job?.state, "released");
-    assert.equal(
-      (await f.resources.list(f.caller.workspaceId)).machines.find((machine) => machine.machineId === "local")?.commitments.length,
-      0,
-    );
+    await eventually(() => f.resources.list(f.caller.workspaceId), value => {
+      assert.equal(value.machines.find((machine) => machine.machineId === "local")?.commitments.length, 0);
+    });
   });
 
   it("keeps polling after restart when inspect throws and the first observation is unknown", async () => {

@@ -28,7 +28,7 @@ beforeEach(() => {
   for (const [name, value] of Object.entries({ document, window, HTMLElement: window.HTMLElement, Element: window.Element, Node: window.Node, IS_REACT_ACT_ENVIRONMENT: true,
     getComputedStyle: () => ({ lineHeight: '20', fontSize: '13' }) })) vi.stubGlobal(name, value);
   window.HTMLElement.prototype.scrollTo = vi.fn();
-  useUIStore.setState({ chatRenderMode: 'live', activityRenderMode: 'collapsed', showReasoningTraces: true, collapsibleThinkingBlocks: true,
+  useUIStore.setState({ chatRenderMode: 'live', activityRenderMode: 'collapsed', collapseCompletedWork: false, showReasoningTraces: true, collapsibleThinkingBlocks: true,
     showExpandedBashTools: false, showExpandedEditTools: false, showTurnChangedFiles: true, showToolFileIcons: true, diffLayoutPreference: 'inline',
     chatContentWidth: 960, fontSize: 100, padding: 100, persistChatDraft: true, inputSpellcheckEnabled: true, draftStartersVisible: true });
   usePreferencesStore.setState({ settingsDefaultFileViewerPreview: true });
@@ -62,6 +62,19 @@ it('changes real activity layout, thinking visibility and tool disclosure defaul
   expect(container.querySelector('[data-conversation-activity-kind="thinking"]')).not.toBeNull();
   await act(async () => useUIStore.setState({ showReasoningTraces: false }));
   expect(container.querySelector('[data-conversation-activity-kind="thinking"]')).toBeNull();
+});
+
+it('shows the final reply alone and lets the reader reopen completed work', async () => {
+  useUIStore.setState({ collapseCompletedWork: true });
+  await render();
+  const toggle = container.querySelector<HTMLButtonElement>('button[data-completed-work]')!;
+  expect(toggle.getAttribute('aria-expanded')).toBe('false');
+  expect(container.textContent).toContain(dict['settings.chat.preview.answer']);
+  expect(container.textContent).not.toContain(dict['settings.chat.preview.narration']);
+  await act(async () => toggle.click());
+  expect(container.textContent).toContain(dict['settings.chat.preview.narration']);
+  await act(async () => useUIStore.setState({ chatRenderMode: 'sorted' }));
+  expect(container.querySelector('[data-completed-work]')?.getAttribute('aria-expanded')).toBe('true');
 });
 
 it('lets users collapse the preview, switch file scenes and change the shared diff preference', async () => {

@@ -30,7 +30,7 @@ vi.mock('@/lib/i18n', async original => { const actual = await original<typeof i
 vi.mock('@/stores/useExternalAgentStore', () => ({ useExternalAgents: () => f.settings,
   useExternalAgentStore: Object.assign(() => null, { getState: () => ({ refresh: f.refresh, select: f.select, setSnapshot: () => {}, clearSnapshot: () => {} }) }) }));
 vi.mock('@/stores/useThreadStore', () => ({ threadHostKey: () => `host:${f.host}` }));
-vi.mock('@/stores/useUIStore', () => ({ useUIStore: Object.assign((select: (state: object) => unknown) => select({ chatRenderMode: 'live' }), { getState: () => ({}) }) }));
+vi.mock('@/stores/useUIStore', () => ({ useUIStore: Object.assign((select: (state: object) => unknown) => select({ chatRenderMode: 'live', collapseCompletedWork: true, showReasoningTraces: true }), { getState: () => ({}) }) }));
 vi.mock('@/stores/useInlineCommentDraftStore', () => ({ useInlineCommentDraftStore: (select: (state: object) => unknown) => select({ drafts: {} }) }));
 vi.mock('@/lib/varinEvents', () => ({ subscribeVarinEvents: () => () => {} }));
 vi.mock('@/lib/agent-editor/attachments', () => ({ subscribeEditorContextAttachments: () => () => {}, getEditorContextAttachmentsRevision: () => 0, listEditorContextAttachments: () => [] }));
@@ -884,10 +884,16 @@ it('opens a supplementary input together with the actual shared execution result
   expect(replyHeaders[0]?.textContent).toContain('settings.agents.thinking.high');
   expect(replyHeaders[0]?.textContent).not.toContain('current-model');
   expect(replyHeaders[0]?.querySelector('img')?.getAttribute('src')).toBe(opencodeLogo);
+  expect(container.textContent).not.toContain('Plan for the work');
+  await act(async () => container.querySelector<HTMLButtonElement>('button[data-completed-work]')!.click());
   expect(container.textContent!.indexOf('OpenCode')).toBeLessThan(container.textContent!.indexOf('Plan for the work'));
   expect(container.textContent).not.toContain('Unrelated historical answer');
   expect(container.textContent).not.toContain('Shares the result of the turn that consumed this input.');
   expect(container.querySelector('form')).toBeNull();
   expect(container.textContent?.match(/Completed/g)).toHaveLength(1);
   expect(container.textContent!.indexOf('Completed')).toBeGreaterThan(container.textContent!.indexOf('Actual shared answer'));
+  await act(async () => root.render(null));
+  await act(async () => root.render(<ExternalConversationView id="prepared" turnId="supplement" />));
+  expect(container.querySelector('[data-completed-work]')?.getAttribute('aria-expanded')).toBe('true');
+  expect(container.textContent).toContain('Plan for the work');
 });

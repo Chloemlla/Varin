@@ -1,5 +1,6 @@
 import { botWorkspaceEn } from './bot-workspaces.js';
 export const settingsDict = {
+  'settings.chat.collapseCompletedWork': 'Automatically collapse completed work',
   "settings.view.nav.group.models": "Models",
   "settings.view.nav.group.capabilities": "Capabilities",
   "settings.view.nav.group.data": "Data",

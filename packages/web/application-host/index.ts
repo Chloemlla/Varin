@@ -1366,7 +1366,7 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
     }
   };
   let managedRemoteTargets: ManagedRemoteTargetRegistry | null = null;
-  let researchSourceReached: ReturnType<typeof createResearchRuntime>['sourceReached'] | undefined;
+  const researchOwner: { current?: ReturnType<typeof createResearchRuntime> } = {};
   const managedTarget = createManagedResourceTarget({
     kernel: kernelClient, storageAvailable: true,
     onError: error => console.error("[VarinManagedRemote]", error.message),
@@ -1389,7 +1389,7 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
     // reconcile inspects and re-polls rather than resubmitting.
     onSourceReachable: (owner) => {
       requestSourceMaintenance();
-      researchSourceReached?.(owner);
+      researchOwner.current?.sourceReached(owner);
       managedMcpOwner.current?.sourceReached(owner);
       managedMcpInteractionsOwner.current?.wake();
       mcpTaskRuntimeOwner.current?.sourceReached();
@@ -2829,7 +2829,7 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
     experiments: experimentService, resources: resourceService, sources: sourceService,
     onError: error => console.error('[Research]', error.message),
   });
-  researchSourceReached = researchRuntime.sourceReached;
+  researchOwner.current = researchRuntime;
   computerRuntimeOwner.current.start(error => console.error('[Computer] Native execution cleanup is unconfirmed:', error instanceof Error ? error.message : String(error)));
   const pluginCredentials = new PluginCredentialCapability(extensionRuntime,
     new HostCredentialService(extensionRuntime.services.hostId, fileSecretStore(path.join(VARIN_DATA_DIR, 'plugin-credentials.json'))),

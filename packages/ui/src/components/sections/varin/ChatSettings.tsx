@@ -35,6 +35,7 @@ export const ChatSettings: React.FC = () => {
   const [previewScene, setPreviewScene] = React.useState<ChatPreviewScene>('conversation');
   const state = useUIStore(useShallow(s => ({
     chatRenderMode: s.chatRenderMode, activityRenderMode: s.activityRenderMode,
+    collapseCompletedWork: s.collapseCompletedWork,
     userMessageRenderingMode: s.userMessageRenderingMode, collapsibleUserMessages: s.collapsibleUserMessages,
     stickyUserHeader: s.stickyUserHeader, promptNavigatorEnabled: s.promptNavigatorEnabled,
     showReasoningTraces: s.showReasoningTraces, collapsibleThinkingBlocks: s.collapsibleThinkingBlocks,
@@ -85,6 +86,8 @@ export const ChatSettings: React.FC = () => {
           options={[{ value: 'collapsed', label: t('settings.chat.collapsed') }, { value: 'summary', label: t('settings.chat.expanded') }]} />
       </SettingsFieldRow> : null}
       <div data-settings-item="chat.reasoning" className="divide-y divide-border/40">
+        <Toggle item="chat.collapse-completed-work" label={t('settings.chat.collapseCompletedWork')} checked={state.collapseCompletedWork}
+          onChange={v => save('collapseCompletedWork', v, actions.setCollapseCompletedWork)} />
         <Toggle item="chat.generation-speed" label={t('settings.chat.generationSpeed')} checked={state.showGenerationSpeed} onChange={actions.setShowGenerationSpeed} />
         <Toggle label={t('settings.chat.thinking')} item="chat.reasoning-traces" checked={state.showReasoningTraces}
           onChange={actions.setShowReasoningTraces} />

@@ -19,7 +19,7 @@ export function createChatPreviewEntries(t: ReturnType<typeof useI18n>['t']): Ch
     entry('edit-result', { role: 'toolResult', timestamp: 0, toolCallId: 'settings-preview:edit', toolName: 'file_edit', isError: false, status: 'success', details: { applied: true }, content: [{ type: 'text', text: 'src/validate.ts · +1 −1' }] }, 'settings-preview:activity'),
     entry('test-result', { role: 'toolResult', timestamp: 0, toolCallId: 'settings-preview:test', toolName: 'process_spawn', isError: false, status: 'success', content: [{ type: 'text', text: t('settings.chat.preview.testOutput') }] }, 'settings-preview:edit-result'),
     entry('answer', assistant('settings-preview:answer', [{ type: 'text', text: `${t('settings.chat.preview.answer')}\n\n${CHAT_PREVIEW_CODE}` }], 'stop'), 'settings-preview:test-result'),
-    { id: `run-usage:${runId}`, parentId: 'settings-preview:answer', runId, timestamp: '', type: 'run_usage', usages: [] },
+    { id: `run-usage:${runId}`, parentId: 'settings-preview:answer', runId, timestamp: '', type: 'run_usage', outcome: 'completed', usages: [] },
   ];
 }
 

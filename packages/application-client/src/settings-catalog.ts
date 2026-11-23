@@ -770,6 +770,12 @@ const CATALOG_ENTRIES: readonly SettingsCatalogEntry[] = [
       keywords: ['goal', 'budget', 'tokens', 'limit'] },
   },
   {
+    id: 'chat.collapse-completed-work', category: 'chat', owner: 'app',
+    field: { path: 'collapseCompletedWork', kind: 'boolean' },
+    apply: 'immediate',
+    ui: { page: 'chat', titleKey: 'settings.chat.collapseCompletedWork', keywords: ['turn', 'collapse', '工作过程', '折叠'] },
+  },
+  {
     id: 'chat.reasoning-traces', category: 'chat', owner: 'app',
     field: { path: 'showReasoningTraces', kind: 'boolean' },
     apply: 'immediate',

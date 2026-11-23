@@ -33,6 +33,10 @@ import { Button } from '@/components/ui/button';
 import { Icon } from '@/components/icon/Icon';
 import { MarkdownRenderer } from '@/components/chat/MarkdownRenderer';
 import { ChatThinkingBlock } from '@/components/conversation/ChatThinkingBlock';
+import { CompletedWorkButton } from '@/components/conversation/CompletedWorkButton';
+import { completedWorkSteps, type WorkPartRole } from '@/components/conversation/completedWork';
+import { completedWorkDisclosure } from '@/components/conversation/completedWorkDisclosure';
+import { threadHostKey } from '@/stores/useThreadStore';
 import { ToolDisclosure, ToolDisclosureScope, ToolStatus } from '@/components/conversation/ToolDisclosure';
 import { ImageAttachmentStrip } from '@/components/chat/composer/ImageAttachmentStrip';
 import { prepareDraftMarkerImages, hasDraftInlineImages } from '@/lib/agent-runtime/draftImages';
@@ -285,22 +289,9 @@ function TurnFooter({ turn, answer }: { turn: ExternalTurn; answer?: string }) {
     </div>
   );
 }
-function Messages({
-  items,
-  activeTurn,
-  cwd,
-  receipts,
-  replyHeader,
-  readAttachment,
-}: {
-  readAttachment(ref: string, signal: AbortSignal): Promise<Blob>;
-  items: ExternalItem[];
-  activeTurn?: string;
-  cwd: string;
-  receipts: ExternalTurn[];
-  replyHeader(execution: ExternalTurn['execution']): React.ReactNode;
-}) {
-  const mode = useUIStore((state) => state.chatRenderMode);
+function projectExternalMessages(items: ExternalItem[], receipts: ExternalTurn[], activeTurn: string | undefined,
+  mode: import('@/stores/useUIStore').ChatRenderMode, collapseWork: boolean, showThinking: boolean) {
+  const receiptsById = new Map(receipts.map(turn => [turn.id, turn]));
   const groups: ExternalItem[][] = [];
   const turns = new Map<string, ExternalItem[]>();
   for (const item of items) {
@@ -308,21 +299,42 @@ function Messages({
     entries.push(item);
     turns.set(item.turnId, entries);
   }
-  const ordered =
-    mode === 'sorted'
-      ? [...turns.values()].flatMap((turn) => [
-          ...turn.filter((i) => i.kind === 'user'),
-          ...turn.filter((i) => ['tool', 'reasoning', 'plan', 'notice'].includes(i.kind)),
-          ...turn.filter((i) => i.kind === 'assistant'),
-        ])
-      : items;
+  const work = new Map<string, Set<ExternalItem>>();
+  if (collapseWork) for (const [id, turn] of turns) {
+    const receipt = receiptsById.get(id);
+    if (id === activeTurn || receipt?.status !== 'completed' || receipt.steering || receipt.consumedByTurnId) continue;
+    const steps = completedWorkSteps(turn, (item): WorkPartRole => {
+      if (item.senderThreadId || item.attachments?.length || item.images?.length) return item.kind === 'tool' ? 'kept-tool' : 'keep';
+      if (item.kind === 'assistant') return item.text.trim() ? item.phase ?? 'reply' : 'keep';
+      if (item.kind === 'tool') return 'tool';
+      return ((item.kind === 'reasoning' && showThinking) || item.kind === 'plan') && item.text.trim() ? 'step' : 'keep';
+    }, item => item.responseId);
+    if (steps.size) work.set(id, steps);
+  }
+  // Sort inside each turn's original slots. A steering input can have its
+  // own receipt between two pieces of the same completed response.
+  let ordered = items;
+  if (mode === 'sorted') {
+    const sortedTurns = new Map([...turns].map(([id, turn]) => [id, {
+      index: 0, items: work.has(id) ? turn : [
+        ...turn.filter(i => i.kind === 'user'),
+        ...turn.filter(i => i.kind !== 'user' && i.kind !== 'assistant'),
+        ...turn.filter(i => i.kind === 'assistant'),
+      ],
+    }]));
+    ordered = items.map(item => {
+      const turn = sortedTurns.get(item.turnId)!;
+      return turn.items[turn.index++]!;
+    });
+  }
   for (const item of ordered) {
-    const activity = item.kind === 'tool' || item.kind === 'reasoning';
+    const activity = item.kind === 'tool' || (item.kind === 'reasoning' && showThinking);
     const last = groups.at(-1);
     if (
       mode !== 'live' &&
+      !work.has(item.turnId) &&
       activity &&
-      last?.every((v) => v.kind === 'tool' || v.kind === 'reasoning') &&
+      last?.every((v) => v.kind === 'tool' || (v.kind === 'reasoning' && showThinking)) &&
       last[0]?.turnId === item.turnId
     )
       last.push(item);
@@ -331,20 +343,45 @@ function Messages({
   // Supplements can interleave their own input receipt with one real turn's
   // output. Its completion belongs after the last group, not every boundary.
   const lastGroupByTurn = new Map(groups.map((group, index) => [group[0]!.turnId, index]));
+  return { groups, turns, work, receiptsById, lastGroupByTurn };
+}
+
+function Messages({ sessionId, items, activeTurn, cwd, receipts, replyHeader, readAttachment }: {
+  sessionId: string;
+  readAttachment(ref: string, signal: AbortSignal): Promise<Blob>;
+  items: ExternalItem[];
+  activeTurn?: string;
+  cwd: string;
+  receipts: ExternalTurn[];
+  replyHeader(execution: ExternalTurn['execution']): React.ReactNode;
+}) {
+  const mode = useUIStore(state => state.chatRenderMode);
+  const collapseWork = useUIStore(state => state.collapseCompletedWork);
+  const showThinking = useUIStore(state => state.showReasoningTraces);
+  const choices = React.useMemo(() => completedWorkDisclosure(sessionId), [sessionId]);
+  const [, updateDisclosure] = React.useReducer(value => value + 1, 0);
+  const { groups, turns, work, receiptsById, lastGroupByTurn } = React.useMemo(() =>
+    projectExternalMessages(items, receipts, activeTurn, mode, collapseWork, showThinking), [items, receipts, activeTurn, mode, collapseWork, showThinking]);
   const shownReplies = new Set<string>();
+  const shownWork = new Set<string>();
   return (
     <>
       {groups.map((group, index) => {
         const first = group[0]!;
         const startsReply = first.kind !== 'user' && !shownReplies.has(first.turnId);
         if (startsReply) shownReplies.add(first.turnId);
-        const receipt = receipts.find((turn) => turn.id === first.turnId);
+        const receipt = receiptsById.get(first.turnId);
+        const step = work.get(first.turnId)?.has(first);
+        const showButton = step && !shownWork.has(first.turnId);
+        if (showButton) shownWork.add(first.turnId);
+        const choiceId = `work:${first.turnId}`;
+        const expanded = choices.isOpen(choiceId);
         const ended =
           receipt &&
           !receipt.consumedByTurnId && !receipt.steering &&
           ['completed', 'failed', 'cancelled', 'interrupted'].includes(receipt.status) &&
           lastGroupByTurn.get(receipt.id) === index;
-        const content = group.length === 1 ? (
+        const content = step && !expanded ? null : group.length === 1 ? (
           <Item readAttachment={readAttachment}
             item={first}
             cwd={cwd}
@@ -365,19 +402,21 @@ function Messages({
             </div>
           </ToolDisclosure>
         );
+        const body = <>
+          {showButton && receipt && <CompletedWorkButton expanded={expanded} durationMs={receipt.updatedAt - receipt.createdAt}
+            onToggle={() => { choices.setOpen(choiceId, !expanded); updateDisclosure(); }} />}
+          {content}
+        </>;
         return (
           <React.Fragment key={first.id}>
-            {startsReply ? <div>{replyHeader(receipt?.execution)}{content}</div> : content}
+            {startsReply ? <div>{replyHeader(receipt?.execution)}{body}</div> : body}
             {ended && (
               <>
                 <TurnFooter
                   turn={receipt}
-                  answer={
-                    turns
-                      .get(receipt.id)
-                      ?.filter((item) => item.kind === 'assistant')
-                      .at(-1)?.text
-                  }
+                  answer={work.has(receipt.id)
+                    ? turns.get(receipt.id)?.filter(item => item.kind === 'assistant' && !work.get(receipt.id)!.has(item)).map(item => item.text).join('\n\n')
+                    : turns.get(receipt.id)?.filter(item => item.kind === 'assistant').at(-1)?.text}
                 />
                 {receipt.error && (
                   <p role="alert" className="whitespace-pre-wrap break-words text-sm text-destructive">
@@ -648,6 +687,10 @@ function ExternalConversationSession({ id, host, readOnly, turnId }: { id: strin
     if (files.some(file => !externalAttachmentSupported(snapshot?.capabilities ?? (snapshot ? settings?.capabilityCache?.[snapshot.conversation.configurationId]?.capabilities : undefined), file))) { setFailure(new Error(t('external.filesUnsupported'))); return; }
     selectThreadFiles(key, files);
   };
+  const consumedTurnId = turnId ? snapshot?.turns.find(turn => turn.id === turnId)?.consumedByTurnId : undefined;
+  const recentItems = snapshot?.items;
+  const messages = React.useMemo(() => [...new Map([...earlier, ...(recentItems ?? [])].map(item => [item.id, item])).values()]
+    .filter(item => !turnId || item.turnId === turnId || item.turnId === consumedTurnId), [earlier, recentItems, turnId, consumedTurnId]);
   if (!snapshot)
     return (
       <p role="status" className="p-6 text-muted-foreground">
@@ -672,9 +715,6 @@ function ExternalConversationSession({ id, host, readOnly, turnId }: { id: strin
     externalOptions: { ...draft.externalOptions, [c.configurationId]: { thinking: value.thinking, mode: value.mode, config: value.config } },
   });
   const errorText = failure instanceof Error ? failure.message : failure ? String(failure) : error;
-  const consumedTurnId = turnId ? snapshot.turns.find(turn => turn.id === turnId)?.consumedByTurnId : undefined;
-  const messages = [...new Map([...earlier, ...snapshot.items].map((item) => [item.id, item])).values()]
-    .filter(item => !turnId || item.turnId === turnId || item.turnId === consumedTurnId);
   const agent = c.executionSource?.resource_owner.kind === 'managed_host' ? undefined
     : settings?.agents.find(agent => agent.id === c.configurationId && agent.harness === c.harness);
   const profileId = c.profileId ?? agent?.profileId ?? c.configurationId;
@@ -737,7 +777,7 @@ function ExternalConversationSession({ id, host, readOnly, turnId }: { id: strin
                     {t('external.history')}
                   </Button>
                 )}
-                <ImageReplyDraftContext.Provider value={readOnly?null:key}><Messages readAttachment={(ref, signal) => api.readAttachment(id, ref, signal)} items={messages} activeTurn={activeTurn} cwd={c.cwd} receipts={snapshot.turns} replyHeader={replyHeader} /></ImageReplyDraftContext.Provider>
+                <ImageReplyDraftContext.Provider value={readOnly?null:key}><Messages sessionId={JSON.stringify([threadHostKey(), 'external', id])} readAttachment={(ref, signal) => api.readAttachment(id, ref, signal)} items={messages} activeTurn={activeTurn} cwd={c.cwd} receipts={snapshot.turns} replyHeader={replyHeader} /></ImageReplyDraftContext.Provider>
               </ToolDisclosureScope>
             </div>
           </div>

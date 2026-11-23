@@ -2,6 +2,7 @@ import { settingsDict as englishSettingsDict } from './en.js';
 
 export const settingsDict = {
   ...englishSettingsDict,
+  'settings.chat.collapseCompletedWork': 'Replier automatiquement les étapes terminées',
   "settings.view.nav.group.models": "Modèles",
   "settings.view.nav.group.capabilities": "Capacités",
   "settings.view.nav.group.data": "Données",

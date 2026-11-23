@@ -493,6 +493,7 @@ const materializeAuthoritativeUiSettings = (settings: DesktopSettings): DesktopS
     showToolFileIcons: defaults.showToolFileIcons,
     codeBlockLineWrap: defaults.codeBlockLineWrap,
     showTurnChangedFiles: defaults.showTurnChangedFiles,
+    collapseCompletedWork: defaults.collapseCompletedWork,
     showExpandedBashTools: defaults.showExpandedBashTools,
     showExpandedEditTools: defaults.showExpandedEditTools,
     timeFormatPreference: defaults.timeFormatPreference,
@@ -644,6 +645,9 @@ const applyDesktopUiPreferences = (settings: DesktopSettings) => applyAuthoritat
   }
   if (typeof settings.showTurnChangedFiles === 'boolean' && settings.showTurnChangedFiles !== store.showTurnChangedFiles) {
     store.setShowTurnChangedFiles(settings.showTurnChangedFiles);
+  }
+  if (typeof settings.collapseCompletedWork === 'boolean' && settings.collapseCompletedWork !== store.collapseCompletedWork) {
+    store.setCollapseCompletedWork(settings.collapseCompletedWork);
   }
   if (typeof settings.showExpandedBashTools === 'boolean' && settings.showExpandedBashTools !== store.showExpandedBashTools) {
     store.setShowExpandedBashTools(settings.showExpandedBashTools);
@@ -1155,6 +1159,7 @@ const sanitizeWebSettings = (payload: unknown): DesktopSettings | null => {
   if (typeof candidate.showTurnChangedFiles === 'boolean') {
     result.showTurnChangedFiles = candidate.showTurnChangedFiles;
   }
+  if (typeof candidate.collapseCompletedWork === 'boolean') result.collapseCompletedWork = candidate.collapseCompletedWork;
   if (typeof candidate.showExpandedBashTools === 'boolean') {
     result.showExpandedBashTools = candidate.showExpandedBashTools;
   }

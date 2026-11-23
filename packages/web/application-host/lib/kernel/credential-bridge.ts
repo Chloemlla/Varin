@@ -42,7 +42,7 @@ export class CredentialBridge {
   /** Selection and start share a run binding. A failed caller rolls back only
    * when no other caller is using the lease or has committed it to the run. */
   async withModelBinding<T>(runId: string, bindingId: string | undefined, owner: ExistingHostCredentialOwner,
-    signal: AbortSignal | undefined, use: (scope: CredentialScope) => Promise<T>): Promise<T> {
+    signal: AbortSignal | undefined, invoke: (scope: CredentialScope) => Promise<T>): Promise<T> {
     const epoch = this.currentEpoch();
     const scope = await waitWithSignal(owner.scope(), signal);
     signal?.throwIfAborted();
@@ -62,7 +62,7 @@ export class CredentialBridge {
     const claims = entry.claims;
     if (claims) claims.pending++;
     try {
-      const result = await use({ ...scope });
+      const result = await invoke({ ...scope });
       if (claims) claims.accepted = true;
       return result;
     } finally {

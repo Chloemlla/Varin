@@ -82,6 +82,8 @@ export interface ChatSystemMessage {
 
 export interface ChatAssistantMessage {
   runId?: string;
+  requestId?: string;
+  phase?: 'commentary' | 'final_answer';
   id: string;
   api: string;
   content: ChatAssistantContent[];
@@ -203,6 +205,7 @@ export interface ChatUsageEntry extends ChatSessionEntryBase {
 
 export interface ChatRunUsageEntry extends ChatSessionEntryBase {
   type: 'run_usage';
+  outcome?: import('@varin/application-client').ThreadRunUsage['outcome'];
   runId: string;
   usages: ChatUsage[];
 }

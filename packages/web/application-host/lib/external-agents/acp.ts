@@ -188,6 +188,7 @@ export async function connectAcp(
       const images = [...(previous?.images ?? []), ...(content.images ?? [])];
       const item = {
         id,
+        responseId: id,
         kind:
           kind === 'agent_message_chunk'
             ? ('assistant' as const)

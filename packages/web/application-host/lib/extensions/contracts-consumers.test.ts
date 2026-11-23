@@ -235,7 +235,10 @@ describe('runtime contract User API through the real HTTP handler and runtime', 
     expect((await fetchRoute(target, { method: 'POST', body: JSON.stringify({ request }) })).status).toBe(401);
     const outsider = path.join(root, 'outside');
     await mkdir(outsider);
-    await expect(api.queryContracts(request, { directory: outsider })).rejects.toThrow('deployment boundary');
+    const denied = await fetchRoute(target, { method: 'POST', headers: { Authorization: 'Bearer host-token' },
+      body: JSON.stringify({ request, context: { directory: outsider } }) });
+    expect(denied.status).toBe(403);
+    expect(await denied.json()).toMatchObject({ error: { code: 'path-escape' } });
     const cancelled = new AbortController();
     cancelled.abort(new Error('Source read cancelled before transport'));
     await expect(api.queryContracts(request, { directory }, cancelled.signal)).rejects.toThrow('cancelled before transport');
@@ -396,7 +399,7 @@ describe('runtime contract User API through the real HTTP handler and runtime', 
     expect(scoped).toMatchObject({ entries: [{ selection: { status: 'resolved', providerKeys: [providerKey] } }] });
     const outsider = path.join(root, 'outside');
     await mkdir(outsider);
-    await expect(api.queryContracts({ action: 'list', kind: 'service' }, { directory: outsider })).rejects.toThrow('deployment boundary');
+    await expect(api.queryContracts({ action: 'list', kind: 'service' }, { directory: outsider })).rejects.toThrow('outside the workspace allowed by this Host');
   });
 
   it('queries a legal unregistered directory without creating a workspace or notifying registration observers', async () => {

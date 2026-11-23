@@ -16,7 +16,11 @@ it('keeps one iframe mounted as an explicit prose slot replaces a tool slot afte
   vi.stubGlobal('getComputedStyle', () => ({ overflowX: 'visible', overflowY: 'visible' }));
   vi.stubGlobal('requestAnimationFrame', () => 1); vi.stubGlobal('cancelAnimationFrame', () => {});
   vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} }); vi.stubGlobal('MutationObserver', class { observe() {} disconnect() {} });
-  Object.assign(window.HTMLElement.prototype, { getBoundingClientRect: () => ({ top: 20, left: 10, right: 610, bottom: 120, width: 600, height: 100 }) });
+  Object.assign(window.HTMLElement.prototype, { getBoundingClientRect(this: HTMLElement) {
+    return this.classList.contains('pointer-events-none')
+      ? { top: 5, left: 3, right: 703, bottom: 505, width: 700, height: 500 }
+      : { top: 20, left: 10, right: 610, bottom: 120, width: 600, height: 100 };
+  } });
   const root = createRoot(document.querySelector('main')!), session = uiSession('inline-test:work', { runtime: 'agent', threadId: 'inline-test', branchId: 'main' }, 0);
   delete session.display;
   mounts = 0;
@@ -26,7 +30,7 @@ it('keeps one iframe mounted as an explicit prose slot replaces a tool slot afte
     expect(document.querySelector('iframe')).toBeNull();
     await act(async () => updateUiSession(session, { source: { ref: 'ui:test@1' }, files: {}, assets: {}, entry: 'index.html', title: 'Work', committed: true, status: '' }));
     const original = document.querySelector('iframe'); expect(original).not.toBeNull(); expect(mounts).toBe(1);
-    expect(original!.parentElement!.style.transform).toBe('translate(10px,20px)');
+    expect(original!.parentElement!.style.transform).toBe('translate(7px,15px)');
     expect(original!.parentElement!.style.width).toBe('600px');
     expect(uiInlineAnchor(session)?.element.style.minHeight).toBe('100px');
     session.interacting = true; session.inlineTarget = 'prose';

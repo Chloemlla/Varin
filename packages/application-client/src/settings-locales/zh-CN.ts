@@ -1,5 +1,6 @@
 import { botWorkspaceZh } from './bot-workspaces.js';
 export const settingsDict = {
+  'settings.chat.collapseCompletedWork': '自动收起已完成的工作过程',
   "settings.view.nav.group.models": "模型",
   "settings.view.nav.group.capabilities": "能力",
   "settings.view.nav.group.data": "数据",

@@ -182,6 +182,7 @@ export class ClaudeContent {
           : {
               id: `block:${JSON.stringify([scope, messageId, index])}`,
               kind: type === 'thinking' ? 'reasoning' : 'assistant',
+              responseId: messageId,
               text: text(raw.text ?? raw.thinking),
             },
     };

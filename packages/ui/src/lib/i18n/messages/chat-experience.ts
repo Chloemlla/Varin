@@ -1,4 +1,5 @@
 const rows = [
+  ['chat.completedWork','Work details','工作过程','工作過程','Étapes de travail','Pasos de trabajo','作業の詳細','작업 과정','Przebieg pracy','Etapas do trabalho','Перебіг роботи'],
   ['settings.chat.generationSpeed','Show generation speed','显示生成速度','顯示生成速度','Afficher la vitesse de génération','Mostrar velocidad de generación','生成速度を表示','생성 속도 표시','Pokaż szybkość generowania','Mostrar velocidade de geração','Показувати швидкість генерації'],
   ['chat.speed.title','Generation speed','生成速度','生成速度','Vitesse de génération','Velocidad de generación','生成速度','생성 속도','Szybkość generowania','Velocidade de geração','Швидкість генерації'],
   ['chat.speed.live','Recent output','近期输出','近期輸出','Sortie récente','Salida reciente','直近の出力','최근 출력','Ostatnio wygenerowane','Saída recente','Нещодавній вивід'],

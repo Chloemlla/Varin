@@ -2,6 +2,7 @@ import { afterEach, expect, it } from 'vitest';
 import { undo } from '@codemirror/commands';
 import { getRuntimeEndpointGeneration, parseContentReferenceInput, projectContentReferenceText, type ContentReference, type ThreadIdentity } from '@varin/application-client';
 import { useThreadDraftStore } from '@/stores/useThreadDraftStore';
+import { clearUnsentComposers } from '@/stores/utils/unsentComposerStorage';
 import { threadComposerKey, threadHostKey } from '@/stores/useThreadStore';
 import { composerReferences } from '@/components/chat/composer/editor/references';
 import { moveComposerMarker } from '@/components/chat/composer/editor/markers';
@@ -15,7 +16,11 @@ const identity: ThreadIdentity = { runtime: 'agent', threadId: 'chat', branchId:
 const key = () => threadComposerKey(threadHostKey(), identity);
 const reference = (ref: string, text: string): ContentReference => ({ ref, title: 'Varin', label: 'Varin', text,
   source: { kind: 'chat', thread: identity, itemId: `entry:${ref}`, passages: [], role: 'assistant' } });
-afterEach(() => { useThreadDraftStore.setState({ drafts: {} }); useI18nStore.setState({ locale: 'en', dictionary: enDictionary }); });
+afterEach(() => {
+  useThreadDraftStore.setState({ drafts: {} });
+  clearUnsentComposers();
+  useI18nStore.setState({ locale: 'en', dictionary: enDictionary });
+});
 
 it('freezes explicit occurrences in original text order while retaining markerless content once', async () => {
   const store = useThreadDraftStore.getState(); store.patch(key(), { text: 'literal [Reference 1]: ' });

@@ -169,6 +169,8 @@ export async function connectCodex(
     if (type === 'agentMessage' || type === 'plan')
       publish(id, {
         kind: type === 'plan' ? 'plan' : 'assistant',
+        responseId: id,
+        ...(raw.phase === 'commentary' || raw.phase === 'final_answer' ? { phase: raw.phase } : {}),
         complete,
         text: typeof raw.text === 'string' ? raw.text : (items.get(id)?.text ?? ''),
       });
@@ -321,6 +323,7 @@ export async function connectCodex(
       const id = text(params.itemId);
       publish(id, {
         kind: method === 'item/plan/delta' ? 'plan' : method === 'item/agentMessage/delta' ? 'assistant' : 'reasoning',
+        responseId: id,
         text: (items.get(id)?.text ?? '') + text(params.delta),
       });
     }

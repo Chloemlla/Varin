@@ -4,13 +4,18 @@ import { afterEach, expect, it } from 'vitest';
 import { getRuntimeEndpointGeneration, type ContentReference, type ThreadIdentity } from '@varin/application-client';
 import { composeUiResult } from './compose';
 import { useThreadDraftStore } from '@/stores/useThreadDraftStore';
+import { clearUnsentComposers } from '@/stores/utils/unsentComposerStorage';
 import { threadComposerKey, threadHostKey } from '@/stores/useThreadStore';
 import { resetEditorContextAttachments } from '@/lib/agent-editor/attachments';
 
 const identity: ThreadIdentity = { runtime: 'agent', threadId: 'thread', branchId: 'branch' };
 const reference = (value: string): ContentReference => ({ ref: `ui:choice@snapshot:${value}`, title: 'Choice', text: value,
   source: { kind: 'ui', snapshotRef: `ui:choice@snapshot:${value}`, revisionRef: 'ui:choice@1' } });
-afterEach(() => { useThreadDraftStore.setState({ drafts: {} }); resetEditorContextAttachments(); });
+afterEach(() => {
+  useThreadDraftStore.setState({ drafts: {} });
+  clearUnsentComposers();
+  resetEditorContextAttachments();
+});
 
 it('fills an unmounted original draft, replaces only untouched source text, and preserves edited text and its reference', async () => {
   const key = threadComposerKey(threadHostKey(), identity);

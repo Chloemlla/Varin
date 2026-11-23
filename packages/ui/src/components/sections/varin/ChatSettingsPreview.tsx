@@ -12,7 +12,9 @@ import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { MarkdownRenderer } from '@/components/chat/MarkdownRenderer';
 import { FileTypeIcon } from '@/components/icons/FileTypeIcon';
-import { ChatTimelineEntryList, ChatTurnUserMessage } from '@/components/conversation/ChatTimelineEntries';
+import { ChatDialogueBlock, ChatTimelineEntryList, ChatTurnUserMessage } from '@/components/conversation/ChatTimelineEntries';
+import { projectCompletedWork } from '@/components/conversation/chatTimelineBlocks';
+import { CompletedWorkButton } from '@/components/conversation/CompletedWorkButton';
 import { ChatTurnAssistantChrome } from '@/components/conversation/ChatTurnAssistantChrome';
 import { ConversationContext, ConversationPreviewContext } from '@/components/conversation/ConversationContext';
 import { projectChatTimeline } from '@/components/conversation/chatTimelineProjection';
@@ -28,12 +30,14 @@ export function ChatSettingsPreview({ scene, onSceneChange }: { scene: ChatPrevi
   const { t } = useI18n();
   const state = useUIStore(useShallow(s => ({ width: s.chatContentWidth, sticky: s.stickyUserHeader, navigator: s.promptNavigatorEnabled,
     layout: s.chatRenderMode, activity: s.activityRenderMode, commands: s.showExpandedBashTools, edits: s.showExpandedEditTools,
+    collapseWork: s.collapseCompletedWork, showThinking: s.showReasoningTraces,
     fontSize: s.fontSize, padding: s.padding, diff: s.diffLayoutPreference, wrap: s.codeBlockLineWrap, icons: s.showToolFileIcons,
     persistDraft: s.persistChatDraft, spellcheck: s.inputSpellcheckEnabled, starters: s.draftStartersVisible })));
   const filePreview = usePreferencesStore(s => s.settingsDefaultFileViewerPreview);
   const followUp = useMessageQueueStore(s => s.followUpBehavior);
   const hiddenFiles = useDirectoryShowHidden();
   const [folded, setFolded] = React.useState(false);
+  const [workOpen, setWorkOpen] = React.useState(false);
   const [reset, setReset] = React.useState(0);
   const [fileOpen, setFileOpen] = React.useState(true);
   const [busy, setBusy] = React.useState(true);
@@ -46,8 +50,11 @@ export function ChatSettingsPreview({ scene, onSceneChange }: { scene: ChatPrevi
   const projection = React.useMemo(() => projectChatTimeline(entries), [entries]);
   const item = projection.items[0];
   const turn = item?.kind === 'turn' ? item.turn : undefined;
+  const work = React.useMemo(() => turn && state.collapseWork
+    ? projectCompletedWork(turn.entries, state.showThinking, new Set(), dialogueExample?.executions, turn.resultByCallId) : undefined,
+  [turn, state.collapseWork, state.showThinking, dialogueExample]);
   const bodyId = React.useId();
-    const resetExample = () => { setReset(value => value + 1); setActivityStep(0); setDraft(''); setSent(undefined); setBusy(true); setFileOpen(false); onSceneChange('conversation'); viewport.current?.scrollTo({ top: 0 }); };
+  const resetExample = () => { setReset(value => value + 1); setWorkOpen(false); setActivityStep(0); setDraft(''); setSent(undefined); setBusy(true); setFileOpen(false); onSceneChange('conversation'); viewport.current?.scrollTo({ top: 0 }); };
   const diagram = `\`\`\`mermaid\nflowchart LR\n  A["${t('settings.chat.preview.diagram')}"] --> B["${t('settings.chat.preview.diagramCheck')}"] --> C["${t('settings.chat.preview.diagramValid')}"]\n\`\`\``;
 
   return <aside className="settings-chat-preview sk-pv" aria-label={t('settings.chat.preview.title')}>
@@ -76,7 +83,12 @@ export function ChatSettingsPreview({ scene, onSceneChange }: { scene: ChatPrevi
                 <ChatTurnUserMessage key={`user:${reset}`} cwd="" entry={turn.userEntry} message={turn.user} />
               </div>
               <ChatTurnAssistantChrome turn={turn} />
-              <ChatTimelineEntryList key={`${reset}:${state.layout}:${state.activity}:${state.commands}:${state.edits}`} cwd="" sessionId={`settings-preview:${reset}`} entries={turn.entries} projectedResultByCallId={turn.resultByCallId} toolExecutions={dialogueExample?.executions ?? {}} turnActive={dialogueExample?.active} />
+              {work && <>
+                <CompletedWorkButton expanded={workOpen} onToggle={() => setWorkOpen(value => !value)} />
+                {work.items.filter(part => workOpen || !work.steps.has(part)).map(part => <ChatDialogueBlock key={part.id} item={part} cwd=""
+                  sessionId={`settings-preview:${reset}`} executions={dialogueExample?.executions ?? {}} results={turn.resultByCallId} active={false} />)}
+              </>}
+              <ChatTimelineEntryList key={`${reset}:${state.layout}:${state.activity}:${state.commands}:${state.edits}`} cwd="" sessionId={`settings-preview:${reset}`} entries={turn.entries} part={work ? 'footer' : undefined} answerText={work?.answerText} projectedResultByCallId={turn.resultByCallId} toolExecutions={dialogueExample?.executions ?? {}} turnActive={dialogueExample?.active} />
             </div>
             {state.navigator && <button type="button" aria-label={t('settings.chat.preview.jump')} className="sticky bottom-2 float-right flex flex-col items-center gap-1 rounded px-2 py-3 text-foreground hover:bg-muted/40"
               onClick={() => viewport.current?.scrollTo({ top: 0, behavior: 'smooth' })}><span className="h-5 w-1 rounded-full bg-current" /><span className="typography-micro">1</span></button>}

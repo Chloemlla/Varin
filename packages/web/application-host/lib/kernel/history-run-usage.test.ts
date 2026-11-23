@@ -46,7 +46,7 @@ it('reads only ended assistant bodies for usage and retains exact page boundarie
   const reader = new HistoryRunUsageReader({ run: async (id: string) => ({ id, state: id === 'ended' ? 'completed' : 'generating' }),
     historyPage: vi.fn(), historyItem, modelPresentations } as unknown as ConstructorParameters<typeof HistoryRunUsageReader>[0]);
   await expect(reader.read('branch', { head: 'streaming', previous: null, items: refs })).resolves.toEqual([
-    { runId: 'ended', throughId: 'later-tool', requests: [{ requestId: 'req', usage }] },
+    { runId: 'ended', outcome: 'completed', throughId: 'later-tool', requests: [{ requestId: 'req', usage }] },
   ]);
   expect(historyItem.mock.calls.map(([ref]) => ref.id)).toEqual(['answer']);
   expect(modelPresentations).toHaveBeenCalledWith(['req'], undefined);

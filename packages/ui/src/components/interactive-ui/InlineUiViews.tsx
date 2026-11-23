@@ -1,5 +1,4 @@
 import React from 'react';
-import { createPortal } from 'react-dom';
 import { subscribeRuntimeEndpointWillChange } from '@varin/application-client';
 import { useI18n } from '@/lib/i18n';
 import { subscribeUiSessions, uiSessionsRevision, notifyUiSessions, type UiSession } from '@/lib/interactive-ui/sessions';
@@ -25,32 +24,38 @@ export function InlineUiSlot({ session, anchorKey, kind, cwd = '' }: { session: 
  * viewport leaves the same iframe document, scripts, focus and lease alive. */
 export function InlineUiViews({ prefix }: { prefix: string }) {
   React.useSyncExternalStore(subscribeUiSessions, uiSessionsRevision, uiSessionsRevision);
-  return <>{mountedUiInlineSessions(prefix).map(session => <InlineUiView key={session.key} session={session} />)}</>;
+  return <div className="pointer-events-none absolute inset-0 z-[1] overflow-hidden">
+    {mountedUiInlineSessions(prefix).map(session => <InlineUiView key={session.key} session={session} />)}
+  </div>;
 }
 function InlineUiView({ session }: { session: UiSession }) {
   const layer = React.useRef<HTMLDivElement>(null);
   const anchor = uiInlineAnchor(session), display = session.display;
   const mounted = Boolean(anchor && display);
   React.useLayoutEffect(() => {
-    const element = anchor?.element, view = layer.current;
-    if (!element || !view) return;
+    const element = anchor?.element, view = layer.current, boundary = view?.parentElement;
+    if (!element || !view || !boundary) return;
     const releaseScroll = bindInlineScroll(view, element);
     let frame = 0;
     const position = () => {
       frame = 0;
       if (!element.isConnected) { view.style.visibility = 'hidden'; return; }
       const rect = element.getBoundingClientRect();
+      const bounds = boundary.getBoundingClientRect();
+      const scaleX = bounds.width && boundary.clientWidth ? bounds.width / boundary.clientWidth : 1;
+      const scaleY = bounds.height && boundary.clientHeight ? bounds.height / boundary.clientHeight : 1;
       const { top, left, right, bottom } = inlineViewportClip(element);
-      view.style.width = `${rect.width}px`;
-      view.style.transform = `translate(${rect.left}px,${rect.top}px)`;
-      const height = view.getBoundingClientRect().height;
+      view.style.width = `${rect.width / scaleX}px`;
+      view.style.transform = `translate(${(rect.left - bounds.left) / scaleX}px,${(rect.top - bounds.top) / scaleY}px)`;
+      const renderedHeight = view.getBoundingClientRect().height;
+      const height = renderedHeight / scaleY;
       session.inlineHeight = height;
       if (element.style.minHeight !== `${height}px`) element.style.minHeight = `${height}px`;
-      view.style.visibility = rect.width > 0 && rect.top + height > top && rect.top < bottom ? 'visible' : 'hidden';
-      view.style.clipPath = `inset(${Math.max(0, top - rect.top)}px ${Math.max(0, rect.right - right)}px ${Math.max(0, rect.top + height - bottom)}px ${Math.max(0, left - rect.left)}px)`;
+      view.style.visibility = rect.width > 0 && rect.top + renderedHeight > top && rect.top < bottom ? 'visible' : 'hidden';
+      view.style.clipPath = `inset(${Math.max(0, top - rect.top) / scaleY}px ${Math.max(0, rect.right - right) / scaleX}px ${Math.max(0, rect.top + renderedHeight - bottom) / scaleY}px ${Math.max(0, left - rect.left) / scaleX}px)`;
     };
     const schedule = () => { if (!frame) frame = requestAnimationFrame(position); };
-    const observer = new ResizeObserver(schedule); observer.observe(element); observer.observe(view);
+    const observer = new ResizeObserver(schedule); observer.observe(element); observer.observe(view); observer.observe(boundary);
     let layoutRoot = element.parentElement;
     for (let parent = element.parentElement; parent; parent = parent.parentElement) {
       observer.observe(parent);
@@ -64,11 +69,11 @@ function InlineUiView({ session }: { session: UiSession }) {
     return () => { releaseScroll(); observer.disconnect(); mutations.disconnect(); window.removeEventListener('scroll', schedule, true); window.removeEventListener('resize', schedule); cancelAnimationFrame(frame); element.style.minHeight = ''; };
   }, [anchor, session, mounted]);
   if (!anchor || !display || typeof document === 'undefined') return null;
-  return createPortal(<UiEmbedAncestryContext.Provider value={[...session.embedAncestors ?? [], display.source.ref ?? session.key]}><div ref={layer} id={`ui-inline-${encodeURIComponent(session.key)}`} className="flow-root min-w-0 text-foreground"
+  return <UiEmbedAncestryContext.Provider value={[...session.embedAncestors ?? [], display.source.ref ?? session.key]}><div ref={layer} id={`ui-inline-${encodeURIComponent(session.key)}`} className="pointer-events-auto absolute top-0 left-0 flow-root min-w-0 text-foreground"
     onFocusCapture={event => { if (event.currentTarget.contains(event.target)) { session.interacting = true; notifyUiSessions(); } }}
-    onBlurCapture={event => { if (event.currentTarget.contains(event.target) && !event.currentTarget.contains(event.relatedTarget as Node | null)) { session.interacting = false; notifyUiSessions(); } }} style={{ position: 'fixed', top: 0, left: 0, zIndex: 1, visibility: 'hidden' }}>
+    onBlurCapture={event => { if (event.currentTarget.contains(event.target) && !event.currentTarget.contains(event.relatedTarget as Node | null)) { session.interacting = false; notifyUiSessions(); } }} style={{ visibility: 'hidden' }}>
     {display.content ? <DeclarativeUiContent node={display.content} sourceKey={session.key} session={session} source={display.source} isStreaming={!display.committed} />
       : <UiWorkView session={session} {...display} cwd={anchor.cwd} anchored />}
     <UiRevisionLink session={session} />
-  </div></UiEmbedAncestryContext.Provider>, document.body);
+  </div></UiEmbedAncestryContext.Provider>;
 }

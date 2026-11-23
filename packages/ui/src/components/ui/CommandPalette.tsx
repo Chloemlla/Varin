@@ -36,6 +36,7 @@ import { useSettingsPageRegistrations } from '@/lib/settings/surface-registry';
 import { useWorkbenchCommandRegistrations } from '@/lib/commands/surface-command-registry';
 import {
   getFileEditorCommandTargetRevision,
+  requestFileEditorFocus,
   subscribeFileEditorCommandTargets,
 } from '@/lib/monaco/editor-command-service';
 import { Icon } from "@/components/icon/Icon";
@@ -53,6 +54,7 @@ import {
 import { useWorkbenchWorkspaceId } from '@/lib/extensions/workbench-workspace';
 import { resourceIdFromWorkspacePath } from '@/lib/documents/path';
 import { openWorkbenchEditor } from '@/lib/workbench/editors/session';
+import { activeEditorTab } from '@/lib/workbench/editors/groups';
 
 
 type CommandEntry = {
@@ -90,6 +92,7 @@ export const CommandPalette: React.FC<{ fileOpenTarget?: 'context' | 'editor' }>
   const setSettingsPage = useUIStore((s) => s.setSettingsPage);
   const openContextFile = useUIStore((s) => s.openContextFile);
   const workspaceId = useWorkbenchWorkspaceId();
+  const fileFocus = React.useRef<Parameters<typeof requestFileEditorFocus> | undefined>(undefined);
   const fileEditorCommandTargetRevision = React.useSyncExternalStore(
     subscribeFileEditorCommandTargets,
     getFileEditorCommandTargetRevision,
@@ -370,7 +373,10 @@ export const CommandPalette: React.FC<{ fileOpenTarget?: 'context' | 'editor' }>
       if (!currentRoot) return;
       if (fileContext.remote) {
         if (!fileContext.location) return;
-        openProjectResourceFile(fileContext.location, projectRelativePath(fileContext.location, filePath), { target: fileOpenTarget }); close(); return;
+        const resourceId = projectRelativePath(fileContext.location, filePath);
+        const tab = activeEditorTab(openProjectResourceFile(fileContext.location, resourceId, { target: fileOpenTarget }));
+        if (tab) fileFocus.current = [{ workspaceId: fileContext.location.workspaceId, resourceId }, tab.viewId];
+        close(); return;
       }
       if (fileOpenTarget === 'editor' && workspaceId) {
         const resourceId = resourceIdFromWorkspacePath(currentRoot, filePath);
@@ -378,7 +384,8 @@ export const CommandPalette: React.FC<{ fileOpenTarget?: 'context' | 'editor' }>
           toast.error(getContextFileOpenFailureMessage('unreadable'));
           return;
         }
-        openWorkbenchEditor(workspaceId, resourceId);
+        const tab = activeEditorTab(openWorkbenchEditor(workspaceId, resourceId));
+        if (tab) fileFocus.current = [{ workspaceId, resourceId }, tab.viewId];
         close();
         return;
       }
@@ -418,7 +425,13 @@ export const CommandPalette: React.FC<{ fileOpenTarget?: 'context' | 'editor' }>
         <DialogTitle>{t('commandPalette.title')}</DialogTitle>
         <DialogDescription>{t('commandPalette.description')}</DialogDescription>
       </DialogHeader>
-      <DialogContent className="overflow-hidden p-0" showCloseButton>
+      <DialogContent className="overflow-hidden p-0" showCloseButton finalFocus={() => {
+        const target = fileFocus.current;
+        fileFocus.current = undefined;
+        if (!target) return true;
+        queueMicrotask(() => requestFileEditorFocus(...target));
+        return false;
+      }}>
         <Command
           shouldFilter={false}
           className="[&_[cmdk-group-heading]]:text-muted-foreground [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group]]:px-2 [&_[cmdk-group]:not([hidden])_~[cmdk-group]]:pt-0 [&_[cmdk-input-wrapper]_svg]:h-4 [&_[cmdk-input-wrapper]_svg]:w-4 [&_[cmdk-input]]:h-8 [&_[cmdk-item]]:px-2 [&_[cmdk-item]]:py-1.5 [&_[cmdk-item]_svg]:h-4 [&_[cmdk-item]_svg]:w-4 [&_[cmdk-item]]:typography-meta"

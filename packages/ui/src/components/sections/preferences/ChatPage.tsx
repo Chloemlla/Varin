@@ -24,6 +24,7 @@ export function ChatPage() {
   const [scene, setScene] = React.useState<ChatPreviewScene>('conversation');
   const s = useUIStore(useShallow(state => ({
     chatRenderMode: state.chatRenderMode, activityRenderMode: state.activityRenderMode,
+    collapseCompletedWork: state.collapseCompletedWork,
     userMessageRenderingMode: state.userMessageRenderingMode, collapsibleUserMessages: state.collapsibleUserMessages,
     stickyUserHeader: state.stickyUserHeader, promptNavigatorEnabled: state.promptNavigatorEnabled,
     showReasoningTraces: state.showReasoningTraces, collapsibleThinkingBlocks: state.collapsibleThinkingBlocks,
@@ -64,6 +65,7 @@ export function ChatPage() {
           <Seg value={s.activityRenderMode} label={t('settings.chat.activity')} onChange={value => save('activityRenderMode', value, ui.setActivityRenderMode)}
             options={[{ value: 'collapsed', label: t('settings.chatx.collapsedByDefault') }, { value: 'summary', label: t('settings.chatx.expandedByDefault') }]} />
         </Row> : null}
+        <Row label={t('settings.chat.collapseCompletedWork')} item="chat.collapse-completed-work"><Sw checked={s.collapseCompletedWork} label={t('settings.chat.collapseCompletedWork')} onChange={value => save('collapseCompletedWork', value, ui.setCollapseCompletedWork)} /></Row>
         <Row label={t('settings.chatx.showThinking')} item="chat.reasoning-traces"><Sw checked={s.showReasoningTraces} label={t('settings.chatx.showThinking')} onChange={ui.setShowReasoningTraces} /></Row>
         <Row label={t('settings.chatx.autoExpandThinking')} description={t('settings.chatx.autoExpandThinkingHint')} sub dim={!s.showReasoningTraces} item="chat.reasoning">
           <Sw checked={!s.collapsibleThinkingBlocks} disabled={!s.showReasoningTraces} label={t('settings.chatx.autoExpandThinking')} onChange={value => ui.setCollapsibleThinkingBlocks(!value)} />

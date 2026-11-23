@@ -1,4 +1,5 @@
 export const settingsDict = {
+  'settings.chat.collapseCompletedWork': 'Contraer automáticamente los pasos completados',
   "settings.view.nav.group.models": "Modelos",
   "settings.view.nav.group.capabilities": "Capacidades",
   "settings.view.nav.group.data": "Datos",

@@ -58,7 +58,7 @@ type FileEditorCommandTarget = {
 };
 
 const targets = new Map<string, FileEditorCommandTarget>();
-const pendingNavigation = new Map<string, { column: number; line: number }>();
+const pendingNavigation = new Map<string, 'focus' | { column: number; line: number }>();
 let activeOwnerId: string | null = null;
 const bridgeDisposers: Array<() => void> = [];
 const targetListeners = new Set<() => void>();
@@ -143,6 +143,12 @@ export const requestFileEditorNavigation = (
   revealTargetPosition(target, line, column);
   return true;
 };
+
+export function requestFileEditorFocus(identity: DocumentIdentity, viewId: string): void {
+  const target = targetForIdentity(identity, viewId);
+  if (target) activateTarget(target, true);
+  else pendingNavigation.set(navigationKey(identity, viewId), 'focus');
+}
 
 const setContext = (key: string, value: string | boolean | number): void => {
   setWorkbenchContextKey(key, value);
@@ -368,7 +374,10 @@ export const registerFileEditorCommandTarget = (target: FileEditorCommandTarget)
     pendingNavigation.delete(fallbackNavigationKey);
     queueMicrotask(() => {
       if (targets.get(target.ownerId) === target) {
-        revealTargetPosition(target, navigation.line, navigation.column);
+        if (navigation === 'focus') {
+          const workspace = peekEditorWorkbench(target.editorWorkspaceId ?? target.identity.workspaceId);
+          if (workspace && activeEditorTab(workspace)?.viewId === target.viewId) activateTarget(target, true);
+        } else revealTargetPosition(target, navigation.line, navigation.column);
       }
     });
   }

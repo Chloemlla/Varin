@@ -1,4 +1,5 @@
 export const settingsDict = {
+  'settings.chat.collapseCompletedWork': '自動收合已完成的工作過程',
   "settings.view.nav.group.models": "模型",
   "settings.view.nav.group.capabilities": "能力",
   "settings.view.nav.group.data": "資料",

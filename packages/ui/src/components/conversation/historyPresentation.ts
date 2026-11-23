@@ -213,6 +213,11 @@ export class HistoryPresentation {
         if (entry.type === 'message' && entry.message.role === 'assistant' && thinking && content.kind !== 'provider_only' && content.kind !== 'reasoning_summary') {
           entry.message.content.unshift({ type: 'thinking', id: thinkingIdentity(envelope, item.id), thinking });
         }
+        if (entry.type === 'message' && entry.message.role === 'assistant') {
+          entry.message.requestId = request;
+          const phase = object(object(envelope.opaque).value).phase;
+          if (phase === 'commentary' || phase === 'final_answer') entry.message.phase = phase;
+        }
         this.entries.set(item.id, entry);
       }
       result.push(entry);
@@ -276,9 +281,9 @@ export class HistoryPresentation {
     for (const item of history) if (visible.has(item.id)) lastByRun.set(item.run_id, item.id);
     const footers = new Map(runUsage.flatMap(run => {
       const after = lastByRun.get(run.runId);
-      if (!after || cutByRun.get(run.runId) !== run.throughId || !run.requests.length) return [];
+      if (!after || cutByRun.get(run.runId) !== run.throughId || (!run.requests.length && !run.outcome)) return [];
       const footer: ChatSessionEntry = { id: `run-usage:${run.runId}`, parentId: after, timestamp: '', type: 'run_usage', runId: run.runId,
-        usages: run.requests.map(({ requestId, usage, completeInputTokens, generation }) => ({ requestId, measurement: usage.measurement, generation,
+        outcome: run.outcome, usages: run.requests.map(({ requestId, usage, completeInputTokens, generation }) => ({ requestId, measurement: usage.measurement, generation,
           unknownReceipts: usage.measurement === 'missing' || usage.inputTokens === null || usage.outputTokens === null ? 1 : 0,
           ...(completeInputTokens == null ? usage.inputTokens === null ? {} : { input: usage.inputTokens } : { input: completeInputTokens, completeInput: completeInputTokens }),
           ...(usage.outputTokens === null ? {} : { output: usage.outputTokens }),

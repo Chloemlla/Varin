@@ -266,6 +266,7 @@ export interface ThreadTreePreview { user: string; assistant: string; activity: 
 /** Original model receipts through the displayed history cut, once per ended Run. */
 export interface ThreadRunUsage {
   runId: string;
+  outcome?: 'completed' | 'failed' | 'cancelled';
   /** Last original item included in this Run's summary. */
   throughId: string;
   requests: Array<Pick<import('@varin/protocol').ModelPresentation, 'requestId' | 'usage' | 'completeInputTokens' | 'generation'>>;

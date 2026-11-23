@@ -56,6 +56,18 @@ it('chooses locally, interleaves prose controls, and composes the exact labelled
   expect(compose).toHaveBeenCalledWith(expect.objectContaining({ text: 'Continue\n\nHair：Long', reference: expect.objectContaining({ ref: 'ui-selection:test' }) }));
   expect(container.textContent).toContain('ui.fragment.filled');
 });
+it('displays and inserts only the selected plan body without sending it', async () => {
+  await render({ type: 'choice', label: 'Check-in', required: true, options: [
+    { key: 'a', label: 'Plan A', content: 'Pick up a badge and join the first group.' },
+    { key: 'b', label: 'Plan B', content: 'Wait for the guide at the front desk.' },
+  ], action: { type: 'compose', label: 'Use this plan' } });
+  await choose(0);
+  expect(container.textContent).toContain('Pick up a badge and join the first group.');
+  expect(container.textContent).not.toContain('Wait for the guide at the front desk.');
+  await action();
+  expect(compose.mock.lastCall?.[0].text).toBe('Check-in：Plan A\n\nPick up a badge and join the first group.');
+  expect(send).not.toHaveBeenCalled();
+});
 it('preserves keyed selections across option reordering, remount, and isolates branch state', async () => {
   await render(choice); await choose(1);
   await render({ ...choice, options: ['Long', 'Short', 'Medium'] }); await action();

@@ -179,6 +179,8 @@ describe('Codex native turn ownership', () => {
     await expect(peer.reply('old-permission')).resolves.toHaveProperty('error');
     expect(s.interaction).not.toHaveBeenCalled();
     expect(s.items.get('answer')?.text).toBe('right');
+    peer.event('item/completed', codexEvent('new', { item: { id: 'answer', type: 'agentMessage', text: 'right', phase: 'final_answer' } }));
+    expect(s.items.get('answer')).toMatchObject({ phase: 'final_answer', complete: true, text: 'right' });
     let done = false;
     void result.then(() => {
       done = true;

@@ -4,6 +4,7 @@ import { create } from 'zustand';
 import { devtools, persist } from 'zustand/middleware';
 import type { SidebarSection } from '@/constants/sidebar';
 import { createDeferredSafeJSONStorage } from './utils/safeStorage';
+import { clearUnsentComposers } from './utils/unsentComposerStorage';
 import type { RecentPointer } from '@/lib/motion/pointer';
 import { CONTEXT_SURFACES, getContextRailMode } from '@/lib/surfaces/registry';
 import { SEMANTIC_TYPOGRAPHY, getTypographyVariable, type SemanticTypographyKey } from '@/lib/typography';
@@ -575,6 +576,8 @@ interface UIStore {
   eventStreamHint: string | null;
   showReasoningTraces: boolean;
   showGenerationSpeed: boolean;
+  collapseCompletedWork: boolean;
+  setCollapseCompletedWork: (value: boolean) => void;
   setShowGenerationSpeed: (value: boolean) => void;
   sessionGoalEnabled: boolean;
   sessionGoalDefaultBudgetEnabled: boolean;
@@ -908,6 +911,8 @@ export const useUIStore = create<UIStore>()(
         eventStreamHint: null,
         showReasoningTraces: true,
         showGenerationSpeed: true,
+        collapseCompletedWork: true,
+        setCollapseCompletedWork: value => set({ collapseCompletedWork: value }),
         setShowGenerationSpeed: value => set({ showGenerationSpeed: value }),
         sessionGoalEnabled: true,
         sessionGoalDefaultBudgetEnabled: false,
@@ -2182,6 +2187,7 @@ export const useUIStore = create<UIStore>()(
         setSummaryLength: (value) => { set({ summaryLength: value }); },
         setMaxLastMessageLength: (value) => { set({ maxLastMessageLength: value }); },
         setPersistChatDraft: (value) => {
+          if (!value && get().persistChatDraft) clearUnsentComposers();
           set({ persistChatDraft: value });
         },
         setInputSpellcheckEnabled: (value) => {
@@ -2338,6 +2344,7 @@ export const useUIStore = create<UIStore>()(
           // Note: isSettingsDialogOpen intentionally NOT persisted
           showReasoningTraces: state.showReasoningTraces,
           showGenerationSpeed: state.showGenerationSpeed,
+          collapseCompletedWork: state.collapseCompletedWork,
           sessionGoalEnabled: state.sessionGoalEnabled,
           sessionGoalDefaultBudgetEnabled: state.sessionGoalDefaultBudgetEnabled,
           sessionGoalDefaultBudget: state.sessionGoalDefaultBudget,

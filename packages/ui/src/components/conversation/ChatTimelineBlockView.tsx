@@ -5,6 +5,7 @@ import type { ChatTimelineProjection } from './chatTimelineProjection';
 import { blockGroupLive, blockGroupSorted, blockGroupDialogue, type ChatTimelineBlock } from './chatTimelineBlocks';
 import { ChatDialogueBlock, ChatSortedActivityGroup, ChatTimelineEntryList, ChatTurnUserMessage, type ChatTimelineProps } from './ChatTimelineEntries';
 import { ChatTurnAssistantChrome } from './ChatTurnAssistantChrome';
+import { CompletedWorkButton } from './CompletedWorkButton';
 import { ConversationContext, useConversationPresentation } from './ConversationContext';
 import { projectTimelineRow } from './timelineRowProjection';
 import { useI18n } from '@/lib/i18n';
@@ -39,13 +40,14 @@ const TimelineRow = React.memo(({ block, projection, sorted, expanded, activityT
   </div>;
   const { group } = block;
   const liveAssistant = blockGroupLive(group, projection);
-  const sortedPresentation = sorted ? blockGroupSorted(group, projection, toolExecutions) : undefined;
+  const sortedPresentation = sorted && block.kind !== 'work-header' && block.kind !== 'work-part' ? blockGroupSorted(group, projection, toolExecutions) : undefined;
   let content: React.ReactNode;
   let bodyKind: string = block.kind;
   let ordinaryActivity = false;
   if (block.kind === 'chrome') content = <ChatTurnAssistantChrome entries={group.entries} liveAssistant={liveAssistant} waiting={assistantWaiting} />;
-  else if (block.kind === 'dialogue') {
-    const item = blockGroupDialogue(group, projection, showThinking, toolExecutions).find(item => item.id === block.itemId);
+  else if (block.kind === 'work-header') content = <CompletedWorkButton expanded={expanded} durationMs={block.work.durationMs} onToggle={() => onExpandedChange(block.id, !expanded)} />;
+  else if (block.kind === 'dialogue' || block.kind === 'work-part') {
+    const item = block.kind === 'work-part' ? block.item : blockGroupDialogue(group, projection, showThinking, toolExecutions).find(item => item.id === block.itemId);
     if (!item) return null;
     bodyKind = item.kind === 'text' ? 'prose' : item.kind;
     content = <ChatDialogueBlock item={item} cwd={cwd} sessionId={props.sessionId} executions={toolExecutions}
@@ -62,6 +64,7 @@ const TimelineRow = React.memo(({ block, projection, sorted, expanded, activityT
       onExpandedChange={value => onExpandedChange(group.id, value)} />;
   } else {
     content = <ChatTimelineEntryList {...props} toolExecutions={toolExecutions} liveGeneration={block.kind === 'footer' ? presentation.liveGeneration : undefined}
+      answerText={block.kind === 'footer' ? block.answerText : undefined}
       entries={block.kind === 'entry' ? [block.entry] : block.kind === 'footer' ? group.entries : []}
       liveAssistant={block.kind === 'footer' || block.kind === 'live-assistant' ? liveAssistant : undefined}
       turnActive={props.activeRunId === group.runId || assistantWaiting !== undefined || liveAssistant?.stopReason === 'pending'}
@@ -69,7 +72,7 @@ const TimelineRow = React.memo(({ block, projection, sorted, expanded, activityT
   }
   // Rows above and below the viewport stay mounted; their loops pause until they scroll back in.
   const body = <div ref={pauseLoopsOffscreen} className="chat-message-column conversation-block" data-conversation-block={bodyKind} data-turn-entry={block.id} data-turn-id={block.ownerId}
-    data-conversation-entry-id={block.kind === 'activity' ? block.sourceId : undefined}
+    data-conversation-entry-id={block.kind === 'activity' ? block.sourceId : block.kind === 'work-part' && block.item.kind === 'entry' ? block.item.sourceId : undefined}
     data-conversation-message-role={block.kind === 'chrome' || block.kind === 'activity' ? 'assistant' : undefined}>{content}</div>;
   return ordinaryActivity ? <motion.div initial={activityTransition === 'opening' ? { height: 0, opacity: 0 } : false}
     animate={activityTransition === 'closing' ? { height: 0, opacity: 0 } : { height: 'auto', opacity: 1 }}

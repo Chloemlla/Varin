@@ -151,6 +151,7 @@ export type DesktopSettings = {
   showToolFileIcons?: boolean;
   codeBlockLineWrap?: boolean;
   showTurnChangedFiles?: boolean;
+  collapseCompletedWork?: boolean;
   showExpandedBashTools?: boolean;
   showExpandedEditTools?: boolean;
   timeFormatPreference?: 'auto' | '12h' | '24h';

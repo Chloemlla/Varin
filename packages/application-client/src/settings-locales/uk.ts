@@ -1,4 +1,5 @@
 export const settingsDict = {
+  'settings.chat.collapseCompletedWork': 'Автоматично згортати перебіг завершеної роботи',
   "settings.view.nav.group.models": "Моделі",
   "settings.view.nav.group.capabilities": "Можливості",
   "settings.view.nav.group.data": "Дані",

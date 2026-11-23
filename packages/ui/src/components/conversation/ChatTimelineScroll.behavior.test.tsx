@@ -256,7 +256,8 @@ it('opens only the owning folded tool group before revealing its exact quoted ca
     <details data-conversation-tool-disclosure="unrelated"><summary>Other calls</summary></details>
   </article>;
   await act(async () => root.render(<ReferenceNavigationContext.Provider value={navigation}>
-    <ChatTimeline sessionId="quote-tools" cwd="/workspace" entries={[entry]} toolExecutions={{}} />
+    <ChatTimeline sessionId="quote-tools" cwd="/workspace" entries={[entry, { id: 'ended', runId: 'tool-run', parentId: entry.id,
+      timestamp: '', type: 'run_usage', outcome: 'completed', usages: [] }]} toolExecutions={{}} />
   </ReferenceNavigationContext.Provider>));
   expect(mount.querySelector('[data-chat-tool-call-id="quoted-call"]')).toBeNull();
   const disclosure = mount.querySelector<HTMLDetailsElement>('[data-conversation-tool-disclosure="group:first-call"]')!;
@@ -266,7 +267,11 @@ it('opens only the owning folded tool group before revealing its exact quoted ca
     this.toggleAttribute('open', value); this.dispatchEvent(new window.Event('toggle'));
   } });
   let located: Promise<void>;
+  expect(viewport.props?.data?.some(row => row.kind === 'work-header')).toBe(true);
+  expect(viewport.props?.data?.some(row => row.kind === 'work-part')).toBe(false);
   await act(async () => { located = navigation.revealSource!({ entryId: entry.id, toolCallId: 'quoted-call' }); });
+  expect(viewport.props?.data?.some(row => row.kind === 'work-part')).toBe(true);
+  await act(async () => frame());
   frame();
   await act(async () => await located!);
   expect(disclosure.open).toBe(true);
