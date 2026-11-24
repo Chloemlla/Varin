@@ -95,8 +95,9 @@ export function createMcpInteractionRuntime(options: { kernel: KernelClient; run
     void entry.opened.catch(() => undefined).then(() => { if (!disposed && entries.get(entry.id) === entry) void flush(entry); });
     if (availability !== 'rpc_closed') { entry.completion?.(); delete entry.completion; }
   };
-  const reconcile = async () => {
-    if (disposed) return; dirty = true;
+  const reconcile = (): Promise<void> => {
+    if (disposed) return Promise.resolve();
+    dirty = true;
     if (poll) return poll;
     poll = (async () => {
       while (dirty && !disposed) {
@@ -125,7 +126,11 @@ export function createMcpInteractionRuntime(options: { kernel: KernelClient; run
     })().finally(() => { poll = undefined; });
     return poll;
   };
-  const wake = () => { void reconcile().catch(report); };
+  const wake = () => {
+    // One dirty bit retains a wake while the Catalog read is in flight.
+    if (poll) { dirty = true; return; }
+    void reconcile().catch(report);
+  };
   const receive = async (input: McpInteractionRequest, sampling = false): Promise<ReviewedAnswer> => {
     if (disposed) throw failure('mcp_interaction_owner_unavailable');
     const decoded = sampling ? { request: input.request, presentation: { mode: 'sampling' as const, message: 'Review this server’s isolated model request' } } : decodeElicitationRequest(input.request);
@@ -362,7 +367,14 @@ export function createMcpInteractionRuntime(options: { kernel: KernelClient; run
       return reviewSamplingChoice(input, 'output', signal);
     },
     errorReceiver,
-    start() { if (started || disposed) return; started = true; removers.push(options.runtime.onReady(wake), options.runtime.onEvent(wake)); wake(); },
+    start() {
+      if (started || disposed) return;
+      started = true;
+      removers.push(options.runtime.onReady(wake), options.runtime.onEvent(event => {
+        if (event.stream !== 'progress') wake();
+      }));
+      wake();
+    },
     async respond(input: McpInteractionRespondParams, signal?: AbortSignal): Promise<McpInteractionView> {
       const read = () => options.kernel.agentRuntimeRequest<McpInteractionView, 'runtime.mcp.interaction.read'>('runtime.mcp.interaction.read', { operationId: input.operationId, interactionId: input.interactionId });
       const run = async () => {

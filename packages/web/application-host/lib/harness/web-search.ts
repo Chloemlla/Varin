@@ -243,8 +243,8 @@ const readMcpTransport = async (response: Response, provider: string, signal?: A
   let pending = "";
   let skipLF = false;
   let data: string[] = [];
-  const abort = () => { void reader.cancel(signal?.reason).catch(() => {}); };
-  signal?.addEventListener("abort", abort, { once: true });
+  const stopReading = () => { void reader.cancel(signal?.reason).catch(() => {}); };
+  signal?.addEventListener("abort", stopReading, { once: true });
   const event = () => {
     const body = data.join("\n");
     data = [];
@@ -291,8 +291,10 @@ const readMcpTransport = async (response: Response, provider: string, signal?: A
       }
     }
   } finally {
-    signal?.removeEventListener("abort", abort);
-    await reader.cancel().catch(() => {});
+    signal?.removeEventListener("abort", stopReading);
+    // Cancel closes the local reader immediately. The transport's cleanup
+    // promise can outlive the RPC result, even after the request is aborted.
+    stopReading();
     reader.releaseLock();
   }
 };

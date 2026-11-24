@@ -41,6 +41,20 @@ const setup = () => {
 };
 const identity = { runtime: 'agent', threadId: 'alice:thread', branchId: 'branch' };
 
+it('forwards model preferences and automatic titles through the Thread update route', async () => {
+  const { app, acted } = setup();
+  const update = { runtime: 'agent', threadId: 'alice:thread', key: 'update', expectedRevision: 3 };
+  for (const fields of [
+    { model: { providerId: 'provider', modelId: 'fallback', thinkingLevel: 'high' } },
+    { titleMode: 'automatic' },
+  ]) {
+    const body = { ...update, ...fields };
+    const response = await request(app).post('/api/threads/update').set('Authorization', 'alice').send(body);
+    expect(response.status).toBe(200);
+    expect(acted).toHaveBeenLastCalledWith(body);
+  }
+});
+
 describe('HTTP routes authorize the actual resources they consume', () => {
   it('rejects another principal on every registered resource route before the owner acts', async () => {
     const { app, acted } = setup();

@@ -262,7 +262,7 @@ export function registerThreadRoutes(app: Express, adapter: ThreadAdapter, requi
     'policy/inspect': ['runtime','threadId','branchId','runId'],
     'policy/restart': ['runtime','threadId','branchId','runId','selectionId'],
     'policy/cancel': ['runtime','threadId','branchId','runId','selectionId'],
-    update: ['runtime', 'threadId', 'key', 'expectedRevision', 'title', 'pinned', 'archived'],
+    update: ['runtime', 'threadId', 'key', 'expectedRevision', 'title', 'titleMode', 'pinned', 'archived', 'model'],
     delete: ['runtime', 'threadId', 'key', 'expectedRevision'],
     read: ['runtime', 'threadId', 'key', 'throughCursor'],
     attention: [], create: ['key', 'organization'], list: ['query', 'archived'], models: [], submit: ['runtime', 'threadId', 'branchId', 'key', 'text', 'images', 'attachmentImageReferences', 'materials', 'attachments', 'expectedHead', 'model', 'source', 'agent', 'clientTime', 'skills', 'references', 'contentReferences', 'contentReferenceOccurrences'],

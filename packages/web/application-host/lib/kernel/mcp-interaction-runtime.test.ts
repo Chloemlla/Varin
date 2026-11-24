@@ -1,9 +1,41 @@
 import { expect, it, vi } from 'vitest';
 import type { McpInteractionRequest } from '../mcp/authority.js';
 import type { KernelClient } from './kernel-client.js';
+import type { AgentRuntimeClient } from './agent-runtime-client.js';
 import type { McpInteractionBinding, McpInteractionRecord, McpInteractionView, McpElicitationResponse, KernelMethodParams } from './protocol.generated.js';
+import { KERNEL_PROTOCOL_VERSION } from './protocol.generated.js';
 import { createMcpInteractionRuntime } from './mcp-interaction-runtime.js';
 const binding=(operationId:string):McpInteractionBinding=>({operationId,executionOwner:{kind:'external',identity:'host',epoch:'one'},endpoint:{server:'original',resourceKey:'resource',configurationVersion:'config',credentialVersion:'grant'},connectionId:'actual-client',source:{kind:'server_request',requestId:operationId,relation:{kind:'rpc_response_stream',outgoingRequestId:operationId}}});
+
+it('only scans durable MCP state on Catalog changes, not streamed model progress', async () => {
+  type Event = Parameters<Parameters<AgentRuntimeClient['onEvent']>[0]>[0];
+  let emit!: (event: Event) => void;
+  let finishFirst!: (records: []) => void;
+  const held = new Promise<[]>(resolve => { finishFirst = resolve; });
+  const request = vi.fn<() => Promise<[]>>().mockReturnValueOnce(held).mockResolvedValue([]);
+  const runtime = createMcpInteractionRuntime({
+    kernel: { agentRuntimeRequest: request } as unknown as KernelClient,
+    runtime: { onReady: () => () => {}, onEvent(listener) { emit = listener; return () => {}; } },
+  });
+  const envelope = { v: KERNEL_PROTOCOL_VERSION, kind: 'runtime-event', kernelEpoch: 'epoch' } as const;
+  try {
+    runtime.start();
+    await Promise.resolve();
+    for (let sequence = 0; sequence < 1000; sequence++) {
+      emit({ ...envelope, stream: 'progress', runId: 'run', threadId: 'thread', branchId: 'branch', requestId: 'request', streamId: 'stream', sequence, event: {} });
+    }
+    finishFirst([]);
+    await new Promise(resolve => setImmediate(resolve));
+    expect(request).toHaveBeenCalledTimes(1);
+    emit({ ...envelope, stream: 'durable', cursor: 1 });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(request).toHaveBeenCalledTimes(2);
+  } finally {
+    finishFirst([]);
+    await runtime.dispose();
+  }
+});
+
 function fixture(){
   const records=new Map<string,McpInteractionView>(), attempts:string[]=[];
   let heldOpen:(()=>Promise<void>)|undefined;

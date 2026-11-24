@@ -51,6 +51,30 @@ describe("configured web search providers", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
+  it("returns a complete SSE result while the transport closes", async () => {
+    let finishClose!: () => void;
+    const closing = new Promise<void>(resolve => { finishClose = resolve; });
+    const cancel = vi.fn(() => closing);
+    const fetch = vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        const rpc = { jsonrpc: "2.0", id: 1, result: { structuredContent: { results: [{ title: "Result", url: "https://exa.example/result" }] } } };
+        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(rpc)}\n\n`));
+      },
+      cancel,
+    }), { headers: { "Content-Type": "text/event-stream" } }));
+    const resolved = resolveConfiguredSearchProvider({ auth: {}, fetch });
+    if ("unavailable" in resolved) throw new Error("default provider unavailable");
+    const search = resolved.search("q", {});
+    try {
+      const result = await Promise.race([search, new Promise(resolve => setImmediate(resolve))]);
+      expect(result).toMatchObject({ providerId: "default-exa", results: [{ title: "Result" }] });
+      expect(cancel).toHaveBeenCalledOnce();
+    } finally {
+      finishClose();
+      await search;
+    }
+  });
+
   it.each(["headers", "body"])("drains a stalled MCP %s attempt before trying its fallback", async (phase) => {
     vi.useFakeTimers();
     const stopped = vi.fn();
