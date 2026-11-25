@@ -177,6 +177,7 @@ impl ContentStore {
             });
         }
         reference["history_text"] = serde_json::to_value(index)?;
+        reference["history_view"] = serde_json::to_value(HistoryViewReferences::from_content(&payload["content"]))?;
         let body = &payload["content"]["content"];
         if body["kind"] == "tool_call" {
             if let Some(id) = body["call"]["call_id"].as_str() {

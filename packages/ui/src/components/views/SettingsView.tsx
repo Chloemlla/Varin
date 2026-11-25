@@ -316,7 +316,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onClose, forceMobile
           <Btn kind="ghost" icon="arrow-left-s" tip={stackedCatalog && catalogStage === 'detail' ? t('settings.shell.backTo', { page: mobileTitle }) : t('settings.view.actions.backToSettings')} onClick={back} />
           {phone ? <span className="sk-mt">{mobileTitle}</span> : <span className="sk-small">{mobileTitle}</span>}
         </div>
-        <ErrorBoundary>{renderContent()}</ErrorBoundary>
+        <ErrorBoundary><React.Suspense fallback={<div className="sk-empty" role="status">{t('common.loading')}</div>}>
+          {renderContent()}
+        </React.Suspense></ErrorBoundary>
       </main>
     </div>
   </SettingsShellContext.Provider></SettingsItemNavigationContext.Provider></SettingsNavigationContext.Provider>;

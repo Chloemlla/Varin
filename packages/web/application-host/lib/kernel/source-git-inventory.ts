@@ -50,22 +50,26 @@ export function createSourceGitInventory(options: { spawn: ManagedSpawn; gitBina
       if (signal?.aborted) throw abortError();
       return (await runGit(directory, args, undefined, signal)).stdout;
     };
-    const [tracked, deleted, untracked, unstaged, staged, stagedMeta] = await Promise.all([
-      collect(["ls-files", "-z"]),
-      collect(["ls-files", "-d", "-z"]),
+    const [untracked, unstaged, staged, stagedMeta, versusHead] = await Promise.all([
       collect(["ls-files", "--others", "--exclude-standard", "-z"]),
       collect(["diff", "--relative", "--name-only", "-z", "--", "."]),
       collect(["diff", "--relative", "--cached", "--name-only", "-z", "--", "."]),
       collect(["ls-files", "-s", "-z"]),
+      unborn ? Promise.resolve("") : collect(["diff", "--relative", "--name-only", "-z", "HEAD", "--", "."]),
     ]);
-    const versusHead = unborn ? [] : parseGitNullList(await collect(["diff", "--relative", "--name-only", "-z", "HEAD", "--", "."]));
+    signal?.throwIfAborted();
+    // Stage records include every tracked path, including index conflicts and
+    // files absent from disk. Reuse them rather than spawning two more
+    // ls-files processes. A staged deletion may no longer be in the index, so
+    // the diff paths still supply it.
+    const entries = parseGitStageList(stagedMeta);
     const gitlinks = [...new Set(
-      parseGitStageList(stagedMeta)
+      entries
         .filter((entry) => entry.mode === "160000")
         .map((entry) => entry.path),
     )].sort();
     const indexModes: Record<string, string> = {};
-    for (const entry of parseGitStageList(stagedMeta)) {
+    for (const entry of entries) {
       if (entry.mode === "100644" || entry.mode === "100755") indexModes[entry.path] = entry.mode;
     }
     // Content is captured and verified by the native file owner. Computing a
@@ -77,12 +81,11 @@ export function createSourceGitInventory(options: { spawn: ManagedSpawn; gitBina
       baseRef,
       unborn,
       paths: [...new Set([
-        ...parseGitNullList(tracked),
-        ...parseGitNullList(deleted),
+        ...entries.map((entry) => entry.path),
         ...parseGitNullList(untracked),
         ...parseGitNullList(unstaged),
         ...parseGitNullList(staged),
-        ...versusHead,
+        ...parseGitNullList(versusHead),
       ])].sort(),
       gitlinks,
       indexFingerprint: createHash("sha256").update(stagedMeta).digest("hex"),

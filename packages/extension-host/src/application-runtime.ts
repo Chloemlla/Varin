@@ -127,6 +127,17 @@ export class ApplicationExtensionRuntime {
   readonly #deleteExtensionData: ApplicationExtensionRuntimeOptions['deleteExtensionData'];
   readonly #onObserverError: (error: unknown) => void;
   readonly #serviceUnsubscribe: () => void;
+  #selectionRead: { revision: number; value: Promise<readonly [VarinExtensionHostStateSnapshot['catalog'], VarinExtensionHostStateSnapshot['routing']]> } | undefined;
+  // Share only overlapping reads at the same observed runtime revision. No settled view
+  // survives the call; package publication/grants and final routing are checked by the owner.
+  #readServiceSelection() {
+    if (this.#selectionRead?.revision === this.#revision) return this.#selectionRead.value;
+    const value = Promise.all([this.catalog.snapshot(), this.routing.read()] as const).finally(() => {
+      if (this.#selectionRead?.value === value) this.#selectionRead = undefined;
+    });
+    this.#selectionRead = { revision: this.#revision, value };
+    return value;
+  }
   #revision = 0;
   readonly #mutations = new Set<Promise<void>>();
   readonly #reads = new Set<Promise<void>>();
@@ -758,22 +769,33 @@ export class ApplicationExtensionRuntime {
     for (;;) {
       options?.signal?.throwIfAborted();
       const revision = this.#revision;
-      const [catalog, routing] = await Promise.all([this.catalog.snapshot(), this.routing.read()]);
-      if (!catalog.authoritative || !routing.authoritative) throw new Error('Cannot resolve a Host composition from stale selection state');
-      if (options?.expectedRoutingRevision !== undefined && options.expectedRoutingRevision !== routing.document.revision) throw new Error('Host service routing changed during resolution');
-      const resolution = resolveDeclaredServiceRouting(catalog, routing, parsed.serviceId, parsed.version, parsed.routing,
-        options?.defaultProviderKey, options?.collection ? 'ordered' : undefined);
-      if (resolution.status !== 'resolved') throw new HostServiceBindingError(resolution.status === 'ambiguous' ? 'ambiguous'
-        : resolution.matchedRule ? 'selected_unavailable' : 'missing', resolution.diagnostics.map(diagnostic => diagnostic.message).join('; '));
-      const services = resolution.extensionIds.map(extensionId => {
-        const plan = createHostCompositionPlan(catalog, routing, extensionId, parsed.routing);
-        const descriptor = plan.root.entry.manifest.provides!.services!.find(service => service.id === parsed.serviceId && service.version === parsed.version)!;
-        if (options?.collection && descriptor.contract?.composition !== 'ordered') throw new HostServiceBindingError('selected_unavailable', 'Every selected provider must declare ordered composition');
-        return { providerKey: `${extensionId}:host:${parsed.serviceId}@${parsed.version}`, descriptor: structuredClone(descriptor), composition: plan.composition };
-      });
-      options?.signal?.throwIfAborted();
-      if (revision === this.#revision) return { services, routingRevision: routing.document.revision };
+      const [catalog, routing] = await this.#readServiceSelection();
+      const result = this.resolveServiceCompositionsAtSnapshot({catalog, routing}, parsed, options);
+      if (revision === this.#revision) return result;
     }
+  }
+
+  /** Pure metadata only: a directory reconciliation shares a single authoritative snapshot.
+   * A snapshot is not a lease. Dispatch and active preparation still check the live routing. */
+  resolveServiceCompositionsAtSnapshot({catalog, routing}: Pick<VarinExtensionHostStateSnapshot, 'catalog' | 'routing'>,
+    parsed: VarinExtensionServiceInvocationRequest,
+    options?: Pick<HostServicePreparationOptions, 'defaultProviderKey' | 'expectedRoutingRevision' | 'signal'> & { collection?: boolean }): ResolvedHostServiceCompositions {
+    if (this.#stopped) throw new Error('Application extension runtime is stopped');
+    options?.signal?.throwIfAborted();
+    if (parsed.providerId) throw new Error('Declaration resolution does not accept a live provider identity');
+    if (!catalog.authoritative || !routing.authoritative) throw new Error('Cannot resolve a Host composition from stale selection state');
+    if (options?.expectedRoutingRevision !== undefined && options.expectedRoutingRevision !== routing.document.revision) throw new Error('Host service routing changed during resolution');
+    const resolution = resolveDeclaredServiceRouting(catalog, routing, parsed.serviceId, parsed.version, parsed.routing,
+      options?.defaultProviderKey, options?.collection ? 'ordered' : undefined);
+    if (resolution.status !== 'resolved') throw new HostServiceBindingError(resolution.status === 'ambiguous' ? 'ambiguous'
+      : resolution.matchedRule ? 'selected_unavailable' : 'missing', resolution.diagnostics.map(diagnostic => diagnostic.message).join('; '));
+    const services = resolution.extensionIds.map(extensionId => {
+      const plan = createHostCompositionPlan(catalog, routing, extensionId, parsed.routing);
+      const descriptor = plan.root.entry.manifest.provides!.services!.find(service => service.id === parsed.serviceId && service.version === parsed.version)!;
+      if (options?.collection && descriptor.contract?.composition !== 'ordered') throw new HostServiceBindingError('selected_unavailable', 'Every selected provider must declare ordered composition');
+      return { providerKey: `${extensionId}:host:${parsed.serviceId}@${parsed.version}`, descriptor: structuredClone(descriptor), composition: plan.composition };
+    });
+    return { services, routingRevision: routing.document.revision };
   }
 
   async #prepareServices(request: VarinExtensionServiceInvocationRequest | unknown,
@@ -789,7 +811,7 @@ export class ApplicationExtensionRuntime {
       return { bindings, routingRevision };
     };
     if (parsed.providerId) return result([this.services.bind(parsed.serviceId, parsed.version, parsed.providerId)], 0);
-    const [catalog, routing] = await Promise.all([this.catalog.snapshot(), this.routing.read()]);
+    const [catalog, routing] = await this.#readServiceSelection();
     if (!catalog.authoritative || (!options?.frozenComposition && !routing.authoritative)) throw new Error("Cannot prepare a Host service from stale selection state");
     if (options?.expectedRoutingRevision !== undefined && routing.document.revision !== options.expectedRoutingRevision) throw new Error("Host service routing changed during preparation");
     const frozen = options?.frozenComposition;
@@ -808,7 +830,7 @@ export class ApplicationExtensionRuntime {
         if (native.length !== 1 || frozen) throw new Error('Workbench service owner identity is unavailable');
         return this.services.bind(parsed.serviceId, parsed.version, native[0]!.providerId);
       }
-      const lease = await this.supervisor.prepareExtension(id, parsed.routing, options?.signal, frozen);
+      const lease = await this.supervisor.prepareExtension(id, parsed.routing, options?.signal, frozen, { catalog: catalog.revision, routing: routing.document.revision });
       try {
         const binding = lease.bind(parsed.serviceId, parsed.version);
         let released = false;

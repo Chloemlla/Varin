@@ -21,7 +21,7 @@ function setup() {
   Object.defineProperty(document, 'hidden', { value: false, configurable: true });
   const ref = { current: node };
   function Probe() { view = useCompanionWindow(ref, true, undefined, () => repeated); return null; }
-  root = createRoot(document.getElementById('root')!); act(() => root!.render(React.createElement(Probe))); act(() => view.refreshHitMask());
+  root = createRoot(document.getElementById('root')!); act(() => root!.render(React.createElement(Probe))); act(() => view.refreshHitMask(() => opaque));
 }
 function event(x = 50) { return { pointerId: 1, button: 0, pointerType: 'mouse', clientX: x, clientY: 50, currentTarget: node, preventDefault() {} } as React.PointerEvent<HTMLCanvasElement>; }
 function tap() { act(() => { view.handlers.onPointerDown(event()); view.handlers.onPointerUp(); }); }
@@ -35,9 +35,9 @@ it('admits only completed clicks, bounds repeated taps, and never turns capture 
   act(() => { view.handlers.onPointerDown(event()); view.handlers.onPointerMove(event(60)); view.handlers.onPointerUp(); }); expect(view.phase).toBe('landing'); expect(view.tapRevision).toBe(2);
 });
 it('rechecks actual drawn alpha while parked and cancels the sole dwell deadline', () => {
-  setup(); act(() => view.handlers.onPointerMove(event())); act(() => vi.advanceTimersByTime(400)); opaque = false; act(() => view.refreshHitMask());
+  setup(); act(() => view.handlers.onPointerMove(event())); act(() => vi.advanceTimersByTime(400)); opaque = false; act(() => view.refreshHitMask(() => opaque));
   expect(view.hovered).toBe(false); act(() => vi.advanceTimersByTime(1000)); expect(view.hoverRevision).toBe(0);
-  opaque = true; act(() => { view.refreshHitMask(); view.handlers.onPointerMove(event()); }); act(() => vi.advanceTimersByTime(700)); expect(view.hoverRevision).toBe(1);
+  opaque = true; act(() => { view.refreshHitMask(() => opaque); view.handlers.onPointerMove(event()); }); act(() => vi.advanceTimersByTime(700)); expect(view.hoverRevision).toBe(1);
   act(() => vi.advanceTimersByTime(20000)); expect(view.hoverRevision).toBe(1); act(() => view.resetLocalInteraction()); expect(view.hovered).toBe(false);
 });
 it('does not greet on resume without a real local click', () => {

@@ -4,9 +4,10 @@ import { CompanionPlayback, frameAt, route, type PlaybackAsset } from './playbac
 import { pickupPreloadDependencies } from './pickupPreload';
 
 /** Only accepted art may follow real Host intent; file-review candidates are not promoted. */
-export function useCompanionPlayback(packages: CompanionPackage[], requestedAction: string | null, paused = false, readyIds: string[] = [], interaction?: { phase: 'rest' | 'lifting' | 'landing'; displayed: () => { packageId: string; exposure: number; context?: string | null } | null }, options?: { allowCandidates?: boolean; presentationKey?: string | null }) {
+export function useCompanionPlayback(packages: CompanionPackage[], requestedAction: string | null, paused = false, readyIds: string[] = [], interaction?: { phase: 'rest' | 'lifting' | 'landing'; displayed: () => { packageId: string; exposure: number; context?: string | null } | null }, options?: { allowCandidates?: boolean; presentationKey?: string | null; awaitingFirstPaint?: boolean }) {
   const presentationKey = options?.presentationKey ?? null;
   const allowCandidates = options?.allowCandidates === true;
+  const awaitingFirstPaint = options?.awaitingFirstPaint === true;
   const accepted = useMemo(() => packages.filter((asset): asset is PlaybackAsset =>
     (asset.reviewStatus === 'accepted' || allowCandidates && asset.reviewStatus === 'candidate') && asset.stage === 'motion-candidate'
     && !!asset.entryPose && !!asset.exitPose && !!asset.geometryReference), [packages, allowCandidates]);
@@ -42,9 +43,14 @@ export function useCompanionPlayback(packages: CompanionPackage[], requestedActi
     const target = candidates.map(asset => ({ asset, path: route(controller.current, asset, accepted, allowCandidates) }))
       .filter(item => item.path.status === 'ready').sort((a,b) => a.path.clips.length-b.path.clips.length)[0]?.asset ?? candidates[0];
     controller.request(target?.id ?? 'missing-current-intent', { urgent: requestedAction === null, context: presentationKey });
-    let request = 0, previous: number | undefined;
+  }, [accepted, controller, requestedAction, presentationKey, allowCandidates]);
+  useEffect(() => {
+    if (!accepted.length) return;
+    let request: number | undefined, previous: number | undefined;
     const reduced = matchMedia('(prefers-reduced-motion: reduce)');
     const draw = (now: number) => {
+      request = undefined;
+      if (document.hidden && !awaitingFirstPaint) return;
       if (controller.loading && ready.current.has(controller.loading)) { controller.advance(); previous = undefined; }
       // Reduced motion suppresses repeated performance at the authored loop's
       // next explicitly safe drawing, not necessary state changes or pointer release/landing.
@@ -61,8 +67,17 @@ export function useCompanionPlayback(packages: CompanionPackage[], requestedActi
         ? old : { context: controller.currentContext, packageId: current?.id ?? null, exposure, blocker: controller.blocker, finished, neededPackageId, gestureActive, worldEvent });
       request = requestAnimationFrame(draw);
     };
-    request = requestAnimationFrame(draw);
-    return () => cancelAnimationFrame(request);
-  }, [accepted, controller, requestedAction, presentationKey, paused]);
+    const onVisibility = () => {
+      previous = undefined;
+      if (request !== undefined) cancelAnimationFrame(request);
+      request = !document.hidden || awaitingFirstPaint ? requestAnimationFrame(draw) : undefined;
+    };
+    onVisibility();
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+      if (request !== undefined) cancelAnimationFrame(request);
+    };
+  }, [accepted, controller, paused, awaitingFirstPaint]);
   return { ...view, beginGrab };
 }

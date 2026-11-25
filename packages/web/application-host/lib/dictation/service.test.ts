@@ -3,10 +3,10 @@ import { EventEmitter } from 'node:events';
 import { createDictationService } from './service.js';
 import { resolveLocalSttLanguage } from './local/model-language.js';
 
-const state = vi.hoisted(() => ({ installed: vi.fn(), connect: vi.fn(), configurations: [] as unknown[] }));
+const state = vi.hoisted(() => ({ installed: vi.fn(), download: vi.fn(), connect: vi.fn(), configurations: [] as unknown[] }));
 vi.mock('./local/model-downloader.js', () => ({
   isLocalSttModelInstalled: state.installed,
-  ensureLocalSttModel: vi.fn(),
+  ensureLocalSttModel: state.download,
 }));
 vi.mock('./local/worker-client.js', () => ({
   DictationWorkerClient: class { shutdown() {} },
@@ -42,6 +42,20 @@ describe('multilingual dictation', () => {
     expect(resolveLocalSttLanguage('whisper-turbo-int8', 'fil-PH')).toBe('tl');
     expect(resolveLocalSttLanguage('whisper-base-int8', 'jv-ID')).toBe('jw');
     expect(resolveLocalSttLanguage('parakeet-tdt-0.6b-v3-int8', 'zh-CN')).toBe('');
+  });
+
+  it('only prepares catalog models on the owning Host through its supplied egress', async () => {
+    state.installed.mockResolvedValue(false);
+    state.download.mockResolvedValue('/owner/models/prepared');
+    const fetchModel = vi.fn<typeof fetch>();
+    const service = createDictationService({ modelsDir: '/owner/models', fetchModel });
+    expect(await service.requestModelDownload('https://not-a-catalog-model.test')).toMatchObject({ ok: false });
+    expect(state.download).not.toHaveBeenCalled();
+    expect(await service.requestModelDownload('sense-voice-small-int8')).toMatchObject({ ok: true, installed: false });
+    expect(state.download).toHaveBeenCalledOnce();
+    expect(state.download).toHaveBeenCalledWith(expect.objectContaining({
+      modelsDir: '/owner/models', modelId: 'sense-voice-small-int8', fetcher: fetchModel,
+    }));
   });
 
   it('returns model capability metadata with the live installation state', async () => {

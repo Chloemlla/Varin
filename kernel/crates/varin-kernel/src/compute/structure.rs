@@ -1,10 +1,9 @@
 //! The existing grammar/query recipes execute in native tree-sitter. There is
 //! no Host text/tree cache and no replacement language or search algorithm.
-use super::{Result,Shared};
+use super::{AdmittedGrammar,Result,Shared};
 use crate::protocol_generated::KernelComputeGrammarParams;
 use serde_json::{json,Value};
-use sha2::{Digest,Sha256};
-use std::{collections::{HashMap,HashSet},fs,ops::ControlFlow,sync::Arc,time::{Duration,Instant}};
+use std::{collections::{HashMap,HashSet},ops::ControlFlow,sync::Arc,time::{Duration,Instant}};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Language,Node,Parser,Query,QueryCursor,QueryCursorOptions,ParseOptions,WasmStore,wasmtime};
 
@@ -29,13 +28,13 @@ pub(crate) struct SyntaxRuntime {
     languages: HashMap<String, CachedLanguage>,
     #[cfg(test)]
     compiled_query_count: usize,
+    #[cfg(test)]
+    language_load_count: usize,
 }
 impl SyntaxRuntime {
-    fn language(&mut self,recipe:&KernelComputeGrammarParams,shared:&Shared)->Result<(String,Language)>{
+    fn language(&mut self,recipe:&AdmittedGrammar,shared:&Shared)->Result<(String,Language)>{
         shared.check()?;
-        let bytes=fs::read(&recipe.grammar_path).map_err(|_|"unavailable: grammar WASM is not readable".to_string())?;
-        let grammar_hash=format!("sha256-{}",hex::encode(Sha256::digest(&bytes)));
-        if recipe.grammar_hash.as_deref()!=Some(grammar_hash.as_str()){return Err("unavailable: Grammar bytes changed after recipe admission".into());}
+        let grammar_hash=recipe.grammar_hash.as_deref().ok_or("unavailable: Missing admitted grammar hash")?;
         let key=format!("{}:{}",recipe.grammar_name,grammar_hash);
         if let Some(cached)=self.languages.get(&key){return Ok((key,cached.language.clone()));}
         // Cache capacity is eviction, not a language admission limit. Resetting
@@ -48,13 +47,14 @@ impl SyntaxRuntime {
         }
         let parser=self.parser.as_mut().unwrap();
         let mut store=parser.take_wasm_store().ok_or("unavailable: native grammar store is unavailable")?;
-        let result=store.load_language(&recipe.grammar_name,&bytes).map_err(|e|format!("unavailable: {e}"));
+        let result=store.load_language(&recipe.grammar_name,recipe.bytes()).map_err(|e|format!("unavailable: {e}"));
         parser.set_wasm_store(store).map_err(|e|format!("unavailable: {e}"))?;
         shared.check()?;
         let language=result?;
         if !(tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION..=tree_sitter::LANGUAGE_VERSION).contains(&language.abi_version()){
             return Err(format!("unavailable: Grammar ABI {} is incompatible with this native runtime",language.abi_version()));
         }
+        #[cfg(test)] { self.language_load_count += 1; }
         self.languages.insert(key.clone(),CachedLanguage{language:language.clone(),queries:None});Ok((key,language))
     }
     fn queries(&mut self, language_key: &str, recipe: &KernelComputeGrammarParams, shared: &Shared) -> Result<Arc<CompiledQueries>> {
@@ -84,11 +84,11 @@ impl SyntaxRuntime {
         cached.queries = Some(CachedQueries { recipe_id: recipe.recipe_id.clone(), compiled: queries.clone() });
         Ok(queries)
     }
-    pub fn probe(&mut self, recipe: &KernelComputeGrammarParams, shared: &Shared) -> Result<Value> {
+    pub fn probe(&mut self, recipe: &AdmittedGrammar, shared: &Shared) -> Result<Value> {
         let (_, language) = self.language(recipe, shared)?;
         Ok(json!({"abi": language.abi_version(), "recipeId": recipe.recipe_id}))
     }
-    pub fn analyze(&mut self,recipe:&KernelComputeGrammarParams,text:&str,lines:&[i64],budget_ms:u64,content_hash:&str,shared:&Shared)->Result<Value>{
+    pub fn analyze(&mut self,recipe:&AdmittedGrammar,text:&str,lines:&[i64],budget_ms:u64,content_hash:&str,shared:&Shared)->Result<Value>{
         let (language_key,language)=self.language(recipe,shared)?;
         // Compilation belongs to the cold grammar load, not the per-file parse budget.
         let compiled=self.queries(&language_key,recipe,shared)?;
@@ -301,7 +301,17 @@ impl JsonOutline<'_>{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::{fs, path::PathBuf};
+    use sha2::{Digest,Sha256};
+    use crate::compute::ComputeManager;
+
+    fn checked(recipe: &KernelComputeGrammarParams) -> AdmittedGrammar {
+        let bytes = fs::read(&recipe.grammar_path).unwrap();
+        let digest = AdmittedGrammar::verify_digest(recipe, &bytes).unwrap();
+        let mut manager = ComputeManager::default();
+        manager.retain_grammar(recipe.clone(), bytes, digest);
+        manager.recipes.remove(&recipe.recipe_id).unwrap()
+    }
 
     fn recipe() -> KernelComputeGrammarParams {
         let grammar = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -342,7 +352,7 @@ mod tests {
                 "recipeId":format!("test-{id}"), "grammarPath":grammar, "grammarHash":pack["integrity"],
                 "grammarName":id,"style":"tags","definitionQuery":fs::read_to_string(root.join("runtime").join(query)).unwrap(),
             })).unwrap();
-            let result=syntax.analyze(&recipe,text,&[],30000,&hex::encode(Sha256::digest(text)),&Shared::new(false)).unwrap();
+            let result=syntax.analyze(&checked(&recipe),text,&[],30000,&hex::encode(Sha256::digest(text)),&Shared::new(false)).unwrap();
             let selected=result["symbols"].as_array().unwrap().iter().find(|s|s["name"]==name).unwrap_or_else(||panic!("{id}: {result}"));
             let start=selected["range"]["startByte"].as_u64().unwrap() as usize;
             let end=selected["range"]["endByte"].as_u64().unwrap() as usize;
@@ -352,13 +362,13 @@ mod tests {
         let mut recipe=recipe();
         recipe.definition_query="(function_declaration name: (identifier) @name) @unit\n(variable_declarator name: (identifier) @name) @unit".into();
         let text="export const version = 1, run = () => {\n return version;\n};";
-        let result=syntax.analyze(&recipe,text,&[],30000,"hash",&Shared::new(false)).unwrap();
+        let result=syntax.analyze(&checked(&recipe),text,&[],30000,"hash",&Shared::new(false)).unwrap();
         let selected=result["symbols"].as_array().unwrap().iter().find(|s|s["name"]=="run").unwrap();
         assert_eq!(selected["range"]["startByte"],0);
         assert_eq!(selected["range"]["endByte"],text.len());
         assert_eq!(selected["kind"],"function");
         let broken="function broken() {\n return 1;";
-        let result=syntax.analyze(&recipe,broken,&[],30000,"hash",&Shared::new(false)).unwrap();
+        let result=syntax.analyze(&checked(&recipe),broken,&[],30000,"hash",&Shared::new(false)).unwrap();
         assert!(result["symbols"].as_array().unwrap().iter().all(|s|s["syntaxComplete"]==false));
     }
 
@@ -367,7 +377,7 @@ mod tests {
         let recipe = recipe();
         let text = "const note = '🌱';\nexport function café() { return fetch('文'); }";
         let result = SyntaxRuntime::default()
-            .analyze(&recipe, text, &[2], 30_000, "hash", &Shared::new(false)).unwrap();
+            .analyze(&checked(&recipe), text, &[2], 30_000, "hash", &Shared::new(false)).unwrap();
         let symbol = &result["symbols"][0];
         let start = symbol["range"]["startByte"].as_u64().unwrap() as usize;
         let end = symbol["range"]["endByte"].as_u64().unwrap() as usize;
@@ -383,11 +393,12 @@ mod tests {
     fn repeated_documents_share_compilation_without_sharing_analysis() {
         let mut syntax = SyntaxRuntime::default();
         let recipe = recipe();
+        let admitted = checked(&recipe);
         let shared = Shared::new(false);
         for index in 0..8 {
             let text = format!("import x from './x';\nfunction fn_{index}() {{ return fetch('/api/{index}'); }}");
             let hash = hex::encode(Sha256::digest(text.as_bytes()));
-            let result = syntax.analyze(&recipe, &text, &[2], 30000, &hash, &shared).unwrap();
+            let result = syntax.analyze(&admitted, &text, &[2], 30000, &hash, &shared).unwrap();
             assert_eq!(result["symbols"][0]["name"], format!("fn_{index}"));
             assert_eq!(result["calls"][0]["literal"], format!("/api/{index}"));
             assert_eq!(result["imports"][0]["source"], "./x");
@@ -396,20 +407,21 @@ mod tests {
             assert_eq!(import["syntaxComplete"], true);
             assert_eq!(result["contentHash"], hash);
             assert_eq!(syntax.compiled_query_count, 3);
+            assert_eq!(syntax.language_load_count, 1);
         }
         let mut selected = recipe.clone();
         selected.recipe_id = "test-selected-typescript".into();
         selected.definition_query = "((function_declaration name: (identifier) @name) @unit (#eq? @name \"included\"))".into();
         let text = "function included() {}\nfunction excluded() {}";
         let hash = hex::encode(Sha256::digest(text.as_bytes()));
-        let result = syntax.analyze(&selected, text, &[], 30000, &hash, &shared).unwrap();
+        let result = syntax.analyze(&checked(&selected), text, &[], 30000, &hash, &shared).unwrap();
         assert_eq!(result["symbols"].as_array().unwrap().len(), 1);
         assert_eq!(result["symbols"][0]["name"], "included");
         assert_eq!(syntax.compiled_query_count, 6);
 
         selected.recipe_id = "test-invalid-query".into();
         selected.definition_query = "(unknown_syntax_node) @unit".into();
-        assert!(syntax.analyze(&selected, text, &[], 30000, &hash, &shared)
+        assert!(syntax.analyze(&checked(&selected), text, &[], 30000, &hash, &shared)
             .unwrap_err().contains("Grammar query is incompatible"));
     }
 
@@ -428,7 +440,7 @@ mod tests {
             selected
         }).collect::<Vec<_>>();
         for (index, selected) in recipes.iter().enumerate() {
-            let result = syntax.analyze(selected, &text, &[], 30000, &hash, &shared).unwrap();
+            let result = syntax.analyze(&checked(selected), &text, &[], 30000, &hash, &shared).unwrap();
             assert_eq!(result["symbols"].as_array().unwrap().len(), 1);
             assert_eq!(result["symbols"][0]["name"], format!("fn_{index}"));
             assert_eq!(syntax.compiled_query_count, 3 * (index + 1));
@@ -439,7 +451,7 @@ mod tests {
         // The old recipe remains usable, but its evicted queries must compile
         // again. A consecutive repeat then reuses that latest compilation.
         for _ in 0..2 {
-            let result = syntax.analyze(&recipes[0], &text, &[], 30000, &hash, &shared).unwrap();
+            let result = syntax.analyze(&checked(&recipes[0]), &text, &[], 30000, &hash, &shared).unwrap();
             assert_eq!(result["symbols"].as_array().unwrap().len(), 1);
             assert_eq!(result["symbols"][0]["name"], "fn_0");
             assert_eq!(syntax.compiled_query_count, 3 * (recipes.len() + 1));
@@ -450,19 +462,71 @@ mod tests {
     }
 
     #[test]
+    fn admitted_snapshot_is_stable_across_same_path_replacement_and_shares_unchanged_bytes() {
+        let mut original = recipe();
+        let bytes = fs::read(&original.grammar_path).unwrap();
+        // Use a private path so replacement cannot touch the bundled fixture.
+        let path = std::env::temp_dir().join(format!("varin-grammar-{}.wasm", uuid::Uuid::new_v4()));
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { let _ = fs::remove_file(&self.0); }
+        }
+        let path = Cleanup(path);
+        fs::write(&path.0, &bytes).unwrap();
+        original.grammar_path = path.0.to_string_lossy().into_owned();
+        let digest = AdmittedGrammar::verify_digest(&original, &bytes).unwrap();
+        let mut manager = ComputeManager::default();
+        manager.retain_grammar(original.clone(), bytes.clone(), digest.clone());
+        let old = manager.recipes[&original.recipe_id].clone();
+        let mut query = original.clone();
+        query.recipe_id = "query-only".into();
+        query.definition_query = "((function_declaration name: (identifier) @name) @unit (#eq? @name \"fresh\"))".into();
+        manager.retain_grammar(query.clone(), bytes.clone(), digest);
+        let updated_query = manager.recipes[&query.recipe_id].clone();
+        assert_eq!(old.bytes().as_ptr(), updated_query.bytes().as_ptr());
+
+        let mut replacement = bytes;
+        // Valid WebAssembly custom section with an empty name and payload.
+        replacement.extend([0, 1, 0]);
+        fs::write(&path.0, &replacement).unwrap();
+        assert!(AdmittedGrammar::verify_digest(&original, &replacement).is_err());
+        let mut updated = original.clone();
+        updated.recipe_id = "new-digest".into();
+        updated.grammar_hash = None;
+        let digest = AdmittedGrammar::verify_digest(&updated, &replacement).unwrap();
+        updated.grammar_hash = Some(digest.clone());
+        manager.retain_grammar(updated.clone(), replacement, digest);
+        let changed = manager.recipes[&updated.recipe_id].clone();
+        assert_ne!(old.bytes().as_ptr(), changed.bytes().as_ptr());
+        // Neither an already queued job nor a new job using the newer verified
+        // recipe needs to reopen the mutable path, even on a fresh worker.
+        fs::remove_file(&path.0).unwrap();
+        let text = "function fresh() {}\nfunction original() {}";
+        let shared = Shared::new(false);
+        let mut syntax = SyntaxRuntime::default();
+        let first = syntax.analyze(&old, text, &[], 30000, "text", &shared).unwrap();
+        let second = syntax.analyze(&updated_query, text, &[], 30000, "text", &shared).unwrap();
+        let third = syntax.analyze(&changed, text, &[], 30000, "text", &shared).unwrap();
+        assert_eq!(first["symbols"], third["symbols"]);
+        assert_eq!(second["symbols"].as_array().unwrap().len(), 1);
+        assert_eq!(second["symbols"][0]["name"], "fresh");
+        assert_eq!(syntax.language_load_count, 2);
+    }
+
+    #[test]
     fn compiled_queries_do_not_bypass_grammar_integrity_or_cancellation() {
         let mut syntax = SyntaxRuntime::default();
         let mut recipe = recipe();
         let text = "function current() {}";
         let hash = hex::encode(Sha256::digest(text.as_bytes()));
-        syntax.analyze(&recipe, text, &[], 30000, &hash, &Shared::new(false)).unwrap();
+        syntax.analyze(&checked(&recipe), text, &[], 30000, &hash, &Shared::new(false)).unwrap();
         assert_eq!(syntax.compiled_query_count, 3);
         recipe.grammar_hash = Some("sha256-changed-after-admission".into());
-        assert!(syntax.analyze(&recipe, text, &[], 30000, &hash, &Shared::new(false))
+        assert!(AdmittedGrammar::verify_digest(&recipe, &fs::read(&recipe.grammar_path).unwrap())
             .unwrap_err().contains("Grammar bytes changed"));
         let cancelled = Shared::new(false);
         cancelled.cancel();
-        assert_eq!(syntax.analyze(&recipe, text, &[], 30000, &hash, &cancelled).unwrap_err(), "cancelled");
+        assert_eq!(syntax.analyze(&checked(&self::recipe()), text, &[], 30000, &hash, &cancelled).unwrap_err(), "cancelled");
         assert_eq!(syntax.compiled_query_count, 3);
     }
 }

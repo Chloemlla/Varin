@@ -50,3 +50,13 @@ Operator checks required before `activate`:
 3. `--bindings-reviewed`: Absolute workspace paths, mounts, SSH/tunnels, model accounts, external harnesses, and schedules match (the tool never rewrites paths inside DBs).
 
 Mount restored scopes at their expected paths and boot the matching Varin release so native owners run normal crash recovery. Regression tests: `node --test scripts/cold-backup.test.mjs`.
+
+## Legacy TriviumDB 0.8 Knowledge Stores
+
+Varin **0.9.53** retains the 0.8 WAL-only conversion bridge. A dormant knowledge store may
+still need it even if the same Host has already opened and converted other stores. Stop the
+affected store's writers and keep an untouched copy of the complete data file group,
+including its WAL. On a separate writable copy, open the affected store under 0.9.53,
+let the storage owner finish recovery, then close normally before testing a later release.
+A read-only open does not perform this conversion. Do not remove a WAL or treat an old WAL
+header as proof of missing checkpoint: a damaged database can have the same header.

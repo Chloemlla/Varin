@@ -73,8 +73,9 @@ pub struct ModelPresentationRead {
 impl Catalog {
     /// The trusted history reader supplies IDs obtained from admitted assistant items.
     pub fn capture_model_presentations(&self, ids: &[String], include_context: bool) -> Result<ModelPresentationRead> {
+        let publication = self.content.begin_read();
         let steps = ids.iter().map(|id| record(&self.db, "model_steps", id)).collect::<Result<Vec<ModelStep>>>()?;
-        Ok(ModelPresentationRead { steps, include_context, content: self.content.clone(), _publication: self.content.begin_publication() })
+        Ok(ModelPresentationRead { steps, include_context, content: self.content.clone(), _publication: publication })
     }
 }
 impl ModelPresentationRead {

@@ -73,7 +73,8 @@ Expose a dev/test machine's files and commands to an existing Agent Host without
 | `VARIN_UI_PASSWORD` | Required when reachable beyond loopback |
 | `VARIN_HOST` | Bind address (Compose default: `0.0.0.0`) |
 | `VARIN_DATA_DIR` | Persistent Varin data root |
-| `VARIN_WORKSPACE_ROOT` | Root for mounted projects |
+| `VARIN_WORKSPACE_ROOT` | Default directory for mounted projects |
+| `VARIN_WORKSPACE_LOCKDOWN` | Defaults to `false` in application images. Live file tools follow the container user's filesystem permissions. Set `true` in the service environment to limit access to `VARIN_WORKSPACE_ROOT`. |
 | `VARIN_SHUTDOWN_TIMEOUT_MS` | Host shutdown budget in ms (default `10000`) |
 | `VARIN_STOP_GRACE_PERIOD` | Compose stop grace (default `15s`; must exceed shutdown timeout) |
 | `VARIN_RESEARCH_RESERVE_CPU_CORES` / `_MEMORY_MB` | Explicit CPU/memory reserved from research admission (default `0`) |

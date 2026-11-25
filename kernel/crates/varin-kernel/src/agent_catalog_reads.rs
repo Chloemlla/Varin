@@ -435,9 +435,8 @@ fn dispatch_read(
                 .map_err(|_| KernelError::Protocol("history page limit out of range".into()))?;
             Ok(serde_json::to_value(
                 catalog
-                    .capture_history_page(&p.branch_id)
-                    .map_err(domain)?
-                    .load_since(
+                    .history_page_since(
+                        &p.branch_id,
                         p.head_id.as_deref(),
                         p.before_id.as_deref(),
                         p.after_id.as_deref(),
@@ -453,9 +452,7 @@ fn dispatch_read(
                 KernelError::Protocol("content chunk index must be nonnegative".into())
             })?;
             let chunk = catalog
-                .history_body_reader(&p.item_id)
-                .map_err(domain)?
-                .chunk(index)
+                .history_chunk_in_snapshot(&p.item_id, index)
                 .map_err(domain)?;
             Ok(
                 json!({"itemId":p.item_id,"contentRef":chunk.content_ref,"chunkIndex":chunk.chunk_index,"chunkCount":chunk.chunk_count,"totalBytes":chunk.total_bytes,"bytesBase64":base64::engine::general_purpose::STANDARD.encode(chunk.bytes)}),

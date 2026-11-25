@@ -74,3 +74,13 @@ Pick tests that verify the real owner of the behavior you changed — do not dup
 - **Host types**: Checked in a dedicated Node TS project and consumed via `#application-host`; production builds exclude `*.test-helper.ts` / `*.fixture.ts`.
 - **Protocol & binary gate**: After changing [kernel/protocol/schema.json](../kernel/protocol/schema.json), run `bun run kernel:protocol` and rebuild the kernel (`bun run kernel:build` or `bun run test:kernel -- --build`). Never hand-edit generated protocol files.
 - **Lockfiles**: [bun.lock](../bun.lock) governs dev/workspace dependencies; [scripts/cloud-runtime.bun.lock](../scripts/cloud-runtime.bun.lock) governs staged cloud production deps (update with `bun run update:cloud-runtime-lock`). See [ops/dependency-updates.md](ops/dependency-updates.md).
+
+### Private Application Host builds
+
+The development launcher owns the published `.application-host-dev-<Host PID>` generation.
+Compilation runs in `.application-host-staging-<builder PID>` and only publishes after validation,
+so a running development Host or its still-running builder is not removed by other builds.
+An ordinary build or `bun run --cwd packages/web clean` reclaims private directories only
+when the corresponding process is confirmed exited. A recycled or uninspectable PID is
+treated as live. Interrupted publication backups are retained for inspection rather than
+removed by generation cleanup.

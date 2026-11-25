@@ -328,6 +328,7 @@ impl Catalog {
         self.capture_checkpoint("SELECT c.id,c.revision,c.body,c.scope FROM runs r JOIN context_checkpoints c ON c.id=r.context_checkpoint_id WHERE r.id=?1",run_id)
     }
     pub(super) fn capture_checkpoint(&self, sql: &str, id: &str) -> Result<Option<CheckpointRead>> {
+        let publication = self.content.begin_read();
         let metadata: Option<(String, u64, String, Option<String>)> = self
             .db
             .query_row(sql, [id], |row| {
@@ -344,7 +345,7 @@ impl Catalog {
                         .transpose()?,
                     reference: serde_json::from_str(&reference)?,
                     content: self.content.clone(),
-                    _publication: self.content.begin_publication(),
+                    _publication: publication,
                 })
             })
             .transpose()
@@ -491,7 +492,6 @@ impl Catalog {
         Ok(Some(capture(ContextReadKind::Checkpoint {
             run_id: run_id.into(),
             owner_generation: epoch,
-            compositions: self.context_compositions.clone(),
             branch_id: run.branch_id.clone(),
             memory: self.capture_memory_state(&run.branch_id)?,
             thread_id: run.thread_id.clone(),
@@ -608,6 +608,7 @@ impl CheckpointRead {
 /// bodies; no Catalog or global cache retains them, and recovery starts cold.
 #[derive(Default)]
 pub struct ContextCompileReuse {
+    compositions: crate::composition::context::ContextCompositions,
     prefix: Option<CompiledContextPrefix>,
 }
 
@@ -644,7 +645,6 @@ enum ContextReadKind {
         owner_generation: u64,
         memory: Option<super::memory_state::MemoryStateRead>,
         thread_id: String,
-        compositions: std::sync::Arc<crate::composition::context::ContextCompositions>,
         branch_id: String,
         content: crate::content::ContentStore,
         checkpoint_id: String,
@@ -702,7 +702,6 @@ impl ContextRead {
         let ContextReadKind::Checkpoint {
             run_id,
             owner_generation,
-            compositions,
             branch_id,
             memory,
             thread_id,
@@ -768,6 +767,16 @@ impl ContextRead {
                     .personalization
                     .as_ref()
                     .and_then(|basis| basis.context_composition.as_ref());
+                // A Run reuses its prepared transforms until its compiler is dropped.
+                // Standalone projections need the registry only while binding this checkpoint.
+                let transient;
+                let compositions = match reuse.as_deref() {
+                    Some(worker) => &worker.compositions,
+                    None => {
+                        transient = crate::composition::context::ContextCompositions::default();
+                        &transient
+                    }
+                };
                 let fragments = compositions
                     .bind(&branch_id, composition)
                     .map_err(RuntimeError::Invalid)?;

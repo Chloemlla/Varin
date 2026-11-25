@@ -46,13 +46,20 @@ const checkpointLegacyWal = `
   database.close();
 `;
 
+// The file-group format alone does not classify this as bridgeable: a
+// checkpointed database and a damaged main file can have the same WAL header.
+export function isLegacyWalOnlyCheckpointError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const { code, details } = error as { code?: unknown; details?: { reason?: unknown } };
+  return code === 'TDB_CORRUPTED_FILE' && typeof details?.reason === 'string'
+    && details.reason.includes('Typed checkpoint missing; recover and export with the original version');
+}
+
 export function openKnowledgeDatabase(file: string, options: TriviumDBOptions) {
   try { return new TriviumDB(file, options); }
   catch (error) {
-    const failure = error as { code?: string; details?: { reason?: string } };
     if (options.accessMode === 'readOnly' || options.accessMode === 'immutable'
-      || failure.code !== 'TDB_CORRUPTED_FILE'
-      || !failure.details?.reason?.includes('Typed checkpoint missing; recover and export with the original version')) throw error;
+      || !isLegacyWalOnlyCheckpointError(error)) throw error;
     // The failed open has released its lease. Let the original engine recover
     // its own WAL and publish a full checkpoint; never recreate the database
     // or translate WAL bytes in the Host.

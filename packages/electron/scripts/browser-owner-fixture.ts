@@ -44,6 +44,8 @@ async function run() {
       const element = state.elements?.find(item => item.name === name); assert(element?.ref, `Missing element: ${name}`); return element.ref;
     };
     const click = await find('Run action');
+    await owner.act(page.pageId, { action: 'evaluate', script: 'history.pushState(null, "", "#section")' });
+    assert.equal(await find('Run action'), click, 'same-document navigation retains the live button reference');
     mark('native-input');
     await owner.act(page.pageId, { action: 'click', ref: click });
     mark('typing');

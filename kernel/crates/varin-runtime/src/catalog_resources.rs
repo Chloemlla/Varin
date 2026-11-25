@@ -584,13 +584,27 @@ fn snapshot_consumer(call:&crate::execution::ToolCall)->Result<Option<ResourceRe
             }
             Ok(Some(request))
         }
-        ("file_read","1"|"2")=> {
+        // load() already checks the exact frozen declaration. Work-location routing
+        // versions its path selector independently of the attachment read shape.
+        ("file_read",_)=> {
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields)]
             struct File {#[serde(rename="ref")] reference:String,offset:Option<u64>,length:Option<u64>}
-            let read:File=serde_json::from_value(call.arguments.clone())?;
-            super::attachments::AttachmentSelection::Ref {reference:read.reference}.validate()?;
-            let _=(read.offset,read.length);
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Batch { files: Vec<Value> }
+            let valid_reference = |read: File| {
+                let _ = (read.offset, read.length);
+                super::attachments::AttachmentSelection::Ref { reference: read.reference }.validate().is_ok()
+            };
+            let arguments = &call.arguments;
+            let valid = if arguments.get("files").is_some() {
+                let batch = Batch::deserialize(arguments)?;
+                batch.files.iter().filter_map(|file| File::deserialize(file).ok()).any(valid_reference)
+            } else {
+                valid_reference(File::deserialize(arguments)?)
+            };
+            if !valid { return Err(denied()); }
             Ok(None)
         }
         ("send","5")=> {

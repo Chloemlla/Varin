@@ -1324,6 +1324,25 @@ const historyFrames = () => {
   return async () => { while (frames.length) await act(async () => { for (const callback of frames.splice(0)) callback(performance.now()); }); };
 };
 
+it('refetches the native history anchor on reopening a free-scrolled evicted conversation', async () => {
+  const f = fixture(true);
+  const key = threadComposerKey(threadHostKey(), identity);
+  const store = useTimelineViewStore.getState();
+  store.enter(key, 'latest', false);
+  const saved = useTimelineViewStore.getState().views[key]!;
+  useTimelineViewStore.setState({ views: { [key]: { ...saved, observedLeafId: 'latest',
+    viewport: { itemId: 'turn:old', historyItemId: 'old', mode: 'free-scrolling', offset: 17 } } } });
+  const item = (id: string, parent: string | null) => ({ id, parent, thread_id: identity.threadId,
+    run_id: 'ui-run', source: 'user' as const, provider: null, content: { text: id } });
+  f.view.history = [item('latest', 'old')];
+  f.view.historyPage = { head: 'latest', previous: 'latest' }; f.view.thread.branches[0]!.head = 'latest';
+  const page = vi.fn(async () => ({ head: 'latest', previous: null, items: [item('old', null)] }));
+  f.api.historyPage = page;
+  await act(async () => root.render(<ThreadConversation api={f.api} identity={identity} />));
+  expect(page).toHaveBeenCalledWith(identity, { headId: 'latest', beforeId: 'latest', limit: 256 }, expect.any(AbortSignal));
+  expect(container.textContent).toContain('old');
+});
+
 it('prefetches earlier images without a load button and retains them while live messages and controls continue', async () => {
   const flushFrames = historyFrames();
   const f = fixture(true);

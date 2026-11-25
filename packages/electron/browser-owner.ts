@@ -6,15 +6,17 @@ import path from 'node:path';
 import type { Accessibility, Browser, CDPSession, Dialog, ElementHandle, Frame, KeyInput, Page, SerializedAXNode } from 'puppeteer-core';
 import { BrowserExecutionError } from '@varin/protocol';
 import type { BrowserAction, BrowserActionResult, BrowserDownload, BrowserElement, BrowserEvent, BrowserObservation, BrowserOwner, BrowserPage, BrowserReadRequest, BrowserRenderRequest, BrowserRenderResult } from '@varin/protocol';
+import { BrowserPageActivity, BrowserFrameReferences } from './browser-page-lifetime.js';
 import { ElectronPageTransport } from './browser-transport.js';
 import { captureBrowserPage, createCaptureNetworkFence } from './browser-web-capture.js';
 
-type Reference = { node: SerializedAXNode; frame: Frame };
 type CoordinateObservation = { navigation: number; viewport: string; scroll: string };
+// Puppeteer's CDP AX nodes use the frame loader to identify their document.
+const loaderId = (frame: Frame) => (frame as Frame & { _loaderId: string })._loaderId;
 type Download = { state: BrowserDownload; item: DownloadItem; file: string; directory: string };
 type OwnedPage = {
   id: string; view: WebContentsView; browser: Browser; page: Page; threads: Set<string>; retained: boolean;
-  refs: Map<string, Reference>; refKeys: Map<string, string>; frameIds: WeakMap<Frame, string>;
+  activity: BrowserPageActivity; refs: BrowserFrameReferences<Frame, SerializedAXNode>; frameIds: WeakMap<Frame, string>;
   observations: Map<string, CoordinateObservation>; navigation: number; queue: Promise<unknown>;
   actions: Set<AbortController>; agentPaused: boolean; activeAction?: string; dialog?: Dialog; crashed?: string;
   captureOnly?: boolean;
@@ -106,7 +108,9 @@ export class ElectronBrowserOwner implements BrowserOwner {
         // The original invocation owns cancellation. Page navigation and explicit wait
         // use their actual signal; no hidden library timer truncates a long operation.
         page.setDefaultTimeout(0); page.setDefaultNavigationTimeout(0);
-        const entry: OwnedPage = { id, view, browser, page, threads: new Set(), retained: false, refs: new Map(), refKeys: new Map(),
+        const entry: OwnedPage = { id, view, browser, page, threads: new Set(), retained: false,
+          activity: new BrowserPageActivity(value => { if (!view.webContents.isDestroyed()) view.webContents.setBackgroundThrottling(value); }),
+          refs: new BrowserFrameReferences(randomUUID),
           frameIds: new WeakMap(), observations: new Map(), navigation: 0, queue: Promise.resolve(), actions: new Set(), inputAcknowledgements: new Set(), pendingScripts: new Set(), agentPaused: false, uploadDirectories: new Set(), captureOnly: Boolean(captureSession) };
         this.pages.set(id, entry);
         const changed = () => this.changed(entry);
@@ -116,10 +120,9 @@ export class ElectronBrowserOwner implements BrowserOwner {
         view.webContents.on('before-input-event', (_event, input) => { if (input.type === 'keyDown') userInput(); });
         view.webContents.on('before-mouse-event', (_event, input) => { if (input.type === 'mouseDown' || input.type === 'mouseWheel') userInput(); });
         page.on('framenavigated', frame => {
-          for (const [ref, value] of entry.refs) if (value.frame === frame) entry.refs.delete(ref);
-          entry.refKeys.clear(); entry.navigation++; entry.observations.clear(); changed();
+          entry.refs.observeDocument(frame, loaderId(frame)); entry.navigation++; entry.observations.clear(); changed();
         });
-        page.on('framedetached', frame => { for (const [ref, value] of entry.refs) if (value.frame === frame) entry.refs.delete(ref); });
+        page.on('framedetached', frame => entry.refs.retire(frame));
         page.on('dialog', dialog => { if (entry.captureOnly) { void dialog.dismiss().catch(() => undefined); return; } entry.dialog = dialog; changed(); this.emit({ kind: 'dialog', pageId: id, type: dialog.type(), message: dialog.message(), defaultPrompt: dialog.defaultValue() }); });
         view.webContents.on('render-process-gone', (_event, details) => { entry.crashed = details.reason; changed(); });
         view.webContents.once('destroyed', () => { this.pages.delete(id); if (!entry.captureOnly) this.emit({ kind: 'closed', pageId: id }); });
@@ -128,7 +131,7 @@ export class ElectronBrowserOwner implements BrowserOwner {
           try { void view.webContents.loadURL(this.url(url)).catch(() => undefined); } catch { /* unsupported external scheme */ }
           return { action: 'deny' };
         });
-        changed(); return entry;
+        entry.activity.present(false); changed(); return entry;
       } catch (error) { view.webContents.close(); throw error; }
     })();
     this.creating.set(id, creating);
@@ -194,9 +197,9 @@ export class ElectronBrowserOwner implements BrowserOwner {
       entry.actions.add(controller);
       entry.view.webContents.setWebRTCIPHandlingPolicy('disable_non_proxied_udp');
       entry.view.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
-      const result = await captureBrowserPage(input, { page: entry.page, signal: controller.signal, close,
+      const result = await entry.activity.during(() => captureBrowserPage(input, { page: entry!.page, signal: controller.signal, close,
         cookies: async url => (await captureSession!.cookies.get({ url })).map(cookie => `${cookie.name}=${cookie.value}`).join('; '),
-      });
+      }));
       return { ...result, blockedRequests: result.blockedRequests + fence.blocked() };
     } finally {
       input.signal?.removeEventListener('abort', abort);
@@ -227,7 +230,7 @@ export class ElectronBrowserOwner implements BrowserOwner {
       window.once('closed', () => {
         if (this.disposed) return;
         for (const page of this.pages.values()) if (page.presentation?.window === window) {
-          this.parking.contentView.addChildView(page.view); page.view.setVisible(true); page.view.webContents.setBackgroundThrottling(false); delete page.presentation;
+          this.parking.contentView.addChildView(page.view); page.view.setVisible(true); page.activity.present(false); delete page.presentation;
         }
       });
     }
@@ -249,7 +252,7 @@ export class ElectronBrowserOwner implements BrowserOwner {
     if (!other.isDestroyed() && other.contentView.children.includes(entry.view)) other.contentView.removeChildView(entry.view);
     if (!target.contentView.children.includes(entry.view)) target.contentView.addChildView(entry.view);
     entry.view.setBounds(visible ? bounds : { ...bounds, x: 0, y: 0 }); entry.view.setVisible(true);
-    entry.view.webContents.setBackgroundThrottling(false);
+    entry.activity.present(visible);
   }
   takeControl(pageId: string, paused: boolean) {
     const entry = this.require(pageId); entry.agentPaused = paused;
@@ -284,7 +287,12 @@ export class ElectronBrowserOwner implements BrowserOwner {
     return handle.clickablePoint();
   }
   async read(input: BrowserReadRequest, signal?: AbortSignal): Promise<BrowserObservation> {
-    signal?.throwIfAborted(); const entry = this.require(input.pageId), page = entry.page;
+    signal?.throwIfAborted();
+    const entry = this.require(input.pageId);
+    return entry.activity.during(() => this.readActive(entry, input, signal));
+  }
+  private async readActive(entry: OwnedPage, input: BrowserReadRequest, signal?: AbortSignal): Promise<BrowserObservation> {
+    const page = entry.page;
     const observationId = randomUUID();
     if (entry.dialog) {
       const bounds = entry.view.getBounds();
@@ -313,18 +321,21 @@ export class ElectronBrowserOwner implements BrowserOwner {
     for (const frame of selectedFrames) {
       signal?.throwIfAborted();
       if (frame.detached) continue;
+      const documentId = loaderId(frame);
+      entry.refs.observeDocument(frame, documentId);
       const root = input.ref ? await this.element(entry, input.ref) : undefined;
       try {
         // Puppeteer's page snapshot uses this same per-frame accessibility owner.
         // Keep frame selection here so cross-origin frame identity stays explicit.
         const tree = await (frame as Frame & { accessibility: Accessibility }).accessibility.snapshot({ interestingOnly: input.view !== 'structure', ...(root ? { root } : {}) });
+        const seen = new Set<string>();
         const walk = (node: SerializedAXNode, depth: number) => {
           // Puppeteer supplies these CDP identity fields alongside its public handle
           // resolver. References never depend on a node's position in the snapshot.
           const identity = node as SerializedAXNode & { backendNodeId?: number; loaderId?: string };
-          const key = identity.backendNodeId ? `${this.frameId(entry, frame)}:${identity.loaderId}:${identity.backendNodeId}` : undefined;
-          const ref = key ? entry.refKeys.get(key) ?? randomUUID() : undefined;
-          if (key && ref) { entry.refKeys.set(key, ref); entry.refs.set(ref, { node, frame }); }
+          const key = identity.backendNodeId ? `${identity.loaderId}:${identity.backendNodeId}` : undefined;
+          if (key) seen.add(key);
+          const ref = key ? entry.refs.record(frame, key, node, input.view !== 'structure') : undefined;
           const state: Record<string, string | number | boolean> = {};
           for (const field of ['disabled', 'expanded', 'focused', 'modal', 'multiline', 'multiselectable', 'readonly', 'required', 'selected', 'checked', 'pressed', 'busy', 'url', 'valuemin', 'valuemax'] as const)
             if (node[field] !== undefined) state[field] = node[field]!;
@@ -333,7 +344,10 @@ export class ElectronBrowserOwner implements BrowserOwner {
             ...(node.description ? { description: node.description } : {}), level: node.level ?? depth, ...(Object.keys(state).length ? { state } : {}) });
           for (const child of node.children ?? []) walk(child, depth + 1);
         };
-        if (tree) walk(tree, 0);
+        if (!frame.detached && loaderId(frame) === documentId) {
+          if (tree) walk(tree, 0);
+          if (!input.ref) entry.refs.finish(frame, seen, input.view === 'structure');
+        }
       } catch (error) {
         if (!frame.detached) throw error;
         const row = result.frames.find(item => item.frameId === this.frameId(entry, frame)); if (row) row.available = false;
@@ -364,7 +378,7 @@ export class ElectronBrowserOwner implements BrowserOwner {
       controller.signal.throwIfAborted();
       if (entry.agentPaused && !user) throw new Error('browser_user_control: The user is working on this page. Read its current state; wait for the user to allow Agent input again.');
       started = true; entry.activeAction = name; this.changed(entry);
-      try { return await effect(controller.signal); }
+      try { return await entry.activity.during(() => effect(controller.signal)); }
       finally {
         if (name !== 'wait') { entry.navigation++; entry.observations.clear(); }
         delete entry.activeAction; this.changed(entry);
@@ -382,7 +396,7 @@ export class ElectronBrowserOwner implements BrowserOwner {
   private async mouseInput(entry: OwnedPage, input: () => Promise<void>): Promise<void> {
     let stop: (() => void) | undefined;
     const dialog = new Promise<void>(resolve => { stop = this.subscribe(event => { if (event.kind === 'dialog' && event.pageId === entry.id) resolve(); }); });
-    const acknowledged = input(); entry.inputAcknowledgements.add(acknowledged);
+    const acknowledged = entry.activity.during(input); entry.inputAcknowledgements.add(acknowledged);
     void acknowledged.then(() => entry.inputAcknowledgements.delete(acknowledged), () => entry.inputAcknowledgements.delete(acknowledged));
     try { await Promise.race([acknowledged, dialog]); } finally { stop?.(); }
   }
@@ -394,7 +408,7 @@ export class ElectronBrowserOwner implements BrowserOwner {
     // User annotation installs a promise that resolves on the user's click. Its
     // cancellation and viewport reads must remain usable while that promise waits.
     if (user && action.action === 'evaluate') return { page: this.state(entry), action: 'evaluate', method: 'page-script',
-      value: await this.frame(entry, action.frameId).evaluate(action.script) };
+      value: await entry.activity.during(() => this.frame(entry, action.frameId).evaluate(action.script)) };
     if (action.action === 'close') {
       signal?.throwIfAborted();
       const previous = this.state(entry); dispatch(); await this.close(pageId); return { page: previous, action: 'close' };
@@ -483,7 +497,7 @@ export class ElectronBrowserOwner implements BrowserOwner {
             // an infinite script. Keep waiting for that execution's own rejection.
             const client = (frame as Frame & { client: CDPSession }).client;
             active.throwIfAborted(); dispatch();
-            const execution = frame.evaluate(action.script);
+            const execution = entry.activity.during(() => frame.evaluate(action.script));
             let finished = false;
             const completion = execution.then(() => { finished = true; }, () => { finished = true; });
             entry.inputAcknowledgements.add(completion);

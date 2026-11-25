@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::fs::File;
 use std::{
+    collections::{HashMap, VecDeque},
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -80,7 +81,50 @@ struct Reference {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     history_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    history_view: Option<HistoryViewReferences>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     dispatch: Option<DispatchReference>,
+}
+/// Derived receipts on an immutable history reference. Some(empty) is indexed;
+/// None belongs to a legacy reference and is resolved from its original payload.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HistoryViewReferences {
+    pub(crate) request: Option<String>,
+    pub(crate) operation: Option<(String, bool)>,
+}
+impl HistoryViewReferences {
+    fn from_content(content: &Value) -> Self {
+        let request = content.get("id").and_then(Value::as_str)
+            .and_then(crate::execution::model_request_from_history_id)
+            .map(str::to_owned);
+        let result = &content["content"]["result"];
+        let completion = &result["completion"];
+        let operation = if content["content"]["kind"] == "tool_result" {
+            if completion["kind"] == "job_accepted" {
+                completion["operation_id"].as_str().map(|id| (id.into(), false))
+            } else if completion["kind"] == "result" && matches!(
+                completion["effect"].as_str(), Some("dispatched" | "partial" | "confirmed" | "unknown")
+            ) {
+                result["request_id"].as_str().zip(result["call_id"].as_str())
+                    .map(|(request, call)| (format!("{request}:tool:{call}"), true))
+            } else { None }
+        } else if content["provenance"]["kind"] == "policy_tool_data"
+            && content["content"]["kind"] == "output"
+        {
+            let r = &content["provenance"]["reference"];
+            r["action_id"].as_str().zip(r["node_id"].as_str())
+                .map(|(action, node)| format!("{action}:node:{node}"))
+                .filter(|id| content["content"]["output"]["data"]["operationId"].as_str() == Some(id))
+                .map(|id| (id, true))
+        } else { None };
+        Self { request, operation }
+    }
+}
+#[derive(Default)]
+struct LegacyHistoryViews {
+    entries: HashMap<String, HistoryViewReferences>,
+    order: VecDeque<String>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -98,14 +142,17 @@ pub(crate) struct ContentStore {
 #[derive(Default)]
 struct PublicationState {
     active: usize,
+    readers: usize,
     sequence: u64,
     collector: Option<Arc<AtomicBool>>,
 }
 #[derive(Default)]
 struct ContentCoordination {
-    // Never held during content I/O or while waiting for the I/O gate.
+    // Never held while waiting for the I/O gate. A collector holds it only
+    // for a single checked unlink, not scans, hashing, or directory sync.
     state: Mutex<PublicationState>,
     io: RwLock<()>,
+    legacy_history_views: Mutex<LegacyHistoryViews>,
     #[cfg(test)]
     write_hook: Mutex<Option<Arc<dyn Fn(&Path) + Send + Sync>>>,
     #[cfg(test)]
@@ -113,14 +160,15 @@ struct ContentCoordination {
 }
 /// Registered under Catalog ownership, retained across worker I/O and reference commit.
 /// Registration never waits for sweep; its sequence invalidates any older mark.
-pub(crate) struct ContentPublication(Arc<ContentCoordination>);
+pub(crate) struct ContentPublication(Arc<ContentCoordination>, bool);
 impl Drop for ContentPublication {
     fn drop(&mut self) {
-        self.0
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .active -= 1;
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.1 {
+            state.readers -= 1;
+        } else {
+            state.active -= 1;
+        }
     }
 }
 #[path = "content_collection.rs"]
@@ -147,7 +195,8 @@ impl ContentStore {
     /// Catalog calls this while owning its mutation lock. A prepared publication can
     /// already own model-reference holders whose input/history rows are not committed.
     pub(crate) fn publication_active(&self) -> bool {
-        self.coordination.state.lock().unwrap_or_else(|e| e.into_inner()).active > 0
+        let state = self.coordination.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.active > 0 || state.readers > 0
     }
     pub(crate) fn begin_publication(&self) -> ContentPublication {
         let mut state = self
@@ -160,7 +209,14 @@ impl ContentStore {
             .checked_add(1)
             .expect("content publication sequence exhausted");
         state.active += 1;
-        ContentPublication(self.coordination.clone())
+        ContentPublication(self.coordination.clone(), false)
+    }
+    /// A reader pins even a pre-commit SQLite snapshot without invalidating marks.
+    /// Acquire before resolving the first reference and hold through final content I/O.
+    pub(crate) fn begin_read(&self) -> ContentPublication {
+        let mut state = self.coordination.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.readers += 1;
+        ContentPublication(self.coordination.clone(), true)
     }
     /// Synchronous fixture conveniences must never wait for a collector while holding Catalog.
     /// Real execution captures an owned preparation/read and performs I/O after unlocking Catalog.
@@ -180,7 +236,7 @@ impl ContentStore {
             .checked_add(1)
             .expect("content publication sequence exhausted");
         state.active += 1;
-        Ok(ContentPublication(self.coordination.clone()))
+        Ok(ContentPublication(self.coordination.clone(), false))
     }
     pub(crate) fn cancel_collection(&self) {
         let state = self
@@ -218,7 +274,7 @@ impl ContentStore {
         })
     }
     pub(crate) fn load_chunk(&self, reference: &Value, index: usize) -> Result<ContentChunk> {
-        let _publication = self.begin_publication();
+        let _publication = self.begin_read();
         let _io = self
             .coordination
             .io
@@ -399,7 +455,7 @@ impl ContentStore {
         if cancelled() {
             return Err(RuntimeError::DispatchCancelled);
         }
-        let _publication = self.begin_publication();
+        let _publication = self.begin_read();
         let _io = self
             .coordination
             .io
@@ -496,6 +552,36 @@ impl ContentStore {
             ));
         }
         Ok((payload.content, payload.provider))
+    }
+    /// A warm legacy view only uses its immutable body identity. Return the body on
+    /// the first lookup so a full-window caller need not read it a second time.
+    pub(crate) fn history_view_references(
+        &self,
+        item: &crate::types::HistoryItem,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(HistoryViewReferences, Option<crate::types::HistoryItem>)> {
+        if let Some(index) = item.content.get("history_view") {
+            return Ok((serde_json::from_value(index.clone())?, None));
+        }
+        let hash = item.content.get("content_object").and_then(Value::as_str)
+            .ok_or_else(|| RuntimeError::Invalid("history content reference missing".into()))?;
+        let mut cache = self.coordination.legacy_history_views.lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = cache.entries.get(hash) {
+            return Ok((index.clone(), None));
+        }
+        drop(cache);
+        let loaded = self.load_stored_history_item(item.clone(), cancelled)?;
+        let index = HistoryViewReferences::from_content(&loaded.content);
+        cache = self.coordination.legacy_history_views.lock().unwrap_or_else(|e| e.into_inner());
+        if !cache.entries.contains_key(hash) {
+            if cache.entries.len() >= 2048 {
+                if let Some(old) = cache.order.pop_front() { cache.entries.remove(&old); }
+            }
+            cache.entries.insert(hash.into(), index.clone());
+            cache.order.push_back(hash.into());
+        }
+        Ok((index, Some(loaded)))
     }
     pub(crate) fn hydrate_history(
         &self,

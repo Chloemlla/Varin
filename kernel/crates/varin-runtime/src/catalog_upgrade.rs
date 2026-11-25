@@ -9,6 +9,8 @@ struct Upgrade {
 }
 
 const UPGRADES: &[Upgrade] = &[
+    // Existing references may omit history-view metadata and are indexed on first read.
+    Upgrade { from: 102, to: 103, convert: |_, _| Ok(()) },
     Upgrade { from: 101, to: 102, convert: |tx, _| threads::initialize_model_preferences(tx) },
     Upgrade { from: 100, to: 101, convert: |tx, _| branch_workspace::initialize(tx) },
     Upgrade { from: 99, to: 100, convert: |tx, _| external::upgrade_availability(tx) },

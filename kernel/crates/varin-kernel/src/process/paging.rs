@@ -106,9 +106,7 @@ impl Piece {
         value
     }
 }
-fn emit(channel: usize, state: &mut ChannelSnapshot, text: Option<&str>, cursor: u64, chunks: &mut Vec<Piece>) {
-    let Some(&(last, _)) = state.pending.last() else { return; };
-    if last < cursor { state.pending.clear(); return; }
+fn piece_for<'a>(channel: usize, state: &ChannelSnapshot, text: Option<&str>, chunks: &'a mut Vec<Piece>) -> &'a mut Piece {
     let encoding = state.encoding.unwrap_or(encoding_rs::UTF_8);
     let join = chunks.last().is_some_and(|previous| previous.channel == channel
         && previous.encoding == encoding && previous.source == state.source && previous.text.is_some() && text.is_some());
@@ -117,10 +115,24 @@ fn emit(channel: usize, state: &mut ChannelSnapshot, text: Option<&str>, cursor:
     }
     let piece = chunks.last_mut().unwrap();
     if let (Some(previous), Some(text)) = (piece.text.as_mut(), text) { previous.push_str(text); }
+    piece
+}
+
+fn extend_range(piece: &mut Piece, offset: u64, length: u64) {
+    if let Some(range) = piece.ranges.last_mut().filter(|range| range.offset + range.byte_length == offset) {
+        range.byte_length += length;
+    } else {
+        piece.ranges.push(SourceRange { offset, byte_length: length });
+    }
+}
+
+fn emit(channel: usize, state: &mut ChannelSnapshot, text: Option<&str>, cursor: u64, chunks: &mut Vec<Piece>) {
+    let Some(&(last, _)) = state.pending.last() else { return; };
+    if last < cursor { state.pending.clear(); return; }
+    let piece = piece_for(channel, state, text, chunks);
     for (offset, byte) in state.pending.drain(..) {
         piece.raw.push(byte);
-        if let Some(range) = piece.ranges.last_mut().filter(|range| range.offset + range.byte_length == offset) { range.byte_length += 1; }
-        else { piece.ranges.push(SourceRange { offset, byte_length:1 }); }
+        extend_range(piece, offset, 1);
     }
 }
 
@@ -170,8 +182,11 @@ fn decode_ascii(channel: &mut Channel, which: usize, offset: u64, bytes: &[u8], 
     debug_assert_eq!(consumed, bytes.len());
     // Replay builds decoder state but must not re-emit already consumed characters.
     let skip = usize::try_from(cursor.saturating_sub(offset)).unwrap_or(usize::MAX).min(bytes.len());
-    channel.state.pending.extend(bytes[skip..].iter().enumerate().map(|(i, byte)| (offset + (skip + i) as u64, *byte)));
-    emit(which, &mut channel.state, Some(&channel.scratch[skip..]), cursor, chunks);
+    if skip != bytes.len() {
+        let piece = piece_for(which, &channel.state, Some(&channel.scratch[skip..]), chunks);
+        piece.raw.extend_from_slice(&bytes[skip..]);
+        extend_range(piece, offset + skip as u64, (bytes.len() - skip) as u64);
+    }
 }
 fn feed(channel: &mut Channel, which: usize, offset: u64, byte: u8, lookahead: &[u8], automatic: (&'static Encoding, &'static str), selection: &Selection, cursor: u64, chunks: &mut Vec<Piece>) {
     if !channel.state.started {
@@ -186,10 +201,12 @@ fn feed(channel: &mut Channel, which: usize, offset: u64, byte: u8, lookahead: &
             if selected == encoding { channel.state.pending.clear(); return; }
         }
         let pending = std::mem::take(&mut channel.state.pending);
-        let mut sample = initial;
-        sample.extend_from_slice(lookahead.get(1..).unwrap_or_default());
         if channel.decoder.is_none() {
-            let (encoding, source) = selection.explicit.map(|encoding| (encoding, selection.source)).unwrap_or_else(|| selection.automatic(&sample));
+            let (encoding, source) = selection.explicit.map(|encoding| (encoding, selection.source)).unwrap_or_else(|| {
+                let mut sample = initial;
+                sample.extend_from_slice(lookahead.get(1..).unwrap_or_default());
+                selection.automatic(&sample)
+            });
             channel.select(encoding, source);
         }
         for (offset, byte) in pending { decode_byte(channel, which, offset, byte, cursor, chunks); }
@@ -235,8 +252,8 @@ pub(super) fn read(live: &OutputHandle, cursor: u64, limit: usize, label: Option
     let fallback = (!pty).then(|| record["outputCodePage"].as_u64()).flatten()
         .and_then(|page| u32::try_from(page).ok()).and_then(super::text::code_page_encoding);
     let selection = Selection { explicit, source, fallback };
-    let mut page = read_output(live, cursor, limit)?;
-    let target = page["nextCursor"].as_u64().unwrap();
+    let snapshot = OutputSnapshot::capture(live);
+    let target = snapshot.target(cursor, limit)?;
     let mut cache = live.shared.text_pages.lock().map_err(|_| failure("text projection poisoned"))?;
     let index = cache.0.entry(format!("{}:{}", explicit.map_or("auto", Encoding::name), fallback.map_or("", Encoding::name))).or_default();
     let mut state = if index.recent.as_ref().is_some_and(|state| state.cursor == cursor) {
@@ -250,17 +267,19 @@ pub(super) fn read(live: &OutputHandle, cursor: u64, limit: usize, label: Option
     while state.cursor < target {
         // Lookahead uses only already-retained bytes, never waits on a producer.
         // It helps Auto preserve UTF-8/legacy line detection across small pages.
-        let raw = read_output(live, state.cursor, CHUNK_BYTES + 4)?;
+        let lookahead = snapshot.target(state.cursor, CHUNK_BYTES + 4)?;
+        let raw = read_output_chunks(live, state.cursor, lookahead, snapshot.file_end)?;
         let mut samples: [Vec<u8>; 2] = Default::default();
-        let frames = raw["chunks"].as_array().unwrap().iter().map(|chunk| {
-            let which = usize::from(chunk["channel"] == "stderr");
-            let bytes = BASE64.decode(chunk["bytesBase64"].as_str().unwrap()).expect("spool base64");
-            let sample_offset = samples[which].len();
-            samples[which].extend_from_slice(&bytes);
-            (which, chunk["offset"].as_u64().unwrap(), bytes, sample_offset)
+        let mut channel_lengths = [0usize; 2];
+        let frames = raw.into_iter().map(|RawOutputChunk { channel, offset, bytes }| {
+            let which = usize::from(channel == "stderr");
+            let sample_offset = channel_lengths[which];
+            channel_lengths[which] += bytes.len();
+            if selection.explicit.is_none() { samples[which].extend_from_slice(&bytes); }
+            (which, offset, bytes, sample_offset)
         }).collect::<Vec<_>>();
         let hints: [Vec<(usize, &'static Encoding, &'static str)>; 2] = std::array::from_fn(|which| {
-            if let Some(encoding) = selection.explicit { return vec![(samples[which].len(), encoding, selection.source)]; }
+            if let Some(encoding) = selection.explicit { return vec![(channel_lengths[which], encoding, selection.source)]; }
             let mut offset = 0;
             samples[which].split_inclusive(|byte| *byte == b'\n').map(|line| {
                 offset += line.len();
@@ -295,7 +314,8 @@ pub(super) fn read(live: &OutputHandle, cursor: u64, limit: usize, label: Option
                     decode_ascii(channel, which, offset + i as u64, &bytes[i..i + count], cursor, &mut chunks);
                     i += count;
                 } else {
-                    feed(channel, which, offset + i as u64, bytes[i], &samples[which][sample_offset + i..], (encoding, source), &selection, cursor, &mut chunks);
+                    let sample = if selection.explicit.is_none() { &samples[which][sample_offset + i..] } else { &[] };
+                    feed(channel, which, offset + i as u64, bytes[i], sample, (encoding, source), &selection, cursor, &mut chunks);
                     i += 1;
                 }
                 state.cursor = offset + i as u64;
@@ -307,15 +327,15 @@ pub(super) fn read(live: &OutputHandle, cursor: u64, limit: usize, label: Option
     }
     for which in 0..2 {
         let channel = if which == 0 { "stdout" } else { "stderr" };
-        let ended = page["channelEnds"].as_array().and_then(|ends| ends.iter().find(|end| end["channel"] == channel))
+        let ended = snapshot.channel_ends.iter().find(|end| end["channel"] == channel)
             .and_then(|end| end["offset"].as_u64()).filter(|offset| *offset <= target)
-            .or_else(|| (page["outputComplete"] == true && target == page["endCursor"].as_u64().unwrap()).then_some(target));
+            .or_else(|| (snapshot.output_complete && target == snapshot.end).then_some(target));
         if let Some(offset) = ended { finish(&mut state.channels[which], which, offset, cursor, &mut chunks); }
     }
     // A zero-byte EOF can diagnose a previously consumed partial unit. Keep that
     // observation repeatable at the same raw cursor by rebuilding its failed tail.
     index.recent = if chunks.iter().any(|piece| piece.text.is_none()) { None } else { Some(state) };
-    page["chunks"] = json!(chunks.into_iter().map(Piece::value).collect::<Vec<_>>());
+    let mut page = snapshot.into_value(target, chunks.into_iter().map(Piece::value).collect());
     page["textProjected"] = json!(true);
     page["requestedCursor"] = json!(cursor);
     page["actualCursor"] = json!(cursor);
@@ -386,6 +406,30 @@ mod tests {
             assert_eq!(original["nextCursor"], cursor);
             std::fs::remove_file(handle.output_path).unwrap();
         }
+    }
+    #[test]
+    fn bulk_ascii_landing_at_checkpoint_keeps_wire_bytes_and_channel_offsets() {
+        let handle = spool();
+        let first_len = CHUNK_BYTES - 2;
+        let first = vec![b'a'; first_len];
+        append(&handle, 1, &first);
+        append(&handle, 1, b"bc");
+        append(&handle, 2, b"E");
+        append(&handle, 1, "界!".as_bytes());
+        let page = read_page(&handle, first_len as u64 - 1, 6, "utf-8");
+        assert_eq!(page["nextCursor"], CHUNK_BYTES + 3);
+        let chunks = page["chunks"].as_array().unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0]["text"], "abc");
+        assert_eq!(chunks[0]["sourceRanges"], json!([{"offset": first_len - 1, "byteLength": 3}]));
+        assert_eq!(BASE64.decode(chunks[0]["bytesBase64"].as_str().unwrap()).unwrap(), b"abc");
+        assert_eq!(chunks[1]["channel"], "stderr");
+        assert_eq!(chunks[1]["text"], "E");
+        let suffix = read_page(&handle, CHUNK_BYTES as u64 + 3, 2, "utf-8");
+        assert_eq!(text(&suffix), "界!");
+        let raw = read_output(&handle, CHUNK_BYTES as u64 + 1, 4).unwrap();
+        assert_eq!(BASE64.decode(raw["chunks"][0]["bytesBase64"].as_str().unwrap()).unwrap(), "界!".as_bytes());
+        std::fs::remove_file(handle.output_path).unwrap();
     }
     #[test]
     fn malformed_utf16_keeps_already_consumed_valid_suffix_across_channels_and_pages() {

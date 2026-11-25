@@ -280,10 +280,11 @@ impl ChildRead {
 }
 impl Catalog {
     pub fn capture_child_read(&self, child: ChildTask) -> ChildRead {
+        let publication = self.content.begin_read();
         ChildRead {
             child,
             content: self.content.clone(),
-            _publication: self.content.begin_publication(),
+            _publication: publication,
         }
     }
     pub fn prepare_child_admission(

@@ -735,19 +735,48 @@ fn channel_end(tag: u8, offset: u64) -> Value {
     value
 }
 
-fn read_output(
-    live: &OutputHandle,
-    cursor: u64,
-    limit: usize,
-) -> Result<Value, KernelError> {
-    let (end, file_end, input_sequence, input_error, output_error, output_complete, channel_ends) = {
+struct OutputSnapshot {
+    end: u64,
+    file_end: u64,
+    input_sequence: i64,
+    input_error: Option<String>,
+    output_error: Option<String>,
+    output_complete: bool,
+    channel_ends: Vec<Value>,
+}
+impl OutputSnapshot {
+    fn capture(live: &OutputHandle) -> Self {
         let buffer = live.shared.lock();
-        (buffer.end, buffer.file_end, buffer.input_sequence, buffer.input_error.clone(),
-            buffer.output_error.clone(), buffer.output_closed && buffer.output_error.is_none(), buffer.channel_ends.clone())
-    };
-    if cursor > end {
-        return Err(failure(format!("process output cursor {cursor} is outside retained range [0, {end}]; read from any cursor in that range")));
+        Self {
+            end: buffer.end, file_end: buffer.file_end, input_sequence: buffer.input_sequence,
+            input_error: buffer.input_error.clone(), output_error: buffer.output_error.clone(),
+            output_complete: buffer.output_closed && buffer.output_error.is_none(),
+            channel_ends: buffer.channel_ends.clone(),
+        }
     }
+
+    fn target(&self, cursor: u64, limit: usize) -> Result<u64, KernelError> {
+        if cursor > self.end {
+            return Err(failure(format!("process output cursor {cursor} is outside retained range [0, {}]; read from any cursor in that range", self.end)));
+        }
+        Ok(cursor.saturating_add(limit as u64).min(self.end))
+    }
+
+    fn into_value(self, next: u64, chunks: Vec<Value>) -> Value {
+        json!({"chunks":chunks,"nextCursor":next,"endCursor":self.end,"startCursor":0,
+            "channelEnds":self.channel_ends,"inputSequence":self.input_sequence,"inputError":self.input_error,
+            "outputError":self.output_error,"outputComplete":self.output_complete})
+    }
+}
+
+struct RawOutputChunk {
+    channel: &'static str,
+    offset: u64,
+    bytes: Vec<u8>,
+}
+
+fn read_output_chunks(live: &OutputHandle, cursor: u64, target: u64, file_end: u64) -> Result<Vec<RawOutputChunk>, KernelError> {
+    if cursor == target { return Ok(Vec::new()); }
     let mut file = File::open(&live.output_path)?;
     let header=|file:&mut File, position:u64, offset:u64| -> Result<SpoolFrame,KernelError> {
         let mut position = position;
@@ -767,7 +796,6 @@ fn read_output(
         Ok(SpoolFrame {offset,position,length,channel})
     };
     let mut index = live.shared.spool_index.lock().map_err(|_|failure("output index poisoned"))?;
-    let target = cursor.saturating_add(limit as u64).min(end);
     while index.tail.as_ref().map_or(0, |frame|frame.offset + frame.length as u64) < target {
         let (offset, position) = index.tail.as_ref().map_or((0,0), |frame|(frame.offset + frame.length as u64, frame.position + 5 + frame.length as u64));
         let frame=header(&mut file,position,offset)?;
@@ -779,8 +807,7 @@ fn read_output(
         Some(index.tail.as_ref().filter(|tail|tail.offset<=cursor).cloned().unwrap_or(checkpoint))
     } else {None};
     drop(index);
-    let mut raw_chunks: Vec<(&str, u64, Vec<u8>)> = Vec::new();
-    let mut remaining = limit;
+    let mut raw_chunks: Vec<RawOutputChunk> = Vec::new();
     let mut next = cursor;
     while let Some(current)=frame {
         if current.offset+current.length as u64<=next {
@@ -789,22 +816,27 @@ fn read_output(
         }
         let channel = current.channel;
         let skip = (next - current.offset) as usize;
-        let count = remaining.min(current.length - skip);
+        let count = ((target - next) as usize).min(current.length - skip);
         file.seek(SeekFrom::Start(current.position + 5 + skip as u64))?;
-        let mut bytes = vec![0u8; count];
-        file.read_exact(&mut bytes)?;
         // Storage frames are transport boundaries, not character boundaries.
-        // Join adjacent output from one channel before projecting UTF-8.
-        if let Some((_, _, previous)) = raw_chunks.last_mut().filter(|(previous,_,_)| *previous==channel) {
-            previous.extend_from_slice(&bytes);
-        } else {
-            raw_chunks.push((channel,next,bytes));
+        // Read adjacent bytes of one channel directly into their final chunk.
+        if !raw_chunks.last().is_some_and(|previous| previous.channel == channel) {
+            raw_chunks.push(RawOutputChunk { channel, offset: next, bytes: Vec::new() });
         }
+        let bytes = &mut raw_chunks.last_mut().unwrap().bytes;
+        let start = bytes.len();
+        bytes.resize(start + count, 0);
+        file.read_exact(&mut bytes[start..])?;
         next += count as u64;
-        remaining -= count;
         frame=if next<target {Some(header(&mut file,current.position+5+current.length as u64,current.offset+current.length as u64)?)} else {None};
     }
-    let chunks=raw_chunks.into_iter().map(|(channel,offset,bytes)|{
+    Ok(raw_chunks)
+}
+
+fn read_output(live: &OutputHandle, cursor: u64, limit: usize) -> Result<Value, KernelError> {
+    let snapshot = OutputSnapshot::capture(live);
+    let target = snapshot.target(cursor, limit)?;
+    let chunks=read_output_chunks(live, cursor, target, snapshot.file_end)?.into_iter().map(|RawOutputChunk { channel, offset, bytes }|{
         let mut chunk=json!({"channel":channel,"offset":offset,"byteLength":bytes.len(),"bytesBase64":BASE64.encode(&bytes),"encoding":"base64"});
         match std::str::from_utf8(&bytes) {
             Ok(text) if !text.contains('\0') => {chunk["text"]=json!(text);chunk["encoding"]=json!("utf8");},
@@ -815,8 +847,7 @@ fn read_output(
         }
         chunk
     }).collect::<Vec<_>>();
-    Ok(json!({"chunks":chunks,"nextCursor":next,"endCursor":end,"startCursor":0,
-            "channelEnds":channel_ends,"inputSequence":input_sequence,"inputError":input_error,"outputError":output_error,"outputComplete":output_complete}))
+    Ok(snapshot.into_value(target, chunks))
 }
 
 #[cfg(test)]

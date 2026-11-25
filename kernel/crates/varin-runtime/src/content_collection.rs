@@ -309,7 +309,7 @@ impl ContentCollection {
         #[cfg(test)]
         self.at(CollectionPoint::BeforeSweep);
         self.check()?;
-        // A foreground body already holding the shared gate registered its publication first.
+        // A foreground body already holding the shared gate registered a read or publication.
         // Never wait behind it: discard this pass instead of delaying foreground I/O.
         let _io = match self.lease.coordination.io.try_write() {
             Ok(guard) => guard,
@@ -357,6 +357,20 @@ impl ContentCollection {
             self.at(CollectionPoint::Roots);
         })
     }
+    /// The check and unlink are one admission operation with respect to snapshot
+    /// registrations and publications. In particular, a writer reusing an orphan
+    /// after mark cannot publish a reference between the final check and unlink.
+    fn unlink(&self, path: &Path) -> WorkResult<()> {
+        let state = self.lease.coordination.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.lease.cancellation.load(Ordering::Acquire) {
+            return Err(Stopped::Cancelled);
+        }
+        if state.sequence != self.lease.sequence || state.active != 0 || state.readers != 0 {
+            return Err(Stopped::PublicationChanged);
+        }
+        fs::remove_file(path)?;
+        Ok(())
+    }
     fn sweep(
         &self,
         live: &HashSet<String>,
@@ -388,8 +402,7 @@ impl ContentCollection {
                         continue;
                     }
                     let bytes = entry.metadata()?.len();
-                    self.check()?;
-                    fs::remove_file(entry.path())?;
+                    self.unlink(&entry.path())?;
                     changed = true;
                     result.removed_objects += 1;
                     result.removed_bytes += bytes;
@@ -416,8 +429,7 @@ impl ContentCollection {
                 if entry.file_type()?.is_file()
                     && uuid::Uuid::parse_str(&entry.file_name().to_string_lossy()).is_ok()
                 {
-                    self.check()?;
-                    fs::remove_file(entry.path())?;
+                    self.unlink(&entry.path())?;
                     changed = true;
                     result.removed_staging_files += 1;
                 }

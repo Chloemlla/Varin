@@ -1738,7 +1738,7 @@ pub(crate) fn run(resources_only: bool) -> Result<(), Box<dyn std::error::Error>
         move |id, method| {
             release_request_credit(&credit_cancellations, &credit_responses, id, method)
         },
-    ));
+    )).transpose()?;
     let worker_agent_control = agent_control.clone();
     let worker_agent_tx = agent_tx.clone();
     let worker_cancellations = cancellations.clone();

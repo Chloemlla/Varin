@@ -445,6 +445,7 @@ impl Catalog {
         Ok(PolicySelectionRead::new(c.selection, &self.content))
     }
     pub fn policy_selections(&self, run_id: &str) -> Result<PolicySelectionsRead> {
+        let publication = self.content.begin_read();
         self.run(run_id)?;
         let launch = self
             .launch_metadata(run_id)?
@@ -458,7 +459,7 @@ impl Catalog {
             ),
             desired: latest(&self.db, run_id)?.map(|value| value.selection),
             content: self.content.clone(),
-            _publication: self.content.begin_publication(),
+            _publication: publication,
         })
     }
     pub fn prepare_policy_selection(

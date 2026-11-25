@@ -2448,3 +2448,25 @@ describe('Document Registry recovery interpretation', () => {
     } finally { await registry.dispose(); }
   });
 });
+
+test('last closed clean document releases its buffer; a surviving view and an unsaved draft are retained', async () => {
+  const memory = createMemoryDocuments(), id = resource();
+  const key = documentKey(id);
+  memory.files.set(key, { content: 'original', revision: 'r1' });
+  const registry = new DocumentRegistry({ documents: memory.api, getGeneration: () => 1, recoverySessionId: 'release' });
+  try {
+    const first = await registry.open(id);
+    const live = registry.subscribe(id, () => {});
+    registry.releaseClosedDocument(id);
+    expect(registry.get(id)).toBe(first);
+    live();
+    expect(registry.get(id)).toBeUndefined();
+    memory.files.set(key, { content: 'restored externally', revision: 'r2' });
+    const fresh = await registry.open(id);
+    expect(fresh).toMatchObject({ baseRevision: 'r2', buffer: 'restored externally' });
+    expect(fresh.documentInstanceId).not.toBe(first.documentInstanceId);
+    registry.applyTransaction(id, 'unsaved', { origin: 'test' });
+    registry.releaseClosedDocument(id);
+    expect(registry.get(id)?.buffer).toBe('unsaved');
+  } finally { await registry.dispose(); }
+});

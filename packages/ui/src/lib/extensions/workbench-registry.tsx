@@ -28,7 +28,7 @@ import {
 } from './workbench-mount';
 import { varinSurfaceRuntime } from './surface-runtime';
 import { createWorkbenchCompositionHost } from './workbench-composition-host';
-import { retryWorkbenchShellLoad } from './shell-component-registry';
+import { resolveWorkbenchShellComponent, retryWorkbenchShellLoad } from './shell-component-registry';
 
 export { VARIN_WORKBENCH_REPLACEMENT_TARGETS as WORKBENCH_REPLACEMENT_TARGETS } from '@varin/extension-contract';
 export { startWorkbenchMountSession } from './workbench-mount';
@@ -345,16 +345,7 @@ const isMessageImplementation = (
   && typeof (value as { postMessage?: unknown }).postMessage === 'function'
 );
 
-export function WorkbenchSurfaceContributionHost<TProps extends object>({
-  className,
-  contribution,
-  fallback,
-  isolatedProps,
-  onMountReady,
-  onError,
-  rejectEmpty,
-  props,
-}: {
+type SurfaceHostProps<TProps extends object> = {
   className?: string;
   contribution: SurfaceContribution;
   fallback: React.ReactNode | ((error: unknown, retry: () => void) => React.ReactNode);
@@ -363,7 +354,27 @@ export function WorkbenchSurfaceContributionHost<TProps extends object>({
   onError?(error: unknown): void;
   rejectEmpty?: boolean;
   props: TProps;
-}): React.ReactNode {
+};
+
+export function WorkbenchSurfaceContributionHost<TProps extends object>(input: SurfaceHostProps<TProps>) {
+  const { contribution, onMountReady, onError, fallback, props } = input;
+  // A linked first-party component is already here. Its slot can render it
+  // directly without scheduling extension activation/messages on each switch.
+  // Checking the actual registered component (never just a claimed ID) leaves
+  // external replacements on the existing readiness/ownership contract.
+  const Component = contribution.descriptor.kind === 'shell' && resolveWorkbenchShellComponent(contribution.owner.extensionId);
+  if (Component && isReactContribution<TProps>(contribution.implementation) && contribution.implementation.Component === Component) {
+    const View: ComponentType<TProps> = contribution.implementation.Component;
+    return <ContributionRenderBoundary key={workbenchContributionInstanceKey(contribution)} contribution={contribution} fallback={fallback} onError={onError}>
+      <ContributionReadySignal onReady={onMountReady}><View {...contribution.implementation.props} {...props} /></ContributionReadySignal>
+    </ContributionRenderBoundary>;
+  }
+  return <ExtensionContributionHost {...input} />;
+}
+
+function ExtensionContributionHost<TProps extends object>({
+  className, contribution, fallback, isolatedProps, onMountReady, onError, rejectEmpty, props,
+}: SurfaceHostProps<TProps>): React.ReactNode {
   useVisibleContributionActivation([contribution]);
   const contributionKey = workbenchContributionInstanceKey(contribution);
   React.useEffect(() => {

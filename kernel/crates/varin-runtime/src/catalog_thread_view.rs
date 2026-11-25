@@ -39,6 +39,24 @@ impl Catalog {
         after_head_id: Option<&str>,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Value> {
+        let _publication = self.content.begin_read();
+        let transaction = self.db.is_autocommit().then(|| self.db.unchecked_transaction()).transpose()?;
+        let result = self.thread_view_in_snapshot(thread_id, branch_id, history_limit, after_head_id, cancelled);
+        if let Some(transaction) = transaction {
+            transaction.rollback()?;
+            self.assert_read_epoch()?;
+        }
+        result
+    }
+
+    fn thread_view_in_snapshot(
+        &self,
+        thread_id: &str,
+        branch_id: &str,
+        history_limit: u32,
+        after_head_id: Option<&str>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Value> {
         let check = || {
             if cancelled() {
                 Err(RuntimeError::DispatchCancelled)
@@ -47,13 +65,7 @@ impl Catalog {
             }
         };
         check()?;
-        // The read pool already owns a transaction; direct callers get the same contract.
-        let _publication = self.content.begin_publication();
-        let _transaction = self
-            .db
-            .is_autocommit()
-            .then(|| self.db.unchecked_transaction())
-            .transpose()?;
+        self.assert_read_epoch()?;
         let event_cursor = self.event_cursor()?;
         let thread = self.inspect_thread(thread_id)?;
         let branch = thread["branches"]
@@ -82,7 +94,7 @@ impl Catalog {
             };
             let item: HistoryItem = record(&self.db, "history", &id)?;
             cursor = item.parent.clone();
-            history.push(self.content.load_stored_history_item(item, cancelled)?);
+            history.push(item);
         }
         history.reverse();
         let previous = cursor
@@ -100,10 +112,25 @@ impl Catalog {
                 None
             }
         });
-        let requests = history
-            .iter()
-            .filter_map(model_request_id)
-            .collect::<BTreeSet<_>>();
+        let start = delta_start.unwrap_or(0);
+        let mut requests = BTreeSet::new();
+        let mut references = BTreeMap::<String, bool>::new();
+        let mut bodies = Vec::with_capacity(history.len() - start);
+        for (i, item) in history.into_iter().enumerate() {
+            check()?;
+            let (index, loaded) = self.content.history_view_references(&item, cancelled)?;
+            if let Some((id, observer)) = index.operation {
+                references.insert(id, observer);
+            }
+            if i >= start {
+                if item.source == HistorySource::Assistant {
+                    requests.extend(index.request);
+                }
+                bodies.push(loaded.map_or_else(
+                    || self.content.load_stored_history_item(item, cancelled), Ok,
+                )?);
+            }
+        }
         let presentations = self
             .capture_model_presentations(&requests.into_iter().collect::<Vec<_>>(), false)?
             .load(cancelled)?
@@ -115,40 +142,6 @@ impl Catalog {
             .into_iter()
             .map(|operation| (operation.id.clone(), operation))
             .collect::<BTreeMap<_, _>>();
-        let mut references = BTreeMap::<String, bool>::new();
-        for item in &history {
-            check()?;
-            let content = &item.content;
-            let result = &content["content"]["result"];
-            let completion = &result["completion"];
-            if content["content"]["kind"] == "tool_result" {
-                if completion["kind"] == "job_accepted" {
-                    if let Some(id) = completion["operation_id"].as_str() {
-                        references.insert(id.into(), false);
-                    }
-                } else if completion["kind"] == "result" && effectful(&completion["effect"]) {
-                    if let (Some(request), Some(call)) =
-                        (result["request_id"].as_str(), result["call_id"].as_str())
-                    {
-                        references.insert(format!("{request}:tool:{call}"), true);
-                    }
-                }
-            }
-            if content["provenance"]["kind"] == "policy_tool_data"
-                && content["content"]["kind"] == "output"
-            {
-                let reference = &content["provenance"]["reference"];
-                if let (Some(action), Some(node)) = (
-                    reference["action_id"].as_str(),
-                    reference["node_id"].as_str(),
-                ) {
-                    let id = format!("{action}:node:{node}");
-                    if content["content"]["output"]["data"]["operationId"].as_str() == Some(&id) {
-                        references.insert(id, true);
-                    }
-                }
-            }
-        }
         for (id, observer) in references {
             check()?;
             if operations.contains_key(&id) {
@@ -172,9 +165,8 @@ impl Catalog {
                 operations.insert(id, operation);
             }
         }
-        let history = history
+        let history = bodies
             .into_iter()
-            .skip(delta_start.unwrap_or(0))
             .map(|item| {
                 check()?;
                 let request_id = model_request_id(&item);
@@ -389,6 +381,10 @@ impl Catalog {
 mod tests {
     use super::*;
     use crate::test_submission::InputAdmission;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     struct Fixture(std::path::PathBuf);
     impl Fixture {
         fn new() -> Self {
@@ -595,7 +591,13 @@ mod tests {
             )
             .unwrap()
             .id;
+        let reads = Arc::new(AtomicUsize::new(0));
+        let observed = reads.clone();
+        db.content.set_history_read_hook(Some(Arc::new(move |_| {
+            observed.fetch_add(1, Ordering::Relaxed);
+        })));
         let delta = db.thread_view("thread", "main", 20, Some(&before)).unwrap();
+        assert_eq!(reads.swap(0, Ordering::Relaxed), 1);
         assert_eq!(delta["history"].as_array().unwrap().len(), 1);
         assert_eq!(delta["historyPage"]["afterHeadId"], before);
         assert_eq!(delta["historyPage"]["head"], head);
@@ -604,6 +606,22 @@ mod tests {
             db.thread_view("thread", "main", 20, Some(&head)).unwrap()["history"],
             json!([])
         );
+        assert_eq!(reads.swap(0, Ordering::Relaxed), 0);
+        // A pre-index body is still readable and scanned once, then cached without rewriting it.
+        db.db
+            .execute(
+                "UPDATE history SET body=json_remove(body,'$.content.history_view') WHERE id=?1",
+                [&before],
+            )
+            .unwrap();
+        for expected in [1, 0] {
+            assert_eq!(
+                db.thread_view("thread", "main", 20, Some(&head)).unwrap()["history"],
+                json!([])
+            );
+            assert_eq!(reads.swap(0, Ordering::Relaxed), expected);
+        }
+        db.content.set_history_read_hook(None);
         let reset = db
             .thread_view("thread", "main", 20, Some("unrelated-cut"))
             .unwrap();
@@ -747,6 +765,17 @@ mod tests {
                     "{origin}/{variant}"
                 );
                 if expected {
+                    let head = view["historyPage"]["head"].as_str().unwrap();
+                    let reads = Arc::new(AtomicUsize::new(0));
+                    let observed = reads.clone();
+                    db.content.set_history_read_hook(Some(Arc::new(move |_| {
+                        observed.fetch_add(1, Ordering::Relaxed);
+                    })));
+                    let delta = db.thread_view("thread", "main", 20, Some(head)).unwrap();
+                    assert_eq!(delta["history"], json!([]));
+                    assert_eq!(delta["operations"], view["operations"]);
+                    assert_eq!(reads.load(Ordering::Relaxed), 0);
+                    db.content.set_history_read_hook(None);
                     assert_eq!(view["operations"][0]["id"], operation_id);
                     assert_eq!(view["operations"][0]["call_completion"], completion);
                     assert_eq!(

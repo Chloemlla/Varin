@@ -23,7 +23,7 @@ mod reconciliation;
 #[path = "tools_retrieval.rs"]
 mod retrieval;
 #[path = "tools_read.rs"]
-mod read;
+pub(crate) mod read;
 #[path = "tools_references.rs"]
 pub(crate) mod references;
 use discovery::FileQueryArgs;

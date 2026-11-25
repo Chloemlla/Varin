@@ -20,14 +20,16 @@ import { pruneLegacyHostArtifacts } from '../../../scripts/host-production-bound
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { reclaimAbandonedHostGenerations } from './application-host-generations.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '..', '..', '..');
 const webRoot = path.join(repoRoot, 'packages', 'web');
 const sourceDir = path.join(webRoot, 'application-host');
 const devOutputArg = process.argv.indexOf('--dev-output');
 const devOutputName = devOutputArg >= 0 ? process.argv[devOutputArg + 1] : null;
-if (devOutputArg >= 0 && (!devOutputName || !/^\.application-host-dev-\d+$/.test(devOutputName))) {
-  throw new Error('--dev-output requires a private .application-host-dev-<pid> directory name');
+if (devOutputArg >= 0 && devOutputName !== `.application-host-dev-${process.ppid}`) {
+  throw new Error('--dev-output must name the launching development Host PID');
 }
 const productOutputArg = process.argv.indexOf('--output');
 if (productOutputArg >= 0 && (!process.argv[productOutputArg + 1] || devOutputName)) throw new Error('--output requires a production directory and cannot be combined with --dev-output');
@@ -45,22 +47,17 @@ const removeGeneratedOutputs = () => {
     // Staged Computer Use driver assets (BC9) — copied from packages/computer-driver.
     path.join(webRoot, 'computer-driver'),
   ];
-  for (const entry of fs.readdirSync(webRoot, { withFileTypes: true })) {
-    if (
-      entry.name.startsWith('.application-host-staging-')
-      || entry.name.startsWith('.application-host-dev-')
-      || entry.name.startsWith('.application-host-types-staging-')
-      || entry.name.startsWith('.application-host-types-backup-')
-      || entry.name.startsWith('.server-backup-')
-    ) {
-      targets.push(path.join(webRoot, entry.name));
-    }
-  }
+  if (devOutputName) throw new Error('--clean cannot target a development Host generation');
+  // A backup may be the last valid build if publication was interrupted.
+  // Neither background reclamation nor clean removes unresolved backups.
   for (const target of targets) {
     if (path.dirname(target) !== webRoot) throw new Error(`Refusing to clean outside Web package: ${target}`);
     fs.rmSync(target, { recursive: true, force: true });
   }
 };
+
+const reclaimed = reclaimAbandonedHostGenerations(webRoot);
+if (reclaimed) log(`Reclaimed ${reclaimed} abandoned Host generation(s).`);
 
 if (process.argv.includes('--clean')) {
   removeGeneratedOutputs();
@@ -71,7 +68,7 @@ if (process.argv.includes('--clean')) {
 // ── Step 1: Compile to a staging directory ───────────────────────────────
 
 const stagingDir = path.join(webRoot, `.application-host-staging-${process.pid}`);
-const buildDir = devOutputName ? outputDir : stagingDir;
+const buildDir = stagingDir;
 
 const cleanBuildDir = () => {
   try {
@@ -82,8 +79,8 @@ const cleanBuildDir = () => {
 };
 
 try {
-  // A private development generation is compiled in place. Production builds
-  // still compile to staging before swapping the public server/ directory.
+  // The builder owns staging even if its development Host parent is killed.
+  // Publish only a validated generation, never the partial staging directory.
   cleanBuildDir();
 
   // Run tsc with a unique outDir to avoid concurrent build conflicts.
@@ -209,6 +206,8 @@ try {
   // retain a directory handle and make the otherwise valid rename fail with
   // EPERM. The private generation is disposable and leaves server/ untouched.
   if (devOutputName) {
+    fs.renameSync(stagingDir, outputDir);
+    log(`Published private generation: ${outputDir}`);
     log('Build complete.');
     process.exit(0);
   }
@@ -217,10 +216,9 @@ try {
   // On Windows, we can't atomically rename over an existing directory.
   // Strategy: rename old server/ to a backup, rename staging to server/,
   // then remove the backup. If the rename fails, restore the backup.
-  const backupDir = path.join(webRoot, `.server-backup-${process.pid}`);
-
-  // Remove any existing backup
-  try { fs.rmSync(backupDir, { recursive: true, force: true }); } catch { /* */ }
+  // The UUID prevents PID reuse from overwriting the last valid generation
+  // preserved by an earlier interrupted publication.
+  const backupDir = path.join(webRoot, `.server-backup-${process.pid}-${randomUUID()}`);
 
   if (fs.existsSync(outputDir)) {
     fs.renameSync(outputDir, backupDir);
@@ -235,7 +233,7 @@ try {
   } catch (renameError) {
     // Restore backup if rename failed
     if (fs.existsSync(backupDir)) {
-      try { fs.renameSync(backupDir, outputDir); } catch { /* */ }
+      try { fs.renameSync(backupDir, outputDir); } catch { log(`Retained previous Host generation at ${backupDir}`); }
     }
     throw new Error(`Failed to replace server/: ${renameError.message}`);
   }

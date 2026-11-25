@@ -1,7 +1,6 @@
 //! Immutable ancestry summaries are cached by branch head; mutable usage receipts are not.
 use super::*;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::cell::RefCell;
 
 #[derive(Clone, Default)]
 struct Summary {
@@ -11,12 +10,15 @@ struct Summary {
 }
 #[derive(Default)]
 struct BranchCache {
+    branch: String,
     head: Option<String>,
     summary: Summary,
     composition: Option<(String, Value)>,
 }
-#[derive(Clone, Default)]
-pub(super) struct InspectionCache(Arc<Mutex<HashMap<String, BranchCache>>>);
+/// Each WAL reader reuses its last inspection. Visiting historical conversations
+/// cannot accumulate a permanent copy of every branch's latest composition.
+#[derive(Default)]
+pub(super) struct InspectionCache(RefCell<Option<BranchCache>>);
 
 impl Catalog {
     pub fn context_inspection(&self, branch_id: &str, head_id: Option<&str>) -> Result<Value> {
@@ -56,46 +58,40 @@ impl Catalog {
                 "latestRequest":null,"contextRequest":null,"checkpointId":checkpoint_id}),
             );
         }
-        let (known_head, known_summary, composition) = {
-            let cache = self
-                .context_inspections
-                .0
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            cache
-                .get(branch_id)
-                .map(|entry| {
-                    (
-                        entry.head.clone(),
-                        entry.summary.clone(),
-                        entry.composition.clone(),
-                    )
-                })
-                .unwrap_or_default()
-        };
-        let mut cursor = head_id.map(str::to_owned);
-        let mut pending = Vec::new();
+        let previous = self.context_inspections.0.take().filter(|entry| entry.branch == branch_id)
+            .unwrap_or_default();
         let mut summary = Summary::default();
-        while let Some(id) = cursor {
-            if known_head.as_deref() == Some(&id) {
-                summary = known_summary;
+        let mut past_compaction = false;
+        let mut ancestry = self.db.prepare_cached("WITH RECURSIVE lineage(id,parent,source) AS (
+            SELECT id,parent,json_extract(body,'$.source') FROM history WHERE id=?1
+            UNION ALL SELECT h.id,h.parent,json_extract(h.body,'$.source') FROM history h
+                JOIN lineage ON h.id=lineage.parent WHERE lineage.id IS NOT ?2)
+            SELECT id,source FROM lineage")?;
+        let mut rows = ancestry.query(params![head_id, previous.head])?;
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            if previous.head.as_ref() == Some(&id) {
+                for (count, prior) in summary.counts.iter_mut().zip(previous.summary.counts) {
+                    *count += prior;
+                }
+                if summary.latest.is_none() {
+                    summary.latest = previous.summary.latest;
+                    if !past_compaction { summary.context = previous.summary.context; }
+                }
                 break;
             }
-            let item: HistoryItem = record(&self.db, "history", &id)?;
-            cursor = item.parent.clone();
-            pending.push((item.id, item.source));
-        }
-        for (id, source) in pending.into_iter().rev() {
             summary.counts[0] += 1;
-            match source {
-                HistorySource::User => summary.counts[1] += 1,
-                HistorySource::Assistant => {
+            match row.get_ref(1)?.as_str().map_err(|e| RuntimeError::Invalid(e.to_string()))? {
+                "user" => summary.counts[1] += 1,
+                "assistant" => {
                     summary.counts[2] += 1;
-                    summary.latest = Some(id.clone());
-                    summary.context = Some(id);
+                    if summary.latest.is_none() {
+                        if !past_compaction { summary.context = Some(id.clone()); }
+                        summary.latest = Some(id);
+                    }
                 }
-                HistorySource::Tool => summary.counts[3] += 1,
-                HistorySource::Compaction => summary.context = None,
+                "tool" => summary.counts[3] += 1,
+                "compaction" => past_compaction = true,
                 _ => {}
             }
         }
@@ -110,7 +106,7 @@ impl Catalog {
         let request_id = latest_item
             .as_ref()
             .and_then(super::thread_view::model_request_id);
-        let known_composition = composition.filter(|(id, _)| Some(id) == request_id.as_ref());
+        let known_composition = previous.composition.filter(|(id, _)| Some(id) == request_id.as_ref());
         let mut presentation = request_id
             .as_ref()
             .map(|id| {
@@ -131,21 +127,9 @@ impl Catalog {
                 .and_then(|value| value.get("context"))
                 .cloned(),
         );
-        {
-            let mut cache = self
-                .context_inspections
-                .0
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            cache.insert(
-                branch_id.into(),
-                BranchCache {
-                    head: head_id.map(str::to_owned),
-                    summary: summary.clone(),
-                    composition,
-                },
-            );
-        }
+        self.context_inspections.0.replace(Some(BranchCache {
+            branch: branch_id.into(), head: head_id.map(str::to_owned), summary: summary.clone(), composition,
+        }));
         let mut context = (summary.context == summary.latest)
             .then(|| presentation.clone())
             .flatten();
@@ -305,8 +289,9 @@ mod tests {
         let composition = first["latestRequest"]["context"].clone();
         assert!(composition["totalTokens"].as_u64().unwrap() > 0);
         {
-            let cache = reader.context_inspections.0.lock().unwrap();
-            let branch = &cache["main"];
+            let cache = reader.context_inspections.0.borrow();
+            let branch = cache.as_ref().unwrap();
+            assert_eq!(branch.branch, "main");
             assert_eq!(branch.head.as_deref(), Some(head.as_str()));
             assert_eq!(
                 branch.composition.as_ref().unwrap(),

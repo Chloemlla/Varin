@@ -322,6 +322,7 @@ impl Catalog {
         Ok(read)
     }
     pub(super) fn capture_input_row(&self, id: &str) -> Result<QueuedInputRead> {
+        let publication = self.content.begin_read();
         let metadata = self.queued_input_metadata(id)?;
         let reference: String = self.db.query_row(
             "SELECT body FROM input_history_content WHERE input_id=?1",
@@ -332,7 +333,7 @@ impl Catalog {
             metadata,
             reference: serde_json::from_str(&reference)?,
             content: self.content.clone(),
-            _publication: self.content.begin_publication(),
+            _publication: publication,
         })
     }
     pub fn capture_queued_inputs(&self, branch: &str) -> Result<Vec<QueuedInputRead>> {

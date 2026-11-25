@@ -333,29 +333,30 @@ impl KernelToolExecutor {
             })().unwrap_or_else(|error|json!({"status":if error.code=="cancelled" {"cancelled"} else {"failed"},"error":error}));
             results.push(json!({"index":index,"request":request,"result":result}));
         }
-        let good = results
-            .iter()
-            .filter(|entry| entry["result"]["status"] == "ready")
-            .count();
-        let status = if good == results.len() {
-            "ready"
+        batch_completion(results, cancel)
+    }
+}
+
+pub(crate) fn batch_completion(results: Vec<Value>, cancel: &CancellationToken) -> ToolCompletion {
+    let good = results.iter().filter(|entry| entry["result"]["status"] == "ready").count();
+    let status = if good == results.len() {
+        "ready"
+    } else if good > 0 {
+        "partial"
+    } else if cancel.is_cancelled() {
+        "cancelled"
+    } else {
+        "failed"
+    };
+    ToolCompletion::Result {
+        outcome: if cancel.is_cancelled() {
+            Outcome::Cancelled
         } else if good > 0 {
-            "partial"
-        } else if cancel.is_cancelled() {
-            "cancelled"
+            Outcome::Succeeded
         } else {
-            "failed"
-        };
-        ToolCompletion::Result {
-            outcome: if cancel.is_cancelled() {
-                Outcome::Cancelled
-            } else if good > 0 {
-                Outcome::Succeeded
-            } else {
-                Outcome::Failed
-            },
-            effect: Effect::None,
-            content: json!({"status":status,"files":results}).into(),
-        }
+            Outcome::Failed
+        },
+        effect: Effect::None,
+        content: json!({"status":status,"files":results}).into(),
     }
 }

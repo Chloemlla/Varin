@@ -15,7 +15,7 @@ it('keeps one iframe mounted as an explicit prose slot replaces a tool slot afte
   for (const [name, value] of Object.entries({ window, document, IS_REACT_ACT_ENVIRONMENT: true, innerWidth: 800, innerHeight: 600 })) vi.stubGlobal(name, value);
   vi.stubGlobal('getComputedStyle', () => ({ overflowX: 'visible', overflowY: 'visible' }));
   vi.stubGlobal('requestAnimationFrame', () => 1); vi.stubGlobal('cancelAnimationFrame', () => {});
-  vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} }); vi.stubGlobal('MutationObserver', class { observe() {} disconnect() {} });
+  vi.stubGlobal('ResizeObserver', class { observe() {} unobserve() {} disconnect() {} }); vi.stubGlobal('MutationObserver', class { observe() {} disconnect() {} });
   Object.assign(window.HTMLElement.prototype, { getBoundingClientRect(this: HTMLElement) {
     return this.classList.contains('pointer-events-none')
       ? { top: 5, left: 3, right: 703, bottom: 505, width: 700, height: 500 }

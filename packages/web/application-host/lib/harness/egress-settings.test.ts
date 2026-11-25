@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
+import { mkdtemp, rename, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createSettingsFileStore } from '@varin/settings-store';
 import { createEgressRuntime } from './egress.js';
 import {
-  encodeOutboundProxyAuth, normalizeOutboundNetwork, OUTBOUND_PROXY_CREDENTIAL_REF,
+  bindEgressHostConfiguration, encodeOutboundProxyAuth, normalizeOutboundNetwork, OUTBOUND_PROXY_CREDENTIAL_REF, projectEgressSettings,
   readEgressHostConfiguration, readOutboundProxyAuth,
 } from './egress-settings.js';
 
@@ -27,4 +31,54 @@ describe('Host outbound settings and credential binding', () => {
     expect(JSON.stringify(diagnosis)).not.toContain(key);
     await rt.close();
   });
+  it('reuses projected policy during requests but immediately observes external replacement and secret rotation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'varin-egress-projection-'));
+    const filePath = join(root, 'settings.json');
+    const store = createSettingsFileStore({ filePath });
+    let validations = 0;
+    let authReads = 0;
+    let auth: Record<string, unknown> = {};
+    const projection = store.createProjection(document => { validations++; return projectEgressSettings(document); });
+    const egress = createEgressRuntime({
+      env: {},
+      getHostConfiguration: bindEgressHostConfiguration(projection, () => { authReads++; return auth; }),
+    });
+    const target = 'https://public.example/request';
+    const setExternal = async (outboundNetwork: unknown) => {
+      await writeFile(`${filePath}.external`, JSON.stringify({ outboundNetwork }));
+      await rename(`${filePath}.external`, filePath);
+    };
+    try {
+      await store.replace({ outboundNetwork: { mode: 'direct' }, unrelated: 'ignored' });
+      const requests = await Promise.all(Array.from({ length: 12 }, () => egress.prepare(target)));
+      expect(requests.every(request => request.policy.mode === 'direct')).toBe(true);
+      expect(validations).toBe(1);
+      expect(authReads).toBe(0);
+
+      await setExternal({ mode: 'proxy', proxyUrl: 'http://proxy.test:8080', credentialRef: 'route-one' });
+      const first = (await egress.prepare(target)).policy;
+      expect(first).toMatchObject({ mode: 'proxy', proxyOrigin: 'http://proxy.test:8080' });
+      expect(first.proxyAuth).toBeUndefined();
+      auth = { [OUTBOUND_PROXY_CREDENTIAL_REF]: {
+        type: 'api_key', key: encodeOutboundProxyAuth('route-one', 'http://proxy.test:8080', 'user', 'new-password'),
+      } };
+      const second = (await egress.prepare(target)).policy;
+      expect(second.proxyAuth).toBe('basic');
+      expect(second.fingerprint).not.toBe(first.fingerprint);
+      expect(validations).toBe(2);
+      expect(authReads).toBe(2);
+
+      await setExternal({ mode: 'proxy', proxyUrl: 'invalid' });
+      await expect(egress.fetch(target)).rejects.toThrow(/valid proxy URL/i);
+      expect(validations).toBe(3);
+      expect(authReads).toBe(2);
+      await setExternal({ mode: 'direct' });
+      expect((await egress.prepare(target)).policy.mode).toBe('direct');
+      expect(validations).toBe(4);
+    } finally {
+      await egress.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
 });

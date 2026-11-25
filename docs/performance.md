@@ -24,7 +24,24 @@ Measure changes by user-perceived outcomes: streaming smoothness, action respons
 
 ## Measurement
 
+### Catalog and Host memory
+
+- Recovery selects unfinished work, retained ownership and pending receipt repairs through SQLite indexes. It captures their row IDs inside the recovery transaction and reads each body immediately before processing it. A child receipt can settle another selected operation in the same transaction.
+- Prepared context transforms belong to the Run compiler. Each Catalog reader keeps its most recent branch inspection and streams the ancestry metadata needed for a cache miss. Both can reconstruct their views from the durable checkpoint.
+- An external Agent connection's idle check reads whether the conversation has turns, unfinished work or an outstanding child report. Fetching conversation history for this timer would allocate item bodies on both sides of the Host/kernel connection.
+- External Agent startup looks up conversations through the open-turn index. Draining the queue reads the first eligible turn and its conversation metadata. Finished turns and transcript bodies do not participate in queue discovery.
+- Kernel transport codecs and Catalog content readers create blocking workers when jobs arrive and retire idle workers. To measure this, sample native thread count before any file work, during a large transfer, and after the worker keep-alive.
+- While a model stream is quiet, worker maintenance can reap completed work. Durable notifications are sent for committed changes and executor ownership transitions. Count notifications during a held local provider response to measure the resulting Host activity.
+- Knowledge vector reconciliation follows the global embedding selection and the installed local embedding component. Editing a desktop preference does not invalidate the registered knowledge indexes.
+- The model directory owns its parsed source data. Its one-time disk load bypasses the shared settings text cache, and atomic replacements invalidate old cached text.
+
+For a Linux memory report, record the kernel and Host PIDs across startup, active execution and idle after completion. Compare `VmRSS`, `RssAnon` and `RssFile` in each PID's `/proc/<pid>/status`, alongside the container's `anon` and `file` values in `memory.stat`. Record active work and retained history size with each sample. Repeating the same work on the same processes distinguishes a growing idle footprint from a restart peak.
+
+### Workload comparisons
+
 Compare identical workloads on the same build type while verifying correctness. Prefer deterministic work counts (IPC calls, snapshot reads, renders) for regression tests; record cold/warm, platform, and sample counts when reporting wall-clock numbers.
+
+For a long chat with tools, measure timeline projection separately from layout and paint. All turns in a projection share the descendant index for that execution snapshot. Verify that the resulting rows and their order agree when comparing implementations.
 
 ```sh
 node --import tsx scripts/measure-document-registry.mjs
@@ -37,3 +54,30 @@ node --import tsx packages/web/scripts/perf-knowledge-recall.ts 1000 8 2048 ipc
 - [measure-interaction-hotpaths.mjs](../scripts/measure-interaction-hotpaths.mjs): Host Documents file-op counts, UI embed/layout counts, and snapshot counts (uses portable fixtures — not full durable save/server latency).
 - [measure-kernel.mjs](../scripts/measure-kernel.mjs): `--compute-hotpaths` against a staged release kernel.
 - Browser profiling: [scripts/profile-browser.md](../scripts/profile-browser.md).
+
+### Built-in preparation and process memory
+
+From a built runtime workspace, run `node --expose-gc --import tsx packages/web/scripts/measure-builtin-preparation.mts --bots=2`.
+Repeat with `--legacy` in a fresh process for the forwarding-broker control. Both variants exercise
+the actual artifact store, service routing, directory, context and lease owners. They do not call a
+model. Each line separates elapsed directory preparation, newly launched brokers and a settled
+sample while tool leases are held. Linux uses private resident pages from smaps rollups.
+Windows uses private committed bytes for the same processes. The native HTTP context-composition
+suite covers the separate client-to-model boundary; directory timing is not first-token latency.
+
+A Linux two-Bot run (56 tools per Bot, no workspace, no model, one cold/warm pair per mode)
+took 6.14/4.91 s in the original forwarding backend and 3.15/2.47 s with direct Host handlers.
+Brokers started went from 12/11 to 0/0. With leases held after preparation, Host plus broker private
+memory was 555/580 MiB versus 267/274 MiB. These samples use the same checkout, not a comparison
+with the Windows installer or a guarantee for other hardware and plugin selections.
+
+On Windows x64 the two-Bot control started 12/11 forwarding processes on cold/warm preparation,
+while direct dispatch started zero in both rounds. With 56 tools per Bot, preparation took
+7.95/6.35 s and 3.14/3.04 s respectively. Host plus live broker private committed memory was
+620/622 MiB in the control and 267/269 MiB with direct dispatch (one cold/warm pair per mode).
+
+Local semantic preparation loads the tokenizer without acquiring ONNX. Actual inference acquires a
+worker shared across concurrent requests; the last physically settled request starts an idle grace
+based on observed reload cost and estimated process RSS growth. Reacquisition keeps the same model
+and tokenizer. For deployment measurements separate the Host-wide RSS estimate from model weights
+and sample the first inference again after worker exit.

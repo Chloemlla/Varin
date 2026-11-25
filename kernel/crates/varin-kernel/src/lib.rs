@@ -5,6 +5,7 @@ mod attachment_tools;
 mod attachment_reads;
 mod work_locations;
 mod agent_runtime;
+mod blocking_pool;
 mod authority;
 mod child_capabilities;
 mod capability_tools;

@@ -80,13 +80,54 @@ describe("managed native language servers", () => {
       },
     });
     expect(manager.inspect("cpp").status).toBe("available");
+    expect(downloads).toBe(0);
+    await expect(readdir(path.join(f.directory, "language-servers"))).rejects.toMatchObject({ code: "ENOENT" });
     const root = path.join(f.directory, "workspace");
     const [first, second] = await Promise.all([manager.ensure("cpp", root), manager.ensure("c", root)]);
     expect(first.command).toBe(second.command);
     expect(downloads).toBe(1);
+    expect(await readdir(path.join(f.directory, "language-servers"))).toEqual(["clangd"]);
     expect(manager.inspect("cpp")).toMatchObject({ status: "installed", command: first.command });
     await manager.dispose();
     await f.cleanup();
+  });
+
+  it("keeps preparation on the executing Host and reuses a preinstalled binary offline", async () => {
+    const searchOwner = await fixture();
+    const executionOwner = await fixture();
+    const { artifact, bytes } = zipArtifact();
+    let downloaded = 0;
+    const create = (directory: string, allowNetwork: boolean) => createManagedLanguageServers({
+      directory, platform: "win32", arch: "x64", env: { PATH: "" },
+      resolveExecutable: async () => null,
+      spawn: async () => { throw new Error("unexpected process"); },
+      artifacts: { clangd: artifact },
+      download: async () => {
+        if (!allowNetwork) throw new Error("offline");
+        downloaded++;
+        return bytes;
+      },
+    });
+    const executing = create(executionOwner.directory, true);
+    const remoteView = create(searchOwner.directory, false);
+    let offline: ReturnType<typeof create> | undefined;
+    try {
+      // The initiating workspace root is deliberately on the other owner.
+      // Installer placement must follow the manager's execution data root.
+      const root = path.join(searchOwner.directory, "remote-workspace");
+      const installed = await executing.ensure("cpp", root);
+      expect(path.relative(executionOwner.directory, installed.command)).not.toMatch(/^\.\./u);
+      expect(executing.inspect("cpp")).toMatchObject({ status: "installed" });
+      expect(remoteView.inspect("cpp")).toMatchObject({ status: "available" });
+      expect(downloaded).toBe(1);
+      await executing.dispose();
+      offline = create(executionOwner.directory, false);
+      await expect(offline.ensure("cpp", root)).resolves.toEqual(installed);
+      expect(downloaded).toBe(1);
+    } finally {
+      await Promise.all([executing.dispose(), remoteView.dispose(), offline?.dispose()]);
+      await Promise.all([searchOwner.cleanup(), executionOwner.cleanup()]);
+    }
   });
 
   it("cancels the last preparation waiter and removes staging output", async () => {

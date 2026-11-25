@@ -107,6 +107,9 @@ export class AgentSettingsService {
     const snapshot = await this.snapshot(cwd);
     return mergeHarnessSettings((snapshot.global.harness ?? {}) as HarnessSettingsInput, (snapshot.project.harness ?? {}) as HarnessSettingsInput);
   }
+  subscribeEmbedding(changed: () => void) {
+    return this.global.subscribeSelection(document => (document.harness as HarnessSettingsInput | undefined)?.embedding, changed);
+  }
   async update(input: { cwd?: string; registeredProjectId?: string; scope: 'global' | 'project'; expectedRevision: string; set: Record<string, JsonValue>; remove: readonly string[] }) {
     if (!['global', 'project'].includes(input.scope) || !object(input.set) || !Array.isArray(input.remove)
       || input.remove.some(key => typeof key !== 'string') || typeof input.expectedRevision !== 'string') throw new ModelConfigurationError('invalid_settings', 'Invalid settings update');

@@ -1,5 +1,8 @@
 import { PassThrough } from 'node:stream';
 import { EventEmitter } from 'node:events';
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
 import type { ExternalAgentConfiguration, ExternalAgentSettings, ExternalConversationSnapshot, ExternalInteractionResponse } from '@varin/application-client';
 import type { KernelClient } from '../kernel/kernel-client.js';
@@ -7,12 +10,13 @@ import type { HarnessConnection } from './adapter.js';
 import type { ExternalAttachmentOwner } from './attachments.js';
 import { connectCodex } from './codex.js';
 import { ExternalAgentsService } from './service.js';
+import { createPlatformEnvironmentRuntime } from '../platform/environment-runtime.js';
 
 vi.mock('./codex.js', () => ({ connectCodex: vi.fn() }));
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); vi.restoreAllMocks(); vi.clearAllMocks(); });
 
-async function fixture(options: { connect?: boolean; probeUnconfirmed?: boolean } = {}) {
+async function fixture(options: { connect?: boolean; probeUnconfirmed?: boolean; directory?: string; environment?: ReturnType<typeof createPlatformEnvironmentRuntime> } = {}) {
   const config: ExternalAgentConfiguration = { id: 'fixture', name: 'Fixture', harness: 'codex', command: process.execPath, args: [], enabled: true };
   let snapshot = {
     conversation: { id: 'external:test', configurationId: config.id, harness: 'codex', cwd: '/tmp', title: 'Test', revision: 1, createdAt: 1, updatedAt: 1, archived: false, pinned: false, deleted: false, needsReview: true },
@@ -40,6 +44,16 @@ async function fixture(options: { connect?: boolean; probeUnconfirmed?: boolean 
     if (params.command.action === 'bind') snapshot.conversation.sessionId = String(params.command.sessionId);
     if (params.command.action === 'child_list' || params.command.action === 'arrangement_pending') return [];
     if (params.command.action === 'read') return snapshot;
+    if (params.command.action === 'inspect_turn') return snapshot.turns.find(turn => turn.id === params.command.turnId);
+    if (params.command.action === 'queued_conversations') return [];
+    if (params.command.action === 'next_queued_turn') {
+      const turn = snapshot.turns.find(turn => turn.status === 'queued' && !turn.arrangementHoldReason && !turn.blockedReason);
+      return turn && !snapshot.conversation.activeTurn && !snapshot.conversation.needsReview ? { conversation: snapshot.conversation, turn } : null;
+    }
+    if (params.command.action === 'connection_activity') return {
+      hasTurns: snapshot.turns.length > 0,
+      busy: Boolean(snapshot.conversation.activeTurn || snapshot.turns.some(turn => !['completed', 'failed', 'cancelled', 'interrupted'].includes(turn.status))),
+    };
     if (params.command.action === 'cleanup_list') return [];
     if (params.command.action === 'update') return { ...snapshot.conversation, deleted: params.command.deleted === true };
     return {};
@@ -47,15 +61,18 @@ async function fixture(options: { connect?: boolean; probeUnconfirmed?: boolean 
   const children: Array<{ end(): void; terminating: boolean }> = [];
   let probe = async () => 'fixture 1';
   const spawnConnection = vi.fn();
-  const spawn = vi.fn(async (_command: string, args: string[]) => {
-    if (args.includes('--version')) {
+  const spawn = vi.fn(async (_command: string, args: string[], _options: { env?: NodeJS.ProcessEnv }) => {
+    const npmView = args[0] === 'view';
+    if (npmView || args.includes('--version')) {
       const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      stderr.end();
       const query = probe;
       const completion = new Promise<void>((resolve, reject) => { setTimeout(() => {
         if (options.probeUnconfirmed) reject(new Error('Version process still owned'));
-        else void query().then(version => { stdout.end(`${version}\n`); resolve(); }, reject);
+        else void (npmView ? Promise.resolve('"1.2.3"') : query()).then(version => { stdout.end(`${version}\n`); resolve(); }, reject);
       }, 0); });
-      return { stdout, stderr: new PassThrough(), completion, exitCode: 0, exitConfirmed: !options.probeUnconfirmed, release: vi.fn() };
+      return { stdout, stderr, completion, exitCode: 0, exitConfirmed: !options.probeUnconfirmed, release: vi.fn() };
     }
     spawnConnection();
     let end!: () => void;
@@ -84,20 +101,46 @@ async function fixture(options: { connect?: boolean; probeUnconfirmed?: boolean 
     } as HarnessConnection;
   });
   const service = new ExternalAgentsService({ kernel: kernel as unknown as KernelClient, spawn: spawn as never,
-    directory: '/tmp/varin-service-portable', resolveWorkspace: async () => ({ workspaceId: 'workspace', root: '/tmp' }) });
+    directory: options.directory ?? '/tmp/varin-service-portable', ...(options.environment ? { environment: options.environment } : {}),
+    resolveWorkspace: async () => ({ workspaceId: 'workspace', root: '/tmp' }) });
   cleanups.push(async () => {
     const close = service.close();
     for (const child of children) child.end();
     await close;
   });
   if (options.connect !== false) await service.connect('external:test');
-  return { service, settings, config, sweep: () => (service as unknown as { sweepIdle(): Promise<void> }).sweepIdle(), commands, spawn: spawnConnection, children, stop, kernel, fail: (error: Error) => fail(error), change: () => change(),
+  return { service, settings, config, sweep: () => (service as unknown as { sweepIdle(): Promise<void> }).sweepIdle(), commands, spawn: spawnConnection, spawnProgram: spawn, children, stop, kernel, fail: (error: Error) => fail(error), change: () => change(),
     setProbe(value: () => Promise<string>) { probe = value; },
     setSnapshot(value: Partial<ExternalConversationSnapshot>) { snapshot = { ...snapshot, ...value }; },
     get snapshot() { return snapshot; },
     durableEvent() { runtimeEvent?.({ stream: 'durable' }); },
   };
 }
+
+it('uses the service PATH to find npm when a login shell resets PATH', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'varin-agent-path-'));
+  cleanups.push(() => rm(directory, { recursive: true, force: true }));
+  const bin = path.join(directory, 'bin');
+  await mkdir(bin);
+  const npm = path.join(bin, process.platform === 'win32' ? 'npm.CMD' : 'npm');
+  await writeFile(npm, '# fixture', { mode: 0o755 });
+  const shellPath = path.join(directory, 'shell-bin');
+  const prefix = path.join(directory, 'npm-global');
+  const environment = createPlatformEnvironmentRuntime({
+    processLike: { platform: process.platform, env: { PATH: bin, HOME: directory, NPM_CONFIG_PREFIX: prefix } },
+    spawnSyncFn: () => ({ status: 0, stdout: 'PATH=' + shellPath + '\0HOME=/shell-home\0NPM_CONFIG_PREFIX=/shell-prefix\0SHELL_ONLY=present\0' }) as never,
+  });
+  const f = await fixture({ connect: false, directory, environment });
+  await f.service.installations({ action: 'check', id: 'pi' });
+  await vi.waitFor(async () => {
+    const { operations } = await f.service.installations({ action: 'state' });
+    expect(operations[0]).toMatchObject({ status: 'succeeded', version: '1.2.3' });
+  });
+  expect(f.spawnProgram).toHaveBeenCalledWith(npm, ['view', '@earendil-works/pi-coding-agent@latest', 'version', '--json'], expect.objectContaining({
+    env: expect.objectContaining({ HOME: directory, NPM_CONFIG_PREFIX: prefix, SHELL_ONLY: 'present' }),
+  }));
+  expect(f.spawnProgram.mock.calls[0]?.[2].env?.PATH?.split(path.delimiter)).toEqual(expect.arrayContaining([bin, shellPath]));
+});
 
 it('reconnect prepares the original session without silently acknowledging interrupted effects', async () => {
   const f = await fixture();
@@ -543,8 +586,8 @@ it('keeps durable delegated work alive even before its transient Host task has s
   vi.spyOn(Date, 'now').mockImplementation(() => now);
   const f = await fixture();
   const original = f.kernel.agentRuntimeRequest.getMockImplementation()!;
-  f.kernel.agentRuntimeRequest.mockImplementation(async (method, params) => params.command.action === 'child_list'
-    ? [{ conversation_id: 'external:test', report: null }] : original(method, params));
+  f.kernel.agentRuntimeRequest.mockImplementation(async (method, params) => params.command.action === 'connection_activity'
+    ? { hasTurns: false, busy: true } : original(method, params));
   now += 60 * 60_000;
   await f.sweep();
   expect(f.children[0]!.terminating).toBe(false);
@@ -735,7 +778,7 @@ it.each([false,true])('prepares project-only external children on the target own
     const c=params.command;actions.push(c);
     if(c.action==='settings')return {revision:1,defaultAgent:null,agents:[targetBinding.configuration]};
     if(c.action==='child_list')return [structuredClone(child)];
-    if(['cleanup_list','list','arrangement_pending'].includes(String(c.action)))return [];
+    if(['cleanup_list','queued_conversations','list','arrangement_pending'].includes(String(c.action)))return [];
     if(c.action==='read')return {conversation:{id:child.conversation_id,needsReview:false},turns:child.turn_id?[{id:child.turn_id,status:'completed'}]:[],items:[]};
     if(c.action==='child_source'){child={...child,source:c.source};return structuredClone(child);}
     if(c.action==='create')return c;

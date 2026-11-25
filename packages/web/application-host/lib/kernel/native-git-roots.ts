@@ -75,18 +75,34 @@ export async function nativeGitRoots(root: string, documents: Pick<DocumentAutho
     // discover markers here; bodies and stability checks remain Rust's one import.
     // Never follow workspace symlinks or descend into Git administration itself.
     const pending = [root];
-    while (pending.length) {
-        signal?.throwIfAborted();
-        const directory = pending.pop()!;
+    // libuv's default pool has four threads. Bound both open directory handles and
+    // authority probes instead of fanning out over an arbitrarily large workspace.
+    const scan = async (directory: string): Promise<string[]> => {
+        const children: string[] = [];
         const entries = await opendir(directory);
         for await (const entry of entries) {
             signal?.throwIfAborted();
-            // The directory entry already tells us whether a Git marker exists.
-            // Avoid a failing .git stat in every dependency/build directory.
-            if (entry.name === '.git') await repository(directory);
+            if (entry.name === '.git') {
+                try { await repository(directory); }
+                catch (error) {
+                    signal?.throwIfAborted();
+                    throw new Error(`Cannot inspect Git administration for ${directory}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+                }
+            }
             if (entry.isDirectory() && !entry.isSymbolicLink() && !['.git', '.varin'].includes(entry.name))
-                pending.push(path.join(directory, entry.name));
+                children.push(path.join(directory, entry.name));
+        }
+        return children;
+    };
+    while (pending.length) {
+        signal?.throwIfAborted();
+        const directories = pending.splice(Math.max(0, pending.length - 4));
+        const scanned = await Promise.allSettled(directories.map(scan));
+        signal?.throwIfAborted();
+        for (const result of scanned) {
+            if (result.status === 'rejected') throw result.reason;
+            for (const child of result.value) pending.push(child);
         }
     }
-    return [...admitted];
+    return [...admitted].sort();
 }

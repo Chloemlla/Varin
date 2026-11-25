@@ -4,6 +4,11 @@ use super::*;
 use crate::execution::{CompletionKind, ToolExecutionContext};
 use serde::Deserialize;
 
+const PENDING_MANAGED_PROCESSES_QUERY: &str =
+    "SELECT body FROM operations INDEXED BY unsettled_managed_processes";
+
+pub(super) const UNSETTLED_MANAGED_PROCESS: &str = "json_extract(body,'$.managed_process') IS NOT NULL AND json_extract(body,'$.effect')!='none' AND coalesce(json_extract(body,'$.external_receipt.executor_stopped'),0)=0";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NodeBinding {
@@ -167,7 +172,9 @@ impl Catalog {
         Ok(op)
     }
     pub fn pending_managed_processes(&self) -> Result<Vec<String>> {
-        let mut query=self.db.prepare("SELECT body FROM operations WHERE json_extract(body,'$.managed_process') IS NOT NULL AND json_extract(body,'$.effect')!='none' AND coalesce(json_extract(body,'$.external_receipt.executor_stopped'),0)=0 ORDER BY id")?;
+        let mut query = self.db.prepare_cached(&format!(
+            "{PENDING_MANAGED_PROCESSES_QUERY} WHERE {UNSETTLED_MANAGED_PROCESS} ORDER BY id"
+        ))?;
         let rows = query.query_map([], |row| row.get::<_, String>(0))?;
         rows.map(|row| {
             let op: Operation = serde_json::from_str(&row?)?;
@@ -342,5 +349,26 @@ impl Catalog {
         event(&tx, id, op.revision, "process.accepted", Value::Null)?;
         tx.commit()?;
         Ok(op)
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_scan_uses_only_the_unsettled_index() {
+        let root = std::env::temp_dir().join(format!("varin-pending-managed-plan-{}", id()));
+        let db = Catalog::open(&root).unwrap();
+        let detail: String = db.db.query_row(
+            &format!("EXPLAIN QUERY PLAN {PENDING_MANAGED_PROCESSES_QUERY} WHERE {UNSETTLED_MANAGED_PROCESS} ORDER BY id"),
+            [],
+            |row| row.get(3),
+        ).unwrap();
+        assert!(detail.contains("unsettled_managed_processes"), "{detail}");
+        assert!(db.pending_managed_processes().unwrap().is_empty());
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

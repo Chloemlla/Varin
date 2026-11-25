@@ -228,7 +228,7 @@ impl AgentControl {
 }
 
 pub(crate) enum Command {
-    AdvanceRuns,
+    AdvanceRuns { ownership_wake: bool },
     Stop,
     ProcessTerminal(crate::process::ProcessTerminal),
     SourceProcessTerminal(crate::source_resources::SourceProcessTerminal),
@@ -302,29 +302,12 @@ pub(crate) fn spawn(
     responses: crate::transport::Sender,
     finished: impl Fn(&str) + Send + Sync + 'static,
     release_credit: impl Fn(&str, &str) + Send + Sync + 'static,
-) -> JoinHandle<()> {
+) -> std::io::Result<JoinHandle<()>> {
     let finished: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(finished);
     let release_credit: Arc<dyn Fn(&str, &str) + Send + Sync> = Arc::new(release_credit);
-    let (content_tasks, content_jobs) = mpsc::channel::<Box<dyn FnOnce() + Send>>();
-    let content_jobs = Arc::new(Mutex::new(content_jobs));
-    // Content work follows CPU parallelism, not the transport in-flight window.
-    // The receiver lock is released before file I/O or decoding; Catalog reads use their own pool.
-    for _ in 0..thread::available_parallelism().map_or(1, |count|count.get()) {
-        let jobs = content_jobs.clone();
-        thread::spawn(move || loop {
-            let job = {
-                jobs.lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .recv()
-            };
-            let Ok(job) = job else {
-                break;
-            };
-            job();
-        });
-    }
+    let content_tasks = crate::blocking_pool::BlockingPool::new("varin-content")?;
 
-    thread::spawn(move || {
+    thread::Builder::new().name("agent-runtime".into()).spawn(move || {
         let mut identity: Option<(PathBuf, String)> = None;
         let mut runtime: Option<Arc<RunSupervisor>> = None;
         let mut run_models: Option<Arc<crate::run_models::RunModels>> = None;
@@ -343,7 +326,7 @@ pub(crate) fn spawn(
                 if runtime.as_ref().is_some_and(|runtime|runtime.has_active_workers()) {
                     match commands.recv_timeout(std::time::Duration::from_millis(200)) {
                         Ok(command) => command,
-                        Err(mpsc::RecvTimeoutError::Timeout) => Command::AdvanceRuns,
+                        Err(mpsc::RecvTimeoutError::Timeout) => Command::AdvanceRuns { ownership_wake: false },
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 } else {
@@ -352,7 +335,7 @@ pub(crate) fn spawn(
                 }
             };
             match command {
-                Command::AdvanceRuns => {
+                Command::AdvanceRuns { ownership_wake } => {
                     if let Some(runtime) = runtime.as_ref() {
                         if let Err(error) = runtime.advance_pending() {
                             let catalog = runtime.catalog();
@@ -364,7 +347,7 @@ pub(crate) fn spawn(
                         // A durable ready fact can precede the original worker's
                         // final unwind. Publish another read hint after reaping its
                         // ownership fence, even when the durable cursor is unchanged.
-                        if let Some((_, epoch)) = identity.as_ref() {
+                        if let Some((_, epoch)) = identity.as_ref().filter(|_| ownership_wake) {
                             if let Ok(catalog) = runtime.catalog().lock() {
                                 if let Ok(cursor) = catalog.event_cursor() {
                                     let _ = responses.send(json!({"v":PROTOCOL_VERSION,"kind":"runtime-event","kernelEpoch":epoch,"stream":"durable","cursor":cursor}));
@@ -404,7 +387,7 @@ pub(crate) fn spawn(
                     let catalog = runtime.catalog();
                     let responses = responses.clone();
                     let cleanup = resources.clone();
-                    let _=content_tasks.send(Box::new(move||{
+                    content_tasks.submit(move||{
                         let id=receipt.id.clone();let epoch=receipt.kernel_epoch.clone();
                         let package_operation = (receipt.call.name == "extension_package").then(|| receipt.call.operation_id.clone());
                         let schedule_operation = (receipt.call.name == "scheduled_task").then(|| receipt.call.operation_id.clone());
@@ -417,7 +400,7 @@ pub(crate) fn spawn(
                             Err(_)=>return,
                         };
                         let _=responses.send(json!({"v":1,"kind":"host-tool-receipt-ack","id":id,"kernelEpoch":epoch,"accepted":accepted}));
-                    }));
+                    });
                 }
                 Command::SourceProcessTerminal(frame)=>{
                     if opening {waiting.push_back(Command::SourceProcessTerminal(frame));continue;}
@@ -593,7 +576,7 @@ pub(crate) fn spawn(
                         let sender = self_sender.clone();
                         thread::spawn(move || {
                             while wakes.recv().is_ok() {
-                                if sender.send(Command::AdvanceRuns).is_err() {
+                                if sender.send(Command::AdvanceRuns { ownership_wake: true }).is_err() {
                                     break;
                                 }
                             }
@@ -812,12 +795,12 @@ pub(crate) fn spawn(
                             let response_id = id.clone();
                             let response_sender = responses.clone();
                             let done = finished.clone();
-                            content_tasks.send(Box::new(move || {
+                            content_tasks.submit(move || {
                                 let counts: Vec<u64> = p.texts.iter().map(|text| counter.count(text)).collect();
                                 let _ = response_sender.send(response_ok(&response_id,
                                     json!({"counts": counts, "tokenizer": counter.description()})));
                                 done(&response_id);
-                            })).map_err(|_| KernelError::Operation("Tokenizer worker is unavailable".into()))?;
+                            });
                             deferred = true;
                             return Ok(Value::Null);
                         }
@@ -1156,7 +1139,7 @@ pub(crate) fn spawn(
                             let response_sender = responses.clone();
                             let done = finished.clone();
                             let cancelled = cancellation.clone();
-                            content_tasks.send(Box::new(move || {
+                            content_tasks.submit(move || {
                                 let result = (|| -> Result<Value, KernelError> {
                                     if cancelled.load(Ordering::Acquire) { return Err(KernelError::Cancelled); }
                                     let snapshot = read.load().map_err(domain)?;
@@ -1169,7 +1152,7 @@ pub(crate) fn spawn(
                                 };
                                 done(&response_id);
                                 let _ = response_sender.send(response);
-                            })).map_err(|_| KernelError::Storage("content reader unavailable".into()))?;
+                            });
                             deferred = true;
                             return Ok(Value::Null);
                         }

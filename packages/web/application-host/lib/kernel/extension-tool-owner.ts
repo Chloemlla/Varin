@@ -23,7 +23,7 @@ import {
   type PermissionSubject,
   type WorkFocusId,
 } from '@varin/protocol';
-import { compileToolJsonSchema, describeToolSchemaFailure } from '../models/schema.js';
+import { compileToolJsonSchema, deferToolJsonSchema, describeToolSchemaFailure } from '../models/schema.js';
 import type { ThreadToolPreparation, AgentSettingsSnapshot } from '@varin/application-client';
 import type { KernelClient } from './kernel-client.js';
 import type {
@@ -89,6 +89,7 @@ export function extensionToolSchema(
   };
 }
 export interface ExtensionToolLease {
+  declaration?: VarinExtensionServiceProvision;
   binding: ExtensionToolBinding;
   generation: number;
   lease: HostToolLease;
@@ -158,6 +159,22 @@ export interface ExtensionToolOwnerOptions {
   configurationIdentity?: ExtensionToolConfiguration;
   subscribeConfiguration?(listener: () => void): () => void;
 }
+// Only exact, application-owned declarations enter this bounded cache. A plugin or a dynamic
+// configuration must still pass schema compilation before its declaration is published.
+const hostValidators = new Map<string, { version: string; input: ReturnType<typeof deferToolJsonSchema>; output: ReturnType<typeof deferToolJsonSchema> }>();
+function toolValidators(schema: LaunchTool, staticSlot?: string) {
+  if (!staticSlot) {
+    const input = compileToolJsonSchema(schema.schema), output = compileToolJsonSchema(schema.output_schema);
+    return { input: () => input, output: () => output };
+  }
+  const previous = hostValidators.get(staticSlot);
+  if (previous?.version === schema.version) return previous;
+  const compiled = { version: schema.version, input: deferToolJsonSchema(structuredClone(schema.schema)),
+    output: deferToolJsonSchema(structuredClone(schema.output_schema)) };
+  hostValidators.set(staticSlot, compiled);
+  return compiled;
+}
+
 export async function retainExtensionTool(
   options: ExtensionToolOwnerOptions,
   selected: HostServiceBinding,
@@ -202,8 +219,9 @@ export async function retainExtensionTool(
       throw new HostBindingRestoreError('tool', 'binding_changed', required.providerKey);
     const references = createHostModelReferences(kernel);
     const referenceDeclaration = { trustedBuiltin: runtime.supervisor.isRetainedBuiltin?.(provider) === true, extensionId: binding.extensionId, serviceId: binding.serviceId, ...(descriptor.tool?.references ? { references: descriptor.tool.references } : {}) };
-    const validateInput = compileToolJsonSchema(schema.schema),
-      validateOutput = compileToolJsonSchema(schema.output_schema);
+    const directHost = runtime.supervisor.isHostBuiltin?.(provider) === true;
+    const validators = toolValidators(schema, directHost && isDeepStrictEqual(descriptor, originalDescriptor)
+      ? `${binding.extensionId}:${binding.serviceId}@${binding.serviceVersion}` : undefined);
     const approved = new Map<string, { identity: string; policy: string; subjects: PermissionSubject[]; permissionSettingsRevision?: PermissionSettingsRevision; arguments: ReturnType<typeof parseVarinToolJson> }>();
     let released = false;
     const policy = async (run: string) => {
@@ -233,6 +251,7 @@ export async function retainExtensionTool(
       catch {
         throw new HostToolAdmissionError('extension_tool_input_schema_invalid', 'Tool arguments must be a valid JSON value.');
       }
+      const validateInput = validators.input();
       if (!validateInput(args)) {
         throw new HostToolAdmissionError('extension_tool_input_schema_invalid',
           `Invalid arguments for ${schema.name}: ${describeToolSchemaFailure(validateInput, args)}.`);
@@ -303,10 +322,11 @@ export async function retainExtensionTool(
       };
     };
     const lease: HostToolLease = {
+      ...(directHost ? { ownerKind: 'builtin-host' as const } : {}),
       releaseSelection: () => selected.release(),
       extensionBinding: binding,
       slot: `extension:${binding.serviceId}@${binding.serviceVersion}`,
-      implementationIdentity: selected.providerId,
+      implementationIdentity: directHost ? `builtin-host:${selected.providerId}` : selected.providerId,
       binding: {
         reference: binding.providerKey,
         generation: provider.generation,
@@ -438,7 +458,7 @@ export async function retainExtensionTool(
             },
           );
           if (domainReceipt) return completeDomain(domainReceipt);
-          if (!validateOutput(output))
+          if (!validators.output()(output))
             return {
               completion: {
                 kind: 'result',
@@ -484,6 +504,7 @@ export async function retainExtensionTool(
     pin.assertAvailable();
     return {
       binding,
+      declaration: originalDescriptor,
       generation: provider.generation,
       lease,
       revocationSignal: pin.revocationSignal,
@@ -613,6 +634,7 @@ export function createExtensionTools(
     };
     const snapshot = await runtime.state();
     signal.throwIfAborted();
+    const declaredSlots = services(snapshot);
     if (
       !snapshot.catalog.authoritative ||
       (!required.length && !snapshot.routing.authoritative)
@@ -656,7 +678,7 @@ export function createExtensionTools(
           throw new HostBindingRestoreError('tool', 'implementation_unavailable', binding.providerKey, { cause });
         }
       }
-      if (!required.length && !run.fixed) await Promise.all([...services(snapshot).values()].map(async entry => {
+      if (!required.length && !run.fixed) await Promise.all([...declaredSlots.values()].map(async entry => {
         try {
           if (entry.declarations.every(descriptor => !enabled(descriptor))) return;
           // Prepare the first complete directory before the first model request.
@@ -675,7 +697,7 @@ export function createExtensionTools(
     }
     const tokenFor = async (state: VarinExtensionHostStateSnapshot, id: string, version: number): Promise<string> => {
       try {
-        const resolved = await runtime.resolveServiceCompositions({ serviceId: id, version, method: 'execute', args: [], routing: routingScope },
+        const resolved = runtime.resolveServiceCompositionsAtSnapshot(state, { serviceId: id, version, method: 'execute', args: [], routing: routingScope },
           { signal, expectedRoutingRevision: state.routing.document.revision });
         return canonical(resolved.services.map(service => ({ provider: service.providerKey, graph: service.composition.root, descriptor: service.descriptor,
           configuration: preparedOptions.configurationIdentity?.(service.descriptor) ?? null })));
@@ -688,19 +710,16 @@ export function createExtensionTools(
     };
     for (const retained of initial) {
       const slot = extensionToolSlot(retained.binding);
-      if (!required.length)
-        tokens.set(
-          slot,
-          await tokenFor(
-            snapshot!,
-            retained.binding.serviceId,
-            retained.binding.serviceVersion,
-          ),
-        );
+      if (!required.length) {
+        const binding = retained.binding;
+        const descriptor = retained.declaration;
+        if (descriptor) tokens.set(slot, canonical([{ provider: binding.providerKey, graph: binding.composition.root,
+          descriptor, configuration: binding.configurationIdentity }]));
+      }
       states.set(slot, {
         serviceId: retained.binding.serviceId,
         version: retained.binding.serviceVersion,
-        declarations: services(snapshot!).get(slot)?.declarations ?? [],
+        declarations: declaredSlots.get(slot)?.declarations ?? [],
         status: 'ready',
         prepared: retained.binding,
       });

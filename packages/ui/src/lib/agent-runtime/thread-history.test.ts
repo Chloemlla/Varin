@@ -1,6 +1,6 @@
 import { expect, it, vi } from 'vitest';
 import type { ThreadHistoryItem, ThreadHistoryPage, ThreadHistoryRuns, ThreadRunUsage, ThreadSnapshot, ThreadsAPI } from '@varin/application-client';
-import { ThreadHistoryWindow } from './thread-history';
+import { threadHistoryWindow, ThreadHistoryWindow } from './thread-history';
 
 const identity = { runtime: 'agent' as const, threadId: 'thread', branchId: 'branch' };
 const items: ThreadHistoryItem[] = Array.from({ length: 10 }, (_, n) => ({ id: `${n}`, parent: n ? `${n - 1}` : null, run_id: 'run', thread_id: 'thread', source: 'assistant', content: {}, provider: null }));
@@ -107,4 +107,19 @@ it.each(['inference.settled', 'model.settled', 'model.interrupted'])('does not r
   expect(api.historyUsage).toHaveBeenCalledTimes(1);
   emit({ cursor: 107, thread_id: identity.threadId, branch_id: identity.branchId, subject: 'inference', revision: 2, kind, data: kind.startsWith('inference.') ? { runId: 'run' } : { state: 'completed' } }); await tick();
   expect(api.historyUsage).toHaveBeenCalledTimes(2); stop();
+});
+
+it('drops closed shared windows with their bodies and receipts, not a second active reader', async () => {
+  const api = { ...navigationAPI, historyPage: vi.fn(), historyUsage: vi.fn(async () => []) } as unknown as ThreadsAPI;
+  const window = threadHistoryWindow(api, 'host', identity);
+  const leave = window.subscribe(() => {}), other = window.subscribe(() => {});
+  window.accept(snapshot(0, 9)); leave(); await tick();
+  expect(threadHistoryWindow(api, 'host', identity)).toBe(window);
+  expect(window.getSnapshot().items).toHaveLength(10);
+  other(); await tick();
+  expect(window.getSnapshot()).toMatchObject({ items: [], usage: [], runs: [], ready: false });
+  const reopened = threadHistoryWindow(api, 'host', identity);
+  expect(reopened).not.toBe(window);
+  const close = reopened.subscribe(() => {}); reopened.accept(snapshot(0, 3));
+  expect(reopened.getSnapshot().head).toBe('3'); close();
 });

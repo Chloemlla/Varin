@@ -312,7 +312,7 @@ import { registerWebSearchCredentialRoutes } from './lib/harness/web-search-rout
 import { createSearchConnectionSettings } from './lib/harness/search-connection-settings.js';
 
 import { createEgressRuntime } from './lib/harness/egress.js';
-import { readEgressHostConfiguration } from './lib/harness/egress-settings.js';
+import { bindEgressHostConfiguration, projectEgressSettings } from './lib/harness/egress-settings.js';
 import { registerEgressRoutes } from './lib/harness/egress-routes.js';
 import { createServiceCredentialStore } from './lib/service-credentials/store.js';
 
@@ -1288,6 +1288,7 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
     return externalAgentIdentity(cwd);
   } });
   const externalAgents = new ExternalAgentsService({ managed: () => ({coordinatorHostId:agentRuntime.coordinatorHostId,source:(owner,signal)=>agentRuntime.managedSource(owner,signal)}), kernel: kernelClient, spawn: externalAgentProcesses.spawn, spawnAdmitted: externalAgentProcesses.spawnAdmitted, directory: externalAgentDirectory,
+    environment: platformEnvironmentRuntime,
     fetch: (input, init) => egressRuntime.fetch(input, init), removeProgram: externalAgentProcesses.removeProgram, fileContext: externalAgentProcesses.fileContext,
     onError: operationId => console.error('[ExternalAgents] Execution or resource cleanup needs reconciliation:', operationId),
     resolveWorkspace: async cwd => {
@@ -1509,11 +1510,9 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
   // and Docker services. Proxy/NO_PROXY routing is shared across deployments.
   const egressRuntime = createEgressRuntime({
     ...(options.desktopNetworkFetch ? { systemFetch: options.desktopNetworkFetch } : {}),
-    getHostConfiguration: async () => {
-      const document = await readSettingsFromDisk();
-      const network = document.outboundNetwork as { mode?: unknown } | undefined;
-      return readEgressHostConfiguration(document, network?.mode === 'proxy' ? serviceCredentials.read() : {});
-    },
+    getHostConfiguration: bindEgressHostConfiguration(
+      settingsRuntime.createSettingsProjection(projectEgressSettings), serviceCredentials.read,
+    ),
   });
   registerEgressRoutes(app, {
     requireAuth: uiAuthController.requireAuth,
@@ -3161,6 +3160,7 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
   let localKnowledgeEmbedder: ReturnType<typeof createLocalSemanticEmbedder> | undefined;
   const localKnowledgeComponent = createLocalSemanticComponentManager({
     dataDir: VARIN_DATA_DIR, version: VARIN_VERSION,
+    fetch: (input, init) => egressRuntime.fetch(input, init),
     onEnabled: async () => {
       const previous = localKnowledgeEmbedder;
       localKnowledgeEmbedder = undefined;
@@ -3178,7 +3178,7 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
       await localKnowledgeEmbedder?.retire?.();
     },
   });
-  const unsubscribeKnowledgeEmbedding = settingsRuntime.subscribe(() => knowledgeVectors?.refreshAll());
+  const unsubscribeKnowledgeEmbedding = modelsService.settings.subscribeEmbedding(() => knowledgeVectors?.refreshAll());
   registerEmbeddingRequestRoutes(app, embeddingRequestSettings, uiAuthController.requireAuth);
   const storageService = createStorageService({
     hostId, name: os.hostname(), dataDirectory: VARIN_DATA_DIR,
@@ -3542,6 +3542,7 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
     attachSignals,
     apiOnly,
     dictationModelsDir: path.join(VARIN_USER_CONFIG_ROOT, 'speech-models'),
+    fetchModel: (input, init) => egressRuntime.fetch(input, init),
     documents: documentsAuthority,
   });
   terminalRuntime = startupResult.terminalRuntime;

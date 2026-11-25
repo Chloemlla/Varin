@@ -44,3 +44,8 @@ a concurrent fallback. Process disconnect, mutation outcome and confirmed close 
 memory and Bot knowledge vectors. The selected model remains in the existing Harness settings.
 Unconfigured recall stays text-only. Scheduler changes take effect at the next Host startup.
 The settings page does not scan source directories or manage retired code indexes.
+
+Archive streaming is shared with the local speech-model downloader. Official downloads use
+the executing Host's egress policy. Both keep downloads
+in fresh staging paths; each owner still validates and publishes its own files independently.
+Cancellation and a failed download do not replace the active semantic component.

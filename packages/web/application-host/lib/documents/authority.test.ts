@@ -14,6 +14,7 @@ import {
   type DocumentAuthorityHarness,
 } from './contract-fixtures.js';
 import type { WorkspaceWatchFs } from './watch.js';
+import type { DurableFileOperationContext } from '../recovery/durable-file-operation.js';
 import { DocumentPathError, DocumentUntrustedError } from './errors.js';
 
 const consumerFor = (threadId: string): AgentInputSnapshotConsumer => ({ kind: 'thread', threadId, branchId: 'main' });
@@ -217,6 +218,80 @@ describe('document authority contract', () => {
     const final = requireStatus(await harness.authority.read(resource), 'ready');
     expect(final.status).toBe('ready');
     expect(['first-write', 'second-write']).toContain(final.content);
+  });
+
+  it('reuses one Host source read when a durable save still has a Storage guard', async () => {
+    await harness.cleanup();
+    let reads = 0;
+    const fsPromises = new Proxy(fs.promises, {
+      get(target, property, receiver) {
+        if (property === 'readFile') return (...args: Parameters<typeof fs.promises.readFile>) => {
+          if (String(args[0]).endsWith(`${path.sep}counted.txt`)) reads += 1;
+          return Reflect.apply(target.readFile, target, args) as ReturnType<typeof fs.promises.readFile>;
+        };
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    harness = await createDocumentAuthorityHarness({ authority: { fsPromises } });
+    const resource = harness.resource('counted.txt');
+    const filename = path.join(harness.workspaceRoot, resource.resourceId);
+    const original = Buffer.from('the same baseline');
+    await fs.promises.writeFile(filename, original);
+    const before = requireStatus(await harness.authority.read(resource), 'ready');
+    reads = 0;
+    const nativeState = { kind: 'regular-file', objectHash: `sha256-${createHash('sha256').update(original).digest('hex')}`, byteLength: original.length };
+    const captureState = vi.fn(async () => ({ state: nativeState }));
+    const writeBytes = vi.fn(async (_identity: unknown, _file: string, bytes: Uint8Array) => {
+      await fs.promises.writeFile(filename, bytes);
+      return { status: 'applied', state: nativeState };
+    });
+    const context = { root: harness.workspaceRoot, identity: harness.identity,
+      resourceOperationGate: { run: (_paths: unknown, operation: () => Promise<unknown>) => operation() },
+      fileStore: { captureState }, fileResources: { writeBytes },
+    } as unknown as DurableFileOperationContext;
+    harness.authority.bindDurableMutationStorage(async (_workspace, operation) => operation(context));
+    const result = await harness.authority.write({
+      token: harness.token(), resource, content: 'new version', encoding: 'utf-8',
+      bom: false, expectedRevision: before.revision,
+    });
+    expect(result.status).toBe('written');
+    expect(reads).toBe(1);
+    expect(captureState).toHaveBeenCalledOnce();
+    expect(writeBytes).toHaveBeenCalledExactlyOnceWith(context.identity, 'counted.txt', Buffer.from('new version'), { expected: nativeState });
+    expect(await fs.promises.readFile(filename, 'utf8')).toBe('new version');
+  });
+
+  it('does not overwrite an external replacement on the non-CAS fallback', async () => {
+    await harness.cleanup();
+    let reads = 0;
+    let armed = false;
+    const fsPromises = new Proxy(fs.promises, {
+      get(target, property, receiver) {
+        if (property === 'readFile') return async (...args: Parameters<typeof fs.promises.readFile>) => {
+          if (armed && String(args[0]).endsWith(`${path.sep}external.txt`) && ++reads === 2) {
+            const destination = String(args[0]);
+            const replacement = `${destination}.external`;
+            await target.writeFile(replacement, 'editor outside Varin');
+            await target.rename(replacement, destination);
+          }
+          return Reflect.apply(target.readFile, target, args) as ReturnType<typeof fs.promises.readFile>;
+        };
+        const member = Reflect.get(target, property, receiver) as unknown;
+        return typeof member === 'function' ? member.bind(target) : member;
+      },
+    });
+    harness = await createDocumentAuthorityHarness({ authority: { fsPromises } });
+    const resource = harness.resource('external.txt');
+    const filename = path.join(harness.workspaceRoot, resource.resourceId);
+    await fs.promises.writeFile(filename, 'baseline');
+    const before = requireStatus(await harness.authority.read(resource), 'ready');
+    armed = true;
+    const result = await harness.authority.write({
+      token: harness.token(), resource, content: 'my save', encoding: 'utf-8',
+      bom: false, expectedRevision: before.revision, operationId: randomUUID(),
+    });
+    expect(result.status).toBe('conflict');
+    expect(await fs.promises.readFile(filename, 'utf8')).toBe('editor outside Varin');
   });
 
   it('preserves the previous document when atomic replacement fails', async () => {

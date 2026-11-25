@@ -333,6 +333,7 @@ export const createSettingsRuntime = (deps: SettingsRuntimeDependencies) => {
   };
 
   return {
+    createSettingsProjection: settingsStore.createProjection,
     readSettingsFromDisk,
     updateSettingsOnDisk,
     persistSettings,

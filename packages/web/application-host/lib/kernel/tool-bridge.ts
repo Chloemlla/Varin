@@ -48,6 +48,8 @@ export interface RecoveredToolReceipt {
 export interface HostToolLease {
   readonly binding: HostToolBinding;
   readonly implementationIdentity: string;
+  /** Recorded on new operation owners only. Frozen declaration identity is independent. */
+  readonly ownerKind?: 'builtin-host';
   /** Different services occupy independent selected slots in one composition owner. */
   readonly slot?: string;
   readonly extensionBinding?: ExtensionToolBinding;
@@ -279,7 +281,7 @@ export class ToolBridge {
         e.epoch === epoch &&
         isDeepStrictEqual(e.binding, binding),
     );
-    const key = retained?.[0] ?? randomUUID();
+    const key = retained?.[0] ?? (lease.ownerKind === 'builtin-host' ? `builtin-host:${randomUUID()}` : randomUUID());
     if (retained) {
       if (!selected) retained[1].retained = true;
       if (retained[1].lease !== lease) lease.release();

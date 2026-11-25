@@ -20,6 +20,7 @@
  *     { type: 'pong' }
  */
 
+import type { ComponentFetch } from '../components/file-transfer.js';
 import { WebSocketServer } from 'ws';
 
 import { DictationStreamManager } from './stream-manager.js';
@@ -84,17 +85,19 @@ export function createDictationRuntime({
   isRequestOriginAllowed,
   rejectWebSocketUpgrade,
   modelsDir,
+  fetchModel,
 }: {
   isDraining?: () => boolean;
   app: Express;
   express: { json(options?: { limit?: string }): import('express').RequestHandler };
   isRequestOriginAllowed: (request: IncomingMessage) => boolean | Promise<boolean>;
   modelsDir: string;
+  fetchModel?: ComponentFetch;
   rejectWebSocketUpgrade: (socket: Duplex, statusCode: number, message: string) => void;
   server: Server;
   uiAuthController?: DictationUiAuthController;
 }) {
-  const service = createDictationService({ modelsDir });
+  const service = createDictationService({ modelsDir, ...(fetchModel ? { fetchModel } : {}) });
 
   // Local text-to-speech (Kokoro in the dictation worker). Returns WAV bytes;
   // 503 with a reason code while the model is still downloading.

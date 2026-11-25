@@ -101,6 +101,7 @@ export const createStartupPipelineRuntime = (dependencies: {
       isRequestOriginAllowed,
       rejectWebSocketUpgrade,
       modelsDir: dictationModelsDir,
+      ...(options.fetchModel ? { fetchModel: options.fetchModel } : {}),
     });
 
     if (apiOnly) {

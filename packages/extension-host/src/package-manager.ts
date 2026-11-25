@@ -52,6 +52,22 @@ export class ExtensionPackageManager {
   readonly catalog: ApplicationExtensionCatalog;
   readonly varinVersion: string;
   readonly #verifiedBuiltinArtifacts = new Set<string>();
+  // Populated only after matching or materializing our own distribution, never by installation.
+  readonly #distributionArtifacts = new Map<string, string>();
+
+  async isDistributionArtifact(extensionId: string, integrity: string): Promise<boolean> {
+    if (this.#distributionArtifacts.get(extensionId) === integrity) return true;
+    // Frozen child selections bypass reconciliation. Verify their original immutable index
+    // against this distribution without installing or changing the selected package.
+    const fingerprintFile = VARIN_BUILTIN_ARTIFACT_FINGERPRINT_FILE;
+    const distributionFingerprint = await this.artifacts.builtinDistributionFingerprint(extensionId, fingerprintFile);
+    if (!distributionFingerprint) return false;
+    const record = await this.#artifact(extensionId, "selected", integrity);
+    if (!await this.artifacts.builtinArtifactMatchesDistribution({ manifest: record.manifest,
+      artifactRoot: record.resolvedPath, artifactIntegrity: integrity, fingerprintFile, distributionFingerprint })) return false;
+    this.#distributionArtifacts.set(extensionId, integrity);
+    return true;
+  }
 
   constructor(options: ExtensionPackageManagerOptions) {
     this.catalog = options.catalog;
@@ -152,6 +168,7 @@ export class ExtensionPackageManager {
           }))
       ) {
         this.#verifiedBuiltinArtifacts.add(verificationKey!);
+        this.#distributionArtifacts.set(definition.manifest.id, existing.integrity);
         continue;
       }
       const prepared = await this.artifacts.prepare({
@@ -160,6 +177,7 @@ export class ExtensionPackageManager {
         specifier: definition.manifest.id,
       });
       current = await this.catalog.selectBuiltinArtifact(prepared);
+      this.#distributionArtifacts.set(definition.manifest.id, prepared.integrity);
       if (distributionFingerprint) {
         this.#verifiedBuiltinArtifacts.add(
           `${definition.manifest.id}\0${prepared.integrity}\0${distributionFingerprint}`,

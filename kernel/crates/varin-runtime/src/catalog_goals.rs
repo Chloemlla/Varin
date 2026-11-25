@@ -368,13 +368,14 @@ fn projection_block(db: &Connection, d: &Definition) -> Result<Option<GoalBlockR
 }
 impl Catalog {
     pub fn capture_goal(&self, id: &str) -> Result<GoalRead> {
+        let publication = self.content.begin_read();
         let definition: Definition = record(&self.db, "goals", id)?;
         Ok(GoalRead {
             blocked: projection_block(&self.db, &definition)?,
             definition,
             usage: record(&self.db, "goal_usage", id)?,
             content: self.content.clone(),
-            _publication: self.content.begin_publication(),
+            _publication: publication,
         })
     }
     pub fn capture_goals(&self, thread: &str) -> Result<Vec<GoalRead>> {

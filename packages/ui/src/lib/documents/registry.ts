@@ -382,6 +382,7 @@ export class DocumentRegistry {
   private readonly textHistory = new Map<string, { state: number; buffer: string; undo: TextHistoryEntry[]; redo: TextHistoryEntry[] }>();
   private readonly pendingSaves = new Map<string, { request: VarinDocumentWriteRequest; record: DocumentRecord }>();
   private readonly savingEdits = new Map<string, { base: string; buffer: string; edits: VarinTextEdit[]; states: Map<number, VarinTextEdit[]> }>();
+  private readonly closedDocuments = new Set<string>();
   private readonly records = new Map<string, DocumentRecord>();
   private readonly openOperations = new Map<string, { promise: Promise<DocumentRecord>; read: OpenRead }>();
   private readonly listeners = new Map<string, Set<DocumentListener>>();
@@ -517,7 +518,10 @@ export class DocumentRegistry {
     this.listeners.set(key, set);
     return () => {
       // The subscription follows its document through a rename.
-      for (const [currentKey, current] of this.listeners) if (current.delete(subscription) && current.size === 0) this.listeners.delete(currentKey);
+      for (const [currentKey, current] of this.listeners) if (current.delete(subscription) && current.size === 0) {
+        this.listeners.delete(currentKey);
+        this.maybeReleaseClosed(this.coordinationByAlias.get(currentKey) ?? currentKey);
+      }
     };
   }
 
@@ -550,6 +554,33 @@ export class DocumentRegistry {
   dirtyResourceIds(workspaceId: string): ReadonlySet<string> {
     return this.dirtyIdsByWorkspace.get(workspaceId) ?? EMPTY_RESOURCE_IDS;
   }
+  /** A tab close, not a virtual row unmount, authorizes disposal. Hidden tabs,
+   * active views, save/recovery work and multi-file undo still own their data. */
+  releaseClosedDocument(identity: DocumentIdentity) {
+    const key = this.keyFor(identity);
+    if (!this.records.has(key) && !this.openOperations.has(key)) return;
+    this.closedDocuments.add(key);
+    this.maybeReleaseClosed(key);
+  }
+
+  private maybeReleaseClosed(key: string) {
+    if (!this.closedDocuments.has(key)) return;
+    const record = this.records.get(key);
+    if (!record || record.dirty || record.saving || record.conflict || record.recoveryJournalId
+      || this.openOperations.has(key) || this.pendingSaves.has(record.documentInstanceId)
+      || this.savingEdits.has(record.documentInstanceId) || this.journalOperations.has(key)
+      || this.journalTimers.has(key) || this.isDirtyBarrierHeld(record.identity)
+      || this.aliasesFor(record.identity).some(alias => this.listeners.get(`${alias.workspaceId}\0${alias.resourceId}`)?.size)) return;
+    const owns = (id: DocumentIdentity) => this.keyFor(id) === key;
+    if ([...this.preparedWorkspaceEdits.values()].some(group => group.documents.some(doc => owns(doc.before.identity)))
+      || [...this.workspaceEditUndoGroups.values()].some(group => group.documents.some(doc => owns(doc.identity)))
+      || [...this.hostWorkspaceEdits.values()].some(group => group.preview.files.some(file => owns(file.identity) || file.from && owns(file.from)))) return;
+    this.closedDocuments.delete(key);
+    this.textHistory.delete(record.documentInstanceId);
+    this.formatUndo.delete(record.documentInstanceId);
+    this.removeRecord(record);
+  }
+
   releaseClosedWorkspace(workspaceId:string):void {
     if(this.dirtyResourceIds(workspaceId).size)return;
     this.watches.get(workspaceId)?.close();this.watches.delete(workspaceId);
@@ -712,6 +743,7 @@ export class DocumentRegistry {
   open(identity: DocumentIdentity, options?: { reload?: boolean; revalidate?: boolean }): Promise<DocumentRecord> {
     return this.resolveIdentity(identity).then((resolved) => {
       const key = this.keyFor(resolved);
+      if (!options?.reload) this.closedDocuments.delete(key);
       if (!options?.reload) {
         const pending = this.openOperations.get(key);
         // A view may join a disk read or upgrade an undecided model acquisition.
@@ -726,7 +758,7 @@ export class DocumentRegistry {
       const operation = this.performOpen(resolved, read, options?.reload === true, currentRead);
       this.openOperations.set(key, { promise: operation, read });
       void operation.finally(() => {
-        if (currentRead()) this.openOperations.delete(key);
+        if (currentRead()) { this.openOperations.delete(key); this.maybeReleaseClosed(key); }
       }).catch(() => undefined);
       return operation;
     });
@@ -1916,6 +1948,7 @@ export class DocumentRegistry {
     this.aliasesByCoordination.clear();
     this.availableAliases.clear();
     this.openOperations.clear();
+    this.closedDocuments.clear();
     this.dirtyIdsByWorkspace.clear();
     this.workspaceVersions.clear();
     this.hostWorkspaceEdits.clear();
@@ -2522,7 +2555,7 @@ export class DocumentRegistry {
     }).then(operation);
     this.journalOperations.set(key, current);
     void current.finally(() => {
-      if (this.journalOperations.get(key) === current) this.journalOperations.delete(key);
+      if (this.journalOperations.get(key) === current) { this.journalOperations.delete(key); this.maybeReleaseClosed(key); }
     }).catch(() => undefined);
     return current;
   }

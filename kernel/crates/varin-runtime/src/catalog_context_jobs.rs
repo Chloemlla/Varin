@@ -635,6 +635,7 @@ impl Catalog {
     }
 
     pub fn capture_context_job(&self, run_id: &str) -> Result<ContextJobRead> {
+        let publication = self.content.begin_read();
         let metadata = self
             .context_job_metadata(run_id)?
             .ok_or_else(|| RuntimeError::Invalid("Run is not a context job".into()))?;
@@ -655,7 +656,7 @@ impl Catalog {
             metadata,
             receipt,
             content: self.content.clone(),
-            _publication: self.content.begin_publication(),
+            _publication: publication,
         })
     }
     fn context_job_publication(&self, key: &str) -> Result<Option<u64>> {

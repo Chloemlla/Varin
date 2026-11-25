@@ -4,6 +4,10 @@
 
 `runtime.ts` owns terminal identity, status projections, ordered display, bounded scrollback, WebSocket attachments and lifecycle routes. Rust owns actual PTY/process trees, raw byte offsets, input receipts and writer lifetime; `KernelProcessService.ptyProvider` is the production backend. Programmatic `createTerminalSession` / `attachTerminalSession` / `inspectSession` are the same authority used by HTTP and WebSocket. Harness background shells create sessions with `owner: 'harness'` and `retainWhenDetached: true`; the runtime allocates their process-wide `sh_N` ids. HTTP create ignores client `owner` / `spawn` / retain flags and cannot reuse a programmatic Harness identity. Closing a retained session detaches viewers and leaves the process running. `shells.ts` discovers executable shell families and resolves the persisted shell ID without accepting command strings or arguments. Clients own tab arrangement and choose stable terminal IDs. Electron uses this same runtime in-process.
 
+The Rust spool pager passes byte slices to its native text projection before serializing the wire
+reply. A projected character retains the exact raw cursor and source ranges even across frames or
+channels; raw output and the existing data protocol remain unchanged.
+
 ## Protocol
 
 `/api/terminal/ws` is the only terminal data transport. It uses v3 binary JSON control frames and is opened through `openRuntimeWebSocket`, preserving direct, Electron proxy, URL-token authentication, and private-relay routing.

@@ -385,7 +385,17 @@ it("audit: a pending materialization retains its source root across branch delet
 
 it("audit: real Documents write, stale save, move and delete use the kernel Recovery gate", async () => {
   const f = await fixture();
-  const h = await createDocumentAuthorityHarness({ hostId: "audit" });
+  let sourceReads = 0;
+  const countedFs = new Proxy(fs, {
+    get(target, prop, receiver) {
+      if (prop === "readFile") return (...args: Parameters<typeof fs.readFile>) => {
+        if (String(args[0]).endsWith(`${path.sep}saved.txt`)) sourceReads += 1;
+        return Reflect.apply(target.readFile, target, args) as ReturnType<typeof fs.readFile>;
+      };
+      return Reflect.get(target, prop, receiver);
+    },
+  });
+  const h = await createDocumentAuthorityHarness({ hostId: "audit", authority: { fsPromises: countedFs } });
   const adapter = new KernelStorageAdapter({ client: f.host, hostId: "audit", storageRoot: f.storageRoot,
     resolveWorkspaceRoot: async (workspaceId) => (await h.authority.inspectWorkspace(workspaceId)).root,
   });
@@ -403,12 +413,17 @@ it("audit: real Documents write, stale save, move and delete use the kernel Reco
     const written = await h.authority.write({ resource: h.resource("saved.txt"), token: h.token(), content: "saved", encoding: "utf-8", bom: false, expectedRevision: null, operationId: "editor-save" });
     assert.equal(written.status, "written");
     if (written.status !== "written") throw new Error("expected a real disk write");
+    sourceReads = 0;
+    const updated = await h.authority.write({ resource: h.resource("saved.txt"), token: h.token(), content: "edited", encoding: "utf-8", bom: false, expectedRevision: written.revision, operationId: "editor-update" });
+    if (updated.status !== "written") throw new Error("expected a real disk update");
+    assert.equal(sourceReads, 1, "Host inspects and serializes the same baseline read");
+    assert.equal(await fs.readFile(path.join(h.workspaceRoot, "saved.txt"), "utf8"), "edited");
     const stale = await h.authority.write({ resource: h.resource("saved.txt"), token: h.token(), content: "stale", encoding: "utf-8", bom: false, expectedRevision: null });
     assert.equal(stale.status, "conflict");
-    const moved = await h.authority.move({ from: h.resource("saved.txt"), to: h.resource("nested/moved.txt"), token: h.token(), expectedRevision: written.revision, operationId: "editor-move" });
+    const moved = await h.authority.move({ from: h.resource("saved.txt"), to: h.resource("nested/moved.txt"), token: h.token(), expectedRevision: updated.revision, operationId: "editor-move" });
     assert.equal(moved.status, "moved");
     if (moved.status !== "moved") throw new Error("expected a real disk rename");
-    assert.equal(await fs.readFile(path.join(h.workspaceRoot, "nested/moved.txt"), "utf8"), "saved");
+    assert.equal(await fs.readFile(path.join(h.workspaceRoot, "nested/moved.txt"), "utf8"), "edited");
     const removed = await h.authority.delete({ resource: h.resource("nested/moved.txt"), token: h.token(), expectedRevision: moved.revision, operationId: "editor-delete" });
     assert.equal(removed.status, "deleted");
     await assert.rejects(fs.stat(path.join(h.workspaceRoot, "nested/moved.txt")), { code: "ENOENT" });

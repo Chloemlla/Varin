@@ -2407,6 +2407,9 @@ const createBrowserWindow = ({
   };
 
   const browserWindow = new BrowserWindow(options);
+  // The companion paints its first frame before being shown. After that handshake
+  // Chromium can suspend hidden animation frames and publish real visibility changes.
+  if (companion) browserWindow.once('show', () => browserWindow.webContents.setBackgroundThrottling(true));
   let auxiliaryClosing = false;
   browserWindow.__varinLabel = label || nextWindowLabel();
   // Lifecycle diagnostics only: never include document URLs or renderer content.

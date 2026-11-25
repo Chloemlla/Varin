@@ -292,10 +292,31 @@ struct Shared {
     response_lanes: Mutex<HashMap<String, Lane>>,
     epoch: String,
     chunk_bytes: usize,
-    body_jobs: mpsc::Sender<BodyJob>,
+    body_jobs: BodyQueue,
     arrivals: Mutex<Arrivals>,
 }
+enum BodyQueue {
+    Workers(crate::blocking_pool::BlockingPool),
+    #[cfg(test)]
+    Capture(mpsc::Sender<BodyJob>),
+}
+
 impl Shared {
+    fn submit_body(self: &Arc<Self>, job: BodyJob) -> io::Result<()> {
+        match &self.body_jobs {
+            BodyQueue::Workers(pool) => {
+                let shared = self.clone();
+                pool.submit(move || {
+                    if let Err(error) = run_body_job(job, &shared) {
+                        shared.fail(Some(("body-codec", error)));
+                    }
+                });
+                Ok(())
+            }
+            #[cfg(test)]
+            BodyQueue::Capture(sender) => sender.send(job).map_err(|_| io::ErrorKind::BrokenPipe.into()),
+        }
+    }
     fn fail(&self, failure: Option<(&'static str, io::Error)>) {
         {
             let _scheduler = self.scheduled.lock().unwrap();
@@ -411,7 +432,7 @@ impl Shared {
         }
         Ok(())
     }
-    fn start_streams(&self) -> io::Result<()> {
+    fn start_streams(self: &Arc<Self>) -> io::Result<()> {
         let mut scheduler = self.scheduled.lock().unwrap();
         let mut used = [0; 2];
         for stream in scheduler.streams.values().filter(|stream| stream.started) {
@@ -429,9 +450,7 @@ impl Shared {
             used[stream.group] += 1;
             if let Some(value) = stream.value.take() {
                 stream.encoding = true;
-                self.body_jobs
-                    .send(BodyJob::Encode(id, value))
-                    .map_err(|_| io::ErrorKind::BrokenPipe)?;
+                self.submit_body(BodyJob::Encode(id, value))?;
             }
         }
         Ok(())
@@ -688,7 +707,6 @@ impl Transport {
         let data_read = data.try_clone()?;
         let (control_tx, control_rx) = mpsc::channel::<Control>();
         let (input_tx, input_rx) = mpsc::channel();
-        let (body_tx, body_rx) = mpsc::channel::<BodyJob>();
         let shared = Arc::new(Shared {
             stopped: AtomicBool::new(false),
             control: control_tx,
@@ -706,7 +724,7 @@ impl Transport {
             response_lanes: Mutex::new(HashMap::new()),
             epoch: epoch.clone(),
             chunk_bytes: bootstrap.chunk_bytes,
-            body_jobs: body_tx,
+            body_jobs: BodyQueue::Workers(crate::blocking_pool::BlockingPool::new("varin-codec")?),
             arrivals: Mutex::new(Arrivals::default()),
         });
         let writer = shared.clone();
@@ -724,21 +742,6 @@ impl Transport {
                 }
             }
         });
-        let body_rx = Arc::new(Mutex::new(body_rx));
-        for _ in 0..thread::available_parallelism().map_or(1, |count| count.get()) {
-            let worker = shared.clone();
-            let jobs = body_rx.clone();
-            thread::spawn(move || loop {
-                let job = jobs.lock().unwrap().recv();
-                let Ok(job) = job else {
-                    break;
-                };
-                if let Err(error) = run_body_job(job, &worker) {
-                    worker.fail(Some(("body-codec", error)));
-                    break;
-                }
-            });
-        }
         let data_writer = shared.clone();
         thread::spawn(move || {
             if let Err(error) = write_data(data, &data_writer) {
@@ -984,10 +987,7 @@ fn read_control(mut input: impl io::Read, shared: &Arc<Shared>) -> io::Result<()
                 {
                     return Err(protocol_error("incomplete content stream"));
                 }
-                shared
-                    .body_jobs
-                    .send(BodyJob::Decode(id, received))
-                    .map_err(|_| io::ErrorKind::BrokenPipe)?;
+                shared.submit_body(BodyJob::Decode(id, received))?;
             }
             "transport-stream-abort" => {
                 let stream = shared

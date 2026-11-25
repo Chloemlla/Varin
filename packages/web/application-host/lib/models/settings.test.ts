@@ -11,6 +11,26 @@ async function fixture() {
   const root = await mkdtemp(join(tmpdir(), 'varin-agent-settings-')); roots.push(root);
   return { root, settings: new AgentSettingsService(root, () => false) };
 }
+it('invalidates knowledge vectors only when the global embedding selection changes', async () => {
+  const { settings } = await fixture();
+  const initial = await settings.read();
+  const changed = vi.fn();
+  const unsubscribe = settings.subscribeEmbedding(changed);
+  try {
+    const local = await settings.updateHarness(initial.revision, harness => ({
+      ...harness, embedding: { protocol: 'local', providerId: 'local', modelId: 'installed' },
+    }));
+    expect(changed).toHaveBeenCalledTimes(1);
+    const unrelated = await settings.update({
+      scope: 'global', expectedRevision: local.revision, set: { titleUpdateInterval: 5 }, remove: [],
+    });
+    expect(changed).toHaveBeenCalledTimes(1);
+    await settings.update({ scope: 'global', expectedRevision: unrelated.globalRevision, set: {}, remove: ['harness'] });
+    expect(changed).toHaveBeenCalledTimes(2);
+  } finally {
+    unsubscribe();
+  }
+});
 it('saves Smart, keeps a legacy Accept edits mode across unrelated writes and supports reset', async () => {
   const { root, settings } = await fixture();
   const initial = await settings.read();

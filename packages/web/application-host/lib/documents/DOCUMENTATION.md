@@ -34,7 +34,10 @@ owners use their existing Documents route. Editors search this catalog rather th
 own list. Host format checks validate shape, while Rust resolves aliases and validates actual codecs.
 The explicit `gb2312-strict` profile is separate from the web-compatible `gb2312` → GBK alias.
 
-Reads carry the actual format separately from raw revision. Writes retain the original interpretation,
+Reads carry the actual format separately from raw revision. A save reuses the Host's inspected bytes
+for serialization rather than reading their baseline again. Native Storage still enforces its final
+compare-and-swap; embedders without native Storage recheck the physical file before replacing it.
+Writes retain the original interpretation,
 BOM and line boundaries unless the caller explicitly changes them. Unrepresentable text remains a
 Unicode draft; only serialization to disk fails. Crash journals stay UTF-8 JSON and retain target-format
 intent independently of whether the file's codec can encode the draft. Project interpretation comes

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, statSync, type BigIntStats } from "node:fs";
 import { languageIdForPath } from "@varin/protocol";
 import type { KernelComputeService } from "../kernel/compute-service.js";
 import type { KernelComputeResult } from "../kernel/compute-runner.js";
@@ -62,9 +62,8 @@ const string = (value: unknown): string => {
   return value;
 };
 
-const grammarIntegrityOf = (file: string): string => (
-  `sha256-${createHash("sha256").update(readFileSync(file)).digest("hex")}`
-);
+const grammarIdentity = (info: BigIntStats): string =>
+  `${info.dev}:${info.ino}:${info.size}:${info.mtimeNs}:${info.ctimeNs}`;
 
 const range = (value: unknown) => {
   const record = recordOf(value);
@@ -131,13 +130,27 @@ export function createTreeSitterStructureProvider(options: TreeSitterStructurePr
   const exists = options.pathExists ?? existsSync;
   const grammarHashes = new Map<string, { identity: string; hash: string }>();
   const grammarHashFor = (file: string): string => {
-    const info = statSync(file);
-    const identity = `${info.ino}:${info.size}:${info.mtimeMs}:${info.ctimeMs}`;
+    const identity = grammarIdentity(statSync(file, { bigint: true }));
     const known = grammarHashes.get(file);
     if (known?.identity === identity) return known.hash;
-    const hash = grammarIntegrityOf(file);
-    grammarHashes.set(file, { identity, hash });
-    return hash;
+
+    // A mutable path may be replaced while we read. Do not publish a digest
+    // for an unstable generation; the kernel also verifies the declared digest
+    // against the exact bytes it retains at recipe admission.
+    const fd = openSync(file, "r");
+    try {
+      const opened = grammarIdentity(fstatSync(fd, { bigint: true }));
+      const bytes = readFileSync(fd);
+      if (opened !== grammarIdentity(fstatSync(fd, { bigint: true }))
+        || opened !== grammarIdentity(statSync(file, { bigint: true }))) {
+        throw new Error("Grammar changed while reading its identity");
+      }
+      const hash = `sha256-${createHash("sha256").update(bytes).digest("hex")}`;
+      grammarHashes.set(file, { identity: opened, hash });
+      return hash;
+    } finally {
+      closeSync(fd);
+    }
   };
   const specFor = (id: string): TreeSitterLanguageSpec | undefined => {
     const bundled = treeSitterLanguageSpec(id);

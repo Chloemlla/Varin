@@ -126,19 +126,22 @@ it('cold-restores a real saved script service without replay, and rechecks the o
     resolveLiveSource: async () => {}, onError: error => { throw error; } });
   let host: ApplicationExtensionRuntime | undefined;
   const scopes: Awaited<ReturnType<ReturnType<typeof createExtensionTools>>>[] = [];
-  async function startHost() {
+  async function startHost(legacyBroker = false) {
     const runtime = await ApplicationExtensionRuntime.create({ dataDir: path.join(root, 'extensions'), varinVersion: '0.9.44',
       brokerScript: path.join(repository, 'packages/extension-host/broker/broker-child.mjs') });
+    // Use the real pre-upgrade broker path with the same packaged bytes and persisted Catalog.
+    if (legacyBroker) runtime.packages.isDistributionArtifact = async () => false;
     runtime.capabilities.register(SCRIPT_CAPABILITY, () => { throw new Error('Restoration must not replay a tool'); });
     await runtime.start(); return runtime;
   }
   const currentPolicy = async () => ({ mode: 'normal' as const, rules: [] });
   const fallback = Object.assign(() => null, { enabled: (descriptor: { id: string }) => descriptor.id === 'varin.script.close' });
   try {
-    host = await startHost(); installation.worker = original.worker_path;
+    host = await startHost(true); installation.worker = original.worker_path;
     const selected = await host.prepareService({ serviceId: 'varin.script.close', version: 1, method: 'execute', args: [], routing: { threadId: 'thread' } });
     const lease = await retainExtensionTool({ runtime: host, kernel, currentPolicy,
       configurationIdentity: await scripts.prepareConfiguration(fallback, source) }, selected);
+    expect(lease.lease.ownerKind).toBeUndefined();
     const saved = structuredClone(lease.binding); lease.lease.release();
     await host.stop(); host = await startHost(); installation.worker = path.join(root, 'current/dist/worker.js');
     await fs.appendFile(installation.worker, '\n// New release.\n');
@@ -146,6 +149,7 @@ it('cold-restores a real saved script service without replay, and rechecks the o
       prepareConfiguration: (run, required) => scripts.prepareConfiguration(fallback, run.source, required) });
     const run = { runId: 'original-run', threadId: 'thread', branchId: 'history', source };
     const restored = await preparer(run, [saved], new AbortController().signal); scopes.push(restored);
+    expect(restored.initial[0]!.lease.ownerKind).toBe('builtin-host');
     expect(restored.initial.map(value => value.binding)).toEqual([saved]);
     expect(processAdmissions).toEqual([]);
     const fresh = await preparer({ ...run, runId: 'fresh-run' }, [], new AbortController().signal); scopes.push(fresh);

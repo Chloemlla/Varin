@@ -528,6 +528,7 @@ impl Catalog {
         thread: Option<&str>,
         branch: Option<&str>,
     ) -> Result<FamilyRead> {
+        let publication = self.content.begin_read();
         let exists: bool = self.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM threads WHERE id=?1)",
             [caller],
@@ -581,7 +582,7 @@ impl Catalog {
                 .ok_or_else(|| RuntimeError::Invalid("Catalog has no database".into()))?
                 .into(),
             content: self.content.clone(),
-            _publication: self.content.begin_publication(),
+            _publication: publication,
             epoch: self.epoch,
             key: self.plan_cursor_key,
             caller: caller.into(),

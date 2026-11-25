@@ -4,7 +4,7 @@ import { countUiWork } from '@/lib/performance-observation';
 import React from 'react';
 import { InlineUiViews } from '@/components/interactive-ui/InlineUiViews';
 import { presentInvocation, invocationData } from './toolInvocation';
-import { projectUiEmbeds } from '@/lib/interactive-ui/embed-projection';
+import { prepareUiEmbeds } from '@/lib/interactive-ui/embed-projection';
 import { uiSession, notifyUiSessions } from '@/lib/interactive-ui/sessions';
 import type { ThreadIdentity, ThreadSnapshot, ThreadsAPI, ThreadMemoryAPI } from '@varin/application-client';
 import type { ThreadHistoryItem as HistoryItem } from '@varin/application-client';
@@ -32,7 +32,9 @@ import { useI18n } from '@/lib/i18n';
 import { toast } from '@/components/ui';
 import type { StreamingToolCall, StreamingTextPart, ToolExecutionProgress } from '@/lib/agent-runtime/thread-projection';
 
-function Timeline({ api, identity, snapshot, history, runUsage, historyReady, historyReset = 0, earlierHistory, navigation, progress, streamingTools = [], toolProgress = [], liveGeneration, cwd, working, readOnly, onQuote, onFork, onRecover, onQuestion, onOpenSection, memory, header, footer, liveUser, liveUserStatus, viewId, onScrollContainerChange, resourceTargets, unavailableResources }: {
+const noStreamingTools: StreamingToolCall[] = [];
+const noToolProgress: ToolExecutionProgress[] = [];
+function Timeline({ api, identity, snapshot, history, runUsage, historyReady, historyReset = 0, earlierHistory, navigation, progress, streamingTools = noStreamingTools, toolProgress = noToolProgress, liveGeneration, cwd, working, readOnly, onQuote, onFork, onRecover, onQuestion, onOpenSection, memory, header, footer, liveUser, liveUserStatus, viewId, onScrollContainerChange, resourceTargets, unavailableResources }: {
   api: ThreadsAPI; identity: ThreadIdentity; snapshot?: ThreadSnapshot; history: readonly HistoryItem[];
   runUsage?: readonly import('@varin/application-client').ThreadRunUsage[];
   historyReady?: boolean; historyReset?: number; earlierHistory?: ChatTimelineProps['earlierHistory'];
@@ -83,7 +85,7 @@ function Timeline({ api, identity, snapshot, history, runUsage, historyReady, hi
       original = parent;
     }
   }, []);
-  const uiCards = React.useMemo(() => {
+  const committedCards = React.useMemo(() => {
     const cards: Record<string, UiCardProjection> = {}, calls = new Map<string, ChatToolCall>();
     const firstByWork = new Map<string, string>();
     const admit = (call: ChatToolCall, work: string, result?: UiCardProjection['result']) => {
@@ -114,13 +116,23 @@ function Timeline({ api, identity, snapshot, history, runUsage, historyReady, hi
         }
       }
     }
-    for (const call of streamingTools) if (call.name === 'render_ui') {
+    return { cards, firstByWork };
+  }, [view.entries]);
+  const uiCards = React.useMemo(() => {
+    const live = streamingTools.filter(call => call.name === 'render_ui');
+    if (!live.length) return committedCards.cards;
+    const cards = { ...committedCards.cards };
+    for (const call of live) {
       const projected: ChatToolCall = { type: 'toolCall', id: call.id, name: call.name, arguments: {}, rawArguments: call.rawArguments, sequence: call.sequence, interrupted: call.interrupted };
-      if (call.reference && firstByWork.has(call.reference.split('@')[0]!)) admit(projected, call.reference.split('@')[0]!);
+      const first = call.reference && committedCards.firstByWork.get(call.reference.split('@')[0]!);
+      if (first) {
+        cards[first] = { call: projected, compact: false };
+        if (first !== call.id) cards[call.id] = { call: projected, compact: true };
+      }
       else cards[call.id] = { call: projected, compact: false };
     }
     return cards;
-  }, [view.entries, streamingTools]);
+  }, [committedCards, streamingTools]);
   React.useLayoutEffect(() => {
     for (const [ownerCallId, projected] of Object.entries(uiCards)) {
       if (projected.compact) continue;
@@ -137,12 +149,8 @@ function Timeline({ api, identity, snapshot, history, runUsage, historyReady, hi
       arguments: call.arguments ?? {}, gateway: call.gateway, rawArguments: call.rawArguments, sequence: call.sequence, interrupted: call.interrupted, order: call.order })),
   ].sort((left, right) => (left.order ?? 0) - (right.order ?? 0)), snapshot?.modelSelection.active?.configuration ?? snapshot?.activeRun?.configuration, working || progress.length > 0), runId: snapshot?.activeRun?.id } : undefined,
     [progress, streamingTools, working, snapshot?.modelSelection.active?.configuration, snapshot?.activeRun?.configuration, snapshot?.activeRun?.id, key]);
-  const previousPlacement = React.useRef<ReturnType<typeof projectUiEmbeds> | undefined>(undefined);
-  const uiPlacement = React.useMemo(() => {
-    const value = shareSnapshot(previousPlacement.current, projectUiEmbeds(view.entries, uiCards, liveAssistant));
-    previousPlacement.current = value;
-    return value;
-  }, [view.entries, uiCards, liveAssistant]);
+  const placeEmbeds = React.useMemo(() => prepareUiEmbeds(view.entries, uiCards), [view.entries, uiCards]);
+  const uiPlacement = React.useMemo(() => placeEmbeds(liveAssistant), [placeEmbeds, liveAssistant]);
   const previousTargets = React.useRef<Array<{ key: string; target: string }>>([]);
   React.useLayoutEffect(() => {
     for (const previous of previousTargets.current) {
@@ -160,6 +168,15 @@ function Timeline({ api, identity, snapshot, history, runUsage, historyReady, hi
   const entering = React.useRef<string | undefined>(undefined);
   const entryKey = `${timelineKey}:${historyReset}`;
   const [preparedEntry, setPreparedEntry] = React.useState<string>();
+  const preparation = React.useRef<AbortController | undefined>(undefined);
+  React.useLayoutEffect(() => () => {
+    preparation.current?.abort(); entering.current = undefined;
+  }, [entryKey]);
+  const nativeItems = React.useMemo(() => new Map(history.map(item => [item.id, item])), [history]);
+  const historyCursorFor = React.useCallback((owner: string, source?: string) => {
+    const id = owner.replace(/^(entry|turn):/, '');
+    return nativeItems.has(id) ? id : source && nativeItems.has(source) ? source : history[0]?.id;
+  }, [nativeItems, history]);
   React.useLayoutEffect(() => {
     if (!snapshot && !historyReady) {
       if (liveUser) setPreparedEntry(entryKey);
@@ -168,13 +185,26 @@ function Timeline({ api, identity, snapshot, history, runUsage, historyReady, hi
     if (entering.current === entryKey) return;
     const preserveReading = entering.current === undefined && Boolean(historyReady);
     entering.current = entryKey;
-    useTimelineViewStore.getState().enter(timelineKey, head, working, preserveReading);
+    const prepare = () => {
+      if (entering.current !== entryKey) return;
+      useTimelineViewStore.getState().enter(timelineKey, head, working, preserveReading);
+      setPreparedEntry(entryKey);
+    };
+    const checkpoint = useTimelineViewStore.getState().views[timelineKey]?.viewport;
+    if (checkpoint?.mode === 'free-scrolling' && checkpoint.historyItemId && snapshot
+      && earlierHistory?.available && !nativeItems.has(checkpoint.historyItemId) && navigation) {
+      const controller = new AbortController();
+      preparation.current = controller;
+      void navigation.ensureItem(checkpoint.historyItemId, controller.signal).catch(() => {
+        // A restore/rewind can remove the target; the list will use its end fallback.
+      }).then(() => { if (!controller.signal.aborted) prepare(); });
+      return;
+    }
     // The virtual list captures its initial target when it mounts. Prepare the
     // saved reading position before mounting it, rather than correcting a
     // different initial scroll after the first rows have already appeared.
-    setPreparedEntry(entryKey);
-  }, [snapshot, historyReady, entryKey, timelineKey, head, working, liveUser]);
-  const nativeItems = React.useMemo(() => new Map(history.map(item => [item.id, item])), [history]);
+    prepare();
+  }, [snapshot, historyReady, entryKey, timelineKey, head, working, liveUser, earlierHistory?.available, navigation, nativeItems]);
   const renderExtras = React.useCallback((itemId: string, options?: { hideImages?: boolean }) => {
     const item = nativeItems.get(itemId); if (!item) return null;
     const parts = historyParts(item.content, item.source);
@@ -213,7 +243,7 @@ function Timeline({ api, identity, snapshot, history, runUsage, historyReady, hi
   const recoverEntry = React.useCallback<NonNullable<ChatTimelineProps['onRecover']>>(entry => onRecover?.(entry.id), [onRecover]);
   const context = React.useMemo(() => ({ api, identity, head, fileDirectory: cwd, readOnly, quote: onQuote, revealQuestion: onQuestion, openFile, fileTarget, openContext, memory, followups: snapshot?.followups, snapshot, openSection: onOpenSection, toolExecutions: view.toolExecutions, uiCards, uiInlineViews: true, uiEmbeds: uiPlacement.embeds, sourceEntry, renderExtras, liveGeneration, resourceTargets, unavailableResources }),
     [api, identity, head, cwd, readOnly, onQuote, onQuestion, openFile, fileTarget, openContext, memory, view.toolExecutions, uiCards, uiPlacement, snapshot, onOpenSection, sourceEntry, renderExtras, liveGeneration, resourceTargets, unavailableResources]);
-  return <ConversationContext.Provider value={context}>{preparedEntry === entryKey && <ChatTimeline key={entryKey} sessionId={timelineKey} cwd={cwd} earlierHistory={earlierHistory} navigation={navigation}
+  return <ConversationContext.Provider value={context}>{preparedEntry === entryKey && <ChatTimeline historyCursorFor={historyCursorFor} key={entryKey} sessionId={timelineKey} cwd={cwd} earlierHistory={earlierHistory} navigation={navigation}
     onScrollContainerChange={onScrollContainerChange}
     entries={entries} toolExecutions={view.toolExecutions} liveAssistant={liveAssistant} liveUser={liveUser} liveUserStatus={liveUserStatus} leafId={head}
     activeRunId={working ? snapshot?.activeRun?.id : undefined}
@@ -232,5 +262,5 @@ export function ConversationTimeline(props: Omit<TimelineProps, 'progress'> & { 
 }
 function StreamingTimeline({ store, streamingEnabled = true, ...props }: Omit<TimelineProps, 'progress'> & { progress?: StreamingTextPart[]; store: ThreadStreamingStore; streamingEnabled?: boolean }) {
   const state = React.useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
-  return <Timeline {...props} progress={streamingEnabled ? state.progress : []} streamingTools={streamingEnabled ? state.streamingTools : []} toolProgress={state.toolProgress} liveGeneration={streamingEnabled ? state.progressActivity ?? undefined : undefined} />;
+  return <Timeline {...props} progress={streamingEnabled ? state.progress : []} streamingTools={streamingEnabled ? state.streamingTools : noStreamingTools} toolProgress={state.toolProgress} liveGeneration={streamingEnabled ? state.progressActivity ?? undefined : undefined} />;
 }

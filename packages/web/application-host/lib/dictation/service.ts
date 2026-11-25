@@ -9,6 +9,7 @@
  *   endpoint (faster-whisper, whisper.cpp, OpenAI).
  */
 
+import type { ComponentFetch } from '../components/file-transfer.js';
 import { rm } from 'fs/promises';
 
 import { DictationWorkerClient, WorkerBackedTranscriptionSession } from './local/worker-client.js';
@@ -45,7 +46,7 @@ interface LocalModelStatus {
 
 const errorMessage = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
-export function createDictationService({ modelsDir }: { modelsDir: string }) {
+export function createDictationService({ modelsDir, fetchModel }: { modelsDir: string; fetchModel?: ComponentFetch }) {
   const workerClient = new DictationWorkerClient();
   /** modelId -> 'downloading' | 'error' */
   const downloadStates = new Map<string, 'downloading' | 'error'>();
@@ -67,6 +68,7 @@ export function createDictationService({ modelsDir }: { modelsDir: string }) {
     const promise = ensureLocalSttModel({
       modelsDir,
       modelId,
+      ...(fetchModel ? { fetcher: fetchModel } : {}),
       onProgress: (downloadedBytes: number, totalBytes: number | null) => {
         downloadProgress.set(
           modelId,

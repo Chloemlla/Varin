@@ -383,6 +383,13 @@ it('load-earlier HTTP history keeps its pinned head while newer conversation tur
   expect(await readImage(f.api, identity, { kind: 'history', itemId: first.id }, first.content)).toEqual(Buffer.from(imageFixture.data, 'base64'));
   const live = await f.api.snapshot(identity);
   expect(live.historyPage.head).not.toBe(pinned.historyPage.head);
+  const delta = await f.api.snapshot(identity, undefined, { afterHeadId: pinned.historyPage.head! });
+  expect(delta.historyPage.afterHeadId).toBe(pinned.historyPage.head);
+  expect(delta.historyPage.head).toBe(live.historyPage.head);
+  expect(delta.history).toEqual(live.history.slice(-2));
+  const unchanged = await f.api.snapshot(identity, undefined, { afterHeadId: live.historyPage.head! });
+  expect(unchanged.historyPage.afterHeadId).toBe(live.historyPage.head);
+  expect(unchanged.history).toEqual([]);
   // A valid record can still be an invalid cursor for this immutable view.
   await expect(f.api.historyPage(identity, { headId: pinned.historyPage.head!, beforeId: live.historyPage.head! })).rejects.toMatchObject({ status: 409, code: 'thread-conflict' });
   const unrelated = await f.api.create('http-unrelated-history');

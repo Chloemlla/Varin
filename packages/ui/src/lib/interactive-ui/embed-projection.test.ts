@@ -1,6 +1,6 @@
 import { expect, it, vi } from 'vitest';
 import * as content from '@varin/application-client';
-import { projectUiEmbeds } from './embed-projection';
+import { prepareUiEmbeds, projectUiEmbeds } from './embed-projection';
 import type { ChatAssistantMessage, ChatSessionEntry } from '@/components/conversation/types';
 import type { UiCardProjection } from '@/components/conversation/ConversationContext';
 const fence = (ref: string) => '```varin-ui\n' + JSON.stringify({ type: 'embed', ref }) + '\n```';
@@ -52,4 +52,15 @@ it('does not reparse retained history on each stream frame and still recomputes 
     projectUiEmbeds([], {}, live);
     expect(parse.mock.calls.length - before).toBe(2);
   } finally { parse.mockRestore(); }
+});
+
+it('never traverses committed entries or republishes a placement for ordinary live text', () => {
+  let visits = 0;
+  const committed = Array.from({ length: 1000 }, (_, id) => {
+    const saved = entry(String(id), [{ type: 'text', text: fence('ui:' + id) }]);
+    return new Proxy(saved, { get(target, key, receiver) { visits++; return Reflect.get(target, key, receiver); } });
+  });
+  const project = prepareUiEmbeds(committed, {}), initial = project(), firstVisits = visits;
+  for (let i = 0; i < 20; i++) expect(project(message('live', [{ type: 'text', text: String(i) }]))).toBe(initial);
+  expect(visits).toBe(firstVisits);
 });

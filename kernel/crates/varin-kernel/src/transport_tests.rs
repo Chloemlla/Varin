@@ -27,7 +27,7 @@ fn fixture() -> (
         response_lanes: Mutex::new(HashMap::new()),
         epoch: "test-epoch".into(),
         chunk_bytes: 16,
-        body_jobs,
+        body_jobs: BodyQueue::Capture(body_jobs),
         arrivals: Mutex::new(Arrivals::default()),
     });
     (shared, input, jobs, controls)

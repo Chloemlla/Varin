@@ -10,6 +10,7 @@ import { registerScheduledTaskRoutes } from '../scheduled-tasks/routes.js';
 import { resourceScopeFixture } from './resource-scope.test-helper.js';
 import { createMemoryOwner } from './memory-owner.js';
 import { ApplicationExtensionRuntime, type HostServiceBinding } from '@varin/extension-host';
+import { createExtensionTools } from './extension-tool-owner.js';
 import { createContextComposition } from './context-composition.js';
 import { createRequire } from 'node:module';
 import { createThreadContext } from './thread-context.js';
@@ -47,7 +48,7 @@ async function listen(server: Server) {
   cleanups.push(async () => { server.closeAllConnections(); await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); });
   return `http://127.0.0.1:${address.port}`;
 }
-async function fixture(reply: (body: Record<string, unknown>, response: ServerResponse) => void | Promise<void>, existingRoot?: string, existingEndpoint?: string) {
+async function fixture(reply: (body: Record<string, unknown>, response: ServerResponse) => void | Promise<void>, existingRoot?: string, existingEndpoint?: string, defaultTools = false) {
   await fs.access(kernelPath);
   const root = existingRoot ?? await fs.mkdtemp(path.join(os.tmpdir(), 'varin-http-review-'));
   const kernel = createKernelClient({ hostId: 'http-review', storageRoot: root, buildVersion, kernelPath, allowCargoDevRunner: false });
@@ -79,7 +80,13 @@ async function fixture(reply: (body: Record<string, unknown>, response: ServerRe
   let refresh = () => Promise.resolve();
   const refreshTasks: Promise<void>[] = [];
   const personalization = createAgentPersonalization({ client: kernel, context: async () => ({ bot: false, projectId: 'selected-project' }), onChanged: () => { const task = refresh(); void task.catch(() => undefined); refreshTasks.push(task); } });
-  const extensions = await ApplicationExtensionRuntime.create({ dataDir: path.join(root, 'extensions'), varinVersion: buildVersion,
+  const forwardingBrokers: string[] = [];
+  const extensions = await ApplicationExtensionRuntime.create({ ...(defaultTools ? {
+    transportFactory: ({ owner }) => {
+      forwardingBrokers.push(owner.extensionId);
+      throw new Error(`Default conversation started a forwarding broker: ${owner.extensionId}`);
+    },
+  } : {}), dataDir: path.join(root, 'extensions'), varinVersion: buildVersion,
     brokerScript: path.join(repository, 'packages/extension-host/broker/broker-child.mjs') });
   await extensions.start(); cleanups.push(() => extensions.stop());
   const composition = createContextComposition(extensions);
@@ -92,7 +99,8 @@ async function fixture(reply: (body: Record<string, unknown>, response: ServerRe
   };
   cleanups.push(close);
 
-  const adapter = new ThreadAdapter(new AgentRuntimeClient(kernel, undefined, undefined, undefined, undefined, undefined, (id, signal) => documents.admitWorkspaceRegistration(id, signal)), {
+  const adapter = new ThreadAdapter(new AgentRuntimeClient(kernel, undefined, undefined, undefined, undefined,
+    defaultTools ? createExtensionTools({ runtime: extensions, kernel, currentPolicy: async () => ({ mode: 'normal', rules: [] }) }) : undefined, (id, signal) => documents.admitWorkspaceRegistration(id, signal)), {
     resolveModel: async selection => {
       if (selection.providerId !== 'fixture-provider' || selection.modelId !== 'fixture-model') throw new Error('unselected model');
       return { configuration, credentialOwner: owner };
@@ -110,7 +118,7 @@ async function fixture(reply: (body: Record<string, unknown>, response: ServerRe
   const hostUrl = await listen(createServer(app));
   configureRuntimeUrlResolver({ apiBaseUrl: hostUrl, realtimeBaseUrl: hostUrl });
   setRuntimeExtraHeaders({ 'x-fixture-auth': 'fixture-client' });
-  return { app, extensions, composition, adapter, flushRefreshes, endpoint, personalization, workspace, documents, workingStates, close, kernel, api: createThreadsHttpAPI(), runtime: adapter.runtime, hostUrl, secret, requests, launchErrors, root, closeKernel: () => kernel.close() };
+  return { app, forwardingBrokers, extensions, composition, adapter, flushRefreshes, endpoint, personalization, workspace, documents, workingStates, close, kernel, api: createThreadsHttpAPI(), runtime: adapter.runtime, hostUrl, secret, requests, launchErrors, root, closeKernel: () => kernel.close() };
 }
 
 const model = { providerId: 'fixture-provider', modelId: 'fixture-model' };
@@ -130,6 +138,25 @@ async function route(f: Awaited<ReturnType<typeof fixture>>, providerKey: string
   return f.extensions.upsertServiceRoutingRule({ expectedRevision: (await f.extensions.routing.read()).document.revision,
     rule: { allowFallback: false, providerKeys: [providerKey], scope, serviceId: 'varin.context.fragments', version: 1 } });
 }
+it('two consecutive HTTP submissions prepare bundled tools and default guidance without a forwarding process', async () => {
+  const f = await fixture((_body, response) => complete(response, `default-${Date.now()}`, 'done'), undefined, undefined, true);
+  const identity = await f.api.create('default-conversation');
+  for (const key of ['cold', 'warm']) {
+    const expectedHead = (await f.api.snapshot(identity)).historyPage.head;
+    const run = await f.api.submit({ ...identity, key, expectedHead, text: key, model });
+    await expect.poll(async () => (await f.api.run(run.run_id)).state, { timeout: 30_000 }).toBe('completed');
+    const request = f.requests.at(-1)!.body;
+    expect(system(request)).toContain('Distinguish completed work');
+    // No workspace or plugin is required for discoverable tools. The model can use the
+    // tool directory, even when detailed schemas are initially deferred.
+    const launch = await f.runtime.launch(run.run_id);
+    expect(launch!.selection.extension_bindings.length).toBeGreaterThan(0);
+    expect(launch!.selection.extension_bindings.some(b => b.extensionId === 'varin.builtin.web')).toBe(true);
+    expect(f.forwardingBrokers).toEqual([]);
+  }
+  expect(f.requests).toHaveLength(2);
+  expect(f.launchErrors).toEqual([]);
+});
 it('packaged default and installable scoped example reach captured model requests and refresh without changing frozen bytes', async () => {
   let held!: ServerResponse; let count = 0;
   const f = await fixture((_body, response) => { if (++count === 1) held = response; else complete(response, `composition-${count}`, 'done'); });

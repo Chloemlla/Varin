@@ -11,6 +11,7 @@ const deferred = () => { let resolve!: () => void; const promise = new Promise<v
 interface LifecycleEntry {
   manifest: VarinExtensionManifest & { entrypoints: { host: VarinExtensionHostEntrypoint }; provides: { services: VarinExtensionServiceProvision[] } };
   integrity: string;
+  source: { kind: 'local'; specifier: string };
   selectedVersion: string;
   desired: { enabled: boolean; revision: number };
   capabilityGrants: Array<Pick<VarinExtensionCapabilityGrant, 'capability' | 'realm' | 'granted' | 'manifestVersion'>>;
@@ -20,7 +21,7 @@ interface LifecycleEntry {
 }
 const entry = (id: string, requires: string[] = [], service = id): LifecycleEntry => ({
   manifest: { schemaVersion: 1, id, version: '1.0.0', engines: { varin: '*' }, entrypoints: { host: { mode: 'brokered', file: 'host.cjs' } }, provides: { services: [{ id: service, version: 1 }] }, requires: { services: requires.map(id => ({ id, realms: ['host'], version: 1, binding: 'single' })) } },
-  integrity: `${id}-v1`, selectedVersion: '1.0.0', desired: { enabled: true, revision: 1 }, capabilityGrants: [], actual: [],
+  source: { kind: 'local', specifier: id }, integrity: `${id}-v1`, selectedVersion: '1.0.0', desired: { enabled: true, revision: 1 }, capabilityGrants: [], actual: [],
 });
 const pin = (services: HostServiceRegistry, id: string) => { const binding = services.bind(id, 1); try { return binding.pin(); } finally { binding.release(); } };
 const tick = () => new Promise<void>(r => setImmediate(r));

@@ -338,13 +338,15 @@ impl EventRead {
 }
 impl Catalog {
     pub fn capture_events_read_for_principal(&self, cursor: u64, limit: u32, principal: Option<&str>) -> Result<EventRead> {
-        Ok(EventRead { events: self.events_after_for_principal(cursor, limit, principal)?, content: self.content.clone(), _publication: self.content.begin_publication() })
+        let publication = self.content.begin_read();
+        Ok(EventRead { events: self.events_after_for_principal(cursor, limit, principal)?, content: self.content.clone(), _publication: publication })
     }
     pub fn capture_events_read(&self, cursor: u64, limit: u32) -> Result<EventRead> {
+        let publication = self.content.begin_read();
         Ok(EventRead {
             events: self.events_after(cursor, limit)?,
             content: self.content.clone(),
-            _publication: self.content.begin_publication(),
+            _publication: publication,
         })
     }
 }

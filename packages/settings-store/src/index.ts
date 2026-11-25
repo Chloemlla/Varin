@@ -8,6 +8,16 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 export type VarinSettingsDocument = Record<string, unknown>;
 
+export type SettingsProjectionValue = string | number | boolean | null | undefined
+  | readonly SettingsProjectionValue[] | { readonly [key: string]: SettingsProjectionValue };
+
+type ReadonlyProjection<Value> = Readonly<Value>;
+
+export interface SettingsProjection<Value extends SettingsProjectionValue> {
+  read(): Promise<ReadonlyProjection<Value>>;
+  readSync(): ReadonlyProjection<Value>;
+}
+
 export interface SettingsFileTransaction<Result> {
   document?: VarinSettingsDocument;
   result: Result;
@@ -16,8 +26,12 @@ export interface SettingsFileTransaction<Result> {
 
 export interface SettingsFileStore {
   readonly filePath: string;
-  read(): Promise<VarinSettingsDocument>;
+  read(options?: { cache?: boolean }): Promise<VarinSettingsDocument>;
   readSync(): VarinSettingsDocument;
+  /** Validate a small, immutable view once per observed file snapshot. */
+  createProjection<Value extends SettingsProjectionValue>(
+    project: (document: VarinSettingsDocument) => Value,
+  ): SettingsProjection<Value>;
   replace(settings: VarinSettingsDocument): Promise<VarinSettingsDocument>;
   transact<Result>(
     mutator: (
@@ -58,11 +72,14 @@ const LOCK_RETRY_MS = 25;
 
 // Text, rather than object identity, is shared across stores in the same Host.
 // The missing sentinel preserves each caller's own default value.
+interface DocumentSnapshot {
+  raw: string | null;
+}
 interface CachedDocument {
-  raw?: string | null;
+  snapshot?: DocumentSnapshot;
   generation: number;
   signature?: string;
-  loading?: Promise<string | null>;
+  loading?: Promise<DocumentSnapshot>;
 }
 const documents = new Map<string, CachedDocument>();
 const statSignature = (stat: fs.Stats): string => `${stat.mtimeMs}:${stat.ctimeMs}:${stat.size}:${stat.ino}`;
@@ -81,6 +98,25 @@ const assertObject = (value: unknown): VarinSettingsDocument => {
 };
 
 const parseSettings = (raw: string): VarinSettingsDocument => assertObject(JSON.parse(raw));
+
+const immutableProjection = <Value extends SettingsProjectionValue>(value: Value): ReadonlyProjection<Value> => {
+  // Detach even when a projector uses its own reusable defaults.
+  const result = structuredClone(value);
+  const visited = new WeakSet<object>();
+  const freeze = (node: unknown): void => {
+    if (node === undefined || node === null || ['boolean', 'number', 'string'].includes(typeof node)) return;
+    if (typeof node !== 'object'
+      || (!Array.isArray(node) && Object.prototype.toString.call(node) !== '[object Object]')) {
+      throw new TypeError('Settings projections must contain plain data');
+    }
+    if (visited.has(node)) return;
+    visited.add(node);
+    for (const child of Object.values(node)) freeze(child);
+    Object.freeze(node);
+  };
+  freeze(result);
+  return result as ReadonlyProjection<Value>;
+};
 
 const processIsAlive = (
   processLike: Pick<NodeJS.Process, 'kill' | 'pid' | 'platform'>,
@@ -123,7 +159,7 @@ export const createSettingsFileStore = ({
 
   const cached = documents.get(resolvedPath) ?? { generation: 0 };
   documents.set(resolvedPath, cached);
-  const invalidate = (): void => { cached.generation++; delete cached.raw; delete cached.signature; delete cached.loading; };
+  const invalidate = (): void => { cached.generation++; delete cached.snapshot; delete cached.signature; delete cached.loading; };
   const signature = async (): Promise<string> => (await Promise.all([resolvedPath, previousPath].map(async target => {
     try { return statSignature(await fsPromises.stat(target)); }
     catch (error) { if (errorCode(error) === 'ENOENT') return 'missing'; throw error; }
@@ -144,34 +180,57 @@ export const createSettingsFileStore = ({
     }
   };
   const decode = (raw: string | null): VarinSettingsDocument => raw === null ? readDefault() : parseSettings(raw);
-  const read = async (): Promise<VarinSettingsDocument> => {
+  const readSnapshot = async (): Promise<DocumentSnapshot> => {
     // Watch notifications can lag behind completed writes (notably on macOS).
     // Verify identity on every read; only unchanged document text is reused.
     const next = await signature();
     if (next !== cached.signature) { invalidate(); cached.signature = next; }
-    if (cached.raw !== undefined) return decode(cached.raw);
+    if (cached.snapshot !== undefined) return cached.snapshot;
     if (!cached.loading) {
       const generation = cached.generation;
       const loading = load().then(raw => {
-        if (cached.generation === generation) cached.raw = raw;
-        return raw;
+        const observed = cached.generation === generation ? cached.snapshot : undefined;
+        if (observed && observed.raw === raw) return observed;
+        const snapshot = { raw };
+        if (cached.generation === generation) cached.snapshot = snapshot;
+        return snapshot;
       }).finally(() => { if (cached.loading === loading) delete cached.loading; });
       cached.loading = loading;
     }
-    return decode(await cached.loading);
+    return cached.loading;
   };
-  const readSync = (): VarinSettingsDocument => {
+  const readSnapshotSync = (): DocumentSnapshot => {
     const next = signatureSync();
     if (next === undefined || next !== cached.signature) { invalidate(); if (next !== undefined) cached.signature = next; }
-    if (cached.raw === undefined) {
-      try { cached.raw = fsModule.readFileSync(resolvedPath, 'utf8'); }
+    if (cached.snapshot === undefined) {
+      try { cached.snapshot = { raw: fsModule.readFileSync(resolvedPath, 'utf8') }; }
       catch (error) {
         if (errorCode(error) !== 'ENOENT') throw error;
-        try { cached.raw = fsModule.readFileSync(previousPath, 'utf8'); }
-        catch (previousError) { if (errorCode(previousError) !== 'ENOENT') throw previousError; cached.raw = null; }
+        try { cached.snapshot = { raw: fsModule.readFileSync(previousPath, 'utf8') }; }
+        catch (previousError) { if (errorCode(previousError) !== 'ENOENT') throw previousError; cached.snapshot = { raw: null }; }
       }
     }
-    return decode(cached.raw);
+    return cached.snapshot;
+  };
+  const read = async (options?: { cache?: boolean }): Promise<VarinSettingsDocument> =>
+    decode(options?.cache === false ? await load() : (await readSnapshot()).raw);
+  const readSync = (): VarinSettingsDocument => decode(readSnapshotSync().raw);
+
+  const createProjection = <Value extends SettingsProjectionValue>(
+    project: (document: VarinSettingsDocument) => Value,
+  ): SettingsProjection<Value> => {
+    // A delayed reader may still hold an older snapshot; key by the actual
+    // input it saw, not the shared cache's possibly newer generation.
+    const values = new WeakMap<DocumentSnapshot, { value: ReadonlyProjection<Value> }>();
+    const projectSnapshot = (snapshot: DocumentSnapshot): ReadonlyProjection<Value> => {
+      let entry = values.get(snapshot);
+      if (!entry) {
+        entry = { value: immutableProjection(project(decode(snapshot.raw))) };
+        values.set(snapshot, entry);
+      }
+      return entry.value;
+    };
+    return { read: async () => projectSnapshot(await readSnapshot()), readSync: () => projectSnapshot(readSnapshotSync()) };
   };
 
   const acquireLock = async (signal?: AbortSignal): Promise<ReleaseLock> => {
@@ -281,7 +340,6 @@ export const createSettingsFileStore = ({
       if (preserveMode) await fsPromises.chmod(temporaryPath, mode);
       await replaceFile(temporaryPath);
       invalidate();
-      cached.raw = raw;
     } finally {
       await fsPromises.rm(temporaryPath, { force: true });
     }
@@ -327,7 +385,7 @@ export const createSettingsFileStore = ({
     return { document: next, result: next };
   });
 
-  return { filePath: resolvedPath, read, readSync, replace, transact, update };
+  return { filePath: resolvedPath, read, readSync, createProjection, replace, transact, update };
 };
 
 export { readProjectTrust, projectTrustFile, canonicalProjectTrustPath, projectTrustDecision, validateProjectTrust } from './project-trust.js';

@@ -1,14 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
-import { gunzip } from "node:zlib";
 import { promisify } from "node:util";
 import fs from "node:fs";
 import { chmod, mkdir, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
-import AdmZip from "adm-zip";
 import type { SpawnOptions } from "node:child_process";
 import { terminateManagedProcess, waitForManagedExit, type ManagedProcessHandle, type ManagedSpawn } from "../process/types.js";
-
-const gunzipAsync = promisify(gunzip);
 
 /** The native servers currently owned by Varin's on-demand provider. */
 export type ManagedLanguageServerName = "gopls" | "rust-analyzer" | "clangd" | "marksman";
@@ -310,7 +306,9 @@ async function writeDownload(url: string, bytes: Uint8Array, expectedSha256: str
   return buffer;
 }
 
-async function extractZip(bytes: Buffer, destination: string): Promise<void> {
+async function extractZip(bytes: Buffer, destination: string, signal: AbortSignal): Promise<void> {
+  const { default: AdmZip } = await import("adm-zip");
+  throwIfAborted(signal);
   const archive = new AdmZip(bytes);
   const entries = archive.getEntries();
   for (const entry of entries) {
@@ -468,10 +466,17 @@ export function createManagedLanguageServers(options: ManagedLanguageServersOpti
   };
 
   const findLocal = async (spec: ServerSpec, signal: AbortSignal): Promise<string | null> => {
-    await mkdir(probeRoot, { recursive: true });
+    let hasProbeRoot = false;
     for (const candidate of localCandidates(spec)) {
+      throwIfAborted(signal);
       const executable = await resolve(platform === "win32" && !candidate.endsWith(".exe") ? `${candidate}.exe` : candidate);
-      if (executable && await probeExecutable(executable, options.spawn, probeRoot, env, signal)) return executable;
+      if (!executable) continue;
+      throwIfAborted(signal);
+      if (!hasProbeRoot) {
+        await mkdir(probeRoot, { recursive: true });
+        hasProbeRoot = true;
+      }
+      if (await probeExecutable(executable, options.spawn, probeRoot, env, signal)) return executable;
     }
     return null;
   };
@@ -597,14 +602,16 @@ export function createManagedLanguageServers(options: ManagedLanguageServersOpti
       throwIfAborted(signal);
       const verified = await writeDownload(archive.url, bytes, archive.sha256);
       if (archive.format === "gzip") {
-        const executable = await gunzipAsync(verified);
+        const { gunzip } = await import("node:zlib");
+        throwIfAborted(signal);
+        const executable = await promisify(gunzip)(verified);
         const target = path.join(staging, archive.executableName);
         await writeFile(target, executable, { mode: 0o755 });
       } else if (archive.format === "raw") {
         const target = path.join(staging, archive.executableName);
         await writeFile(target, verified, { mode: 0o755 });
       } else {
-        await extractZip(verified, staging);
+        await extractZip(verified, staging, signal);
       }
       const executable = await findFile(staging, archive.executableName);
       if (!executable) throw new Error(`Verified ${spec.name} archive does not contain ${archive.executableName}`);

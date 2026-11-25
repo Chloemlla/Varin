@@ -8,18 +8,24 @@ const launchProcess = (command: string, args: readonly string[], options: SpawnO
 
 it('prepares on demand and shares startup between concurrent requests', async () => {
   const harness = await createDocumentAuthorityHarness();
-  const prepare = vi.fn(async () => ({ command: process.execPath, args: VARIN_LSP_FIXTURE_SERVER_ARGS }));
+  const prepare = vi.fn(async (_providerId: string) => ({ command: process.execPath, args: VARIN_LSP_FIXTURE_SERVER_ARGS }));
   const launch = vi.fn(launchProcess);
   const supervisor = createLanguageSupervisor({ documents: harness.authority, spawn: launch, prepareProvider: prepare });
   supervisor.registerProvider({ providerId: 'managed', command: 'not-installed', languageIds: ['go'], source: 'builtin' });
+  supervisor.registerProvider({ providerId: 'managed-rust', command: 'not-installed', languageIds: ['rust'], source: 'builtin' });
   try {
-    supervisor.getStatus(harness.identity.workspaceId, 'go');
+    expect(supervisor.getStatus(harness.identity.workspaceId, 'go').status).toBe('absent');
+    expect(supervisor.getStatus(harness.identity.workspaceId, 'rust').status).toBe('absent');
+    expect(launch).not.toHaveBeenCalled();
+
     expect(prepare).not.toHaveBeenCalled();
     const request = { resource: harness.resource('main.go'), languageId: 'go', content: 'package main\n', documentVersion: 1, reason: 'open' };
     const results = await Promise.all([supervisor.syncDocument(request), supervisor.syncDocument(request)]);
     expect(results.map((result) => result.status)).toEqual(['synced', 'synced']);
     expect(prepare).toHaveBeenCalledTimes(1);
+    expect(prepare.mock.calls.map(call => call[0])).toEqual(['managed']);
     expect(launch).toHaveBeenCalledTimes(1);
+    expect(supervisor.getStatus(harness.identity.workspaceId, 'rust').status).toBe('absent');
   } finally { await supervisor.dispose(); await harness.cleanup(); }
 });
 

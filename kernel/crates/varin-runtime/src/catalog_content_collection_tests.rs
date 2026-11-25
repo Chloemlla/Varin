@@ -77,6 +77,67 @@ fn finished(
 }
 
 #[test]
+fn completed_read_snapshots_do_not_invalidate_the_marks() {
+    let root = Root::new();
+    let (catalog, receipt) = fixture_catalog(&root);
+    catalog.content.save(&json!({"orphan":"uncommitted"})).unwrap();
+    let mut reader = catalog.read_view().unwrap();
+    let (resume, worker) = pause(
+        ready(&catalog, Arc::new(AtomicBool::new(false))),
+        CollectionPoint::BeforeSweep,
+    );
+    for _ in 0..10 {
+        reader.read_snapshot::<_, RuntimeError>(|view| {
+            assert_eq!(view.run(&receipt.run_id)?.state, RunState::Accepted);
+            Ok(())
+        }).unwrap();
+    }
+    let report = finished(resume, worker);
+    assert_eq!(report.status, ContentCollectionStatus::Completed);
+    assert!(report.removed_objects > 0);
+}
+
+#[test]
+fn active_read_snapshot_blocks_sweep_until_its_old_cut_releases() {
+    let root = Root::new();
+    let (catalog, _) = fixture_catalog(&root);
+    let old_value = json!({"revision":"one"});
+    let old = catalog.content.save(&old_value).unwrap();
+    catalog.db.execute(
+        "INSERT INTO memory_states(branch_id,body) VALUES('main',?1)",
+        [old.to_string()],
+    ).unwrap();
+    let mut reader = catalog.read_view().unwrap();
+    reader.read_snapshot::<_, RuntimeError>(|view| {
+        // The snapshot already saw the old reference when the writer replaces it.
+        let read_reference = |conn: &Connection| -> Result<Value> {
+            let body: String = conn.query_row(
+                "SELECT body FROM memory_states WHERE branch_id='main'",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok(serde_json::from_str(&body)?)
+        };
+        assert_eq!(read_reference(&view.db)?, old);
+        let replacement = catalog.content.save(&json!({"revision":"two"}))?;
+        catalog.db.execute(
+            "UPDATE memory_states SET body=?1 WHERE branch_id='main'",
+            [replacement.to_string()],
+        )?;
+        assert_eq!(read_reference(&catalog.db)?, replacement);
+        let report = ready(&catalog, Arc::new(AtomicBool::new(false))).run();
+        assert_eq!(report.status, ContentCollectionStatus::Deferred);
+        assert_eq!(report.removed_objects, 0);
+        assert_eq!(view.content.load(&read_reference(&view.db)?)?, old_value);
+        Ok(())
+    }).unwrap();
+    let report = ready(&catalog, Arc::new(AtomicBool::new(false))).run();
+    assert_eq!(report.status, ContentCollectionStatus::Completed);
+    assert!(report.removed_objects > 0);
+    assert!(catalog.content.load(&old).is_err());
+}
+
+#[test]
 fn roots_verification_and_actual_unlink_leave_catalog_status_and_cancel_available() {
     for point in [
         CollectionPoint::Roots,

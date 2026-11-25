@@ -2,6 +2,11 @@ import { createHash } from 'node:crypto';
 import type { VarinTextFormat } from '@varin/application-client';
 import { DocumentAuthorityError } from './errors.js';
 
+// Keep the exact view range and do not copy a native Buffer just to serialize it.
+const bytesToBase64 = (input: Uint8Array): string => (Buffer.isBuffer(input)
+  ? input
+  : Buffer.from(input.buffer, input.byteOffset, input.byteLength)).toString('base64');
+
 export const revisionFromBytes = (bytes: Buffer | Uint8Array): string => (
   `d1_${createHash('sha256').update(bytes).digest('base64url')}`
 );
@@ -74,7 +79,7 @@ export interface InspectDocumentOptions { encoding?: string; defaultEncoding?: s
 export function inspectDocumentBytes(input: Buffer | Uint8Array, includeContent?: true, options?: InspectDocumentOptions): Promise<InspectedDocument>;
 export function inspectDocumentBytes(input: Buffer | Uint8Array, includeContent: false, options?: InspectDocumentOptions): Promise<InspectedDocumentMetadata>;
 export async function inspectDocumentBytes(input: Buffer | Uint8Array, includeContent = true, options: InspectDocumentOptions = {}): Promise<InspectedDocument | InspectedDocumentMetadata> {
-  const result = await codec().textDecode({ bytesBase64: Buffer.from(input).toString('base64'), includeContent, ...options });
+  const result = await codec().textDecode({ bytesBase64: bytesToBase64(input), includeContent, ...options });
   if (result.kind !== 'text') return result;
   if (includeContent && typeof result.content !== 'string') throw new Error('Native text read returned no content');
   return { kind: 'text', encoding: result.format.encoding, bom: result.format.bom, format: result.format,
@@ -90,7 +95,7 @@ export const serializeDocumentText = async (options: EncodeDocumentTextOptions) 
   // JSON would replace lone surrogates before Rust can inspect a string. Reject them at this boundary.
   if (/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(options.content)) throw new DocumentAuthorityError('The document contains an unpaired Unicode surrogate', { code: 'invalid-text', statusCode: 400 });
   const result = await codec().textSerialize({ content: options.content,
-    ...(options.sourceBytes ? { sourceBytesBase64: Buffer.from(options.sourceBytes).toString('base64') } : {}),
+    ...(options.sourceBytes ? { sourceBytesBase64: bytesToBase64(options.sourceBytes) } : {}),
     ...(options.sourceFormat ? { sourceFormat: options.sourceFormat } : {}),
     targetFormat: { encoding: options.encoding, bom: options.bom, ...(options.lineEnding ? { lineEnding: options.lineEnding } : {}) },
     ...(options.normalizeLineEndings === undefined ? {} : { normalizeLineEndings: options.normalizeLineEndings }),

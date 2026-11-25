@@ -7,6 +7,7 @@ mod query;
 
 use crate::protocol_generated::{KernelComputeGrammarParams, KernelComputeStartParams};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{collections::{HashMap, VecDeque}, fs::File, path::PathBuf,
     sync::{mpsc, Arc, Condvar, Mutex, Weak, atomic::{AtomicBool, Ordering}}, thread::{self, JoinHandle}};
 
@@ -27,13 +28,42 @@ pub(crate) enum Source {
     Disk { root: PathBuf, device: bool },
     Objects,
 }
+/// An admitted recipe owns its verified executable bytes. Running or queued
+/// jobs must not observe a later replacement of the original filesystem path.
+#[derive(Clone)]
+pub(crate) struct AdmittedGrammar {
+    recipe: Arc<KernelComputeGrammarParams>,
+    bytes: Arc<[u8]>,
+}
+
+impl AdmittedGrammar {
+    pub(crate) fn verify_digest(recipe: &KernelComputeGrammarParams, bytes: &[u8]) -> Result<String> {
+        let digest = format!("sha256-{}", hex::encode(Sha256::digest(bytes)));
+        if recipe.grammar_hash.as_deref().is_some_and(|expected| expected != digest) {
+            return Err("unavailable: Grammar bytes changed after recipe admission".into());
+        }
+        Ok(digest)
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl std::ops::Deref for AdmittedGrammar {
+    type Target = KernelComputeGrammarParams;
+    fn deref(&self) -> &Self::Target {
+        &self.recipe
+    }
+}
+
 pub(crate) struct Task {
     pub params: KernelComputeStartParams,
     pub text_receipts:crate::storage::text_formats::Snapshot,
     pub source: Source,
     pub overlays: Vec<ObjectSource>,
     pub scopes: Vec<String>,
-    pub recipes: HashMap<String, KernelComputeGrammarParams>,
+    pub recipes: HashMap<String, AdmittedGrammar>,
     pub traversal: Option<source::Traversal>,
 }
 struct Buffered { cursor: u64, bytes: usize, record: Value }
@@ -192,11 +222,26 @@ impl ComputeWatch {
 #[derive(Default)]
 pub(crate) struct ComputeManager {
     pub jobs:HashMap<String,Job>,
-    pub recipes:HashMap<String,KernelComputeGrammarParams>,
+    pub recipes:HashMap<String,AdmittedGrammar>,
+    grammar_blobs: HashMap<String, Weak<[u8]>>,
     foreground:Arc<Queue>, background:Arc<Queue>,
     workers:Vec<JoinHandle<()>>,
 }
 impl ComputeManager {
+    pub(crate) fn retain_grammar(&mut self, recipe: KernelComputeGrammarParams, bytes: Vec<u8>, digest: String) {
+        debug_assert_eq!(recipe.grammar_hash.as_deref(), Some(digest.as_str()));
+        self.grammar_blobs.retain(|_, weak| weak.strong_count() > 0);
+        let bytes = match self.grammar_blobs.get(&digest).and_then(Weak::upgrade) {
+            Some(bytes) => bytes,
+            None => {
+                let bytes: Arc<[u8]> = bytes.into();
+                self.grammar_blobs.insert(digest, Arc::downgrade(&bytes));
+                bytes
+            }
+        };
+        self.recipes.insert(recipe.recipe_id.clone(), AdmittedGrammar { recipe: Arc::new(recipe), bytes });
+    }
+
     fn ensure_workers(&mut self) -> Result<()> {
         if !self.workers.is_empty(){return Ok(());}
         // The actual workers and native admission use the same deployment budget. Background

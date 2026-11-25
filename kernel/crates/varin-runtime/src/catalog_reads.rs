@@ -17,7 +17,6 @@ impl Catalog {
             content: self.content.clone(),
             resource_admission: self.resource_admission.clone(),
             nested_tools: self.nested_tools.clone(),
-            context_compositions: self.context_compositions.clone(),
             _owner: None,
             database_path: self.database_path.clone(),
             epoch: self.epoch,
@@ -25,7 +24,7 @@ impl Catalog {
             continuation_stopping: self.continuation_stopping.clone(),
             event_observers: self.event_observers.clone(),
             attention_cache: Default::default(),
-            context_inspections: self.context_inspections.clone(),
+            context_inspections: Default::default(),
         })
     }
 
@@ -40,7 +39,7 @@ impl Catalog {
     {
         // Register before SQLite fixes its WAL cut: the current writer may retire
         // these body references while this reader still owns the older snapshot.
-        let _publication = self.content.begin_publication();
+        let _publication = self.content.begin_read();
         self.db
             .execute_batch("BEGIN DEFERRED")
             .map_err(RuntimeError::from)?;
@@ -50,24 +49,12 @@ impl Catalog {
             .and_then(|_| read(self));
         // Read transactions have nothing to commit; rollback also releases the WAL read mark
         // on an application error. No snapshot remains leased to the pooled connection.
-        let release = self
-            .db
-            .execute_batch("ROLLBACK")
-            .map_err(RuntimeError::from);
-        match result {
-            Ok(value) => {
-                release?;
-                self.assert_read_epoch()?;
-                Ok(value)
-            }
-            Err(error) => {
-                let _ = release;
-                Err(error)
-            }
-        }
+        self.db.execute_batch("ROLLBACK").map_err(RuntimeError::from)?;
+        self.assert_read_epoch()?;
+        result
     }
 
-    fn assert_read_epoch(&self) -> Result<()> {
+    pub(super) fn assert_read_epoch(&self) -> Result<()> {
         let epoch = self
             .db
             .query_row("SELECT epoch FROM runtime_meta WHERE id=1", [], |row| {

@@ -53,7 +53,8 @@ pub enum RuntimeError {
     },
 }
 type Result<T> = std::result::Result<T, RuntimeError>;
-pub(crate) const FORMAT: i64 = 102;
+const LEGACY_FAILED_RESULT: &str = "json_extract(body,'$.phase')='terminal' AND json_extract(body,'$.outcome')='failed' AND json_extract(body,'$.effect')='none' AND json_extract(body,'$.execution_owner.kind')='kernel' AND json_extract(body,'$.call_completion') IS NULL";
+pub(crate) const FORMAT: i64 = 103;
 fn sql_number(value: u64) -> Result<i64> {
     i64::try_from(value).map_err(|_| RuntimeError::Invalid("integer exceeds catalog range".into()))
 }
@@ -240,12 +241,17 @@ fn initialize_metadata(
     // the read does not scan retained history. Their predicates match attention::OPEN_*.
     tx.execute_batch("CREATE INDEX IF NOT EXISTS attention_open_runs ON runs(branch_id) WHERE json_extract(body,'$.state') NOT IN ('completed','failed','cancelled');
         CREATE INDEX IF NOT EXISTS attention_open_operations ON operations(run_id) WHERE (json_extract(body,'$.phase')!='terminal' OR json_extract(body,'$.effect')='unknown' OR json_extract(body,'$.outcome')='indeterminate' OR (json_extract(body,'$.mcp_resource_subscription') IS NOT NULL AND (json_extract(body,'$.cancel_requested')=0 OR json_extract(body,'$.mcp_resource_subscription.localReleased')=0)))")?;
+    // Reconciliation needs only dispatched processes whose physical owner has not stopped.
+    tx.execute_batch(&format!("CREATE INDEX IF NOT EXISTS unsettled_managed_processes ON operations(id) WHERE {}", managed_process::UNSETTLED_MANAGED_PROCESS))?;
     // Product discovery and Bot ancestry need only memory-work owners, not every retained tool.
     tx.execute_batch(&format!("CREATE INDEX IF NOT EXISTS pending_host_jobs ON operations(run_id) WHERE {}", host_jobs::PENDING_JOB))?;
     tx.execute_batch("CREATE INDEX IF NOT EXISTS thread_memory_operations ON operations(run_id) WHERE json_extract(body,'$.intent.kind')='memory_work_v1'")?;
     tx.execute_batch("CREATE INDEX IF NOT EXISTS pending_code_exchange_jobs ON operations(run_id) WHERE json_extract(body,'$.host_job.binding.domain')='collaboration.code' AND (coalesce(json_extract(body,'$.external_receipt.executor_stopped'),0)=0 OR json_extract(body,'$.phase')!='terminal')")?;
     tx.execute_batch(&format!("CREATE INDEX IF NOT EXISTS pending_waits_by_event ON waits(json_extract(body,'$.subject'),json_extract(body,'$.kind')) WHERE {PENDING_WAIT}"))?;
     observations::initialize_recovery_index(&tx)?;
+    tx.execute_batch(&format!("CREATE INDEX IF NOT EXISTS recovery_failed_result ON operations(json_extract(body,'$.result.reference.content_object')) WHERE {LEGACY_FAILED_RESULT};
+        CREATE INDEX IF NOT EXISTS policy_actions_by_run ON operations(run_id) WHERE json_extract(body,'$.intent.kind') IN ({});
+        CREATE INDEX IF NOT EXISTS recovery_model_steps ON model_steps(state) WHERE state IN ('prepared','dispatched')", policy_body::ACTION_KINDS))?;
     source_retention::initialize(&tx)?;
     if version == 0 {
         collaboration::initialize_new(&tx)?;
@@ -266,6 +272,7 @@ fn initialize_metadata(
         threads::initialize_model_preferences(&tx)?;
     }
     collaboration::initialize_recovery_indexes(&tx)?;
+    external::initialize_activity_index(&tx)?;
     titles::initialize(&tx)?;
     let epoch = tx.query_row(
         "UPDATE runtime_meta SET epoch=epoch+1 WHERE id=1 RETURNING epoch",
@@ -284,7 +291,6 @@ pub struct Catalog {
     content: crate::content::ContentStore,
     resource_admission: std::sync::Arc<crate::resource_admission::ResourceAdmission>,
     nested_tools: std::sync::Arc<crate::nested_tools::NestedTools>,
-    context_compositions: std::sync::Arc<crate::composition::context::ContextCompositions>,
     _owner: Option<std::sync::Arc<File>>,
     database_path: std::path::PathBuf,
     epoch: u64,
@@ -341,9 +347,6 @@ impl Catalog {
             content,
             resource_admission,
             nested_tools: std::sync::Arc::new(crate::nested_tools::NestedTools::default()),
-            context_compositions: std::sync::Arc::new(
-                crate::composition::context::ContextCompositions::default(),
-            ),
             _owner: Some(std::sync::Arc::new(owner)),
             database_path,
             epoch,
@@ -1511,34 +1514,20 @@ impl Catalog {
         // Result (including tool_invoke). Repair only its known content identity; arbitrary
         // tool output and original caller receipts must never be rewritten on reopen.
         let legacy_interrupted_result = crate::content::ContentStore::reference(&interrupted_body)?;
-        let interrupted_read: bool = self.db.query_row(&format!("SELECT EXISTS(SELECT 1 FROM operations WHERE
-            (json_extract(body,'$.phase')='running' AND json_extract(body,'$.effect')='none'
-             AND coalesce(json_extract(body,'$.intent.kind'),'') NOT IN ({}))
-            OR (json_extract(body,'$.execution_owner.kind')='kernel' AND json_extract(body,'$.phase')='terminal'
-             AND json_extract(body,'$.outcome')='failed' AND json_extract(body,'$.effect')='none'
-             AND json_extract(body,'$.result.reference.content_object')=?1))", policy_body::ACTION_KINDS),
-            [legacy_interrupted_result["content_object"].as_str()], |row| row.get(0))?;
-        let interrupted_result = interrupted_read
-            .then(|| self.content.save_output(&interrupted_body.into()))
-            .transpose()?;
+        let mut interrupted_result = recovery_output(&self.content, interrupted_body);
         // Older Catalogs retained an interrupted Host Result's owner but no result body.
         // Preserve that uncertainty while giving explicit cancellation a truthful caller
         // completion to pair. This is not an executor-stop receipt or a replay admission.
-        let interrupted_observation: bool = self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM operations WHERE json_extract(body,'$.execution_owner.kind')='external'
-             AND json_extract(body,'$.phase') IN ('running','terminal')
-             AND json_extract(body,'$.result') IS NULL
-             AND json_extract(body,'$.intent.contract.completion')='result'
-             AND json_extract(body,'$.intent.contract.lifetime')='run')", [], |row| row.get(0))?;
-        let interrupted_observation_result = interrupted_observation.then(|| self.content.save_output(&json!({
+        let mut interrupted_observation_result = recovery_output(&self.content, json!({
             "error":"tool_result_unavailable",
             "message":"The original call was interrupted before its result was recorded. Its executor has not been confirmed stopped; no retry was started."
-        }).into())).transpose()?;
+        }));
         let tx = self.db.transaction()?;
         policy_switch::interrupt_candidates(&tx)?;
         tx.execute("UPDATE resumptions SET claimed=0 WHERE acknowledged=0", [])?;
-        let runs: Vec<Value> = read_all(&tx, "runs")?;
-        for value in runs {
+        let open_run = attention::OPEN_RUN;
+        for value in recovery_rows(&tx, "runs", &format!("SELECT rowid FROM runs WHERE {open_run}"), [])? {
+            let value = value?;
             if utility_run::recover(&tx, &value, self.epoch)? { continue; }
             let mut run: Run = serde_json::from_value(value)?;
             if !run.state.terminal() {
@@ -1578,8 +1567,8 @@ impl Catalog {
                 )?;
             }
         }
-        let steps: Vec<ModelStep> = read_all(&tx, "model_steps")?;
-        for mut step in steps {
+        for step in recovery_rows(&tx, "model_steps", "SELECT rowid FROM model_steps WHERE state IN ('prepared','dispatched')", [])? {
+            let mut step: ModelStep = step?;
             if step.state == ModelStepState::Dispatched {
                 if step.usage.is_none() {
                     let usage = crate::execution::UsageReceipt::default();
@@ -1601,8 +1590,16 @@ impl Catalog {
                 put(&tx, "model_steps", &step.id, &step)?;
             }
         }
-        let operations: Vec<Operation> = read_all(&tx, "operations")?;
-        for mut op in operations {
+        // Pin candidate identities before writes. Recovering a child can settle its parent,
+        // so fetch each current body only when it is that operation's turn.
+        let candidates = format!("SELECT o.rowid FROM operations o INDEXED BY attention_open_operations WHERE {}
+            UNION SELECT o.rowid FROM resource_occupancy occupied CROSS JOIN operations o ON o.id=occupied.operation_id
+            UNION SELECT rowid FROM operations INDEXED BY policy_actions_by_run
+              WHERE run_id IN (SELECT id FROM runs INDEXED BY attention_open_runs WHERE {open_run}) AND json_extract(body,'$.intent.kind') IN ({})
+            UNION SELECT rowid FROM operations INDEXED BY recovery_failed_result WHERE {LEGACY_FAILED_RESULT} AND json_extract(body,'$.result.reference.content_object')=?1",
+            attention::OPEN_OPERATION, policy_body::ACTION_KINDS);
+        for op in recovery_rows(&tx, "operations", &candidates, [legacy_interrupted_result["content_object"].as_str()])? {
+            let mut op: Operation = op?;
             if policy_model::model_metadata(&op)?.is_some() {
                 let mut result = policy_model::model_result(&op)?;
                 if result.dispatch == crate::execution::PolicyModelDispatch::Dispatched
@@ -1764,14 +1761,7 @@ impl Catalog {
                     } else {
                         op.outcome = Some(Outcome::Failed);
                         op.result = Some(OperationResultMetadata::Content {
-                            reference: interrupted_result
-                                .as_ref()
-                                .ok_or_else(|| {
-                                    RuntimeError::Invalid(
-                                        "interrupted result was not prepared".into(),
-                                    )
-                                })?
-                                .clone(),
+                            reference: interrupted_result()?,
                         });
                     }
                 }
@@ -1796,9 +1786,7 @@ impl Catalog {
                 && matches!(&op.result, Some(OperationResultMetadata::Content { reference }) if reference == &legacy_interrupted_result)
             {
                 op.result = Some(OperationResultMetadata::Content {
-                    reference: interrupted_result.as_ref().ok_or_else(|| {
-                        RuntimeError::Invalid("interrupted kernel result was not prepared".into())
-                    })?.clone(),
+                    reference: interrupted_result()?,
                 });
                 op.revision += 1;
                 put(&tx, "operations", &op.id, &op)?;
@@ -1806,9 +1794,7 @@ impl Catalog {
             }
             if op.result.is_none() && recovery::cancellable_result_observation(&op)? {
                 op.result = Some(OperationResultMetadata::Content {
-                    reference: interrupted_observation_result.as_ref().ok_or_else(|| {
-                        RuntimeError::Invalid("interrupted tool observation was not prepared".into())
-                    })?.clone(),
+                    reference: interrupted_observation_result()?,
                 });
                 op.revision += 1;
                 put(&tx, "operations", &op.id, &op)?;
@@ -1817,6 +1803,28 @@ impl Catalog {
         }
         tx.commit()?;
         Ok(())
+    }
+}
+fn recovery_rows<'db, T: DeserializeOwned>(
+    db: &'db Connection, table: &str, query: &str, params: impl rusqlite::Params,
+) -> Result<impl Iterator<Item = Result<T>> + 'db> {
+    let ids = db.prepare(query)?.query_map(params, |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut lookup = db.prepare(&format!("SELECT body FROM {table} WHERE rowid=?1"))?;
+    Ok(ids.into_iter().map(move |id| {
+        let body: String = lookup.query_row([id], |r| r.get(0))?;
+        Ok(serde_json::from_str(&body)?)
+    }))
+}
+
+fn recovery_output(store: &crate::content::ContentStore, body: Value) -> impl FnMut() -> Result<Value> + '_ {
+    let body = body.into();
+    let mut saved: Option<Value> = None;
+    move || {
+        if let Some(reference) = &saved { return Ok(reference.clone()); }
+        let reference = store.save_output(&body)?;
+        saved = Some(reference.clone());
+        Ok(reference)
     }
 }
 fn read_all<T: DeserializeOwned>(db: &Connection, table: &str) -> Result<Vec<T>> {

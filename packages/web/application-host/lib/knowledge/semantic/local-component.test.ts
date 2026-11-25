@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
+import { PassThrough } from "node:stream";
+import express from "express";
+import type { Request, Response } from "express";
+import { registerLocalSemanticComponentRoutes } from "./local-component-routes.js";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -113,6 +117,104 @@ describe("local semantic component manager", () => {
     expect(manager.status()).toMatchObject({ status: "ready", version: "test-version" });
     expect(resolveInstalledModelPack(dataDir)).toMatchObject({ source: "component", recipe: { dim: 3 } });
     await manager.dispose();
+  });
+
+  it("routes an authenticated offline import to the executing Host and exposes status to another client", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "varin-local-semantic-executing-"));
+    const otherDir = await mkdtemp(join(tmpdir(), "varin-local-semantic-separate-"));
+    roots.push(dataDir, otherDir);
+    const archive = await readFile(await makeArchive());
+    const options = {
+      version: "test",
+      fetch: async () => { throw new Error("network disabled"); },
+      validatePack: async () => undefined,
+    };
+    const owner = createLocalSemanticComponentManager({ ...options, dataDir });
+    const other = createLocalSemanticComponentManager({ ...options, dataDir: otherDir });
+    const router = express.Router();
+    registerLocalSemanticComponentRoutes(router as unknown as express.Express, {
+      manager: owner, requireAuth: (req, res, next) => {
+        if (req.headers.authorization !== "Bearer test-owner") res.status(401).json({ error: "unauthorized" });
+        else next();
+      },
+    });
+    const boundary = "varin-offline-test";
+    const bytes = Buffer.concat([
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="component.tar.gz"\r\nContent-Type: application/gzip\r\n\r\n`),
+      archive, Buffer.from(`\r\n--${boundary}--\r\n`),
+    ]);
+    const call = (method: string, url: string, client: string, body?: Buffer, authed = true) => {
+      const req = Object.assign(new PassThrough(), {
+        method, url, headers: {
+          ...(authed ? { authorization: "Bearer test-owner" } : {}),
+          "user-agent": client,
+          ...(body ? { "content-type": `multipart/form-data; boundary=${boundary}`, "content-length": String(body.length) } : {}),
+        },
+      });
+      return new Promise<{ status: number; body: unknown }>((resolve, reject) => {
+        const res = {
+          statusCode: 200,
+          status(code: number) { this.statusCode = code; return this; },
+          setHeader() {},
+          json(body: unknown) { resolve({ status: this.statusCode, body }); return this; },
+        };
+        router(req as unknown as Request, res as unknown as Response, reject);
+        req.end(body);
+      }).finally(() => req.destroy());
+    };
+    try {
+      const prefix = "/api/harness/local-semantic";
+      expect(await call("POST", prefix + "/import", "mobile-test", bytes, false)).toMatchObject({ status: 401 });
+      expect(await call("POST", prefix + "/import", "mobile-test", bytes)).toMatchObject({ status: 202 });
+      await expect.poll(() => owner.status().status).toBe("ready");
+      expect(await call("GET", prefix, "light-desktop-test")).toMatchObject({
+        status: 200, body: { status: "ready", version: "test-version" },
+      });
+      expect(resolveInstalledModelPack(dataDir)?.source).toBe("component");
+      expect(other.status()).toEqual({ status: "not-installed" });
+      expect(resolveInstalledModelPack(otherDir)).toBeNull();
+    } finally {
+      await Promise.all([owner.dispose(), other.dispose()]);
+    }
+  });
+
+  it("cancels a remote replacement without losing the active model and retries through the same owner", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "varin-local-semantic-download-"));
+    roots.push(dataDir);
+    const original = await makeArchive();
+    const replacement = new Uint8Array(await readFile(await makeArchive({ modelBytes: "replacement-model" })));
+    let reachedFetch!: () => void;
+    const fetching = new Promise<void>((resolve) => { reachedFetch = resolve; });
+    let requests = 0;
+    const fetcher: typeof fetch = async () => {
+      if (++requests === 1) {
+        reachedFetch();
+        return new Response(new ReadableStream<Uint8Array>({
+          start(controller) { controller.enqueue(replacement.subarray(0, 32)); },
+        }));
+      }
+      return new Response(replacement, { headers: { "content-length": String(replacement.byteLength) } });
+    };
+    const manager = createLocalSemanticComponentManager({ dataDir, version: "test", fetch: fetcher, validatePack: async () => undefined });
+    try {
+      await manager.importArchive(original);
+      const previous = resolveInstalledModelPack(dataDir);
+      expect(previous?.root).toBeDefined();
+      const installing = manager.install();
+      await fetching;
+      expect(manager.install()).toBe(installing);
+      expect(() => manager.importArchive(original)).toThrow('Another local semantic component');
+      manager.cancel();
+      await installing;
+      expect(manager.status()).toMatchObject({ status: "ready", error: expect.stringContaining("cancelled") });
+      expect(resolveInstalledModelPack(dataDir)?.root).toBe(previous?.root);
+      await manager.install();
+      expect(manager.status()).toMatchObject({ status: "ready" });
+      expect(resolveInstalledModelPack(dataDir)?.root).not.toBe(previous?.root);
+      expect(requests).toBe(2);
+    } finally {
+      await manager.dispose();
+    }
   });
 
   it("leaves the previously enabled package usable after a failed replacement", async () => {

@@ -1,4 +1,5 @@
 import React from 'react';
+import { observeInlineLayout } from '@/lib/interactive-ui/inline-layout';
 import { subscribeRuntimeEndpointWillChange } from '@varin/application-client';
 import { useI18n } from '@/lib/i18n';
 import { subscribeUiSessions, uiSessionsRevision, notifyUiSessions, type UiSession } from '@/lib/interactive-ui/sessions';
@@ -36,9 +37,7 @@ function InlineUiView({ session }: { session: UiSession }) {
     const element = anchor?.element, view = layer.current, boundary = view?.parentElement;
     if (!element || !view || !boundary) return;
     const releaseScroll = bindInlineScroll(view, element);
-    let frame = 0;
     const position = () => {
-      frame = 0;
       if (!element.isConnected) { view.style.visibility = 'hidden'; return; }
       const rect = element.getBoundingClientRect();
       const bounds = boundary.getBoundingClientRect();
@@ -54,19 +53,9 @@ function InlineUiView({ session }: { session: UiSession }) {
       view.style.visibility = rect.width > 0 && rect.top + renderedHeight > top && rect.top < bottom ? 'visible' : 'hidden';
       view.style.clipPath = `inset(${Math.max(0, top - rect.top) / scaleY}px ${Math.max(0, rect.right - right) / scaleX}px ${Math.max(0, rect.top + renderedHeight - bottom) / scaleY}px ${Math.max(0, left - rect.left) / scaleX}px)`;
     };
-    const schedule = () => { if (!frame) frame = requestAnimationFrame(position); };
-    const observer = new ResizeObserver(schedule); observer.observe(element); observer.observe(view); observer.observe(boundary);
-    let layoutRoot = element.parentElement;
-    for (let parent = element.parentElement; parent; parent = parent.parentElement) {
-      observer.observe(parent);
-      if (/(auto|scroll)/.test(getComputedStyle(parent).overflowY)) { layoutRoot = parent; break; }
-    }
-    // Virtual row transforms and growth above the slot do not necessarily resize
-    // the slot. Observe its layout owner, batching all notifications per frame.
-    const mutations = new MutationObserver(schedule);
-    if (layoutRoot) mutations.observe(layoutRoot, { subtree: true, childList: true, characterData: true, attributes: layoutRoot !== document.body });
-    window.addEventListener('scroll', schedule, true); window.addEventListener('resize', schedule); position();
-    return () => { releaseScroll(); observer.disconnect(); mutations.disconnect(); window.removeEventListener('scroll', schedule, true); window.removeEventListener('resize', schedule); cancelAnimationFrame(frame); element.style.minHeight = ''; };
+    const stop = observeInlineLayout(element, view, boundary, position);
+    position();
+    return () => { releaseScroll(); stop(); element.style.minHeight = ''; };
   }, [anchor, session, mounted]);
   if (!anchor || !display || typeof document === 'undefined') return null;
   return <UiEmbedAncestryContext.Provider value={[...session.embedAncestors ?? [], display.source.ref ?? session.key]}><div ref={layer} id={`ui-inline-${encodeURIComponent(session.key)}`} className="pointer-events-auto absolute top-0 left-0 flow-root min-w-0 text-foreground"

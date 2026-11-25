@@ -4,12 +4,15 @@ type RecordValue = Record<string, unknown>;
 const record = (value: unknown): value is RecordValue =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
+type OutboundMode = 'auto' | 'direct' | 'proxy';
+type NormalizedOutboundNetwork = { mode: OutboundMode; proxyUrl: string; noProxy: string; credentialRef?: string };
+
 /** Validate a UI write without silently discarding a malformed security choice. */
-export function normalizeOutboundNetwork(value: unknown): RecordValue {
-  if (!record(value) || !['auto', 'direct', 'proxy'].includes(String(value.mode))) {
+export function normalizeOutboundNetwork(value: unknown): NormalizedOutboundNetwork {
+  if (!record(value) || (value.mode !== 'auto' && value.mode !== 'direct' && value.mode !== 'proxy')) {
     throw new Error('Outbound network mode must be auto, direct, or proxy');
   }
-  const mode = value.mode as 'auto' | 'direct' | 'proxy';
+  const mode = value.mode;
   if (value.proxyUrl !== undefined && typeof value.proxyUrl !== 'string') throw new Error('Proxy URL must be a string');
   if (value.noProxy !== undefined && typeof value.noProxy !== 'string') throw new Error('NO_PROXY must be a string');
   if (value.credentialRef !== undefined && typeof value.credentialRef !== 'string') throw new Error('Proxy credential binding must be a string');
@@ -32,7 +35,7 @@ export function outboundProxyBinding(document: RecordValue): { credentialRef: st
   if (document.outboundNetwork === undefined) return null;
   const setting = normalizeOutboundNetwork(document.outboundNetwork);
   if (setting.mode !== 'proxy' || typeof setting.credentialRef !== 'string' || !setting.credentialRef) return null;
-  return { credentialRef: setting.credentialRef, proxyOrigin: new URL(setting.proxyUrl as string).origin };
+  return { credentialRef: setting.credentialRef, proxyOrigin: new URL(setting.proxyUrl).origin };
 }
 
 export function encodeOutboundProxyAuth(credentialRef: string, proxyOrigin: string, username: string, password: string): string {
@@ -56,21 +59,49 @@ export function readOutboundProxyAuth(auth: RecordValue, credentialRef: string, 
   return { username: decoded.username, password: decoded.password };
 }
 
-/** Preserve malformed external edits as a fail-closed state for the egress runtime. */
-export function readEgressHostConfiguration(document: RecordValue, auth: RecordValue = {}): EgressHostConfiguration | undefined {
+type EgressSettingsProjection =
+  | { mode: 'proxy'; invalid: string }
+  | { mode: OutboundMode; proxyUrl: string; noProxy: string; credential?: { ref: string; origin: string } }
+  | undefined;
+
+const invalidEgress = (error: unknown): { mode: 'proxy'; invalid: string } => ({
+  mode: 'proxy',
+  invalid: error instanceof Error ? error.message : 'invalid Host egress configuration',
+});
+
+/** Project only non-secret settings; malformed external policy remains fail closed. */
+export function projectEgressSettings(document: RecordValue): EgressSettingsProjection {
   if (document.outboundNetwork === undefined) return undefined;
   try {
-    const setting = normalizeOutboundNetwork(document.outboundNetwork);
-    const proxyAuth = setting.mode === 'proxy' && setting.credentialRef
-      ? readOutboundProxyAuth(auth, setting.credentialRef as string, new URL(setting.proxyUrl as string).origin)
-      : undefined;
+    const { mode, proxyUrl, noProxy, credentialRef } = normalizeOutboundNetwork(document.outboundNetwork);
     return {
-      mode: setting.mode as EgressHostConfiguration['mode'],
-      proxyUrl: setting.proxyUrl as string,
-      noProxy: setting.noProxy as string,
-      ...(proxyAuth ? { proxyAuth } : {}),
+      mode, proxyUrl, noProxy,
+      ...(mode === 'proxy' && credentialRef ? { credential: { ref: credentialRef, origin: new URL(proxyUrl).origin } } : {}),
     };
   } catch (error) {
-    return { mode: 'proxy', invalid: error instanceof Error ? error.message : 'invalid Host egress configuration' };
+    return invalidEgress(error);
   }
 }
+
+const resolveEgressSettings = (
+  projection: EgressSettingsProjection, readAuth: () => RecordValue,
+): EgressHostConfiguration | undefined => {
+  if (!projection || 'invalid' in projection) return projection;
+  try {
+    const { mode, proxyUrl, noProxy, credential } = projection;
+    // Secrets have their own writer and may change without any settings write.
+    const proxyAuth = credential ? readOutboundProxyAuth(readAuth(), credential.ref, credential.origin) : undefined;
+    return { mode, proxyUrl, noProxy, ...(proxyAuth ? { proxyAuth } : {}) };
+  } catch (error) {
+    return invalidEgress(error);
+  }
+};
+
+export function readEgressHostConfiguration(document: RecordValue, auth: RecordValue = {}): EgressHostConfiguration | undefined {
+  return resolveEgressSettings(projectEgressSettings(document), () => auth);
+}
+
+export const bindEgressHostConfiguration = (
+  projection: { read(): Promise<EgressSettingsProjection> },
+  readAuth: () => RecordValue,
+) => async (): Promise<EgressHostConfiguration | undefined> => resolveEgressSettings(await projection.read(), readAuth);

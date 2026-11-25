@@ -15,38 +15,53 @@ function embedReferences(part: ChatTextContent, streaming: boolean) {
   parsedEmbeds.set(part, { text: part.text, streaming, embeds });
   return embeds;
 }
-/** Resolve final placement before history mounts. Tool receipts remain intact. */
-export function projectUiEmbeds(entries: readonly ChatSessionEntry[], cards: Record<string, UiCardProjection>, live?: ChatAssistantMessage) {
-  const embeds: Record<string, UiEmbedPlacement> = {}, targets: Record<string, string> = {};
-  let turn = 'history', pending: Array<{ key: string; ref: string; entryId: string }> = [], owners = new Map<string, string>();
-  const flush = () => {
-    const first = new Map<string, UiEmbedPlacement>();
-    for (const item of pending) {
-      const owner = owners.get(item.ref);
-      const placement = first.get(item.ref) ?? { sessionId: owner ?? `embed:${turn}:${item.ref}`, primaryKey: item.key, sourceEntryId: item.entryId, ref: item.ref };
-      first.set(item.ref, placement); embeds[item.key] = placement;
-      targets[placement.sessionId] = placement.primaryKey;
+type Pending = { key: string; ref: string; entryId: string };
+type Cards = Record<string, UiCardProjection>;
+
+function collect(entryId: string, message: ChatAssistantMessage, cards: Cards, pending: Pending[], owners: Map<string, string>) {
+  message.content.forEach((part, index) => {
+    if (part.type === 'toolCall') {
+      const projection = cards[part.id], receipt = projection?.result?.details as { ref?: string } | undefined;
+      if (receipt?.ref && !projection?.compact) owners.set(receipt.ref, part.id);
     }
-    pending = []; owners = new Map();
-  };
-  const text = (entryId: string, message: ChatAssistantMessage) => {
-    message.content.forEach((part, contentIndex) => {
-      if (part.type === 'toolCall') {
-        const projected = cards[part.id], receipt = projected?.result?.details as { ref?: string } | undefined;
-        if (receipt?.ref && !projected?.compact) owners.set(receipt.ref, part.id);
-      }
-      if (part.type !== 'text') return;
-      for (const fragment of embedReferences(part, message.stopReason === 'pending')) {
-        pending.push({ key: part.id ? `${part.id}:offset:${fragment.start}` : `${entryId}:${part.contentIndex ?? contentIndex}:offset:${fragment.start}`, ref: fragment.ref, entryId });
-      }
-    });
-  };
+    if (part.type !== 'text') return;
+    for (const { start, ref } of embedReferences(part, message.stopReason === 'pending')) {
+      pending.push({ key: part.id ? `${part.id}:offset:${start}` : `${entryId}:${part.contentIndex ?? index}:offset:${start}`, ref, entryId });
+    }
+  });
+}
+type Placement = { embeds: Record<string, UiEmbedPlacement>; targets: Record<string, string> };
+function place(turn: string, pending: Pending[], owners: Map<string,string>, out: Placement) {
+  const first = new Map<string, UiEmbedPlacement>();
+  for (const item of pending) {
+    const placement = first.get(item.ref) ?? { sessionId: owners.get(item.ref) ?? `embed:${turn}:${item.ref}`, primaryKey: item.key, sourceEntryId: item.entryId, ref: item.ref };
+    first.set(item.ref, placement); out.embeds[item.key] = placement; out.targets[placement.sessionId] = placement.primaryKey;
+  }
+}
+/** A projection belongs to a specific immutable committed history + card snapshot.
+ * Live text only visits the active assistant. Keep placement identity when prose
+ * grows around already-visible embeds, so the timeline does not rebind old cards. */
+export function prepareUiEmbeds(entries: readonly ChatSessionEntry[], cards: Cards) {
+  const complete: Placement = { embeds: {}, targets: {} };
+  let turn = 'history', pending: Pending[] = [], owners = new Map<string,string>();
   for (const entry of entries) {
     if (entry.type !== 'message') continue;
-    if (entry.message.role === 'user') { flush(); turn = entry.id; }
-    if (entry.message.role === 'assistant') text(entry.id, entry.message);
+    if (entry.message.role === 'user') { place(turn, pending, owners, complete); turn = entry.id; pending = []; owners = new Map(); }
+    if (entry.message.role === 'assistant') collect(entry.id, entry.message, cards, pending, owners);
   }
-  if (live) text(live.id, live);
-  flush();
-  return { embeds, targets };
+  let previous: Placement | undefined, signature: string | undefined;
+  return (live?: ChatAssistantMessage) => {
+    const tail: Pending[] = [], tailOwners = new Map<string,string>();
+    if (live) collect(live.id, live, cards, tail, tailOwners);
+    const next = tail.length || tailOwners.size ? JSON.stringify([tail, [...tailOwners]]) : '';
+    if (signature === next && previous) return previous;
+    const out = { embeds: { ...complete.embeds }, targets: { ...complete.targets } };
+    place(turn, pending.concat(tail), new Map([...owners, ...tailOwners]), out);
+    signature = next; previous = out;
+    return out;
+  };
+}
+
+export function projectUiEmbeds(entries: readonly ChatSessionEntry[], cards: Cards, live?: ChatAssistantMessage) {
+  return prepareUiEmbeds(entries, cards)(live);
 }

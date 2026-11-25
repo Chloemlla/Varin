@@ -104,7 +104,10 @@ PDFs and Web materials share original-byte views, explicit grants, revision chec
 `ThreadMaterials.upload` uses `documentReader` to retain original PDF bytes in MaterialStore under the
 admitted Thread scope. Submission, the three enqueue paths and child continuation pass the captured
 snapshot, without browser extraction or a separate Rust PDF wire. Knowing a material ID does not grant
-access; collection sharing is an explicit owner operation.
+access; collection sharing is an explicit owner operation. PDF rendering opens an on-demand worker for
+the pixel-aligned requested region. One raster job at a time owns a canvas and PNG encoder; cancellation
+removes queued jobs or stops the active worker before the next job acquires that slot. Native text
+extraction and optional managed Docling/Tesseract execution keep their separate paths.
 
 ## Research jobs
 

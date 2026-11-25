@@ -393,14 +393,14 @@ impl RunAssembly {
             collaboration_source = Some(collaboration_binding);
         }
         if !is_context_job {
-            let existing=declarations.iter().position(|declaration|declaration.schema.name=="file_read").map(|index|declarations.remove(index));
-            let path_read = existing.is_some();
-            let reader = crate::attachment_reads::declaration(existing,runtime.catalog(),self.resource.clone());
-            declarations.push(reader);
+            let path_read = declarations.iter().any(|declaration| declaration.schema.name == "file_read");
             if path_read && !is_child && host_authority && crate::work_locations::eligible(launch_source.as_ref()) {
                 crate::work_locations::route_declarations(&mut declarations, p.run_id.clone(), launch_source.as_ref().unwrap().clone(),
                     runtime.catalog(), resources.clone().with_journal_catalog(runtime.catalog()));
             }
+            let existing=declarations.iter().position(|declaration|declaration.schema.name=="file_read").map(|index|declarations.remove(index));
+            let reader = crate::attachment_reads::declaration(existing,runtime.catalog(),self.resource.clone());
+            declarations.push(reader);
             declarations.push(crate::agent_resources::declaration(
                 runtime.catalog(),
                 self.resource.clone(),

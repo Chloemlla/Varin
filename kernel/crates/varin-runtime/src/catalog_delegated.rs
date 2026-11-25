@@ -538,12 +538,13 @@ impl Catalog {
         &self,
         execution: DelegatedExecution,
     ) -> Result<DelegatedExecutionRead> {
+        let publication = self.content.begin_read();
         Ok(DelegatedExecutionRead {
             agent_id: self.db.query_row("SELECT agent_code FROM threads WHERE id=(SELECT child_thread_id FROM child_tasks WHERE id=?1)",[&execution.child_operation_id],|r|r.get(0))?,
             relation: relation(&self.db, &execution.child_operation_id)?,
             execution,
             content: self.content.clone(),
-            _publication: self.content.begin_publication(),
+            _publication: publication,
         })
     }
     pub fn execution_task(&self, id: &str) -> Result<ChildTask> {

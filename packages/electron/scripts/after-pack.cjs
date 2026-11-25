@@ -206,25 +206,13 @@ module.exports = (context) => {
     windowsHide: true,
   });
 
-  const packagedPdfjsEntry = path.join(packagedPdfjsRoot, 'legacy', 'build', 'pdf.mjs');
+  const packagedPdfEngine = path.join(resourcesPath, 'app.asar', 'node_modules', '@varin', 'web', 'server', 'lib', 'harness', 'pdf-engine.js');
   const pdfRuntimeSmoke = `
     import { createRequire } from 'node:module';
-    import { existsSync } from 'node:fs';
-    import path from 'node:path';
-    import { sep } from 'node:path';
     import { pathToFileURL } from 'node:url';
-    const pdfjsEntry = ${JSON.stringify(packagedPdfjsEntry)};
-    const pdfRequire = createRequire(pdfjsEntry);
-    const canvas = pdfRequire('@napi-rs/canvas');
-    const pdfjs = await import(pathToFileURL(pdfjsEntry).href);
-    if (typeof pdfjs.getDocument !== 'function') {
-      throw new Error('PDF.js legacy runtime could not be loaded.');
-    }
-    const packageRoot = path.resolve(path.dirname(pdfjsEntry), '..', '..');
-    const unpackedRoot = packageRoot.replace('app.asar' + sep, 'app.asar.unpacked' + sep);
-    const assetRoot = existsSync(path.join(unpackedRoot, 'standard_fonts')) ? unpackedRoot : packageRoot;
-    const cMapUrl = pathToFileURL(path.join(assetRoot, 'cmaps') + sep).href;
-    const standardFontDataUrl = pathToFileURL(path.join(assetRoot, 'standard_fonts') + sep).href;
+    const entry = ${JSON.stringify(packagedPdfEngine)};
+    const { createPdfEngine } = await import(pathToFileURL(entry).href);
+    const canvas = createRequire(entry)('@napi-rs/canvas');
     const content = 'q\\n0 0 1 rg\\n20 20 60 40 re\\nf\\nBT /F1 14 Tf 20 90 Td (packaged PDF render) Tj ET\\nQ\\n';
     const objects = [
       '<< /Type /Catalog /Pages 2 0 R >>',
@@ -243,31 +231,16 @@ module.exports = (context) => {
     source += 'xref\\n0 ' + (objects.length + 1) + '\\n0000000000 65535 f \\n';
     for (const offset of offsets.slice(1)) source += String(offset).padStart(10, '0') + ' 00000 n \\n';
     source += 'trailer\\n<< /Size ' + (objects.length + 1) + ' /Root 1 0 R >>\\nstartxref\\n' + xrefOffset + '\\n%%EOF\\n';
-    const loading = pdfjs.getDocument({
-      cMapPacked: true,
-      cMapUrl,
-      data: new Uint8Array(Buffer.from(source, 'ascii')),
-      standardFontDataUrl,
-      wasmUrl: pathToFileURL(path.join(assetRoot, 'wasm') + sep).href,
-      iccUrl: pathToFileURL(path.join(assetRoot, 'iccs') + sep).href,
-    });
-    let document;
-    try {
-      document = await loading.promise;
-      const page = await document.getPage(1);
-      const viewport = page.getViewport({ scale: 1 });
-      const width = Math.ceil(viewport.width);
-      const height = Math.ceil(viewport.height);
-      const surface = canvas.createCanvas(width, height);
-      await page.render({ canvas: surface, canvasContext: surface.getContext('2d'), viewport }).promise;
-      const png = surface.toBuffer('image/png');
-      if (width !== 200 || height !== 120 || !Buffer.isBuffer(png) || png.length <= 8) {
-        throw new Error('Packaged PDF.js returned an empty or incorrectly sized render.');
-      }
-      console.log('[electron] rendered the embedded PDF with packaged PDF.js and native Canvas');
-    } finally {
-      await loading.destroy();
+    const { data, width, height } = await createPdfEngine().renderPage({ source: Buffer.from(source, 'ascii'), page: 1, scale: 1 });
+    if (width !== 200 || height !== 120) throw new Error('Incorrect packaged PDF raster size');
+    const ctx = canvas.createCanvas(width, height).getContext('2d');
+    ctx.drawImage(await canvas.loadImage(data), 0, 0);
+    // The text occupies a separate band above the blue rectangle.
+    const band = ctx.getImageData(20, 12, 170, 26).data;
+    if (!band.some((v, i) => i % 4 === 0 && v < 128)) {
+      throw new Error('The packaged Host PDF raster worker failed to paint the text');
     }
+    console.log('[electron] rendered PDF text through the packaged Host worker');
   `;
   execFileSync(packagedExecutable, ['--input-type=module', '-e', pdfRuntimeSmoke], {
     cwd: path.resolve(__dirname, '..', '..', '..'),

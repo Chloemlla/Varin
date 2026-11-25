@@ -904,6 +904,7 @@ impl Catalog {
         Ok(metadata)
     }
     pub(super) fn launch_read(&self, metadata: LaunchMetadata) -> Result<LaunchRead> {
+        let publication = self.content.begin_read();
         Ok(LaunchRead {
             principal_id: self.run(&metadata.run_id)?.principal_id,
             driver_preparable: super::driver::preparable(&self.db, &metadata.run_id, &metadata)?,
@@ -916,7 +917,7 @@ impl Catalog {
             pause: self.capture_policy_pause(&metadata.run_id)?,
             metadata,
             content: self.content.clone(),
-            _publication: self.content.begin_publication(),
+            _publication: publication,
         })
     }
     pub fn capture_launch(&self, run_id: &str) -> Result<Option<LaunchRead>> {

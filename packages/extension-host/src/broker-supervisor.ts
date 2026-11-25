@@ -1,3 +1,7 @@
+import { join } from 'node:path';
+import { VARIN_BUILTIN_EXTENSION_PACKAGE_ROOTS } from '@varin/extension-builtins/host';
+import { varinBuiltinDefinition, VARIN_BUILTIN_TYPESCRIPT_LANGUAGE_EXTENSION_ID, VARIN_BUILTIN_LANGUAGE_SERVERS_EXTENSION_ID, VARIN_BUILTIN_WORKSPACE_RECOVERY_EXTENSION_ID } from '@varin/extension-builtins';
+import { builtinServiceProvisions, declarationLifecycle } from './builtin-services.js';
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { fork, type ChildProcess } from "node:child_process";
@@ -454,9 +458,12 @@ export class BrokeredHostSupervisor {
   readonly #preparations = new Map<string, AbortController>();
   readonly #roots = new Set<RootConsumer>();
   readonly #anchors = new Map<string, HostCompositionLease>();
+  // Simultaneous slots from one request often select the same implementation.
+  // Coalesce planning, never pins or execution. An already computed plan is never cached.
+  readonly #directoryPlans = new WeakMap<AbortSignal, Map<string, Promise<HostCompositionPlan>>>();
   readonly #ownerGrants = new Map<string, {
     owner: HostServiceOwnerIdentity; artifactIntegrity: string; grants: VarinExtensionCapabilityGrant[];
-    desiredRevision: number; slot: 'candidate' | 'selected'; broker: BrokeredHostTransport; native: boolean; builtin: boolean;
+    desiredRevision: number; slot: 'candidate' | 'selected'; broker: BrokeredHostTransport; native: boolean; builtin: boolean; hostBuiltin: boolean;
   }>();
   readonly #epochs = new Map<string, number>();
   readonly #restartWork = new Map<string, Promise<void>>();
@@ -602,6 +609,11 @@ export class BrokeredHostSupervisor {
     const retained = this.#ownerGrants.get(ownerStorageKey(owner));
     return retained?.owner.extensionVersion === owner.extensionVersion && retained.builtin;
   }
+  /** Execution identity, not the declaration's durable provider selection. */
+  isHostBuiltin(owner: HostServiceOwnerIdentity): boolean {
+    const retained = this.#ownerGrants.get(ownerStorageKey(owner));
+    return retained?.owner.extensionVersion === owner.extensionVersion && retained.hostBuiltin;
+  }
   /** Trusted capability consumers read the calling generation, including a draining retained one. */
   getRetainedManifest(owner: HostServiceOwnerIdentity): VarinExtensionManifest | undefined {
     const instance = this.#instance(owner);
@@ -658,10 +670,25 @@ export class BrokeredHostSupervisor {
     return createHostCompositionPlan(catalog, routing, extensionId, scope, candidate);
   }
   async prepareExtension(extensionId: string, scope: VarinExtensionServiceRoutingContext = {}, signal?: AbortSignal,
-    frozen?: VarinHostServiceComposition): Promise<HostCompositionLease> {
+    frozen?: VarinHostServiceComposition, selection?: { catalog: number; routing: number }): Promise<HostCompositionLease> {
     this.#assertRunning(); signal?.throwIfAborted();
-    const plan = frozen ? restoreHostCompositionPlan(frozen, await this.#catalog.snapshot()) : await this.#plan(extensionId, scope);
+    const plan = frozen ? restoreHostCompositionPlan(frozen, await this.#catalog.snapshot())
+      : await this.#directoryPlan(extensionId, scope, signal, selection);
     return this.prepareComposition(plan, signal, frozen === undefined);
+  }
+  #directoryPlan(extensionId: string, scope: VarinExtensionServiceRoutingContext, signal?: AbortSignal, selection?: { catalog: number; routing: number }): Promise<HostCompositionPlan> {
+    if (!signal || !selection) return this.#plan(extensionId, scope);
+    const group = this.#directoryPlans.get(signal) ?? new Map<string, Promise<HostCompositionPlan>>();
+    const key = JSON.stringify([extensionId, scope, selection.catalog, selection.routing]);
+    const pending = group.get(key);
+    if (pending) return pending;
+    this.#directoryPlans.set(signal, group);
+    const plan = this.#plan(extensionId, scope).finally(() => {
+      group.delete(key);
+      if (!group.size) this.#directoryPlans.delete(signal);
+    });
+    group.set(key, plan);
+    return plan;
   }
   async prepareSurfaceExtension(extensionId: string, scope: VarinExtensionServiceRoutingContext, signal: AbortSignal,
     candidate?: { extensionId: string; integrity: string }): Promise<HostCompositionLease> {
@@ -1285,7 +1312,9 @@ export class BrokeredHostSupervisor {
         || grantIdentity(currentSelection.capabilityGrants, selection.version) !== grantIdentity(selection.capabilityGrants, selection.version)) {
         throw new Error(`Host capability review or selection changed before activation: ${entry.manifest.id}`);
       }
-      const artifact = await this.#packages.resolveBrokeredHostEntrypoint(entry.manifest.id, selection.slot, selection.integrity);
+      const builtin = selection.slot === "selected" && entry.source.kind === "builtin"
+        && await this.#packages.isDistributionArtifact?.(entry.manifest.id, selection.integrity)
+        ? varinBuiltinDefinition(entry.manifest.id) : undefined;
       controller.signal.throwIfAborted();
       this.#assertRunning();
       const generation = (this.#generations.get(entry.manifest.id) ?? 0) + 1;
@@ -1303,7 +1332,18 @@ export class BrokeredHostSupervisor {
       const requestFromExtension = (method: string, params: unknown, signal: AbortSignal, cleanup = false) => (
         this.#handleChildRequest(owner, grants, method, params, signal, cleanup)
       );
-      const broker = selection.manifest.entrypoints?.host?.mode === "native"
+      const direct = builtin && builtinServiceProvisions(selection.manifest, (capability, method, input, context) =>
+        this.#capabilities.invoke(owner, grants, capability, method, input, context.signal, context.invocation));
+      const residentRoot = builtin && [VARIN_BUILTIN_TYPESCRIPT_LANGUAGE_EXTENSION_ID,
+        VARIN_BUILTIN_LANGUAGE_SERVERS_EXTENSION_ID, VARIN_BUILTIN_WORKSPACE_RECOVERY_EXTENSION_ID].some(id => id === entry.manifest.id)
+        ? VARIN_BUILTIN_EXTENSION_PACKAGE_ROOTS.get(entry.manifest.id) : undefined;
+      // Only code from the application distribution may be loaded in the Host. Never turn a
+      // catalog-provided path, a matching manifest, or an unverified frozen package into code execution.
+      const artifact = direct ? undefined : residentRoot
+        ? { modulePath: join(residentRoot, builtin!.manifest.entrypoints!.host!.file), packageRoot: residentRoot }
+        : await this.#packages.resolveBrokeredHostEntrypoint(entry.manifest.id, selection.slot, selection.integrity);
+      controller.signal.throwIfAborted();
+      const broker = direct ? declarationLifecycle : residentRoot || selection.manifest.entrypoints?.host?.mode === "native"
         ? new NativeHostTransport({ requestFromExtension })
         : this.#transportFactory({
           grants,
@@ -1316,49 +1356,53 @@ export class BrokeredHostSupervisor {
           },
         });
       this.#ownerDependencies.set(ownerStorageKey(owner), { bindings: composition.dependencies, pins: composition.dependencyPins });
-      this.#ownerGrants.set(ownerStorageKey(owner), { owner, artifactIntegrity: selection.integrity, grants, desiredRevision: entry.desired.revision, slot: selection.slot, broker, native: selection.manifest.entrypoints?.host?.mode === "native", builtin: (selection.slot === "candidate" ? entry.candidate?.source : entry.source)?.kind === "builtin" });
+      this.#ownerGrants.set(ownerStorageKey(owner), { owner, artifactIntegrity: selection.integrity, grants, desiredRevision: entry.desired.revision, slot: selection.slot, broker, hostBuiltin: !!(direct || residentRoot), native: selection.manifest.entrypoints?.host?.mode === "native", builtin: (selection.slot === "candidate" ? entry.candidate?.source : entry.source)?.kind === "builtin" });
       const cancelPreparation = () => broker.forceTerminate();
       controller.signal.addEventListener("abort", cancelPreparation, { once: true });
       if (controller.signal.aborted) cancelPreparation();
       try {
-        const address = { extensionId: entry.manifest.id, key: "state", scope: "application" as const };
-        let storageSnapshot = await this.#storage.read(address);
-        const targetSchemaVersion = selection.manifest.storage?.schemaVersion ?? storageSnapshot.document.schemaVersion;
-        const storageSession: BrokerStorageSession = {
-          address,
-          phase: "activating",
-          schemaVersion: targetSchemaVersion,
-          snapshot: storageSnapshot,
-          transaction: null,
-        };
-        const storages = new Map([[storageAddressKey(address), storageSession]]);
-        this.#storageSessions.set(ownerStorageKey(owner), storages);
-        storageSession.transaction = await this.#storage.prepareMigration(address, targetSchemaVersion, async (input) => {
-          const migrated = await broker.request("migrate", { input, modulePath: artifact.modulePath }, controller.signal);
-          if (!isRecord(migrated)) throw new Error("Host migration must return a JSON object");
-          return migrated as JsonObject;
-        });
-        if (storageSession.transaction) {
-          storageSnapshot = {
-            ...storageSession.transaction.previous,
-            document: {
-              ...storageSession.transaction.previous.document,
-              data: structuredClone(storageSession.transaction.targetData),
-              schemaVersion: storageSession.transaction.targetSchemaVersion,
-            },
+        const storages = new Map<string, BrokerStorageSession>();
+        let provisions = direct;
+        if (!provisions) {
+          const address = { extensionId: entry.manifest.id, key: "state", scope: "application" as const };
+          let storageSnapshot = await this.#storage.read(address);
+          const targetSchemaVersion = selection.manifest.storage?.schemaVersion ?? storageSnapshot.document.schemaVersion;
+          const storageSession: BrokerStorageSession = {
+            address,
+            phase: "activating",
+            schemaVersion: targetSchemaVersion,
+            snapshot: storageSnapshot,
+            transaction: null,
           };
+          storages.set(storageAddressKey(address), storageSession);
+          this.#storageSessions.set(ownerStorageKey(owner), storages);
+          storageSession.transaction = await this.#storage.prepareMigration(address, targetSchemaVersion, async (input) => {
+            const migrated = await broker.request("migrate", { input, modulePath: artifact!.modulePath }, controller.signal);
+            if (!isRecord(migrated)) throw new Error("Host migration must return a JSON object");
+            return migrated as JsonObject;
+          });
+          if (storageSession.transaction) {
+            storageSnapshot = {
+              ...storageSession.transaction.previous,
+              document: {
+                ...storageSession.transaction.previous.document,
+                data: structuredClone(storageSession.transaction.targetData),
+                schemaVersion: storageSession.transaction.targetSchemaVersion,
+              },
+            };
+          }
+          storageSession.snapshot = storageSnapshot;
+          const activation = await broker.request("activate", {
+            modulePath: artifact!.modulePath,
+            packageRoot: artifact!.packageRoot,
+            storage: storageSnapshot,
+            dependencies: composition.dependencies,
+          }, controller.signal) as BrokerActivationResult;
+          if (crashed) throw crashed;
+          provisions = this.#provisions(owner, broker, activation.provisions, selection.manifest);
         }
-        storageSession.snapshot = storageSnapshot;
-        const activation = await broker.request("activate", {
-          modulePath: artifact.modulePath,
-          packageRoot: artifact.packageRoot,
-          storage: storageSnapshot,
-          dependencies: composition.dependencies,
-        }, controller.signal) as BrokerActivationResult;
         controller.signal.throwIfAborted();
         if ((this.#epochs.get(entry.manifest.id) ?? 0) !== epoch) throw new Error("Host activation was superseded");
-        if (crashed) throw crashed;
-        const provisions = this.#provisions(owner, broker, activation.provisions, selection.manifest);
         prepared = true;
         return {
           preparationId: randomUUID(),

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
+import type { Worker } from 'node:worker_threads';
 import { tmpdir } from 'node:os';
 import { createLocalSemanticEmbedder } from './local-embedder.js';
 import { localComponentFixture } from './fixtures/local-component.test-helper.js';
@@ -61,6 +62,19 @@ describe('real local encoder queue and physical settlement', () => {
     await f.encoder.dispose!();
     expect(await active).toMatchObject({ requestStarted: true, completed: false, usage: { measurement: 'estimated', inputTokens: 4 } });
   });
+  it('settles a crashed worker once and serves the next request on a fresh worker', async () => {
+    const f = await fixture();
+    const started = new Promise<Worker>(resolve => process.once('worker', resolve));
+    const pending = f.encoder.localExecution!.batch(['HOLD_FORWARD original'], {
+      signal: new AbortController().signal, beforeDispatch: async () => {}, priority: 'foreground',
+    });
+    const worker = await started;
+    await waitUntil(async () => (await f.calls()).length === 1);
+    await worker.terminate();
+    expect(await pending).toMatchObject({ requestStarted: true, completed: false });
+    expect(await f.encoder.embed(['new request'])).toHaveLength(1);
+    expect(await f.calls()).toEqual([['HOLD_FORWARD original'], ['new request']]);
+  });
   it('retains observed input estimates when the actual worker exits after encoder entry', async () => {
     const f = await fixture();
     const result = await f.encoder.localExecution!.batch(['EXIT_FORWARD original'], { signal: new AbortController().signal, beforeDispatch: async () => {}, priority: 'foreground' });
@@ -68,4 +82,25 @@ describe('real local encoder queue and physical settlement', () => {
     expect(result.error).toBeTruthy();
     expect(await f.calls()).toEqual([['EXIT_FORWARD original']]);
   });
+});
+
+
+it('does not start inference for tokenization; idle eviction preserves tokenization and reacquires the model', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'varin-lazy-inference-'));
+  cleanups.push(() => rm(root, {recursive: true, force: true}));
+  const { pack } = await localComponentFixture(root);
+  const starts: Worker[] = [], exits: number[] = [];
+  const onWorker = (value: Worker) => { starts.push(value); value.once('exit', () => exits.push(1)); };
+  process.on('worker', onWorker);
+  cleanups.push(async () => { process.off('worker', onWorker); });
+  const encoder = createLocalSemanticEmbedder({ dataDir: root, pack, idleWorkerDelay: () => 5 });
+  cleanups.push(() => encoder.dispose!());
+  await encoder.prepare();
+  const tokens = encoder.countTokens('nebula docking');
+  expect(starts).toHaveLength(0);
+  const first = await encoder.embed(['nebula docking']);
+  await waitUntil(async () => exits.length === 1);
+  expect(encoder.countTokens('nebula docking')).toBe(tokens);
+  expect(await encoder.embed(['nebula docking'])).toEqual(first);
+  expect(starts).toHaveLength(2);
 });

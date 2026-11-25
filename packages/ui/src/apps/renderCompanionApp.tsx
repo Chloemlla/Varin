@@ -1,3 +1,4 @@
+import { artworkHitTest } from '../components/companion/artwork-hit-test';
 import { ThemeSystemProvider } from '@/contexts/ThemeSystemContext';
 import { useThemeSystem } from '@/contexts/useThemeSystem';
 import { resolveCompanionAccentPalette } from '@/components/companion/companionAccentPalette';
@@ -301,7 +302,7 @@ function CompanionApp({ apis }: { apis: RuntimeAPIs }) {
   }, [companionWindow.hoverRevision, localAllowed, controlsOpen, assetList, directorMode, localDirectorResponse]);
   React.useEffect(() => { if (!companionWindow.hovered) { setLocalAction(current => current === 'hover-response' ? null : current); setDirectorLocal(current => current?.event === 'hover' ? null : current); } }, [companionWindow.hovered]);
   const displayedDrawing = React.useRef<{ packageId: string; exposure: number; context: string | null } | null>(null);
-  const automatic = useCompanionPlayback(assetList, displayAction, playing || manualReview, Object.keys(imageLibrary), { phase: companionWindow.phase, displayed: () => displayedDrawing.current }, { allowCandidates: directorReview, presentationKey: receiptAction && displayAction === receiptAction ? currentReceipt?.key : directorMode ? directorContextKey : null });
+  const automatic = useCompanionPlayback(assetList, displayAction, playing || manualReview, Object.keys(imageLibrary), { phase: companionWindow.phase, displayed: () => displayedDrawing.current }, { allowCandidates: directorReview, awaitingFirstPaint: !presented, presentationKey: receiptAction && displayAction === receiptAction ? currentReceipt?.key : directorMode ? directorContextKey : null });
   React.useEffect(() => {
     if (directorMode && automatic.context === directorContextKey && automatic.finished && !['director-supervise', 'work-active'].includes(directorRequestedAction)
       && assetList.find(item => item.id === automatic.packageId)?.action === directorRequestedAction) {
@@ -552,7 +553,7 @@ function CompanionApp({ apis }: { apis: RuntimeAPIs }) {
       lastVisibleCue.current = cueKey;
       setVisibleCue({ cue, context: drawnContext, action: sequence.sceneAction ?? sequence.action, instance: ++visibleCueCounter.current });
     }
-    companionWindow.refreshHitMask();
+    companionWindow.refreshHitMask(artworkHitTest(images[frame.page]!, frame));
   };
   // Swap to the predecoded same-exposure drawing before sending native movement,
   // rather than letting an embedded stool travel for a React/animation frame.

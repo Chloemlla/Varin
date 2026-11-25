@@ -447,10 +447,11 @@ impl Catalog {
         })
     }
     pub fn capture_operation_read(&self, operation: Operation) -> OperationRead {
+        let publication = self.content.begin_read();
         OperationRead {
             operation,
             content: self.content.clone(),
-            _publication: self.content.begin_publication(),
+            _publication: publication,
         }
     }
     pub fn prepare_tool_intent(&self) -> ToolIntentPreparation {

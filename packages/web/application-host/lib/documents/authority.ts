@@ -828,6 +828,10 @@ export const createDocumentAuthority = (options: DocumentAuthorityOptions) => {
   function snapshotFile(resource: DocumentResource, absolutePath: string, signal?: AbortSignal, includeContent?: true, interpretation?: { encoding?: string; defaultEncoding?: string }, reconcilePending?: boolean): Promise<SnapshotResult>;
   function snapshotFile(resource: DocumentResource, absolutePath: string, signal: AbortSignal | undefined, includeContent: false, interpretation?: { encoding?: string; defaultEncoding?: string }, reconcilePending?: boolean): Promise<SnapshotMetadata>;
   async function snapshotFile(resource: DocumentResource, absolutePath: string, signal?: AbortSignal, includeContent = true, interpretation?: { encoding?: string; defaultEncoding?: string }, reconcilePending = false): Promise<SnapshotResult | SnapshotMetadata> {
+    return (await snapshotFileWithBytes(resource, absolutePath, signal, includeContent, interpretation, reconcilePending)).snapshot;
+  }
+
+  async function snapshotFileWithBytes(resource: DocumentResource, absolutePath: string, signal?: AbortSignal, includeContent = false, interpretation?: { encoding?: string; defaultEncoding?: string }, reconcilePending = false): Promise<{ snapshot: SnapshotResult | SnapshotMetadata; bytes?: Buffer }> {
     signal?.throwIfAborted();
     const missing = async (): Promise<Extract<SnapshotResult, { status: 'missing' }>> => {
       const rule = interpretation ?? await options.resolveTextEncoding?.(resource) ?? {};
@@ -838,7 +842,7 @@ export const createDocumentAuthority = (options: DocumentAuthorityOptions) => {
     try {
       stat = await fsPromises.lstat(absolutePath);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return missing();
+      if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return { snapshot: await missing() };
       throw error;
     }
     if (stat.isSymbolicLink()) {
@@ -846,7 +850,7 @@ export const createDocumentAuthority = (options: DocumentAuthorityOptions) => {
       try {
         real = await fsPromises.realpath(absolutePath);
       } catch (error) {
-        if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return missing();
+        if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return { snapshot: await missing() };
         throw error;
       }
       const workspace = await loadWorkspace(resource.workspaceId);
@@ -869,13 +873,13 @@ export const createDocumentAuthority = (options: DocumentAuthorityOptions) => {
     const inspected = includeContent ? await inspectDocumentBytes(bytes, true, rule) : await inspectDocumentBytes(bytes, false, rule);
     const modifiedAt = toIso(stat.mtimeMs);
     if (inspected.kind === 'binary') {
-      return {
+      return { bytes, snapshot: {
         status: 'binary',
         resource,
         revision,
         byteLength: inspected.byteLength,
         modifiedAt,
-      };
+      } };
     }
     if (inspected.kind === 'unsupported-encoding') {
       const result: SnapshotResult = {
@@ -886,9 +890,9 @@ export const createDocumentAuthority = (options: DocumentAuthorityOptions) => {
         modifiedAt,
       };
       if (inspected.candidates) (result as { candidates?: string[] }).candidates = inspected.candidates;
-      return result;
+      return { bytes, snapshot: result };
     }
-    return {
+    return { bytes, snapshot: {
       status: 'ready',
       resource,
       revision,
@@ -898,7 +902,7 @@ export const createDocumentAuthority = (options: DocumentAuthorityOptions) => {
       format: inspected.format,
       byteLength: inspected.byteLength,
       modifiedAt,
-    };
+    } };
   }
 
   const atomicReplace = async (absolutePath: string, bytes: Uint8Array): Promise<void> => {
@@ -1186,24 +1190,23 @@ export const createDocumentAuthority = (options: DocumentAuthorityOptions) => {
             if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
             throw error;
           });
-          if (!currentBytes || revisionFromBytes(currentBytes) !== revisionFromObjectHash(originalState.objectHash)) {
+          const revision = currentBytes && revisionFromBytes(currentBytes);
+          if (!currentBytes || revision !== revisionFromObjectHash(originalState.objectHash)) {
             return { status: 'conflict', current: { ...(await snapshotFile(request.resource, resolved.absolutePath, undefined, false)), epoch: request.token.epoch } };
           }
           // The current bytes are used only after proving the original receipt's raw hash.
           // No new content owner/grant or fallback write is needed to consume this receipt.
           const inspected = await inspectDocumentBytes(currentBytes, false, { encoding: request.encoding });
           if (inspected.kind !== 'text') throw new Error('The original document write format is unavailable');
-          const receipt = { status: 'written' as const, revision: revisionFromBytes(currentBytes), byteLength: currentBytes.length,
+          const receipt = { status: 'written' as const, revision, byteLength: currentBytes.length,
             encoding: inspected.encoding, bom: inspected.bom, format: inspected.format };
           await reconcileWrittenEncoding(request, receipt.encoding);
           return receipt;
         }
       }
 
-      const current = {
-        ...(await snapshotFile(request.resource, resolved.absolutePath, undefined, false)),
-        epoch: request.token.epoch,
-      } as WithoutContentResult;
+      const { snapshot, bytes: sourceBytes } = await snapshotFileWithBytes(request.resource, resolved.absolutePath);
+      const current: WithoutContentResult = { ...snapshot, epoch: request.token.epoch };
       if (request.expectedRevision === null) {
         if (current.status !== 'missing') {
           return { status: 'conflict', current };
@@ -1211,12 +1214,8 @@ export const createDocumentAuthority = (options: DocumentAuthorityOptions) => {
       } else if (current.status === 'missing' || current.revision !== request.expectedRevision) {
         return { status: 'conflict', current };
       }
-      // Pin the user's original interpretation independently of current project preferences.
-      // Raw revision is rechecked after this read and again by the Storage CAS below.
-      const sourceBytes = current.status === 'missing' ? undefined : await fsPromises.readFile(resolved.absolutePath);
-      if (sourceBytes && revisionFromBytes(sourceBytes) !== request.expectedRevision) {
-        return { status: 'conflict', current: { ...(await snapshotFile(request.resource, resolved.absolutePath, undefined, false)), epoch: request.token.epoch } };
-      }
+      // The codec sees the same bytes that produced the accepted revision and
+      // format; native Storage still checks the exact filesystem state at commit.
       const serialized = await serializeDocumentText({
         content: request.content, encoding: request.encoding, bom: request.bom,
         ...(sourceBytes ? { sourceBytes } : {}),
@@ -1226,12 +1225,23 @@ export const createDocumentAuthority = (options: DocumentAuthorityOptions) => {
         ...(request.edits ? { edits: request.edits } : {}),
       });
       const bytes = serialized.bytes;
-      let writeConflict = false;
+      // Non-native embedders have no Storage CAS. Keep a final read check on
+      // that fallback only; atomicReplace itself is not a compare-and-swap.
+      const replaceAfterRecheck = async (): Promise<boolean> => {
+        const observed = await fsPromises.readFile(resolved.absolutePath).catch(error => {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+          throw error;
+        });
+        if (current.status === 'missing' ? observed !== undefined :
+          observed === undefined || revisionFromBytes(observed) !== current.revision) return true;
+        await atomicReplace(resolved.absolutePath, bytes);
+        return false;
+      };
+      let writeConflict: boolean;
       if (durableMutationStorage) {
         writeConflict = await durableMutationStorage(request.resource.workspaceId, async (context) => {
           if (!context.fileResources) {
-            await atomicReplace(resolved.absolutePath, bytes);
-            return false;
+            return replaceAfterRecheck();
           }
           const captured = await context.fileStore.captureState(
             context.identity,
@@ -1268,7 +1278,7 @@ export const createDocumentAuthority = (options: DocumentAuthorityOptions) => {
           return result.status === 'conflict';
         });
       } else {
-        await atomicReplace(resolved.absolutePath, bytes);
+        writeConflict = await replaceAfterRecheck();
       }
       if (writeConflict) {
         const latest = {

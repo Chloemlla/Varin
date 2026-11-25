@@ -4,13 +4,12 @@
  * with the system `tar` into the speech-models directory.
  */
 
-import { createWriteStream } from 'fs';
+import { randomUUID } from 'node:crypto';
 import { mkdir, rename, rm, stat } from 'fs/promises';
 import path from 'path';
-import { Readable } from 'stream';
-import { pipeline } from 'stream/promises';
 import { spawn } from 'child_process';
 
+import { fetchComponentFile, type ComponentFetch } from '../../components/file-transfer.js';
 import { getLocalSttModelSpec } from './model-catalog.js';
 
 async function hasRequiredFiles(modelDir: string, requiredFiles: string[]): Promise<boolean> {
@@ -33,32 +32,16 @@ async function hasRequiredFiles(modelDir: string, requiredFiles: string[]): Prom
 async function downloadToFile(
   url: string,
   outputPath: string,
-  onProgress?: (downloadedBytes: number, totalBytes: number | null) => void,
+  onProgress: ((downloadedBytes: number, totalBytes: number | null) => void) | undefined,
+  fetcher: ComponentFetch,
 ): Promise<void> {
-  const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`Failed to download ${url}: ${res.status} ${res.statusText}`);
-  }
-  if (!res.body) {
-    throw new Error(`Failed to download ${url}: missing response body`);
-  }
-
-  const totalBytes = Number.parseInt(res.headers.get('content-length') || '', 10) || null;
-  let downloadedBytes = 0;
-
-  const tmpPath = `${outputPath}.tmp-${Date.now()}`;
+  const tmpPath = `${outputPath}.tmp-${randomUUID()}`;
   await mkdir(path.dirname(outputPath), { recursive: true });
-
-  const nodeStream = Readable.fromWeb(res.body);
-  if (typeof onProgress === 'function') {
-    nodeStream.on('data', (chunk: Buffer) => {
-      downloadedBytes += chunk.length;
-      onProgress(downloadedBytes, totalBytes);
-    });
-  }
-
   try {
-    await pipeline(nodeStream, createWriteStream(tmpPath));
+    await fetchComponentFile(url, tmpPath, {
+      label: 'Speech model', fetcher,
+      ...(onProgress ? { onProgress: (downloadedBytes, totalBytes) => onProgress(downloadedBytes, totalBytes ?? null) } : {}),
+    });
     await rename(tmpPath, outputPath);
   } catch (error) {
     await rm(tmpPath, { force: true }).catch(() => undefined);
@@ -70,7 +53,9 @@ async function extractTarArchive(archivePath: string, destDir: string): Promise<
   await mkdir(destDir, { recursive: true });
 
   await new Promise<void>((resolve, reject) => {
-    const child = spawn('tar', ['xf', archivePath, '-C', destDir], {
+    // GNU tar treats the colon in a Windows drive-qualified archive name as a remote host.
+    const child = spawn('tar', ['xf', path.relative(destDir, archivePath)], {
+      cwd: destDir,
       stdio: 'ignore',
       windowsHide: true,
     });
@@ -118,9 +103,10 @@ export async function isLocalSttModelInstalled(modelsDir: string, modelId: strin
  *           onProgress?: (downloadedBytes: number, totalBytes: number | null) => void }} options
  * @returns {Promise<string>}
  */
-export async function ensureLocalSttModel({ modelsDir, modelId, onProgress }: {
+export async function ensureLocalSttModel({ modelsDir, modelId, onProgress, fetcher = fetch }: {
   modelId: string;
   modelsDir: string;
+  fetcher?: ComponentFetch;
   onProgress?: (downloadedBytes: number, totalBytes: number | null) => void;
 }): Promise<string> {
   const spec = getLocalSttModelSpec(modelId);
@@ -138,10 +124,10 @@ export async function ensureLocalSttModel({ modelsDir, modelId, onProgress }: {
   const archivePath = path.join(downloadsDir, archiveFilename);
 
   if (!(await isNonEmptyFile(archivePath))) {
-    await downloadToFile(spec.archiveUrl, archivePath, onProgress);
+    await downloadToFile(spec.archiveUrl, archivePath, onProgress, fetcher);
   }
 
-  const stagingDir = path.join(modelsDir, `.staging-${spec.extractedDir}-${Date.now()}`);
+  const stagingDir = path.join(modelsDir, `.staging-${spec.extractedDir}-${randomUUID()}`);
   try {
     await extractTarArchive(archivePath, stagingDir);
 

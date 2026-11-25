@@ -6,11 +6,17 @@ import { toolRecord } from './toolInvocation';
 export const isStandaloneTool = (name: string, execution?: ChatToolExecutionState, result?: ChatToolResultMessage) =>
   ['dispatch', 'send', 'ask_user', 'render_ui', 'image_generate', 'image_edit'].includes(name) || viewedImages(name, result, execution).length > 0;
 
-/** Already observed descendants only. No extra reads to fill a heading. */
-export function standaloneDescendants(executions: Record<string, ChatToolExecutionState> = {}): Map<string, ChatToolCall[]> {
+const emptyDescendants: ReadonlyMap<string, ChatToolCall[]> = new Map();
+const descendantsByExecutionSnapshot = new WeakMap<Record<string, ChatToolExecutionState>, ReadonlyMap<string, ChatToolCall[]>>();
+
+/** All timeline turns share one index of the observed descendants in this snapshot. */
+export function standaloneDescendants(executions?: Record<string, ChatToolExecutionState>): ReadonlyMap<string, ChatToolCall[]> {
+  if (!executions) return emptyDescendants;
+  const cached = descendantsByExecutionSnapshot.get(executions);
+  if (cached) return cached;
   const groups = new Map<string, ChatToolCall[]>(), seen = new Set<string>();
   for (const execution of Object.values(executions)) {
-    if (!isStandaloneTool(execution.name) || !execution.parentToolCallId
+    if (!execution.parentToolCallId || !isStandaloneTool(execution.name)
       || toolRecord(toolRecord(execution.operation?.intent).call).name === 'tool_invoke') continue;
     let root = execution.parentToolCallId;
     const visited = new Set([execution.toolCallId]);
@@ -22,5 +28,6 @@ export function standaloneDescendants(executions: Record<string, ChatToolExecuti
     calls.push({ type: 'toolCall', id: execution.toolCallId, name: execution.name, arguments: execution.args ?? {} });
     groups.set(root, calls);
   }
+  descendantsByExecutionSnapshot.set(executions, groups);
   return groups;
 }

@@ -151,6 +151,12 @@ remove staging directories and never publish a half-written executable. A concur
 ensure for one server shares one preparation, while a caller cancellation only aborts
 the shared job after the last waiter leaves.
 
+Managed language-server construction and inventory inspection do not load
+archive extractors, allocate a probe directory, or run a binary. ZIP/GZIP
+helpers load only for a verified artifact of that format; a private probe
+directory is created only if a PATH candidate is available for the executable
+check.
+
 Production artifact downloads use the Host's shared egress fetch, including the configured proxy,
 environment and desktop system-network policy. They do not bypass it through global Node fetch.
 Download failures identify the origin, HTTP status or available transport cause code without putting
@@ -195,3 +201,10 @@ closing the overlay. A close notification alone does not guarantee that a provid
 cached disk text. The read's original session/open binding must still be current; a delayed success
 or failure cannot close a newer query binding. Missing/unreadable text never becomes a fake empty
 change. Fixed source views and editor-owned buffers retain their separate invalidation rules.
+
+
+Package or prepare native servers on the Host that runs the language service.
+The workspace root identifies the view, not the destination for installed executables.
+A server already in that Host's private cache or valid on its PATH can be used
+offline; a second Host keeps its own inventory. Offline import of Tree-sitter
+grammars is separate from native executable preparation.

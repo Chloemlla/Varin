@@ -5,12 +5,13 @@ import { webOutput } from '../kernel/web-runtime.js';
 import { createDocumentReader } from "./document-reading.js";
 import { readDocumentMaterial } from './document-material.js';
 import type { ThreadMaterialAuthority, WebSnapshotDraft, WebMaterialStore } from "./web-materials.js";
-import type { createPdfEngine } from "./pdf-engine.js";
+import { createPdfEngine } from "./pdf-engine.js";
+import { makePdf } from "./pdf-test-fixture.js";
 
 const hash = (bytes: Buffer): string => `sha256-${createHash("sha256").update(bytes).digest("hex")}`;
 const authority = (threadId: string): ThreadMaterialAuthority => ({ kind: "thread", owningWorkspaceId: "ws", threadId });
 
-const fixture = (failText = false) => {
+const fixture = (failText = false, realEngine?: typeof createPdfEngine) => {
   const entries = new Map<string, { ref: WebSnapshotRef; body: Buffer; source?: Buffer; threadId: string }>();
   let serial = 0;
   const materials = {
@@ -81,7 +82,7 @@ const fixture = (failText = false) => {
       ...(parser === "docling" ? { docling: "2.130.0" } : ocr ? { tesseract: "5.0" } : {}) })),
     parseStructure: vi.fn(async (_input: unknown) => ({ status: "unavailable" as const, reason: "not configured" })) };
   const reader = createDocumentReader({ materials: materials as unknown as WebMaterialStore,
-    engineFactory: (() => engine) as unknown as typeof createPdfEngine });
+    engineFactory: realEngine ?? ((() => engine) as unknown as typeof createPdfEngine) });
   const source = Buffer.from("%PDF-fixed-original");
   const ctx = (threadId = "owner", signal?: AbortSignal) => ({ workspaceId: "ws", authority: authority(threadId), ...(signal ? { signal } : {}) });
   return { reader, materials, engine, source, ctx, entries };
@@ -118,6 +119,23 @@ describe("independent document reading", () => {
     expect(page.status).toBe("ok");
     if (page.status === "ok") expect(page.pageImage).toMatchObject({ page: 2, sourceHash: hash(f.source),
       data: Buffer.from("png-2").toString("base64") });
+  });
+
+  it("reads a real rotated PDF crop through document_read and returns its original byte identity", async () => {
+    const f = fixture(false, createPdfEngine);
+    const source = makePdf(90);
+    const opened = await f.reader.ingest({ source, sourceUrl: "https://example.com/rotated.pdf" }, f.ctx());
+    if (opened.status !== "ok") throw new Error("source unavailable");
+    const result = await f.reader.read({
+      snapshotId: opened.snapshot!.snapshotId, view: "page-image", page: 1, scale: 2,
+      region: { x: 0.5, y: 0, width: 0.25, height: 0.25 },
+    }, f.ctx());
+    if (result.status !== "ok" || !result.pageImage) throw new Error(`unexpected render: ${result.status}`);
+    expect(result.pageImage).toMatchObject({ mimeType: "image/png", width: 50, height: 100, sourceHash: hash(source) });
+    const png = Buffer.from(result.pageImage.data, "base64");
+    expect(png.subarray(0, 8)).toEqual(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+    expect(png.readUInt32BE(16)).toBe(50);
+    expect(png.readUInt32BE(20)).toBe(100);
   });
 
   it("can render a page after a separate overview probe fails", async () => {

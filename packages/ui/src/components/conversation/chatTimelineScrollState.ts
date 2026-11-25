@@ -4,6 +4,8 @@ export type ChatTimelineScrollMode =
   | 'free-scrolling';
 
 export interface ChatTimelineViewportAnchor {
+  /** Durable page cursor for recovering this position after history cache eviction. */
+  historyItemId?: string;
   itemId: string;
   mode: Exclude<ChatTimelineScrollMode, 'anchoring-new-turn'>;
   offset: number;

@@ -214,6 +214,10 @@ fn catalog_upgrade_v78_preserves_history_queue_receipts_and_effect_fencing() {
     let mut indexed_history: Value = serde_json::from_str(&indexed_history).unwrap();
     assert!(indexed_history["content"]["history_text"].is_object());
     assert_eq!(
+        indexed_history["content"]["history_view"],
+        json!({"request":null,"operation":null})
+    );
+    assert_eq!(
         catalog
             .content
             .history_text_preview(&indexed_history["content"], 1000)
@@ -225,6 +229,10 @@ fn catalog_upgrade_v78_preserves_history_queue_receipts_and_effect_fencing() {
         .as_object_mut()
         .unwrap()
         .remove("history_text");
+    indexed_history["content"]
+        .as_object_mut()
+        .unwrap()
+        .remove("history_view");
     assert_eq!(
         indexed_history,
         serde_json::from_str::<Value>(&original_history).unwrap()

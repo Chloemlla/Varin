@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { createSettingsFileStore, type VarinSettingsDocument, type SettingsFileStore } from '@varin/settings-store';
 import { ConfigWatchManager } from '../configuration-watch.js';
 
@@ -52,6 +53,17 @@ export class ConfigurationFile<T extends VarinSettingsDocument> {
   async #observe() {
     try { this.#publish((await this.read()).revision); }
     catch { this.#publish('invalid'); }
+  }
+  subscribeSelection<S>(select: (document: T) => S, changed: () => void) {
+    let previous = this.#valid && { value: select(this.#valid.document) };
+    return this.subscribe(revision => {
+      const snapshot = this.#valid;
+      if (!snapshot || snapshot.revision !== revision) return;
+      const value = select(snapshot.document);
+      if (previous && isDeepStrictEqual(previous.value, value)) return;
+      previous = { value };
+      changed();
+    });
   }
   subscribe(listener: (revision: string) => void) {
     this.#listeners.add(listener);

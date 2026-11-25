@@ -1,4 +1,5 @@
 import React from 'react';
+import type { ArtworkHitTest } from './artwork-hit-test';
 import { invokeDesktop, isElectronShell } from '@/lib/desktop';
 import { LocalInteractionTiming } from './localInteractionTiming';
 
@@ -40,22 +41,18 @@ export function useCompanionWindow(canvas: React.RefObject<HTMLCanvasElement | n
     ignored.current = false;
     if (isElectronShell()) passthroughQueue.current = passthroughQueue.current.catch(() => {}).then(() => invokeDesktop('desktop_companion_passthrough', { enabled: false })).catch(() => {});
   }, []);
-  const alpha = React.useRef<{ width: number; height: number; pixels: Uint8ClampedArray } | null>(null);
-  const refreshHitMask = React.useCallback(() => {
-    const node = canvas.current, context = node?.getContext('2d');
-    alpha.current = node && context ? { width: node.width, height: node.height, pixels: context.getImageData(0,0,node.width,node.height).data } : null;
+  const alpha = React.useRef<ArtworkHitTest | undefined>(undefined);
+  const refreshHitMask = React.useCallback((hitTest: ArtworkHitTest) => {
+    alpha.current = hitTest;
     reevaluatePointer.current(); reevaluateHover.current();
-  }, [canvas]);
+  }, []);
   const pointer = React.useRef<{ id: number; x: number; y: number; anchor: { x: number; y: number }; moving: boolean } | null>(null);
   const hit = React.useCallback((x: number, y: number) => {
     const node = canvas.current;
     if (!node) return false;
     const bounds = node.getBoundingClientRect();
     if (!bounds.width || !bounds.height || x < bounds.left || y < bounds.top || x >= bounds.right || y >= bounds.bottom) return false;
-    const mask = alpha.current;
-    if (!mask) return false;
-    const px = Math.floor((x-bounds.left)*mask.width/bounds.width), py = Math.floor((y-bounds.top)*mask.height/bounds.height);
-    return (mask.pixels[(py*mask.width+px)*4+3] ?? 0) > 16;
+    return alpha.current?.((x - bounds.left) * node.width / bounds.width, (y - bounds.top) * node.height / bounds.height) ?? false;
   }, [canvas]);
   const send = React.useCallback((phase: 'start' | 'move' | 'end') => {
     if (!isElectronShell()) return;

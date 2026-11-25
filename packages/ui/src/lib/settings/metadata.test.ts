@@ -5,6 +5,9 @@ vi.doMock('@/hooks/useProviderLogo', () => ({
   preloadProviderLogos: () => undefined,
   useProviderLogo: () => ({ hasLogo: false, onError: () => undefined, src: null }),
 }));
+vi.doMock('@/components/sections/devices/WorkspacesPage', () => ({
+  WorkspacesPage: () => 'workspace page rendered',
+}));
 
 const { registerBuiltinSettingsWorkbench } = await import('@/workbenches/settings/register');
 registerBuiltinSettingsWorkbench();
@@ -45,15 +48,14 @@ describe('settings metadata', () => {
 
 
   test('the workspace settings route resolves to its service-owned page on desktop, web and mobile', async () => {
-    const { isValidElement } = await import('react');
-    const { WorkspacesPage } = await import('@/components/sections/devices/WorkspacesPage');
+    const { renderToReadableStream } = await import('react-dom/server');
     expect(resolveSettingsSlug('workspaces')).toBe('workspaces');
     const pages = getSettingsPageRegistrations().filter(entry => entry.meta.slug === 'workspaces');
     expect(pages).toHaveLength(1);
     const [page] = pages;
     expect(page?.meta).toMatchObject({ titleKey: 'settings.page.workspaces.title', kind: 'single' });
-    const element = page?.implementation.renderContent();
-    expect(isValidElement(element) && element.type === WorkspacesPage).toBe(true);
+    const view = await renderToReadableStream(page!.implementation.renderContent());
+    expect(await new Response(view).text()).toContain('workspace page rendered');
     for (const surface of ['isMobile', 'isDesktop', 'isWeb'] as const) {
       expect(page?.meta.isAvailable?.({ ...runtimeContext(false), isWeb: false, [surface]: true }) ?? true).toBe(true);
     }

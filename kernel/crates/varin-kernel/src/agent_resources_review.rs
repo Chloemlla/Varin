@@ -532,7 +532,13 @@ impl ModelProvider for AttachmentPages {
         }).collect::<Vec<_>>();
         let done = pages.len() == 3;
         let content = if done {
-            assert_eq!(pages.iter().map(|page| page.model_data()["content"]["text"].as_str().unwrap()).collect::<String>(), "abcdefghi");
+            let batch = pages[1].model_data();
+            assert_eq!(batch["status"], "partial");
+            assert_eq!(batch["files"][0]["result"]["content"]["text"], "workspace bytes");
+            assert_eq!(batch["files"][2]["result"]["error"]["details"]["status"], "denied");
+            assert_eq!(pages[0].model_data()["content"]["text"], "abc");
+            assert_eq!(batch["files"][1]["result"]["content"]["text"], "def");
+            assert_eq!(pages[2].model_data()["content"]["text"], "ghi");
             assert!(pages[2].model_data().get("nextRead").is_none());
             Content::Text { text: "Read the original immutable file through all three pages.".into() }
         } else {
@@ -541,10 +547,10 @@ impl ModelProvider for AttachmentPages {
                 1 => {
                     let reference = pages[0].model_data()["ref"].as_str().unwrap();
                     assert!(reference.starts_with("file:"));
-                    json!({"ref":reference,"offset":3,"length":3})
+                    json!({"files":[{"path":"workspace.txt"},{"ref":reference,"offset":3,"length":3},{"ref":"attachment:denied"}]})
                 }
                 2 => {
-                    let next = &pages[1].model_data()["nextRead"];
+                    let next = &pages[1].model_data()["files"][1]["result"]["nextRead"];
                     assert_eq!(next["tool"], "file_read");
                     assert!(next["arguments"]["ref"].as_str().unwrap().starts_with("read:"));
                     next["arguments"].clone()
@@ -566,8 +572,26 @@ impl ModelProvider for AttachmentPages {
     }
 }
 
+struct WorkspaceReader;
+impl ToolExecutor for WorkspaceReader {
+    fn plan(&self, call: &ToolCall, frozen: &FrozenToolContext, cancel: &CancellationToken) -> Result<ToolPreparation, ExecutionError> {
+        self.prepare(call, frozen, cancel).map(ToolPreparation::Ready)
+    }
+    fn prepare(&self, call: &ToolCall, _: &FrozenToolContext, _: &CancellationToken) -> Result<ToolContract, ExecutionError> {
+        Ok(ToolContract { name: call.name.clone(), schema_version: call.schema_version.clone(), read_only: true, completion: CompletionKind::Result,
+            lifetime: varin_runtime::Lifetime::Run, resources: vec![] })
+    }
+    fn authorize(&self, _: &ToolExecutionContext, call: &ToolCall, _: &ToolContract, _: &CancellationToken) -> Result<(), ExecutionError> {
+        assert_eq!(call.arguments, json!({"files":[{"path":"workspace.txt"}]}));
+        Ok(())
+    }
+    fn execute(&self, _: &ToolExecutionContext, _: &ToolCall, _: &ToolContract, cancel: &CancellationToken) -> ToolCompletion {
+        crate::tools::read::batch_completion(vec![json!({"index":0,"result":{"status":"ready","content":{"text":"workspace bytes"}}})], cancel)
+    }
+}
+
 #[test]
-fn attachment_file_reference_and_continuation_retain_the_original_resource_consumer() {
+fn routed_attachment_file_reads_keep_the_original_owner_in_batches_and_continuations() {
     let root = std::env::temp_dir().join(format!("varin-resource-pages-{}", uuid::Uuid::new_v4()));
     let mut catalog = Catalog::open(&root).unwrap();
     catalog.create_thread("thread", "branch").unwrap();
@@ -588,8 +612,13 @@ fn attachment_file_reference_and_continuation_retain_the_original_resource_consu
     let (out, frames) = mpsc::sync_channel(4);
     let bridge = OwnerChannel::new("resource", out);
     bridge.initialize("epoch");
+    let mut schemas = crate::tools::KernelToolExecutor::selected_schemas(&[crate::tools::ToolKind::FileRead].into_iter().collect());
+    crate::work_locations::add_schemas(&mut schemas);
+    let file_read = schemas.into_iter().find(|schema| schema.name == "file_read").unwrap();
+    assert_eq!(file_read.version, "3");
+    let workspace = varin_runtime::composition::tools::ToolDeclaration::new(file_read, Arc::new(WorkspaceReader));
     let directory = Arc::new(ToolDirectory::assemble(vec![
-        crate::attachment_reads::declaration(None, db.clone(), bridge.clone()),
+        crate::attachment_reads::declaration(Some(workspace), db.clone(), bridge.clone()),
     ]).unwrap());
     let binding = RequestBinding {
         pricing: None, tool_output_visible_bytes: None, mcp_tools: vec![], execution_environment: None,
@@ -623,6 +652,12 @@ fn attachment_file_reference_and_continuation_retain_the_original_resource_consu
                 let result = json!({"status":"ready","attachment":{"ref":"attachment:fixed","filename":"fixed.txt","mimeType":"text/plain","byteLength":9},
                     "content":{"text":text,"offset":page * 3,"nextOffset":(page + 1) * 3,"byteLength":9,"eof":page == 2}});
                 bridge.receive(json!({"v":1,"kind":"resource-response","id":frame["id"],"kernelEpoch":"epoch","result":result}));
+                if page == 1 {
+                    let denied = frames.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                    assert_eq!(denied["query"]["callId"], frame["query"]["callId"]);
+                    assert_eq!(denied["query"]["request"]["ref"], "attachment:denied");
+                    bridge.receive(json!({"v":1,"kind":"resource-response","id":denied["id"],"kernelEpoch":"epoch","result":{"status":"denied","reason":"Attachment is not visible on this branch"}}));
+                }
             }
         })
     };

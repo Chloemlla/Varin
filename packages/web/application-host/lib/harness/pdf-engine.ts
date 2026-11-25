@@ -6,6 +6,7 @@ import { dirname, join, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { PDFDocumentProxy, PDFPageProxy, PageViewport } from "pdfjs-dist";
 import type { TextItem } from "pdfjs-dist/types/src/display/api.js";
+import { rasterizePdf } from "./pdf-raster.js";
 import type { ManagedSpawn } from "../process/types.js";
 import { executableExists, runOwnedCommand as runCommand, type ProcessDirectoryState } from "../process/run-command.js";
 
@@ -110,7 +111,8 @@ const pdfAssets = (): { cMapUrl: string; standardFontDataUrl: string; wasmUrl: s
   const packageRoot = join(dirname(require.resolve("pdfjs-dist/legacy/build/pdf.mjs")), "..", "..");
   const unpackedRoot = packageRoot.replace(`app.asar${sep}`, `app.asar.unpacked${sep}`);
   const root = existsSync(join(unpackedRoot, "standard_fonts")) ? unpackedRoot : packageRoot;
-  const assetUrl = (directory: string) => pathToFileURL(join(root, directory) + sep).href;
+  // PDF.js's Node binary-data factory passes this string straight to fs.readFile.
+  const assetUrl = (directory: string) => join(root, directory).split(sep).join("/") + "/";
   return { cMapUrl: assetUrl("cmaps"), standardFontDataUrl: assetUrl("standard_fonts"),
     wasmUrl: assetUrl("wasm"), iccUrl: assetUrl("iccs") };
 };
@@ -216,54 +218,6 @@ const extractPageFromDoc = async (doc: PDFDocumentProxy, pageNumber: number, ver
   }
   flush();
   return { ...pageInfo(page, pageNumber), text: lines.map((line) => line.text).join("\n"), lines, parser: "pdfjs", parserVersion: version };
-};
-
-const validateRegion = (region?: PdfRegion): PdfRegion => {
-  const value = region ?? { x: 0, y: 0, width: 1, height: 1 };
-  if (![value.x, value.y, value.width, value.height].every(Number.isFinite)
-      || value.x < 0 || value.y < 0 || value.width <= 0 || value.height <= 0
-      || value.x + value.width > 1 + Number.EPSILON || value.y + value.height > 1 + Number.EPSILON) {
-    throw new RangeError("PDF region must be a non-empty rectangle within the normalized page");
-  }
-  return value;
-};
-
-const renderPageFromDoc = async (doc: PDFDocumentProxy, input: PdfRenderInput, version: string): Promise<PdfPageImage> => {
-  const page = await checkedPage(doc, input.page, input.signal);
-  const scale = input.scale ?? 2;
-  if (!Number.isFinite(scale) || scale <= 0) throw new RangeError("PDF render scale must be positive");
-  const region = validateRegion(input.region);
-  const full = page.getViewport({ scale });
-  const left = Math.floor(region.x * full.width);
-  const top = Math.floor(region.y * full.height);
-  const right = Math.ceil((region.x + region.width) * full.width);
-  const bottom = Math.ceil((region.y + region.height) * full.height);
-  const width = right - left;
-  const height = bottom - top;
-  const canvasFactory = doc.canvasFactory as {
-    create(width: number, height: number): { canvas: NonNullable<Parameters<PDFPageProxy["render"]>[0]["canvas"]> & { toBuffer(mimeType: "image/png"): Buffer }; context: Parameters<PDFPageProxy["render"]>[0]["canvasContext"] };
-    destroy(value: { canvas: unknown; context: unknown }): void;
-  };
-  const canvasAndContext = canvasFactory.create(width, height);
-  try {
-    const viewport = page.getViewport({ scale, offsetX: -left, offsetY: -top });
-    const task = page.render({ canvas: canvasAndContext.canvas, canvasContext: canvasAndContext.context, viewport, background: "#ffffff" });
-    try {
-      await awaitWithAbort(task.promise, input.signal, () => task.cancel());
-    } catch (error) {
-      // PDF.js releases its canvas/render state when the task settles.
-      await task.promise.catch(() => undefined);
-      throw error;
-    }
-    throwIfAborted(input.signal);
-    const data = canvasAndContext.canvas.toBuffer("image/png");
-    const pageSize = page.getViewport({ scale: 1 });
-    return { data, mimeType: "image/png", width, height, pageWidth: pageSize.width, pageHeight: pageSize.height,
-      region: { x: left / full.width, y: top / full.height, width: width / full.width, height: height / full.height },
-      parser: "pdfjs", parserVersion: version };
-  } finally {
-    canvasFactory.destroy(canvasAndContext);
-  }
 };
 
 export const parseTesseractTsv = (tsv: string, rendered: Pick<PdfPageImage, "width" | "height">, crop: PdfRegion): PdfOcrLine[] => {
@@ -558,8 +512,13 @@ export const createPdfEngine = (options: PdfEngineOptions = {}, runtime: PdfEngi
       return output;
     });
 
-  const renderPage = async (input: PdfRenderInput): Promise<PdfPageImage> =>
-    await withDocument(input, async (doc, version) => await renderPageFromDoc(doc, input, version));
+  const renderPage = async (input: PdfRenderInput): Promise<PdfPageImage> => {
+    throwIfAborted(input.signal);
+    const entry = createRequire(import.meta.url).resolve("pdfjs-dist/legacy/build/pdf.mjs");
+    const unpacked = entry.replace(`app.asar${sep}`, `app.asar.unpacked${sep}`);
+    const moduleUrl = pathToFileURL(existsSync(unpacked) ? unpacked : entry).href;
+    return await rasterizePdf(input, moduleUrl, pdfAssets());
+  };
 
   const ocrPage = async (input: PdfRenderInput): Promise<PdfOcrResult> => {
     throwIfAborted(input.signal);

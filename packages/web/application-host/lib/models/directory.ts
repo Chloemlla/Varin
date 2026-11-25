@@ -50,7 +50,8 @@ export class ModelDirectory {
   }
   async #load() {
     try {
-      const document = await this.#file.read();
+      // The directory owns the parsed sources for this Host's lifetime.
+      const document = await this.#file.read({ cache: false });
       if (!Object.keys(document).length) return;
       if (document.version !== 1 || !object(document.sources)) throw new Error('Invalid directory cache');
       for (const [url, source] of Object.entries(document.sources)) {

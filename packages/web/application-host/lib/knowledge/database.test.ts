@@ -4,7 +4,7 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it } from 'vitest';
-import { openKnowledgeDatabase } from './database.js';
+import { isLegacyWalOnlyCheckpointError, openKnowledgeDatabase } from './database.js';
 
 const require = createRequire(import.meta.url);
 const roots: string[] = [];
@@ -98,4 +98,30 @@ it('does not discard a corrupt legacy WAL during checkpoint upgrade', () => {
   writeFileSync(`${file}.wal`, wal);
   expect(() => openKnowledgeDatabase(file, options)).toThrow();
   expect(readFileSync(`${file}.wal`)).toEqual(wal);
+});
+
+
+it('distinguishes the next-release guidance condition from normal WAL recovery and another corruption with the same header', () => {
+  const { TriviumDB } = require('triviumdb') as typeof import('triviumdb');
+  const missing = legacy(false), intact = legacy(true), damaged = legacy(true);
+  const damagedMain = Buffer.from('damaged 0.8 checkpoint');
+  writeFileSync(damaged, damagedMain);
+  const wal = readFileSync(`${damaged}.wal`);
+  for (const file of [missing, intact]) expect(readFileSync(`${file}.wal`).subarray(0, 6)).toEqual(wal.subarray(0, 6));
+  const diagnostic = (file: string) => {
+    try { new TriviumDB(file, options).close(); } catch (error) { return error; }
+    return null;
+  };
+  const missingWal = readFileSync(`${missing}.wal`);
+  expect(isLegacyWalOnlyCheckpointError(diagnostic(missing))).toBe(true);
+  expect(readFileSync(`${missing}.wal`)).toEqual(missingWal);
+  expect(diagnostic(intact)).toBeNull();
+  const corruption = diagnostic(damaged);
+  expect(corruption).toMatchObject({ code: 'TDB_CORRUPTED_FILE' });
+  expect(isLegacyWalOnlyCheckpointError(corruption)).toBe(false);
+  expect(() => openKnowledgeDatabase(damaged, options)).toThrow(expect.objectContaining({
+    message: (corruption as Error).message,
+  }));
+  expect(readFileSync(damaged)).toEqual(damagedMain);
+  expect(readFileSync(`${damaged}.wal`)).toEqual(wal);
 });

@@ -102,12 +102,37 @@ const persistStructural = (state: EditorWorkbenchState): EditorWorkbenchState =>
   return state;
 };
 
+// Recheck after React/model subscribers have observed the structural change.
+// Separate workbenches may expose aliases for the same physical file.
+async function releaseClosedResources(workspaceId: string, removed: string[], runtime: string) {
+  const { peekDocumentRegistry } = await import('@/lib/documents/session');
+  if (runtime !== session.runtimeKey) return;
+  const resource = getEditorResourceWorkspace(workspaceId);
+  const registry = resource?.scope.documents ?? peekDocumentRegistry();
+  if (!registry) return;
+  const stillOpen = new Set<string>();
+  for (const workbench of session.byWorkspace.values()) {
+    const other = getEditorResourceWorkspace(workbench.workspaceId);
+    if ((other?.scope.documents ?? peekDocumentRegistry()) !== registry) continue;
+    const workspaceId = other?.documentWorkspaceId ?? workbench.workspaceId;
+    for (const resourceId of listOpenResourceIds(workbench.tree)) stillOpen.add(registry.keyFor({ workspaceId, resourceId }));
+  }
+  for (const resourceId of removed) {
+    const identity = { workspaceId: resource?.documentWorkspaceId ?? workspaceId, resourceId };
+    if (!stillOpen.has(registry.keyFor(identity))) registry.releaseClosedDocument(identity);
+  }
+}
+
 export const replaceEditorWorkbench = (
   state: EditorWorkbenchState,
   options?: { persist?: boolean; notify?: boolean },
 ): EditorWorkbenchState => {
   const previous = session.byWorkspace.get(state.workspaceId);
-  if (previous) {
+  if (previous && previous.tree !== state.tree) {
+    const open = new Set(listOpenResourceIds(state.tree));
+    const closed = listOpenResourceIds(previous.tree).filter(id => !open.has(id));
+    if (closed.length) void releaseClosedResources(state.workspaceId, closed, session.runtimeKey)
+      .catch(error => console.error('[Documents] Failed to release closed documents:', error));
     const retainedPages = new Set(listEditorGroups(state.tree).flatMap(group => group.tabs.map(tab => tab.viewState.browserPageId)));
     for (const tab of listEditorGroups(previous.tree).flatMap(group => group.tabs)) {
       const pageId = tab.viewState.browserPageId;

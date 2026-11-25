@@ -200,12 +200,23 @@ export const ChatTimeline: React.FC<ChatTimelineProps> = (props) => {
   }, [activityState, dialogueChoices, activityTransitions, workDisclosure]);
   const blocksRef = React.useRef<ChatTimelineBlocks | undefined>(undefined);
   const blockAliases = React.useMemo(() => timelinePresentationCache(props.sessionId, 'block-identities', () => new Map() as ChatTimelineBlockAliases), [props.sessionId]);
-  const blocks = projectChatTimelineBlocks(projection, { sorted: sortedMessages, dialogue: dialogueMessages, collapseCompletedWork, activeRunId: props.activeRunId, expanded: id => isActivityExpanded(id) || activityTransitions.get(id)?.phase === 'closing', previous: blocksRef.current, customIds, showThinking, aliases: blockAliases, executions: props.toolExecutions });
+  const blocks = React.useMemo(() => projectChatTimelineBlocks(projection, {
+    sorted: sortedMessages, dialogue: dialogueMessages, collapseCompletedWork, activeRunId: props.activeRunId,
+    expanded: id => isActivityExpanded(id) || activityTransitions.get(id)?.phase === 'closing',
+    previous: blocksRef.current, customIds, showThinking, aliases: blockAliases, executions: props.toolExecutions,
+  }), [projection, sortedMessages, dialogueMessages, collapseCompletedWork, props.activeRunId, customIds,
+    showThinking, blockAliases, props.toolExecutions, isActivityExpanded, activityTransitions, activityRevision]);
   blocksRef.current = blocks;
   const stickyHeaders = React.useMemo(() => !isMobile && stickyUserHeader ? blocks.items.flatMap((block, index) => block.kind === 'user' ? [index] : []) : [], [blocks.items, isMobile, stickyUserHeader]);
-  const latestGroups = [...blocks.groups.values()].reverse();
-  const waitingGroupId = (props.activeRunId ? latestGroups.find(group => group.runId === props.activeRunId) : undefined)?.id
-    ?? latestGroups.find(group => group.ownerId === assistantWaitingTurnId)?.id;
+  const waitingGroupId = React.useMemo(() => {
+    if (!props.assistantWaiting) return undefined;
+    let runGroup: string | undefined, turnGroup: string | undefined;
+    for (const group of blocks.groups.values()) {
+      if (props.activeRunId && group.runId === props.activeRunId) runGroup = group.id;
+      if (group.ownerId === assistantWaitingTurnId) turnGroup = group.id;
+    }
+    return runGroup ?? turnGroup;
+  }, [blocks.groups, props.assistantWaiting, props.activeRunId, assistantWaitingTurnId]);
 
   const timelineView = useTimelineViewStore(useShallow((state) => (
     state.views[props.sessionId] ?? DEFAULT_CHAT_TIMELINE_VIEW
@@ -229,6 +240,8 @@ export const ChatTimeline: React.FC<ChatTimelineProps> = (props) => {
     : -1, [entryTarget, blocks.items]);
   const initialScrollAtEnd = entryTarget.kind === 'end' || entryTargetIndex < 0;
   const firstVisibleIndexRef = React.useRef(-1);
+  const historyCursorFor = React.useRef(props.historyCursorFor);
+  historyCursorFor.current = props.historyCursorFor;
   const viewportRef = React.useRef<ChatTimelineViewportAnchor | undefined>(timelineView.viewport);
   const observedLeafIdRef = React.useRef<string | null | undefined>(timelineView.observedLeafId);
   const atEndRef = React.useRef(initialScrollAtEnd);
@@ -352,7 +365,10 @@ export const ChatTimeline: React.FC<ChatTimelineProps> = (props) => {
     if (!item) return;
     const position = state.positionAtIndex(index);
     if (!Number.isFinite(position) || !Number.isFinite(state.scroll)) return;
+    const cursor = historyCursorFor.current?.(item.ownerId,
+      item.kind === 'user' ? item.turn.userEntry?.id : item.group.entries[0]?.id);
     viewportRef.current = {
+      ...(cursor ? { historyItemId: cursor } : {}),
       itemId: item.id,
       mode: modeRef.current === 'free-scrolling' ? 'free-scrolling' : 'following-end',
       offset: position - state.scroll,

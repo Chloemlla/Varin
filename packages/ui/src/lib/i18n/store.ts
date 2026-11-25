@@ -38,7 +38,7 @@ async function loadDictionary(locale: Locale): Promise<I18nDictionary> {
       : locale === 'fr'
         ? await import('./messages/fr') as { dict: I18nDictionary }
       : locale === 'zh-TW'
-        ? { dict: { ...enDict, ...(await import('./messages/zh-TW')).dict } as I18nDictionary }
+        ? await import('./messages/zh-TW') as { dict: I18nDictionary }
         : locale === 'es'
           ? await import('./messages/es') as { dict: I18nDictionary }
           : locale === 'pt-BR'

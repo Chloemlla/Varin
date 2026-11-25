@@ -139,17 +139,24 @@ export const createPlatformEnvironmentRuntime = (options: {
     return cachedShellEnvironment;
   };
 
-  const applyLoginShellEnvSnapshot = (): void => {
+  const getLaunchEnvironment = (): Environment => {
+    const environment = { ...processLike.env };
     const snapshot = getLoginShellEnvSnapshot();
     for (const [key, value] of Object.entries(snapshot ?? {})) {
       if (key.toLowerCase() === 'path' || ['PWD', 'OLDPWD', 'SHLVL', '_'].includes(key)) continue;
       if (typeof processLike.env[key] !== 'string' || processLike.env[key].length === 0) {
-        processLike.env[key] = value;
+        environment[key] = value;
       }
     }
-    const augmented = buildAugmentedPath();
+    if (processLike.platform === 'win32') for (const key of Object.keys(environment)) if (key.toLowerCase() === 'path' && key !== 'PATH') delete environment[key];
+    environment.PATH = buildAugmentedPath();
+    return environment;
+  };
+
+  const applyLoginShellEnvSnapshot = (): void => {
+    const environment = getLaunchEnvironment();
     if (processLike.platform === 'win32') for (const key of Object.keys(processLike.env)) if (key.toLowerCase() === 'path' && key !== 'PATH') delete processLike.env[key];
-    processLike.env.PATH = augmented;
+    Object.assign(processLike.env, environment);
   };
 
   const buildAugmentedPath = (): string => {
@@ -204,6 +211,7 @@ export const createPlatformEnvironmentRuntime = (options: {
     refresh: () => { cachedShellEnvironment = undefined; resolvedGitBinary = null; applyLoginShellEnvSnapshot(); },
     applyLoginShellEnvSnapshot,
     buildAugmentedPath,
+    getLaunchEnvironment,
     getLoginShellEnvSnapshot,
     isExecutable,
     resolveGitBinaryForSpawn,

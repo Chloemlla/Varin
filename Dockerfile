@@ -140,7 +140,8 @@ LABEL io.varin.image.role="application"
 ENV HOME=/home/varin \
   NODE_ENV=production \
   VARIN_DATA_DIR=/home/varin/.config/varin \
-  VARIN_WORKSPACE_ROOT=/home/varin/workspaces
+  VARIN_WORKSPACE_ROOT=/home/varin/workspaces \
+  VARIN_WORKSPACE_LOCKDOWN=false
 
 COPY --from=builder --chown=varin:varin /app/artifacts/cloud-runtime/ ./
 RUN --mount=type=cache,target=/home/varin/.cache/bun,uid=1000,gid=1000 \

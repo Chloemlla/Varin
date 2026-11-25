@@ -77,6 +77,24 @@ describe("PDF engine", () => {
     await expect(engine.parseStructure({ source, pageRange: { start: 1, end: 1 } })).resolves.toMatchObject({ status: "unavailable" });
   });
 
+  it("cancels queued and active raster work without detaching the source or holding the next slot", async () => {
+    const engine = createPdfEngine();
+    const source = makePdf();
+    const unchanged = Buffer.from(source);
+    const active = new AbortController();
+    const queued = new AbortController();
+    const a = engine.renderPage({ source, page: 1, scale: 12, signal: active.signal });
+    const b = engine.renderPage({ source, page: 1, scale: 12, signal: queued.signal });
+    const aRejected = expect(a).rejects.toThrow("active raster cancelled");
+    const bRejected = expect(b).rejects.toThrow("queued raster cancelled");
+    await Promise.resolve();
+    queued.abort(new DOMException("queued raster cancelled", "AbortError"));
+    active.abort(new DOMException("active raster cancelled", "AbortError"));
+    await Promise.all([aRejected, bRejected]);
+    expect(source).toEqual(unchanged);
+    await expect(engine.renderPage({ source, page: 1, scale: 1 })).resolves.toMatchObject({ width: 200, height: 100 });
+  });
+
   it("maps Docling document structure, bottom-left boxes and linked captions", () => {
     const mapped = mapDoclingDocument({
       version: "1.8.0",

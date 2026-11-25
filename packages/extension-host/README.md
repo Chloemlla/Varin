@@ -122,8 +122,16 @@ from that exact still-retained generation; it cannot revive an unpinned retired 
 supervisor keeps its artifact identity through actual owner retirement. Normal replacement preserves
 pinned calls; disable/crash drainage
 revokes both the active generation and older retained generations without waiting for abandoned pins.
-The first production native consumer is `varin.context.fragments@1`: existing scoped routing selects
-one brokered package or an explicitly ordered collection. `prepareServiceCollection` returns exact
+The Application Host implements the exact bundled tools and default guidance in-process. Installation,
+scope and fallback still select the provider through the same registry. A matching ID is not enough:
+the selected built-in artifact must match the running distribution. Original package/composition,
+schema and configuration still identify frozen child grants. New direct execution owners are marked
+`builtin-host`; completed and uncertain operations keep their original owners and are not replayed.
+Plugin declarations are compiled at admission; exact application-owned schemas compile on first use.
+The selected recovery surface and bundled language descriptors run trusted distribution code, never
+a module loaded from a user-installed package path.
+
+For `varin.context.fragments@1`, scoped routing selects one provider or an explicitly ordered collection. `prepareServiceCollection` returns exact
 selected handles without changing the ordinary `prepareService`/`invokeService` result. Only the selected
 roots and their original dependencies prepare. Frozen declarations cross the private context boundary,
 and Rust's existing composition resolver/registry binds the typed immutable ordered transform. The SDK's `provideContextFragments`

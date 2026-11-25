@@ -19,6 +19,8 @@ For contributing and local setup, see [CONTRIBUTING.md](../.github/CONTRIBUTING.
 | Extension contracts, plugin center & runtime composition | [extensions.md](extensions.md) |
 | Trust boundaries, auth & privilege limits | [security.md](security.md) |
 | Local dev, build graph & verification | [development.md](development.md), [performance.md](performance.md) |
+| Proposed resource optimizations and rollout | [Host, kernel, client and distribution design](design/resource-optimization.md) |
+| Proposed on-demand execution and resource lifecycle | [Bots, resource owners and independent deployment roles](design/on-demand-resource-lifecycle.md) |
 | Real-environment acceptance checklist | [runtime-acceptance.md](runtime-acceptance.md) |
 | Deployment, reverse proxy, backup, themes & extension authoring | [ops/README.md](ops/README.md) |
 

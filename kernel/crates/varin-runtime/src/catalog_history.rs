@@ -60,10 +60,10 @@ impl Catalog {
         before_id: Option<&str>,
         limit: u32,
     ) -> Result<HistoryPage> {
-        self.capture_history_page(branch_id)?
-            .load(head_id, before_id, limit, &|| false)
+        self.history_page_since(branch_id, head_id, before_id, None, limit, &|| false)
     }
     pub fn capture_history_page(&self, branch_id: &str) -> Result<HistoryPageRead> {
+        let publication = self.content.begin_read();
         Ok(HistoryPageRead {
             head: self.head(branch_id)?,
             epoch: self.epoch,
@@ -72,11 +72,12 @@ impl Catalog {
                 .path()
                 .ok_or_else(|| RuntimeError::Invalid("Catalog has no database".into()))?
                 .into(),
-            _publication: self.content.begin_publication(),
+            _publication: publication,
         })
     }
 
     pub fn history_body_reader(&self, item_id: &str) -> Result<HistoryBodyRead> {
+        let publication = self.content.begin_read();
         let item: HistoryItem = record(&self.db, "history", item_id)?;
         Ok(HistoryBodyRead {
             database: self
@@ -86,10 +87,48 @@ impl Catalog {
                 .into(),
             epoch: self.epoch,
             content: self.content.clone(),
-            _publication: self.content.begin_publication(),
+            _publication: publication,
             reference: item.content,
         })
     }
+    /// Use the caller's WAL snapshot and reader connection. A standalone caller
+    /// owns that snapshot and checks the epoch before and after releasing it.
+    pub fn history_page_since(
+        &self,
+        branch_id: &str,
+        head_id: Option<&str>,
+        before_id: Option<&str>,
+        after_id: Option<&str>,
+        limit: u32,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<HistoryPage> {
+        let _publication = self.content.begin_read();
+        let tx = self
+            .db
+            .is_autocommit()
+            .then(|| self.db.unchecked_transaction())
+            .transpose()?;
+        let result = self.assert_read_epoch().and_then(|_| {
+            query_history_page(
+                &self.db, self.head(branch_id)?, head_id, before_id, after_id, limit, cancelled,
+            )
+        });
+        if let Some(tx) = tx {
+            tx.rollback()?;
+            self.assert_read_epoch()?;
+        }
+        result
+    }
+
+    /// Only use within read_snapshot: the outer owner performs the post-release check.
+    pub fn history_chunk_in_snapshot(&self, item_id: &str, index: usize) -> Result<crate::content::ContentChunk> {
+        if self.db.is_autocommit() {
+            return self.history_body_reader(item_id)?.chunk(index);
+        }
+        let item: HistoryItem = record(&self.db, "history", item_id)?;
+        self.content.load_chunk(&item.content, index)
+    }
+
     pub fn active_thread_operations(
         &self,
         thread_id: &str,
@@ -145,84 +184,96 @@ impl HistoryPageRead {
                 "history reader belongs to a previous owner epoch".into(),
             ));
         }
-        if limit == 0 || limit > 256 {
-            return Err(RuntimeError::Invalid(
-                "history page size must be between 1 and 256".into(),
-            ));
-        }
-        let current = self.head.clone();
-        let mut cursor = current.clone();
-        // Ancestry is an original Catalog relation. Traverse it without repeatedly decoding
-        // unrelated history metadata; only the returned page needs complete references.
-        let mut parents = db.prepare("SELECT parent FROM history WHERE id=?1")?;
-        let mut parent = |key: &str| -> Result<Option<String>> {
-            parents.query_row([key], |row| row.get(0)).optional()?
-                .ok_or_else(|| RuntimeError::NotFound(key.into()))
-        };
-        if let Some(anchor) = head_id {
-            while cursor.as_deref() != Some(anchor) {
-                if cancelled() {
-                    return Err(RuntimeError::DispatchCancelled);
-                }
-                let key = cursor.ok_or_else(|| {
-                    RuntimeError::Conflict("history anchor is no longer on this branch".into())
-                })?;
-                cursor = parent(&key)?;
-            }
-        }
-        let head = cursor.clone();
-        if let Some(before) = before_id {
-            loop {
-                if cancelled() {
-                    return Err(RuntimeError::DispatchCancelled);
-                }
-                let key = cursor.ok_or_else(|| {
-                    RuntimeError::Conflict("history cursor is not on the anchored view".into())
-                })?;
-                if after_id == Some(key.as_str()) {
-                    return Err(RuntimeError::Conflict("history cursor precedes the selected incremental boundary".into()));
-                }
-                cursor = parent(&key)?;
-                if key == before {
-                    break;
-                }
-            }
-        }
-        let mut items = Vec::new();
-        let mut reached_after = after_id.is_none();
-        let mut references = db.prepare("SELECT body FROM history WHERE id=?1")?;
-        while items.len() < (limit as usize) {
+        let page = query_history_page(&db, self.head, head_id, before_id, after_id, limit, cancelled);
+        db.execute_batch("ROLLBACK")?;
+        current_history_owner(&self.database, self.epoch)?;
+        page
+    }
+}
+fn query_history_page(
+    db: &Connection,
+    current: Option<String>,
+    head_id: Option<&str>,
+    before_id: Option<&str>,
+    after_id: Option<&str>,
+    limit: u32,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<HistoryPage> {
+    if limit == 0 || limit > 256 {
+        return Err(RuntimeError::Invalid(
+            "history page size must be between 1 and 256".into(),
+        ));
+    }
+    let mut cursor = current.clone();
+    // Ancestry is an original Catalog relation. Traverse it without repeatedly decoding
+    // unrelated history metadata; only the returned page needs complete references.
+    let mut parents = db.prepare_cached("SELECT parent FROM history WHERE id=?1")?;
+    let mut parent = |key: &str| -> Result<Option<String>> {
+        parents.query_row([key], |row| row.get(0)).optional()?
+            .ok_or_else(|| RuntimeError::NotFound(key.into()))
+    };
+    if let Some(anchor) = head_id {
+        while cursor.as_deref() != Some(anchor) {
             if cancelled() {
                 return Err(RuntimeError::DispatchCancelled);
             }
-            let Some(key) = cursor else {
-                break;
-            };
-            if after_id == Some(key.as_str()) { reached_after = true; cursor = None; break; }
-            let raw: String = references.query_row([&key], |row| row.get(0)).optional()?
-                .ok_or_else(|| RuntimeError::NotFound(key.clone()))?;
-            let item: HistoryItem = serde_json::from_str(&raw)?;
-            cursor = item.parent.clone();
-            items.push(HistoryReference::try_from(item)?);
+            let key = cursor.ok_or_else(|| {
+                RuntimeError::Conflict("history anchor is no longer on this branch".into())
+            })?;
+            cursor = parent(&key)?;
         }
-        items.reverse();
-        let boundary_reset = cursor.is_none() && !reached_after;
-        let previous = if cursor.is_some() && cursor.as_deref() != after_id {
-            items.first().map(|item| item.id.clone())
-        } else {
-            None
-        };
+    }
+    let head = cursor.clone();
+    if let Some(before) = before_id {
+        loop {
+            if cancelled() {
+                return Err(RuntimeError::DispatchCancelled);
+            }
+            let key = cursor.ok_or_else(|| {
+                RuntimeError::Conflict("history cursor is not on the anchored view".into())
+            })?;
+            if after_id == Some(key.as_str()) {
+                return Err(RuntimeError::Conflict("history cursor precedes the selected incremental boundary".into()));
+            }
+            cursor = parent(&key)?;
+            if key == before {
+                break;
+            }
+        }
+    }
+    let mut items = Vec::new();
+    let mut reached_after = after_id.is_none();
+    let mut references = db.prepare_cached("SELECT body FROM history WHERE id=?1")?;
+    while items.len() < (limit as usize) {
         if cancelled() {
             return Err(RuntimeError::DispatchCancelled);
         }
-        current_history_owner(&self.database, self.epoch)?;
-        Ok(HistoryPage {
-            boundary_reset,
-            head,
-            items,
-            previous,
-        })
+        let Some(key) = cursor else {
+            break;
+        };
+        if after_id == Some(key.as_str()) { reached_after = true; cursor = None; break; }
+        let raw: String = references.query_row([&key], |row| row.get(0)).optional()?
+            .ok_or_else(|| RuntimeError::NotFound(key.clone()))?;
+        let item: HistoryItem = serde_json::from_str(&raw)?;
+        cursor = item.parent.clone();
+        items.push(HistoryReference::try_from(item)?);
     }
+    items.reverse();
+    let boundary_reset = cursor.is_none() && !reached_after;
+    let previous = if cursor.is_some() && cursor.as_deref() != after_id {
+        items.first().map(|item| item.id.clone())
+    } else {
+        None
+    };
+    if cancelled() {
+        return Err(RuntimeError::DispatchCancelled);
+    }
+    Ok(HistoryPage {
+        boundary_reset,
+        head,
+        items,
+        previous,
+    })
 }
 
 /// A retained SQLite snapshot cannot prove that the current owner is still the captured owner.
@@ -261,6 +312,7 @@ impl Catalog {
         self.capture_bot_history_scoped(bot_id,thread_id,branch_id,head_id,item_id,None)
     }
     pub fn capture_bot_history_scoped(&self, bot_id: &str, thread_id: &str, branch_id: &str, head_id: &str, item_id: &str, principal: Option<Option<String>>) -> Result<BotHistoryRead> {
+        let publication = self.content.begin_read();
         if let Some(principal)=&principal { if !self.db.query_row("SELECT EXISTS(SELECT 1 FROM threads WHERE id=?1 AND principal_id IS ?2)", params![thread_id,principal], |r|r.get::<_,bool>(0))? { return Err(RuntimeError::Conflict("History source is outside this principal".into())); } }
         if (self.bot_for_thread(thread_id)?.as_deref() != Some(bot_id)
             && !super::bot_work::linked(&self.db, &super::bot_work::entry(&self.db, bot_id)?, thread_id, Some(branch_id), false, true)?) || self.branch_thread_id(branch_id)? != thread_id {
@@ -268,7 +320,7 @@ impl Catalog {
         }
         Ok(BotHistoryRead { database: self.database_path.clone(), epoch: self.epoch, content: self.content.clone(),
             principal, bot_id: bot_id.into(), thread_id: thread_id.into(), branch_id: branch_id.into(), head_id: head_id.into(), item_id: item_id.into(),
-            _publication: self.content.begin_publication() })
+            _publication: publication })
     }
 }
 impl BotHistoryRead {

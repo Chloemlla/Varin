@@ -94,6 +94,8 @@ fn completed_external_child() -> (std::path::PathBuf, Mutex<Catalog>, String) {
         "configurationId":"external","harness":"codex","title":"External worker","cwd":"/workspace",
         "parent":{"operationId":child.operation_id,"runId":child.parent_run_id,"threadId":child.parent_thread_id}}),
     );
+    let activity = json!({"action":"connection_activity","id":child.conversation_id});
+    assert_eq!(external(&owner, activity.clone()), json!({"hasTurns":false,"busy":true}));
     let input = external_children::execute(
         &owner,
         json!({"action":"child_input","operationId":child.operation_id}),
@@ -121,6 +123,7 @@ fn completed_external_child() -> (std::path::PathBuf, Mutex<Catalog>, String) {
         json!({"action":"child_finish","operationId":child.operation_id,"released":false}),
     )
     .unwrap();
+    assert_eq!(external(&owner, activity), json!({"hasTurns":true,"busy":false}));
     let db = owner.lock().unwrap();
     let completed = db.external_child(&child.operation_id).unwrap().unwrap();
     assert!(completed.report.is_some() && completed.receipt_published);

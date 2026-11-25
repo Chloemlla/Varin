@@ -1,4 +1,11 @@
-# Structure sources
+# Structure sources The kernel retains the verified bytes once at admission, shares them
+by digest across immutable recipes and already queued jobs, and compiles each
+name/digest at most once per warm worker until that cache is evicted. Recipes
+sharing a grammar may still select new query sets independently. The Host tracks
+native file identity (device, inode, and high-resolution change stamps) to notice
+externally replaced generations; on a cold read both the held file and the
+registered digest are verified before publication. A previously admitted recipe
+does not reopen a mutable path on each source file.
 
 The Application Host resolves language/grammar recipes and projects native syntax facts.
 Rust kernel compute owns workspace bytes, Tree-sitter parsing and query execution. Production

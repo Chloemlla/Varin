@@ -1,12 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { createReadStream, createWriteStream, existsSync, readFileSync } from "node:fs";
+import { createReadStream, existsSync, readFileSync } from "node:fs";
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
-import { Readable, Transform } from "node:stream";
-import { pipeline } from "node:stream/promises";
 import { basename, join, relative, resolve } from "node:path";
 import { extract } from "tar";
 import type { LocalSemanticStatus } from "@varin/protocol";
+import { fetchComponentFile, stageComponentFile, type ComponentFetch } from "../../components/file-transfer.js";
 import { resolveModelPackAtComponentRoot, type ResolvedModelPack } from "./model-store.js";
 
 import { parseManifest, safeRelativePath, type LocalSemanticComponentManifest } from './local-component-manifest.js';
@@ -27,9 +26,13 @@ interface LocalSemanticComponentManagerOptions {
   version: string;
   platform?: "win32" | "linux" | "darwin";
   arch?: "x64" | "arm64";
-  fetch?: typeof fetch;
+  fetch?: ComponentFetch;
   validatePack?: (pack: ResolvedModelPack, signal?: AbortSignal) => Promise<void>;
   onEnabled?: () => void | Promise<void>;
+}
+
+export class ComponentInstallConflict extends Error {
+  constructor() { super("Another local semantic component is being installed. Wait for it to finish or cancel it before replacing it."); }
 }
 
 export interface LocalSemanticComponentManager {
@@ -213,21 +216,6 @@ const defaultValidatePack = async (pack: ResolvedModelPack, signal?: AbortSignal
   });
 };
 
-const writeArchiveWithProgress = async (
-  source: AsyncIterable<Uint8Array> | NodeJS.ReadableStream,
-  destination: string,
-  signal: AbortSignal,
-  onBytes: (bytes: number) => void,
-): Promise<void> => {
-  const progress = new Transform({
-    transform(chunk: Buffer, _encoding, callback) {
-      onBytes(chunk.byteLength);
-      callback(null, chunk);
-    },
-  });
-  await pipeline(Readable.from(source as AsyncIterable<Uint8Array>), progress, createWriteStream(destination), { signal });
-};
-
 const extractArchive = async (archive: string, destination: string, signal: AbortSignal): Promise<void> => {
   await extract({
     file: archive,
@@ -270,8 +258,7 @@ export function createLocalSemanticComponentManager(
     : existsSync(activePathFor(options.dataDir))
       ? { status: "failed", error: "The installed local semantic component pointer or manifest is unreadable or unsupported. The current Host requires manifest format 4 and worker protocol 1. Rebuild and import it with the current component builder." }
       : { status: "not-installed" };
-  let controller: AbortController | null = null;
-  let running: Promise<void> | null = null;
+  let running: { source: { url?: string; file?: string }; controller: AbortController; task: Promise<void> } | null = null;
   let disposed = false;
 
   const setStatus = (next: LocalSemanticStatus): void => {
@@ -303,23 +290,23 @@ export function createLocalSemanticComponentManager(
       let totalBytes: number | undefined;
       let downloadedBytes = 0;
       if (source.url) {
-        const response = await fetchImpl(source.url, { signal });
-        if (!response.ok) throw new Error(`Local semantic component download failed: ${response.status} ${response.statusText}`);
-        const contentLength = response.headers.get("content-length");
-        totalBytes = contentLength === null ? undefined : Number(contentLength);
-        if (totalBytes !== undefined && (!Number.isFinite(totalBytes) || totalBytes < 0)) totalBytes = undefined;
-        if (!response.body) throw new Error("Local semantic component download returned an empty body.");
-        setStatus({ status: "installing", stage: "downloading", ...installedFields, ...(totalBytes === undefined ? {} : { totalBytes }), downloadedBytes: 0 });
-        await writeArchiveWithProgress(Readable.fromWeb(response.body as never), archive, signal, (bytes) => {
-          downloadedBytes += bytes;
-          setStatus({ status: "installing", stage: "downloading", ...installedFields, downloadedBytes, ...(totalBytes === undefined ? {} : { totalBytes }) });
-        });
+        ({ downloadedBytes, totalBytes } = await fetchComponentFile(source.url, archive, {
+          fetcher: fetchImpl,
+          signal,
+          label: "Local semantic component",
+          onProgress: (downloadedBytes, totalBytes) => setStatus({
+            status: "installing", stage: "downloading", ...installedFields, downloadedBytes,
+            ...(totalBytes === undefined ? {} : { totalBytes }),
+          }),
+        }));
       } else {
         if (!source.file) throw new Error("A local semantic component archive is required.");
         setStatus({ status: "installing", stage: "downloading", ...installedFields });
-        await writeArchiveWithProgress(createReadStream(source.file), archive, signal, (bytes) => {
-          downloadedBytes += bytes;
-          setStatus({ status: "installing", stage: "downloading", ...installedFields, downloadedBytes, totalBytes: downloadedBytes });
+        downloadedBytes = await stageComponentFile(createReadStream(source.file), archive, {
+          signal,
+          onProgress: (downloadedBytes) => setStatus({
+            status: "installing", stage: "downloading", ...installedFields, downloadedBytes, totalBytes: downloadedBytes,
+          }),
         });
       }
       signal.throwIfAborted();
@@ -376,15 +363,17 @@ export function createLocalSemanticComponentManager(
 
   const begin = (source: { url?: string; file?: string }): Promise<void> => {
     if (disposed) return Promise.resolve();
-    if (running) return running;
+    if (running) {
+      if (source.url === running.source.url && source.file === running.source.file && !running.controller.signal.aborted) return running.task;
+      throw new ComponentInstallConflict();
+    }
     const installedFields = preserveInstalledFields();
-    controller = new AbortController();
+    const controller = new AbortController();
     setStatus({ status: "installing", stage: "downloading", ...installedFields });
     const task = runInstall(source, controller.signal, installedFields).finally(() => {
-      if (running === task) running = null;
-      controller = null;
+      running = null;
     });
-    running = task;
+    running = { source, controller, task };
     return task;
   };
 
@@ -393,13 +382,13 @@ export function createLocalSemanticComponentManager(
     install: (url = componentUrl(options.version, platform, arch)) => begin({ url }),
     importArchive: (file) => begin({ file }),
     cancel: () => {
-      controller?.abort();
+      running?.controller.abort();
       return { ...currentStatus };
     },
     dispose: async () => {
       disposed = true;
-      controller?.abort();
-      await running;
+      running?.controller.abort();
+      await running?.task;
     },
   };
 }

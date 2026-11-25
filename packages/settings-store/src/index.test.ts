@@ -129,7 +129,10 @@ describe('shared settings read cache', () => {
       fsPromises: { ...fsPromises, readFile: ((...args: Parameters<typeof fsPromises.readFile>) => { reads++; return fsPromises.readFile(...args); }) as typeof fsPromises.readFile,
         stat: ((...args: Parameters<typeof fsPromises.stat>) => { stats++; return fsPromises.stat(...args); }) as typeof fsPromises.stat } };
     const first = createSettingsFileStore(options), second = createSettingsFileStore(options);
-    await first.read(); reads = 0; stats = 0;
+    assert.deepEqual(await first.read({ cache: false }), { nested: { value: 1 } });
+    await first.read();
+    assert.equal(reads, 2, 'a one-time load does not retain the serialized document');
+    reads = 0; stats = 0;
     for (let index = 0; index < 30; index++) {
       const value = await first.read(); (value.nested as { value: number }).value = 99;
       assert.deepEqual(second.readSync(), { nested: { value: 1 } });
@@ -213,4 +216,98 @@ it('releases all process resources after reads and directory removal', async () 
   const { stdout } = await promisify(execFile)(process.execPath,
     ['--import', 'tsx', '--input-type=module', '--eval', script], { timeout: 10_000 });
   assert.equal(stdout.trim(), 'finished');
+});
+
+describe('validated settings projections', () => {
+  it('validates once on warm reads, isolates editable documents and refreshes after writes', async () => {
+    const { filePath, store } = await createStore();
+    await store.replace({ port: 1, unrelated: { value: 'untouched' } });
+    let checks = 0;
+    const projection = store.createProjection(document => {
+      checks++;
+      assert.equal(typeof document.port, 'number');
+      return { settings: { port: document.port as number }, order: [1, 2] };
+    });
+    const [first, second] = await Promise.all([projection.read(), projection.read()]);
+    assert.strictEqual(second, first);
+    assert.strictEqual(projection.readSync(), first);
+    assert.equal(checks, 1);
+    assert.equal(Object.isFrozen(first), true);
+    assert.equal(Object.isFrozen(first.settings), true);
+    assert.equal(Object.isFrozen(first.order), true);
+    assert.throws(() => { first.settings.port = 99; }, TypeError);
+    const editable = await store.read();
+    editable.port = 99;
+    assert.equal((await projection.read()).settings.port, 1);
+    assert.equal(checks, 1);
+
+    const externalPath = `${filePath}.external`;
+    await fsPromises.writeFile(externalPath, '{"port":2}');
+    await fsPromises.rename(externalPath, filePath);
+    const external = await projection.read();
+    assert.equal(external.settings.port, 2);
+    assert.notStrictEqual(first, external);
+    assert.equal(checks, 2);
+    await createSettingsFileStore({ filePath }).update(document => ({ ...document, port: 3 }));
+    assert.equal(projection.readSync().settings.port, 3);
+    assert.equal(checks, 3);
+
+    await fsPromises.writeFile(filePath, '[1]');
+    await assert.rejects(projection.read(), /non-object payload/);
+    assert.equal(checks, 3);
+  });
+
+  it('does not publish an old projection when its read finishes after a newer snapshot', async () => {
+    const { filePath, store } = await createStore();
+    await store.replace({ port: 1 });
+    let entered!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let pausing = true;
+    const slowReader = createSettingsFileStore({
+      filePath,
+      fsPromises: {
+        ...fsPromises,
+        readFile: (async (...args: Parameters<typeof fsPromises.readFile>) => {
+          const result = await fsPromises.readFile(...args);
+          if (pausing && args[0] === filePath) {
+            pausing = false;
+            entered();
+            await gate;
+          }
+          return result;
+        }) as typeof fsPromises.readFile,
+      },
+    });
+    let validations = 0;
+    const projection = slowReader.createProjection(document => { validations++; return document.port as number; });
+    const old = projection.read();
+    try {
+      await started;
+      await store.replace({ port: 2 });
+      assert.equal(await projection.read(), 2);
+    } finally {
+      release();
+    }
+    assert.equal(await old, 1);
+    assert.equal(projection.readSync(), 2);
+    assert.equal(validations, 2);
+  });
+
+  it('keeps missing defaults per store and observes recovery-copy creation and unlink', async () => {
+    const { filePath } = await createStore();
+    const first = createSettingsFileStore({ filePath, defaultValue: { port: 1 } })
+      .createProjection(document => document.port as number);
+    const second = createSettingsFileStore({ filePath, defaultValue: { port: 2 } })
+      .createProjection(document => document.port as number);
+    assert.equal(await first.read(), 1);
+    assert.equal(second.readSync(), 2);
+    await fsPromises.writeFile(`${filePath}.previous`, '{"port":7}');
+    assert.equal(await first.read(), 7);
+    assert.equal(await second.read(), 7);
+    await fsPromises.unlink(`${filePath}.previous`);
+    assert.equal(first.readSync(), 1);
+    assert.equal(await second.read(), 2);
+  });
 });

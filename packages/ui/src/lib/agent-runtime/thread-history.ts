@@ -22,6 +22,8 @@ export class ThreadHistoryWindow {
   private usage = new Map<string, ThreadRunUsage>();
   private listeners = new Set<() => void>();
   private controller?: AbortController;
+  private waitingCalls = new Set<string>();
+  private previewOnly = false;
   private target: string | null = null;
   private pending?: Promise<void>;
   private usagePending = new Map<string, Promise<void>>();
@@ -35,7 +37,7 @@ export class ThreadHistoryWindow {
   private navigationRuns: ThreadHistoryRun[] = [];
   private activeRunId?: string;
   constructor(private api: Pick<ThreadsAPI, 'historyPage' | 'historyUsage' | 'historyRuns' | 'historyRunPreview'> & Partial<Pick<ThreadsAPI, 'observe'>>, private identity: ThreadIdentity,
-    private options: { usage?: boolean } = {}) {}
+    private options: { usage?: boolean; onRelease?: (window: ThreadHistoryWindow) => void } = {}) {}
 
   getSnapshot = (): ThreadHistoryWindowView => this.view;
   subscribe = (listener: () => void): (() => void) => {
@@ -62,9 +64,28 @@ export class ThreadHistoryWindow {
         this.pending = undefined; this.usagePending.clear(); this.usageDirty.clear(); this.usageRevision = undefined;
         this.navigationPending = undefined; this.navigationStale = true;
         this.view = { ...this.view, loading: false, connecting: false };
+        // StrictMode and a simultaneous second reader can reacquire the same window.
+        queueMicrotask(() => { if (!this.listeners.size) this.options.onRelease?.(this); });
       }
     };
   };
+  /** Only presentation data. Drafts, submissions and reading anchors have other owners. */
+  releaseCache() {
+    if (this.listeners.size) return false;
+    // Keep only the question rows still owned by a pending interactive operation.
+    // They remain read-only previews until the fresh snapshot restores execution.
+    const waiting = this.waitingCalls.size ? this.view.items.filter(item => {
+      const envelope = item.content as { content?: { kind?: string; call?: { call_id?: string } } } | null;
+      const call = envelope?.content;
+      return call?.kind === 'tool_call' && !!call.call?.call_id && this.waitingCalls.has(call.call.call_id);
+    }) : [];
+    this.previewOnly = waiting.length > 0;
+    this.items.clear(); this.usage.clear(); this.target = null;
+    this.navigationHead = undefined; this.navigationRuns = []; this.activeRunId = undefined;
+    this.view = { head: waiting.at(-1)?.id ?? null, previous: null, items: waiting, usage: [], runs: [], ready: this.previewOnly,
+      connecting: false, loading: false, latencyMs: 0, reset: 0 };
+    return !this.previewOnly;
+  }
   private publish(patch: Partial<ThreadHistoryWindowView>) {
     const next = shareSnapshot(this.view, { ...this.view, ...patch });
     if (next === this.view) return;
@@ -94,6 +115,16 @@ export class ThreadHistoryWindow {
     this.publish({ ...next, head: this.target, ready: true, connecting: false, reset, usage, ...(!next.previous ? { error: undefined } : {}) });
   }
   accept(snapshot: ThreadSnapshot) {
+    if (this.previewOnly) {
+      this.previewOnly = false;
+      this.view = { ...this.view, items: [], head: null, ready: false };
+    }
+    this.waitingCalls.clear();
+    for (const operation of snapshot.operations ?? []) {
+      if (operation.phase !== 'waiting' || !operation.waiting_on?.startsWith('question:')) continue;
+      const intent = operation.intent as { call?: { call_id?: string } } | null;
+      if (intent?.call?.call_id) this.waitingCalls.add(intent.call.call_id);
+    }
     this.controller ??= new AbortController();
     const page = { ...snapshot.historyPage, items: snapshot.history };
     const priorReset = this.view.reset;
@@ -239,6 +270,8 @@ export function threadHistoryWindow(api: ThreadsAPI, owner: string, identity: Th
   if (!windows) { windows = new Map(); hosts.set(api, windows); }
   const key = JSON.stringify([owner, identity.runtime, identity.threadId, identity.branchId]);
   let window = windows.get(key);
-  if (!window) { window = new ThreadHistoryWindow(api, { ...identity }); windows.set(key, window); }
+  if (!window) { window = new ThreadHistoryWindow(api, { ...identity }, { onRelease: released => {
+    if (windows.get(key) === released && released.releaseCache()) windows.delete(key);
+  } }); windows.set(key, window); }
   return window;
 }

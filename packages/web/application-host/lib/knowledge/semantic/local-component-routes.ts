@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Express, RequestHandler } from "express";
 import multer from "multer";
-import type { LocalSemanticComponentManager } from "./local-component.js";
+import { ComponentInstallConflict, type LocalSemanticComponentManager } from "./local-component.js";
 
 export interface LocalSemanticComponentRoutesOptions {
   manager: LocalSemanticComponentManager;
@@ -36,7 +36,8 @@ export const registerLocalSemanticComponentRoutes = (
       void manager.install().catch(next);
       response.status(202).json(manager.status());
     } catch (error) {
-      next(error);
+      if (error instanceof ComponentInstallConflict) response.status(409).json({ error: error.message });
+      else next(error);
     }
   });
 
@@ -52,7 +53,8 @@ export const registerLocalSemanticComponentRoutes = (
       response.status(202).json(manager.status());
     } catch (error) {
       await rm(file.path, { force: true }).catch(() => undefined);
-      next(error);
+      if (error instanceof ComponentInstallConflict) response.status(409).json({ error: error.message });
+      else next(error);
     }
   });
 

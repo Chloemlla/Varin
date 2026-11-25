@@ -2,7 +2,7 @@
 //! Cancellation/revocation cannot free that reference while a worker is reading.
 use super::*;
 use super::file_resources::parse_file_params;
-use crate::compute::{ObjectSource,Source,Task};
+use crate::compute::{AdmittedGrammar,ObjectSource,Source,Task};
 use crate::protocol_generated::{KernelComputeGrammarParams,KernelComputeStartParams,KernelComputeReadParams,KernelComputeHandleParams};
 fn failure(message:impl Into<String>)->KernelError{KernelError::Operation(message.into())}
 fn relative(value:&str)->Result<String,KernelError>{
@@ -145,12 +145,14 @@ impl Storage {
         self.computations.read(&id,0,65536).map_err(failure)
     }
     fn register_compute_grammar(&mut self,value:&Value)->Result<Value,KernelError>{
+        self.check_cancelled()?;
         let mut recipe:KernelComputeGrammarParams=parse_file_params(value)?;
         if !matches!(recipe.style.as_str(),"code"|"json"|"tags"){return Err(failure("Unknown native grammar recipe style"));}
         let path=Path::new(&recipe.grammar_path);
         if !path.is_absolute(){return Err(KernelError::Authorization("Grammar requires a Host-admitted absolute path".into()));}
         recipe.grammar_path=fs::canonicalize(path)?.to_string_lossy().into();
         let bytes=fs::read(&recipe.grammar_path)?;
+        let digest=AdmittedGrammar::verify_digest(&recipe,&bytes).map_err(failure)?;
         // Preserve the existing installer/runtime ABI; inspect the actual wasm
         // exports rather than guessing a language from a file extension.
         let mut exports=Vec::new();
@@ -165,11 +167,12 @@ impl Storage {
         }
         if recipe.grammar_name.is_empty(){if exports.len()!=1{return Err(failure("Grammar has no unambiguous language export"));}recipe.grammar_name=exports.remove(0);}
         if recipe.grammar_name.contains('\0')||!recipe.grammar_name.chars().all(|c|c.is_ascii_alphanumeric()||c=='_'){return Err(failure("Invalid native grammar export name"));}
-        recipe.grammar_hash=Some(format!("sha256-{}",hex::encode(Sha256::digest(&bytes))));
+        recipe.grammar_hash=Some(digest.clone());
         let identity=json!(["native-tree-sitter-0.25.10-r5",recipe.grammar_hash,recipe.grammar_name,recipe.style,recipe.definition_query,
             recipe.import_query,recipe.literal_call_query,recipe.max_depth,recipe.max_symbols]);
         let id=hash_json(&identity)?;recipe.recipe_id=id.clone();
-        self.computations.recipes.insert(id.clone(),recipe);
+        self.check_cancelled()?;
+        self.computations.retain_grammar(recipe,bytes,digest);
         Ok(json!({"recipeId":id,"minAbi":tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION,"maxAbi":tree_sitter::LANGUAGE_VERSION}))
     }
     pub(crate) fn dispatch_compute(&mut self,method:&str,value:&Value,grant:&Grant)->Result<Value,KernelError>{

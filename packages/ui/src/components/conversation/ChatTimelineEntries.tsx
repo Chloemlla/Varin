@@ -100,6 +100,7 @@ import { attachmentSize } from '@/lib/agent-runtime/fileAttachments';
 import { ThreadMedia } from '../thread/ThreadMedia';
 
 export interface ChatTimelineProps {
+  historyCursorFor?: (owner: string, source?: string) => string | undefined;
   navigation?: {
     runs: readonly import('@varin/application-client').ThreadHistoryRun[];
     readPreview(runId: string, signal: AbortSignal): Promise<string>;

@@ -67,3 +67,15 @@ it('forwards the native codec catalog without a second Host whitelist', async ()
   await expect(documentTextEncodings()).resolves.toEqual(entries);
   expect(port.textEncodings).toHaveBeenCalledExactlyOnceWith();
 });
+
+it('passes only the bytes in a typed-array subview to decode and serialize', async () => {
+  const port = responsePort('owner');
+  bind(port);
+  const view = Uint8Array.from([0xff, 0x78, 0x00]).subarray(1, 2);
+  await inspectDocumentBytes(view, false);
+  expect(port.textDecode).toHaveBeenCalledExactlyOnceWith({ bytesBase64: 'eA==', includeContent: false });
+  await serializeDocumentText({ content: 'x', encoding: 'utf-8', bom: false, sourceBytes: view });
+  expect(port.textSerialize).toHaveBeenCalledExactlyOnceWith({
+    content: 'x', sourceBytesBase64: 'eA==', targetFormat: { encoding: 'utf-8', bom: false },
+  });
+});

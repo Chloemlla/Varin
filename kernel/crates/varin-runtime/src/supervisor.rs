@@ -1273,8 +1273,14 @@ impl RunSupervisor {
                 .filter_map(|id| workers.remove(&id).and_then(|worker| worker.join))
                 .collect::<Vec<_>>()
         };
+        let released_operations = !completed_operations.is_empty();
         for join in completed_operations {
             join.join().map_err(|_| error("operation worker panicked"))?;
+        }
+        // A worker can signal just before its thread exits. Publish the actual
+        // release if maintenance was the first caller able to join it.
+        if released_operations {
+            if let Some(sender) = self.wake.lock().map_err(error)?.as_ref() { let _ = sender.send(()); }
         }
         let completed = {
             let workers = self.workers.lock().map_err(error)?;

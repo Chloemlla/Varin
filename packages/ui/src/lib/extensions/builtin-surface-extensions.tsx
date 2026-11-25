@@ -1,3 +1,4 @@
+import React from 'react';
 /* eslint-disable react-refresh/only-export-components */
 import {
   VARIN_BUILTIN_AGENTS_EXTENSION,
@@ -9,13 +10,7 @@ import {
   type VarinApplicationSurface,
 } from '@varin/extension-contract';
 import type { SurfaceActivation, SurfaceActivationContext } from '@varin/extension-surface';
-import { AgentsPage } from '@/components/sections/agents/AgentsPage';
-import { AgentsSidebar } from '@/components/sections/agents/AgentsSidebar';
-import { BotSettingsPage } from '@/components/sections/bots/BotSettings';
-import {
-  HarnessSettingsPage,
-  type HarnessSettingsSection,
-} from '@/components/sections/harness/HarnessSettingsPage';
+import type { HarnessSettingsSection } from '@/components/sections/harness/HarnessSettingsPage';
 import { BuiltinWorkbenchTransitionScene } from '@/components/ui/BuiltinWorkbenchTransitionScene';
 import type { SettingsPageImplementation } from '@/lib/settings/page-types';
 import { resolveWorkbenchShellComponent } from './shell-component-registry';
@@ -23,6 +18,12 @@ import {
   WorkbenchOwnedView,
   WORKBENCH_REPLACEMENT_TARGETS,
 } from './workbench-registry';
+
+// Register metadata synchronously. Page modules load only when their content mounts.
+const AgentsPage = React.lazy(() => import('@/components/sections/agents/AgentsPage').then(m => ({ default: m.AgentsPage })));
+const AgentsSidebar = React.lazy(() => import('@/components/sections/agents/AgentsSidebar').then(m => ({ default: m.AgentsSidebar })));
+const BotSettingsPage = React.lazy(() => import('@/components/sections/bots/BotSettings').then(m => ({ default: m.BotSettingsPage })));
+const HarnessSettingsPage = React.lazy(() => import('@/components/sections/harness/HarnessSettingsPage').then(m => ({ default: m.HarnessSettingsPage })));
 
 const HARNESS_SECTION_BY_SLUG: Record<string, HarnessSettingsSection> = {
   'harness-tools': 'tools',
