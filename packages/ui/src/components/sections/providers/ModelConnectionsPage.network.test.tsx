@@ -185,6 +185,56 @@ test('testing uses connection drafts without saving; edited connections retire d
   expect(fixtures.api.discoverDraft).toHaveBeenCalledWith({ channel: expect.objectContaining({ baseUrl: 'http://localhost/new' }), secret: 'draft-key' }, expect.any(AbortSignal)); expect(fixtures.api.save).not.toHaveBeenCalled(); expect(fixtures.api.storeCredential).not.toHaveBeenCalled();
   await edit('settings.models.endpoint', 'http://localhost/changed'); await click('settings.models.addModel'); expect(button('Discovered')).toBeUndefined();
 });
+test('discovery shows progress only on Fetch and skips the picker when every service model is listed', async () => {
+  snapshot.types[0]!.discovery = true;
+  snapshot.types[0]!.catalog = [model('catalog-only', 'Catalog only')];
+  snapshot.channels[0]!.models = [{ ...model('local-alias'), requestModelId: 'already-configured', enabled: false }];
+  let resolve!: (result: { models: Array<{ id: string; name: string }> }) => void;
+  fixtures.api.discoverDraft.mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+  await open();
+  await click('settings.models.discover');
+  expect(button('settings.models.discover').getAttribute('aria-busy')).toBe('true');
+  expect(button('settings.models.testConnection').getAttribute('aria-busy')).toBe('false');
+  expect(container.textContent).not.toContain('settings.common.actions.saving');
+  await act(async () => resolve({ models: [{ id: 'already-configured', name: 'Configured' }] }));
+  expect(container.textContent).toContain('settings.models.discoveryUpToDate');
+  expect(container.querySelector('[role="dialog"]')).toBeNull();
+  expect(fixtures.api.test).not.toHaveBeenCalled();
+  expect(fixtures.api.save).not.toHaveBeenCalled();
+});
+test('discovery only offers new service results and saves after confirmation', async () => {
+  snapshot.types[0]!.discovery = true;
+  snapshot.types[0]!.catalog = [model('catalog-only', 'Catalog only')];
+  snapshot.channels[0]!.models = [model()];
+  fixtures.api.discoverDraft.mockResolvedValueOnce({ models: [model(), { id: 'new-model', name: 'New model' }] });
+  await open();
+  await click('settings.models.discover');
+  const picker = container.querySelector('[role="dialog"]');
+  expect(picker?.querySelector('[aria-label="New model"]')).toBeTruthy();
+  expect(picker?.querySelector('[aria-label="Model"], [aria-label="Catalog only"]')).toBeNull();
+  expect(fixtures.api.save).not.toHaveBeenCalled();
+  await click('New model');
+  await click('settings.models.addSelected · 1');
+  expect(lastSaved().models.map(model => model.id)).toEqual(['model', 'new-model']);
+  expect(container.querySelector('[role="dialog"]')).toBeNull();
+});
+test('empty and failed discovery report beside the model list and leave manual entry available', async () => {
+  snapshot.types[0]!.discovery = true;
+  fixtures.api.discoverDraft.mockResolvedValueOnce({ models: [] }).mockRejectedValueOnce(new Error('Provider did not respond'));
+  await open();
+  await click('settings.models.discover');
+  expect(container.textContent).toContain('settings.models.discoveryEmpty');
+  expect(container.querySelector('[role="dialog"]')).toBeNull();
+  await click('settings.models.discover');
+  expect(container.querySelector('[role="alert"]')?.textContent).toBe('Provider did not respond');
+  expect(container.textContent).not.toContain('settings.models.discoveryEmpty');
+  expect(container.querySelector('[role="dialog"]')).toBeNull();
+  await click('settings.models.addModel');
+  expect(field('settings.models.modelId')).toBeTruthy();
+  expect(field('settings.models.filterModels')).toBeNull();
+  expect(button('settings.models.addSelected')).toBeUndefined();
+  expect(fixtures.api.save).not.toHaveBeenCalled();
+});
 test('non-discovery connection tests use the first enabled model', async () => {
   snapshot.channels[0]!.models = [{ ...model('disabled'), enabled: false }, model('enabled')]; await open(); await edit('settings.models.endpoint', 'http://localhost/draft'); await click('settings.models.testConnection');
   expect(fixtures.api.test).toHaveBeenCalledWith(expect.objectContaining({ channel: expect.objectContaining({ baseUrl: 'http://localhost/draft' }), modelId: 'enabled' }), expect.any(AbortSignal)); expect(fixtures.api.save).not.toHaveBeenCalled();

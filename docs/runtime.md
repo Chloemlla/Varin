@@ -41,6 +41,17 @@ Authoritative schema & code: [kernel/protocol/schema.json](../kernel/protocol/sc
 - **Typed short refs**: `file:`, `proc:`, `env:`, `material:`, `page:`, `obs:`, `item:` map via Catalog's ref index to immutable owners/versions without string-scanning prose or expanding permissions.
 - **Resource & compute admission** ([resource_admission.rs](../kernel/crates/varin-runtime/src/resource_admission.rs)): Acquires full resource plan + `configured_compute_capacity` (default `min(cores, 2)`, override `VARIN_COMPUTE_CONCURRENCY`) atomically; non-conflicting work bypasses blocked queues. Linux research probes read cgroup v1/v2 limits (`VARIN_RESEARCH_RESERVE_CPU_CORES`, `VARIN_RESEARCH_RESERVE_MEMORY_MB`).
 - **Operation receipts & cancellation**: Track phase, outcome, effect (`none` | `dispatched` | `partial` | `confirmed` | `unknown`), and confirmed `executor_stopped` separately. Cancel writes intent first, then drains owners. Unknown dispatched work is never auto-replayed on restart; explicit foreground cancel can settle a Run while leaving the underlying Operation/occupation open for late reconciliation.
+- **Script admission**: A missing Source or fixed revision does not activate a physical evaluator
+  provider or inspect its Node/worker binding, except that an ordinary native Run may advertise
+  the built-in script tools for its saved canonical local default. Its first `script_open` obtains
+  the current directory instructions before process admission and may return a revision to include
+  in a new call. Only after that confirmation is the original live Source stored on the environment
+  Operation and the actual worker binding resolved. Cells and close retain that environment’s own
+  binding; selecting another work location does not move the heap. Managed dormant defaults,
+  aliases, nested opens and alternate script locations remain unsupported.
+  An admitted physical Run retains its selected evaluator;
+  open rechecks the captured Source and evaluator before requesting process authority. A lost
+  open acknowledgement keeps the original Operation pending instead of spawning another heap.
 - **Script nested calls**: Reuse frozen `ToolDirectory`, permissions, and resource admission; `script_run.title` labels the collapsible tree of nested Operations in UI.
 
 ## Context Preparation & Compaction
@@ -68,6 +79,76 @@ Authoritative schema & code: [kernel/protocol/schema.json](../kernel/protocol/sc
 - **Providers & Auth**: Native adapters ([providers/README.md](../kernel/crates/varin-runtime/src/providers/README.md), [AUTH.md](../kernel/crates/varin-runtime/src/providers/AUTH.md)) resolve secrets via Host [models](../packages/web/application-host/lib/models/DOCUMENTATION.md) right before dispatch; secrets never enter snapshots, history, or events. Custom extension protocols (`varin.models@1`) pin exact `adapterIdentity` + `adapterBindingId`.
 - **Usage ledger**: `runtime.usage.summary` reads content-free per-request billing records frozen at dispatch (retained after conversation deletion; priced from custom or models.dev snapshots in USD; pushed via `usage.updated`). External harnesses report their own turn/cumulative stats separately.
 - **Image tools** ([image-runtime.ts](../packages/web/application-host/lib/kernel/image-runtime.ts)): `image_generate` and `image_edit` bind explicitly configured image models (never implicitly inheriting chat models), store outputs as media resources, and preserve raw provider usage units.
+
+## Host activity and parking
+
+An authenticated Host owner can read the content-free activity projection at
+`GET /api/system/lifecycle`; an embedding supervisor can read the same facts
+from `getHostActivity()`. The read remains available during drain. It reports
+Catalog admission counts, Calendar preparation and pending delivery, the next
+projected Calendar wake, Calendar asset watchers, HTTP observations and active
+external ingress. An unavailable owner is reported separately from a known
+zero. This is an observation, not an atomic handoff receipt or permission to stop.
+
+The Host stays online. Follow-up, timed waits, other owner retention and external
+wake acknowledgement are not covered by this projection; parking remains
+unsupported. Do not use the cancelling shutdown API to implement an idle park.
+The durable ingress and wake protocol must first prove that accepted input and
+scheduler responsibility survive a stopped Host.
+
+### Opt-in local supervisor handoff (POSIX)
+
+`VARIN_LOCAL_SUPERVISOR=1` enables a filesystem inbox at
+`$VARIN_DATA_DIR/supervisor-wake`. The journal is private to the Host OS account;
+there is no new network ingress. A built Host includes
+`server/lib/lifecycle/local-supervisor.js` for a separately managed local
+supervisor to run under that same account:
+
+- `node local-supervisor.js DIRECTORY OWNER status` reports the current wake
+  revision and whether accepted input is pending. `OWNER` is the original stable
+  Host identity stored in the journal's private `owner.json`.
+- `publish REVISION AT_MS` records the original wake owner's monotonic revision
+  and chosen time, or `publish REVISION none` for a newer cancellation.
+  Do not synthesize a revision from a polled projection.
+- `wake-due REVISION -- EXECUTABLE ARG...` reconciles a due registration and
+  writes a ready receipt only when the supplied readiness command succeeds and
+  the revision is still current. The outer supervisor supplies the timer and
+  an idempotent command that waits for the same logical Host's readiness.
+  `wait-due REVISION -- EXECUTABLE ARG...` can instead wait on that absolute
+  deadline locally. It returns stale if the registration is superseded and
+  checks long deadlines in bounded intervals rather than scheduling one timer.
+- `node local-supervisor.js DATA_DIR/supervisor-wake OWNER run` is the opt-in
+  resident foreground process for an already initialized Host. Run just one
+  supervisor for this original state directory; stop the direct Host first.
+  It launches the same built Host separately on loopback (honoring `VARIN_PORT`),
+  checks startup using the spawned process's private IPC and live kernel readiness,
+  and reconciles wake receipts and pending inbox work. The supervisor, not its
+  child, is what your service manager should stop and restart. Explicit stop
+  forwards the ordinary Host drain; an unrequested child exit, even exit 0, is
+  restarted with bounded backoff, not treated as Park. Losing the supervisor's
+  IPC makes a supervised Host drain rather than relaunch itself.
+- `accept PAGE_KEY < page.json` fsyncs an original Catalog event page before
+  returning an acceptance receipt. `wake-inbox -- EXECUTABLE ARG...` lets the
+  supervisor start or reconcile the original Host when accepted input is waiting.
+
+The supervisor must already own the selected event feed and supply its original
+authenticated Catalog source identity, event IDs and expected/next cursors.
+Do not run another producer for the same cursor. Host replay passes the page
+through the original Catalog event-receive command (including its active-source
+and deduplication checks), and verifies the returned identity and checkpoint.
+Conflicts or invalid acknowledgements leave the accepted page pending. The
+journal keeps an acknowledged copy privately because ordinary Catalog WAL
+receipts do not promise power-loss durability. This increment has no automatic
+archive compaction or recovery from a storage rollback; budget disk space and
+keep this directory private. On a process crash before acknowledgement, the
+same pending page is delivered again under its original keys.
+
+This does **not** switch automatic parking on or transfer Calendar scheduling.
+There is no Park command and the production Host does not emit a quiescent
+exit receipt. The resident supervisor must not turn an ordinary exit or stop
+into Park. Incomplete owner coverage, external scheduler publication and
+lossless close are still blockers. On filesystems without supported directory
+sync or on Windows, do not enable the local supervisor journal.
 
 ## Graceful Shutdown & Cold Backup
 

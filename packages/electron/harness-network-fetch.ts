@@ -22,6 +22,8 @@ export const createDesktopNetworkFetch = (networkSession: Session) => (
   url: string,
   init: RequestInit,
 ): Promise<Response> => new Promise((resolve, reject) => {
+  const { signal } = init;
+  signal?.throwIfAborted();
   const prepared = new Request(url, init);
   const outbound = net.request({
     url: prepared.url,
@@ -33,7 +35,13 @@ export const createDesktopNetworkFetch = (networkSession: Session) => (
     bypassCustomProtocolHandlers: true,
   });
   let settled = false;
+  let cancelUpload: (() => void) | undefined;
+  const dispose = (): void => {
+    signal?.removeEventListener('abort', onAbort);
+    cancelUpload?.();
+  };
   const fail = (error: unknown): void => {
+    dispose();
     if (settled) return;
     settled = true;
     reject(error);
@@ -42,14 +50,11 @@ export const createDesktopNetworkFetch = (networkSession: Session) => (
     fail(error);
     outbound.abort();
   };
-  const onAbort = (): void => abort(init.signal?.reason ?? new Error('request aborted'));
+  const onAbort = (): void => abort(signal?.reason);
+  // ClientRequest is a Writable. Its close event marks the end of the
+  // upload stream and can fire before Chromium receives response headers.
   outbound.on('error', fail);
-  outbound.on('close', () => {
-    init.signal?.removeEventListener('abort', onAbort);
-    if (!settled) fail(new Error('Network request closed before receiving a response'));
-  });
-  if (init.signal?.aborted) { onAbort(); return; }
-  init.signal?.addEventListener('abort', onAbort, { once: true });
+  signal?.addEventListener('abort', onAbort, { once: true });
 
   const respond = (build: () => Response, stopRedirect = false): void => {
     if (settled) return;
@@ -61,7 +66,10 @@ export const createDesktopNetworkFetch = (networkSession: Session) => (
       abort(error);
       return;
     }
-    if (stopRedirect) outbound.abort();
+    if (stopRedirect) {
+      dispose();
+      outbound.abort();
+    }
   };
   outbound.on('redirect', (statusCode, _method, redirectUrl, rawHeaders) => respond(() => {
     const headers = responseHeaders(rawHeaders);
@@ -75,7 +83,13 @@ export const createDesktopNetworkFetch = (networkSession: Session) => (
     const headers = responseHeaders(incoming.headers);
     const noBody = prepared.method === 'HEAD' || status === 204 || status === 205 || status === 304;
     // Electron exposes a Node Readable at runtime. Preserve its backpressure.
-    const body = noBody ? null : Readable.toWeb(incoming as unknown as Readable) as ReadableStream<Uint8Array>;
+    const stream = incoming as unknown as Readable;
+    stream.once('close', dispose);
+    if (noBody) {
+      stream.once('error', dispose);
+      stream.resume();
+    }
+    const body = noBody ? null : Readable.toWeb(stream) as ReadableStream<Uint8Array>;
     return new Response(body, { status, headers });
   }));
   const send = async (): Promise<void> => {
@@ -83,19 +97,18 @@ export const createDesktopNetworkFetch = (networkSession: Session) => (
     if (!prepared.body) { outbound.end(); return; }
     outbound.chunkedEncoding = true;
     const reader = prepared.body.getReader();
-    // An early response or abort can close the request during a pending upload read.
-    let closed = false;
-    const stopUpload = () => { closed = true; void reader.cancel().catch(() => undefined); };
-    outbound.once('close', stopUpload);
+    // A network error or an abort can arrive during a pending upload read.
+    let cancelled = false;
+    cancelUpload = () => { cancelled = true; void reader.cancel().catch(() => undefined); };
     try {
       for (;;) {
         const { done, value } = await reader.read();
-        if (done || closed || init.signal?.aborted) break;
+        if (done || cancelled) break;
         outbound.write(Buffer.from(value));
       }
-      if (!closed && !init.signal?.aborted) outbound.end();
+      if (!cancelled) outbound.end();
     } finally {
-      outbound.off('close', stopUpload);
+      cancelUpload = undefined;
       reader.releaseLock();
     }
   };

@@ -97,7 +97,7 @@ impl Storage {
                 || p.source.mode != varin_runtime::SourceMode::LiveRoot
                 || p.source.workspace_id != p.source.execution_workspace_id
                 || p.enabled_tools.len() != 1
-                || !crate::work_locations::alternate_tool(&p.enabled_tools[0])
+                || crate::work_locations::grant_capabilities(&p.enabled_tools[0]).is_none()
                 || p.purpose == "work_location_read" && p.enabled_tools != ["file_read"]))
             || (p.purpose == "external_harness" && (!p.enabled_tools.is_empty()
                 || p.operation_id.as_deref().is_none_or(str::is_empty)

@@ -22,7 +22,7 @@ import { useBotNavigation } from '@/lib/bots';
 import { useWorkbenchProfileId } from '@/lib/workbench/profile-context';
 import { VARIN_WORKBENCH_BOT_PROFILE_ID } from '@varin/extension-contract';
 
-export function ConversationTreePanel({ active = true }: { active?: boolean }) {
+export function ConversationTreePanel({ active = true, onRevealTurn }: { active?: boolean; onRevealTurn?: () => void }) {
   const { t } = useI18n();
   const host = React.useSyncExternalStore(subscribeRuntimeEndpointChanged, getRuntimeEndpointGeneration, getRuntimeEndpointGeneration);
   const selected = useThreadStore(state => state.selectedIdentity);
@@ -31,12 +31,12 @@ export function ConversationTreePanel({ active = true }: { active?: boolean }) {
   const api = useRuntimeAPIs().threads;
   const identity = profile === VARIN_WORKBENCH_BOT_PROFILE_ID ? botEntry : selected;
   if (!active) return null;
-  return identity && api ? <ConversationTree key={`${host}:${identity.threadId}`} api={api} identity={identity} host={host} />
+  return identity && api ? <ConversationTree key={`${host}:${identity.threadId}`} api={api} identity={identity} host={host} onRevealTurn={onRevealTurn} />
     : <p className="p-4 typography-meta text-muted-foreground">{t('chat.tree.openConversation')}</p>;
 }
 
 const previewKey = (node: ThreadConversationTreeNode) => JSON.stringify([node.firstItemId, node.lastItemId]);
-function ConversationTree({ api, identity, host }: { api: ThreadsAPI; identity: ThreadIdentity; host: number }) {
+function ConversationTree({ api, identity, host, onRevealTurn }: { api: ThreadsAPI; identity: ThreadIdentity; host: number; onRevealTurn?: () => void }) {
   const { t } = useI18n();
   const key = JSON.stringify([threadHostKey(), identity.threadId]);
   const view = useConversationTreeStore(state => state.views[key] ?? EMPTY_TREE_VIEW);
@@ -162,6 +162,7 @@ function ConversationTree({ api, identity, host }: { api: ThreadsAPI; identity: 
       await openThreadFromNavigation(target);
       if (request !== navigationRequest.current || host !== getRuntimeEndpointGeneration() || lifetime.current.signal.aborted) return;
       useConversationTreeStore.getState().request(threadComposerKey(threadHostKey(), target), { kind, entryId: node.firstItemId, runId: node.runId });
+      if (kind === 'reveal') onRevealTurn?.();
     } catch (cause) {
       if (request === navigationRequest.current && !lifetime.current.signal.aborted) setError(String(cause));
     }

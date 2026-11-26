@@ -66,6 +66,9 @@ Expose a dev/test machine's files and commands to an existing Agent Host without
    ```
 3. Start the node (`docker compose -f docker-compose.resource-node.yml up -d`, bound to `127.0.0.1:3001` by default; reach cross-machine via SSH forward or controlled HTTPS) and register its address + token in your Agent Host's Connections settings. Revoke with `revoke <clientId>` while stopped.
 
+The node image stages only the JavaScript and assets reachable by its compiled Resource Node entrypoint, a role-specific frozen Bun lock, and the workspace packages reachable by that role. Its build follows the frozen installed dependency graph and rejects unrelated installed packages. Use `bun run update:resource-node-lock` for dependency/version metadata changes; for a changed import graph, build the Cloud Runtime first, then run `node scripts/build-resource-node.mjs artifacts/cloud-runtime artifacts/resource-node --update-lock` before rebuilding the image. The node health check probes its live resource kernel control channel without starting a kernel or acquiring a workspace.
+
+
 ### Runtime Environment
 
 | Variable | Behavior |
@@ -111,3 +114,82 @@ When production dependencies or overrides change, refresh and review the dedicat
 ```bash
 bun run update:cloud-runtime-lock
 ```
+
+### Dedicated Browser control plane
+
+Build the separate Linux container with `docker build --target browser-node` using
+the same pinned runtime base and source inputs as the other image targets. This image
+runs only the authenticated managed Browser API and its local durable identity/auth
+state. It does not include Chromium, the Application Host, or an Electron renderer.
+Provision a supported Chromium CDP process (and its own persistent profile volume)
+separately, on private networking. Do not publish the upstream CDP port.
+
+- Set `VARIN_BROWSER_CDP_ENDPOINT` to the provisioned HTTP(S) or WebSocket address.
+  An operator may instead provision `browser-node-settings.json` in the private node
+  state directory, with the standard Browser connections under `browser`.
+- Keep `VARIN_DATA_DIR` on its own persistent volume. For Browser file transfer, set
+  `VARIN_BROWSER_CDP_SCRATCH_DIRECTORY` and mount its directory at the **same absolute
+  path** in both services. Without a shared scratch volume the CDP provider deliberately
+  does not advertise upload/download. Keep the Chromium profile on its separate volume.
+- Run the image's offline `pair --output /private/client.json` command with the state
+  volume mounted and the serving Browser container stopped. Keep the generated file on a
+  private mount outside the state and scratch trees. Configure the node URL/token in
+  the coordinator's existing trusted Host connections, then discover and acquire its
+  Browser resource. `revoke CLIENT_ID` is also an offline command.
+- `/health` reports ready control-plane state without dialing or starting a browser.
+  The coordinator's authenticated Acquire opens the actual CDP connection. Its live
+  instance identity derives from the Chrome debugger session, not the persistent node ID.
+  Node and browser restarts can therefore preserve different parts of the binding.
+- Configuration and probes on this role are local operator concerns: a paired Browser
+  peer cannot ask the service to connect to arbitrary endpoints or read upstream headers.
+  Protect the coordinator connection with the same private-network or HTTPS ingress
+  requirements as a File and command node.
+
+For an opt-in positive Browser integration check, use a local Chromium executable
+and the matching release kernel on a machine that allows their native sockets
+and process sandboxing. The test creates an isolated profile and loopback page;
+it does not use a personal browser profile or an external website:
+
+```sh
+VARIN_TEST_BROWSER_CHROMIUM=/absolute/path/to/chromium \
+VARIN_TEST_KERNEL_PATH=/absolute/path/to/varin-kernel \
+  node node_modules/vitest/vitest.mjs run --config packages/web/vitest.kernel.config.ts browser-node-chromium.native.test.ts
+```
+
+This is separate from the default CI role smoke. It exercises the regular
+coordinator and Browser node APIs, not a CDP stub: the Browser role may restart
+without replacing its Chromium process or tab, and restarting Chromium keeps
+the disk profile but invalidates the previously bound live instance.
+
+The existing **Container validation** workflow also accepts the optional
+`real_linux_roles` dispatch input. Enable it to run the real Chromium test and
+the Computer driver's isolated Xvfb/AT-SPI test against the exact checked-out
+source and the checksum-verified Linux/amd64 kernel from that run's Browser
+candidate. Set `benchmark`, `toolbelt`, and `multi_platform` to false for a
+focused run. Ordinary CI checks the shipped Linux Computer driver's PyGObject,
+AT-SPI and GDK imports inside its exact image. It does not provision a desktop, and
+the opt-in check exercises capture against the isolated runner display instead.
+
+### Dedicated Computer control plane
+
+The Linux `computer-node` build target packages the existing platform driver alongside
+its own frozen Node dependency graph, without the Host UI or Agent. Only this
+dedicated image installs the Linux driver's AT-SPI and GDK runtime libraries. Keep its
+`VARIN_DATA_DIR` mounted between launches. Its passive health confirms kernel control
+and role ingress, not the presence of an accessible desktop, approved capture portal
+or installed applications. A ready role can report that any specific capability is
+unavailable. Install/expose the actual desktop session and supported platform
+applications separately, using the regular Computer owner and OS approval model.
+The Linux image is not a macOS or Windows service installer.
+
+Run offline `pair --output /private/client.json` to grant observation only. The operator
+can explicitly add `--allow-control`; `--allow-system` also requires control and permits
+system-level Computer operations. Keep generated credentials on a private mount
+separate from the durable role data. Use offline `revoke CLIENT_ID` to retire a grant.
+Computer assignment credentials are additionally tied to their paired client and
+to the serving process; reassume the actual desktop assignment after a restart.
+
+These two new image targets are built and qualified in the disposable container
+validation graph. This does not publish new tags or change ordinary release image
+names. Use an exact source revision and immutable configured runtime base when
+building a deployment artifact.

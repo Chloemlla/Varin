@@ -26,6 +26,7 @@ import { isDesktopLocalOriginActive, isDesktopShell } from '@/lib/desktop';
 import { isMobileSurfaceRuntime } from '@/lib/runtimeSurface';
 import { ensureOutsideFileGrantForDesktop } from '@/lib/outsideFileGrants';
 import { openFileInMainEditor } from '@/lib/openFileInMainEditor';
+import { useMobilePages } from '@/contexts/mobile-pages';
 import { useWorkbenchProfileId } from '@/lib/workbench/profile-context';
 import { VARIN_WORKBENCH_IDE_PROFILE_ID } from '@varin/extension-contract';
 import { getDirectoryForFilePath, isFilePathWithinDirectory, toAbsoluteFilePath } from '@/lib/path-utils';
@@ -394,6 +395,7 @@ const useFileReferenceInteractions = ({
   effectiveDirectory: string;
   enabled: boolean;
 }) => {
+  const mobilePages = useMobilePages();
   const annotationDebounceRef = React.useRef<number | null>(null);
   const profileId = useWorkbenchProfileId();
 
@@ -403,6 +405,21 @@ const useFileReferenceInteractions = ({
       return;
     }
     let cancelled = false;
+    // Authored links can be followed on tap without probing paths in every streaming message.
+    if (mobilePages) {
+      const follow = (event: MouseEvent) => {
+        const anchor = event.target instanceof Element ? event.target.closest('a[href]') : null;
+        if (!enabled || !anchor || event.defaultPrevented || event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+        const href = anchor.getAttribute('href') ?? '';
+        if (href.startsWith('//') || href.startsWith('#') || (/^[a-z][a-z0-9+.-]*:/i.test(href) && !/^[a-z]:[\\/]/i.test(href))) return;
+        const file = getResolvedReference(href, effectiveDirectory);
+        if (!file) return;
+        event.preventDefault();
+        mobilePages.openDocument({ directory: getDirectoryForFilePath(effectiveDirectory, file.resolvedPath), path: file.resolvedPath, line: file.line, column: file.column });
+      };
+      container.addEventListener('click', follow);
+      return () => container.removeEventListener('click', follow);
+    }
     const fileReferenceLinkLimit = FILE_REFERENCE_LINK_LIMIT;
     // On mobile surfaces, file-reference highlighting is disabled entirely — not
     // just visually. The annotation pass is what issues the filesystem `stat`
@@ -597,7 +614,7 @@ const useFileReferenceInteractions = ({
       container.removeEventListener('click', handleClick);
       container.removeEventListener('keydown', handleKeyDown);
     };
-  }, [containerRef, effectiveDirectory, enabled, profileId]);
+  }, [containerRef, effectiveDirectory, enabled, profileId, mobilePages]);
 };
 
 const useMermaidInlineInteractions = ({

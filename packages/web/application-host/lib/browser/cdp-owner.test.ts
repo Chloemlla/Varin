@@ -1,4 +1,8 @@
 import { createServer } from 'node:http';
+import express from 'express';
+import request from 'supertest';
+import { BrowserResources } from './browser-resources.js';
+import { registerBrowserResourceRoutes } from './browser-resource-routes.js';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -84,6 +88,43 @@ beforeEach(async () => { peer = new BrowserPeer(); await peer.start(); scratch =
 afterEach(async () => { await owner.dispose(); await peer.stop(); await rm(scratch, { recursive: true, force: true }); });
 
 describe('independent CDP browser owner', () => {
+  it('keeps HTTP discovery cold and opens only the explicitly acquired owner', async () => {
+    const resources = new BrowserResources();
+    resources.register(owner, 'Office browser', 'This Host', { source: 'cdp' });
+    const app = express();
+    registerBrowserResourceRoutes(app, resources, (_req, _res, next) => next(), async () => 'client');
+    const prefix = '/api/browser-resources';
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const reply = await request(app).get(prefix).expect(200);
+      expect(reply.body.resources).toMatchObject([{ browserId: 'office', state: 'disconnected', activation: 'connect' }]);
+    }
+    expect(peer.requests).toHaveLength(0);
+    const [first, second] = await Promise.all([request(app).post(prefix + '/office/acquire'), request(app).post(prefix + '/office/acquire')]);
+    expect(first.status).toBe(200);
+    expect(first.body.resource).toMatchObject({ browserId: 'office', state: 'online' });
+    expect(second.body.resource.instanceId).toBe(first.body.resource.instanceId);
+    expect(peer.requests.filter(request => request.method === 'Browser.getVersion')).toHaveLength(1);
+    const pages = await request(app).get(`${prefix}/office/${first.body.resource.instanceId}/pages`).expect(200);
+    expect(pages.body.pages.map((page: { pageId: string }) => page.pageId)).toEqual(['tab-1', 'tab-2']);
+  });
+
+  it('the explicit viewer holds one ephemeral page while plain reads do not retain it', async () => {
+    const resources = new BrowserResources();
+    resources.register(owner, 'Office browser', 'This Host', { source: 'cdp' });
+    await resources.acquire('office');
+    const instanceId = (await owner.resource()).instanceId!;
+    const viewed = await owner.open({ url: 'https://example.test/' }, { threadId: 'original' });
+    const release1 = await resources.holdPage({ browserId: 'office', instanceId, pageId: viewed.pageId }, new AbortController().signal);
+    const release2 = await resources.holdPage({ browserId: 'office', instanceId, pageId: viewed.pageId }, new AbortController().signal);
+    await owner.releaseThread('original');
+    expect(peer.targets.has(viewed.pageId)).toBe(true);
+    await release1(); expect(peer.targets.has(viewed.pageId)).toBe(true);
+    await release2(); expect(peer.targets.has(viewed.pageId)).toBe(false);
+    const observed = await owner.open({ url: 'https://example.test/' }, { threadId: 'another' });
+    await resources.use({ browserId: 'office', instanceId, pageId: observed.pageId }, {}, port => port.read({ pageId: observed.pageId }));
+    await owner.releaseThread('another');
+    expect(peer.targets.has(observed.pageId)).toBe(false);
+  });
   it('observes and controls the real target identity, invalidates stale refs and reports native tab events', async () => {
     const events: BrowserEvent[] = []; owner.subscribe(event => events.push(event));
     const pages = await owner.list(); expect(pages.map(page => page.pageId)).toEqual(['tab-1', 'tab-2']);
@@ -113,11 +154,13 @@ describe('independent CDP browser owner', () => {
     await owner.act('tab-1', { action: 'dialog', accept: true });
     expect(peer.inputHeld).toBeUndefined();
   });
-  it('automatically rechecks a disconnected resource without replaying operations', async () => {
+  it('reacquires a disconnected resource only on explicit demand without replaying operations', async () => {
     await owner.list(); const initial = await owner.resource();
     for (const socket of peer.sockets) socket.terminate();
     await expect.poll(async () => (await owner.resource()).state).toBe('interrupted');
-    await new Promise(resolve => setTimeout(resolve, 1_020));
+    expect((await owner.resource()).state).toBe('interrupted');
+    expect(peer.requests.filter(request => request.method === 'Browser.getVersion')).toHaveLength(1);
+    await owner.prepareResource();
     expect(await owner.resource()).toMatchObject({ instanceId: initial.instanceId, state: 'online' });
     expect(peer.requests.some(request => request.method.startsWith('Input.'))).toBe(false);
   });

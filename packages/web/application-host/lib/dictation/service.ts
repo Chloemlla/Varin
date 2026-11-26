@@ -103,7 +103,8 @@ export function createDictationService({ modelsDir, fetchModel }: { modelsDir: s
    * @param {{ provider?: string, language?: string, localModel?: string,
    *           openaiCompatible?: { baseUrl?: string, model?: string, apiKey?: string } }} options
    */
-  const createSttSession = async (options: DictationStartOptions = {}): Promise<SttSessionResolution> => {
+  const createSttSession = async (options: DictationStartOptions = {}, signal?: AbortSignal): Promise<SttSessionResolution> => {
+    signal?.throwIfAborted();
     const provider = options.provider === 'openai-compatible' ? 'openai-compatible' : 'local';
 
     if (provider === 'openai-compatible') {
@@ -116,7 +117,10 @@ export function createDictationService({ modelsDir, fetchModel }: { modelsDir: s
       });
       try {
         await session.connect();
+        signal?.throwIfAborted();
       } catch (error) {
+        session.close();
+        signal?.throwIfAborted();
         return {
           error: errorMessage(error),
           retryable: false,
@@ -131,6 +135,7 @@ export function createDictationService({ modelsDir, fetchModel }: { modelsDir: s
     try { language = resolveLocalSttLanguage(modelId, options.language); }
     catch (error) { return { error: errorMessage(error), retryable: false, reasonCode: 'stt_language_unsupported' }; }
     const installed = await isLocalSttModelInstalled(modelsDir, modelId);
+    signal?.throwIfAborted();
     if (!installed) {
       const state = downloadStates.get(modelId);
       if (state === 'error') {
@@ -152,9 +157,15 @@ export function createDictationService({ modelsDir, fetchModel }: { modelsDir: s
     }
 
     const session = new WorkerBackedTranscriptionSession(workerClient, { modelsDir, modelId, language });
+    const abort = () => session.close();
+    signal?.addEventListener('abort', abort, { once: true });
     try {
+      signal?.throwIfAborted();
       await session.connect();
+      signal?.throwIfAborted();
     } catch (error) {
+      session.close();
+      signal?.throwIfAborted();
       const message = errorMessage(error);
       // A model that passes the file-presence check but fails to load is
       // corrupt on disk (e.g. truncated by an interrupted extraction). Remove
@@ -173,6 +184,8 @@ export function createDictationService({ modelsDir, fetchModel }: { modelsDir: s
         retryable: true,
         reasonCode: 'stt_unavailable',
       };
+    } finally {
+      signal?.removeEventListener('abort', abort);
     }
     return { session };
   };
@@ -319,9 +332,7 @@ export function createDictationService({ modelsDir, fetchModel }: { modelsDir: s
     return { ok: true };
   };
 
-  const shutdown = (): void => {
-    workerClient.shutdown();
-  };
+  const shutdown = (): Promise<void> => workerClient.shutdown();
 
   return {
     createSttSession,
@@ -329,6 +340,7 @@ export function createDictationService({ modelsDir, fetchModel }: { modelsDir: s
     getStatus,
     requestModelDownload,
     deleteModel,
+    activity: () => workerClient.activity(),
     shutdown,
   };
 }

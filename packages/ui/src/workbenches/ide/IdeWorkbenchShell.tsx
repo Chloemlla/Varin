@@ -20,7 +20,7 @@ import { WindowsWindowControls } from '@/components/desktop/WindowsWindowControl
 import { ProjectActionsButton } from '@/components/layout/ProjectActionsButton';
 import { WorkbenchProfileSwitcher } from '@/components/layout/WorkbenchProfileSwitcher';
 import { SettingsTitlebar } from '@/components/layout/SettingsTitlebar';
-import { useDesktopSettingsTransition } from '@/components/layout/useDesktopSettingsTransition';
+import { useSettingsTransition } from '@/components/layout/useSettingsTransition';
 import { useWorkbenchShellActive } from '@/lib/workbench/shell-activity';
 import { activationPoint } from '@/lib/motion/pointer';
 import { WorkbenchServices } from '@/components/layout/WorkbenchServices';
@@ -191,7 +191,7 @@ export const IdeWorkbenchShell: React.FC<Record<string, unknown>> = () => {
   const branchLabel = useGitBranchLabel(gitDirectory);
   const { usesFramelessChrome, side: windowControlsSide } = useDesktopWindowControlsLayout();
   const titlebarLeftInset = useTitlebarLeftInset('0.5rem');
-  const settings = useDesktopSettingsTransition(useWorkbenchShellActive());
+  const settings = useSettingsTransition(useWorkbenchShellActive());
   const setSettingsDialogOpen = useUIStore((state) => state.setSettingsDialogOpen);
   const setCommandPaletteOpen = useUIStore((state) => state.setCommandPaletteOpen);
   const isMultiRunLauncherOpen = useUIStore((state) => state.isMultiRunLauncherOpen);

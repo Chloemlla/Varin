@@ -67,6 +67,9 @@ impl ChildAdmissionPreparation {
         let resolved = original.resolve_with_attachments(&self.input,&self.attachments)?;
         if resolved.frozen_reference != self.launch.frozen_reference
             || resolved.profile != self.launch.selected_profile
+            || resolved.lazy_work_location != self.launch.selection.lazy_work_location
+            || (resolved.lazy_work_location.is_some() && (self.handoff.is_some()
+                || !matches!(self.context.origin, crate::execution::ToolOrigin::ModelStep { .. })))
             || !super::usage_ledger::same_configuration(&serde_json::to_value(&resolved.model.configuration)?, &self.launch.configuration)
         {
             return Err(RuntimeError::Conflict(
@@ -91,7 +94,7 @@ impl ChildAdmissionPreparation {
         let parent:Run=record(&database,"runs",&self.context.run_id)?;
         if original.project(&self.input)?.is_some() {
             if self.handoff.is_some(){return Err(RuntimeError::Conflict("Project dispatch cannot borrow the parent's source handoff".into()));}
-        } else {super::dispatch::validate_agent_source(&database,&parent,self.input.source_agent.as_deref(),self.handoff.as_ref())?;}
+        } else {super::dispatch::validate_agent_source(&database,&parent,self.input.source_agent.as_deref(),self.handoff.as_ref(),operation.resource_source.as_ref())?;}
         if let Some(handoff) = &self.handoff {
             handoff.source.validate()?;
             if handoff.source_path.as_deref() != self.input.source_path.as_deref().filter(|path| *path != ".") {

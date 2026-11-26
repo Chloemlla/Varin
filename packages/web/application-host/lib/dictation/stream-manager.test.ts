@@ -211,3 +211,27 @@ describe('DictationStreamManager', () => {
     expect(partials.length).toBeGreaterThan(0);
   });
 });
+
+it('aborts disconnected and superseded startup and closes each late session without publishing it', async () => {
+  const messages: DictationEvent[] = [];
+  const pending: Array<{ signal: AbortSignal | undefined; resolve: (value: { session: FakeSttSession }) => void }> = [];
+  const manager = new DictationStreamManager({
+    emit: event => messages.push(event),
+    createSttSession: (_options, signal) => new Promise(resolve => pending.push({ signal, resolve })),
+  });
+  const first = manager.handleStart('d', FORMAT);
+  const second = manager.handleStart('d', FORMAT);
+  expect(pending[0]?.signal?.aborted).toBe(true);
+  const stale = new FakeSttSession();
+  pending[0]!.resolve({ session: stale });
+  await first;
+  expect(stale.closed).toBe(true);
+  expect(messages).toHaveLength(0);
+  manager.cleanupAll();
+  expect(pending[1]?.signal?.aborted).toBe(true);
+  const disconnected = new FakeSttSession();
+  pending[1]!.resolve({ session: disconnected });
+  await second;
+  expect(disconnected.closed).toBe(true);
+  expect(messages).toHaveLength(0);
+});

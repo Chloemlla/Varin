@@ -551,6 +551,28 @@ pub struct AgentSelection {
     pub work_focus: String,
     pub tools: Option<Vec<String>>,
 }
+/// A remembered target, not a prepared Source or permit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LazyWorkLocation {
+    pub resource_owner: SourceResourceOwner,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+}
+impl LazyWorkLocation {
+    pub fn validate(&self) -> Result<()> {
+        let p = self.path.as_bytes();
+        let absolute = p.starts_with(b"/") || p.starts_with(b"\\\\")
+            || (p.len() >= 3 && p[0].is_ascii_alphabetic() && p[1] == b':' && matches!(p[2], b'/' | b'\\'));
+        if !absolute || self.path.contains('\0') || !self.resource_owner.validate()
+            || self.workspace_id.as_ref().is_some_and(|id| id.trim().is_empty())
+        {
+            return Err(RuntimeError::Invalid("invalid lazy work location".into()));
+        }
+        Ok(())
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchSelection {
@@ -576,6 +598,8 @@ pub struct LaunchSelection {
     pub tools: Vec<ToolSchema>,
     pub policy: PolicyIdentity,
     pub source: Option<SourceSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lazy_work_location: Option<LazyWorkLocation>,
 }
 impl LaunchSelection {
     pub fn from_binding(
@@ -600,6 +624,7 @@ impl LaunchSelection {
             tools: binding.tools.clone(),
             policy,
             source,
+            lazy_work_location: None,
         }
     }
     pub(super) fn validate(&self) -> Result<()> {
@@ -619,6 +644,12 @@ impl LaunchSelection {
     /// A delegated child intent retains the parent's handoff while its own source is
     /// Pending. Its actual Run must still pass `validate` after the source becomes Ready.
     pub(super) fn validate_structure(&self) -> Result<()> {
+        if let Some(location) = &self.lazy_work_location {
+            location.validate()?;
+            if self.source.is_some() {
+                return Err(RuntimeError::Invalid("a lazy work location cannot replace a concrete source".into()));
+            }
+        }
         self.driver.validate().map_err(|error| RuntimeError::Invalid(error.to_string()))?;
         validate_policy_models(&self.driver_models)?;
         if self.agent.as_ref().is_some_and(|agent| !WORK_FOCUS_IDS.contains(&agent.work_focus.as_str())) {
@@ -976,6 +1007,15 @@ impl Catalog {
         // Delegated capabilities and context-job recipes have their own owners.
         let current_tools = bound && !self.is_context_job(run_id)?
             && self.require_child_launch(run_id)?.is_none();
+        if let Some(location) = selection.lazy_work_location.as_ref() {
+            let run = self.run(run_id)?;
+            if !self.thread_has_host_authority(&run.thread_id)? || self.is_context_job(run_id)? {
+                return Err(RuntimeError::Invalid("lazy work locations require owner-controlled native work".into()));
+            }
+            if self.child_task_for_thread(&run.thread_id)?.is_some() {
+                self.require_lazy_child_launch(run_id, location)?;
+            }
+        }
         let tx = self.db.transaction()?;
         let mut run: Run = record(&tx, "runs", run_id)?;
         fence(&run, self.epoch)?;

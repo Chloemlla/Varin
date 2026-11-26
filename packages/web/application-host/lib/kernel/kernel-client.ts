@@ -1401,6 +1401,14 @@ export class KernelClient {
     return this.requestRaw<KernelHealthResult>("storage.health", { ...(options.deep === undefined ? {} : { deep: options.deep }), ...(options.gcPreview ? { gcPreview: true } : {}) }, { signal: options.signal });
   }
 
+  /** Probe an existing control channel without starting or restarting its kernel. */
+  async probeControl(signal?: AbortSignal): Promise<boolean> {
+    const epoch = this.handshakeResult?.kernelEpoch;
+    if (!epoch) return false;
+    const response = await this.requestRaw<{ kernelEpoch: string; ready: boolean }>('kernel.ping', {}, { signal });
+    return response.ready === true && response.kernelEpoch === epoch && this.handshakeResult?.kernelEpoch === epoch;
+  }
+
   /** Host settings only: collect exactly the previewed objects, rechecking all live references. */
   async collectStorageObjects(operationId: string, objectHashes: string[]): Promise<Record<string, unknown>> {
     if (!this.handshakeResult) await this.start();

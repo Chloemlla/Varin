@@ -42,6 +42,7 @@ try {
       if (health?.ok) {
         const body = await health.json();
         assert.equal(body.role, 'resources');
+        assert.equal(body.control, 'ready');
         assert.equal(body.releaseId, releaseId);
         return origin;
       }

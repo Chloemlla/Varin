@@ -4,6 +4,7 @@ import type { ScheduledTask } from '@varin/application-client';
 import type { CalendarDefinitionInput, CalendarOccurrence, CalendarPreparation, CalendarRule } from '@varin/protocol';
 import type { AgentRuntimeClient } from '../kernel/agent-runtime-client.js';
 import { KernelClientError } from '../kernel/kernel-error.js';
+import type { CalendarActivity } from '../lifecycle/host-activity.js';
 import { calculateCalendarSlots } from './recurrence.js';
 
 interface CalendarOwners {
@@ -109,6 +110,33 @@ export class CalendarOwner {
       }
     }
     return { enabled, running };
+  }
+  async activity(watchingAssets: boolean, signal: AbortSignal): Promise<CalendarActivity> {
+    const projection: CalendarActivity = {
+      watchingAssets, nextWakeAtMs: null, activeOccurrences: 0,
+      pendingDelivery: 0, pendingPreparation: 0, unresolvedSchedules: 0,
+    };
+    const runtime = this.owners.runtime;
+    for (const projectId of await runtime.calendarProjects(signal)) {
+      for (const definition of (await runtime.calendar({ projectId }, signal)).definitions) {
+        if (definition.enabled && !definition.deleted) {
+          if (definition.next_at_ms !== null
+            && (projection.nextWakeAtMs === null || definition.next_at_ms < projection.nextWakeAtMs)) {
+            projection.nextWakeAtMs = definition.next_at_ms;
+          }
+          if (definition.calculation_pending || definition.calculation_failure || !definition.synchronized || definition.activation_hold) {
+            projection.unresolvedSchedules++;
+          }
+        }
+        for (const occurrence of await runtime.calendarOccurrences({ definitionId: definition.id }, signal)) {
+          if (occurrence.state === 'skipped' || !active(occurrence)) continue;
+          projection.activeOccurrences++;
+          if (occurrence.state === 'observed' || occurrence.state === 'preparing' || occurrence.state === 'held') projection.pendingPreparation++;
+          if (occurrence.state === 'queued') projection.pendingDelivery++;
+        }
+      }
+    }
+    return projection;
   }
   async run(projectId: string, taskId: string, key: string): Promise<CalendarOccurrence> {
     const definition = (await this.owners.runtime.calendar({ projectId })).definitions.find(value => value.task_id === taskId && !value.deleted);

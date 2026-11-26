@@ -615,6 +615,7 @@ pub fn text_compaction_launch(
         tool_schema_generation: 0,
         tools: Vec::new(),
         policy: policy_identity(),
+        lazy_work_location: None,
         source: None,
     })
 }

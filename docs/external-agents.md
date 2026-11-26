@@ -48,3 +48,9 @@ Varin connects to external CLI/SDK agents running on an execution Host — **Cod
 - **Sources & code exchange**: Default is shared live directory. `isolated_write` uses Native Workspace fork/mount + three-way Integration merge (`read_only` sandbox is not claimed for external CLIs and rejects before dispatch).
 - **Current limits**: Exposing Varin's CLI/Skills/MCP to external harnesses is deferred; importing pre-existing external CLI history or attaching to outside terminals is not supported.
 - **Brand identity**: `HarnessIcon` resolves by Catalog `configurationId` + `harness` (never title/avatar guessing). Assets in [harness-logos](../packages/ui/src/assets/harness-logos/README.md).
+
+Explicit live capability refresh, continuation acknowledgement, and a managed
+attachment capture hold the existing native connection until the operation
+returns. The idle sweep cannot retire a connection during one of those uses;
+after settlement the normal warm window starts again. This does not make
+cached history or settings reads acquire an external adapter.

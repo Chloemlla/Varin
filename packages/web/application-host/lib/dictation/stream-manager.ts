@@ -32,10 +32,11 @@ const SILENCE_PEAK_THRESHOLD = 300;
 
 export class DictationStreamManager {
   readonly emit: (message: DictationEvent) => void;
-  readonly createSttSession: (options: DictationStartOptions) => Promise<SttSessionResolution>;
+  readonly createSttSession: (options: DictationStartOptions, signal?: AbortSignal) => Promise<SttSessionResolution>;
   readonly finalTimeoutMs: number;
   autoCommitSeconds: number;
   private readonly streams: Map<string, DictationStreamState>;
+  private readonly starting = new Map<string, AbortController>();
 
   /**
    * @param {object} params
@@ -49,7 +50,7 @@ export class DictationStreamManager {
    */
   constructor({ emit, createSttSession, finalTimeoutMs, autoCommitSeconds }: {
     autoCommitSeconds?: number;
-    createSttSession: (options: DictationStartOptions) => Promise<SttSessionResolution>;
+    createSttSession: (options: DictationStartOptions, signal?: AbortSignal) => Promise<SttSessionResolution>;
     emit: (message: DictationEvent) => void;
     finalTimeoutMs?: number;
   }) {
@@ -61,6 +62,8 @@ export class DictationStreamManager {
   }
 
   cleanupAll(): void {
+    for (const admission of this.starting.values()) admission.abort();
+    this.starting.clear();
     for (const dictationId of Array.from(this.streams.keys())) {
       this.cleanupStream(dictationId);
     }
@@ -80,13 +83,25 @@ export class DictationStreamManager {
       return;
     }
 
+    const admission = new AbortController();
+    this.starting.set(dictationId, admission);
     let resolved;
     try {
-      resolved = await this.createSttSession(startOptions);
+      resolved = await this.createSttSession(startOptions, admission.signal);
     } catch (error) {
-      this.failStream(dictationId, error instanceof Error ? error.message : String(error), true);
+      if (this.starting.get(dictationId) === admission) {
+        this.starting.delete(dictationId);
+        this.failStream(dictationId, error instanceof Error ? error.message : String(error), true);
+      }
       return;
     }
+    if (this.starting.get(dictationId) !== admission) {
+      if (!('error' in resolved)) {
+        try { resolved.session.close(); } catch { /* session already lost */ }
+      }
+      return;
+    }
+    this.starting.delete(dictationId);
     if ('error' in resolved) {
       this.failStream(
         dictationId,
@@ -101,7 +116,7 @@ export class DictationStreamManager {
 
     stt.on('committed', ({ segmentId }: { segmentId: string }) => {
       const state = this.streams.get(dictationId);
-      if (!state) {
+      if (state?.stt !== stt) {
         return;
       }
       state.committedSegmentIds.push(segmentId);
@@ -121,7 +136,7 @@ export class DictationStreamManager {
       transcript: string;
     }) => {
       const state = this.streams.get(dictationId);
-      if (!state) {
+      if (state?.stt !== stt) {
         return;
       }
       state.transcriptsBySegmentId.set(segmentId, transcript);
@@ -147,6 +162,7 @@ export class DictationStreamManager {
     });
 
     stt.on('error', (err: unknown) => {
+      if (this.streams.get(dictationId)?.stt !== stt) return;
       const message = err instanceof Error ? err.message : String(err);
       this.failAndCleanupStream(dictationId, message, true);
     });
@@ -321,6 +337,8 @@ export class DictationStreamManager {
   }
 
   cleanupStream(dictationId: string): void {
+    this.starting.get(dictationId)?.abort();
+    this.starting.delete(dictationId);
     const state = this.streams.get(dictationId);
     if (!state) {
       return;
@@ -328,12 +346,12 @@ export class DictationStreamManager {
     if (state.finalTimeout) {
       clearTimeout(state.finalTimeout);
     }
+    this.streams.delete(dictationId);
     try {
       state.stt.close();
     } catch {
       // no-op
     }
-    this.streams.delete(dictationId);
   }
 
   estimateFinalizationTimeout(state: DictationStreamState): number {

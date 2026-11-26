@@ -764,6 +764,9 @@ impl Catalog {
             let launch = self
                 .launch_metadata(&run.id)?
                 .ok_or_else(|| RuntimeError::NotFound("previous Run launch".into()))?;
+            if launch.selection.lazy_work_location.is_some() {
+                return Err(RuntimeError::Invalid("Deferred file authority belongs to the original dispatch; dispatch a new Agent to continue this work".into()));
+            }
             let writers = if matches!(previous.source, Some(ChildSource::Absent | ChildSource::Shared { .. })) {
                 None
             } else {

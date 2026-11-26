@@ -12,11 +12,15 @@ The native product identity is Varin-owned:
 - notification service: `dev.varin.mobile.notification-service`;
 - deep-link scheme: `varin://`.
 
+## Workspace navigation
+
+Bot and Workbench share one mobile frame for the directory, conversation, detail page and settings. The active profile supplies its own conversation list and details. On a phone, opening the directory or a detail page keeps the current conversation and its editor mounted. On tablets, the directory can stay beside the conversation, with a third pane for details in wide landscape. Web Back and Forward restore mobile pages within the corresponding profile. The profile switcher and settings share the desktop lattice renderer and motion preference.
+
 ## Runtime model
 
 - The native app bundles the mobile UI only; the Application Host and native Agent runtime stay on the connected server.
 - On first launch in Capacitor, the app shows a connection screen for an existing Varin server.
-- Connections are saved locally in the app and can be managed from the mobile overflow menu under `Instances`.
+- Connections are saved locally. Open a workbench conversation’s details and choose `Instances` from its menu to manage them.
 - The connection screen and `Instances` menu item are Capacitor-only. Hosted `mobile.html` in a normal browser keeps the regular web behavior.
 - Password-protected Varin servers can be unlocked from the mobile app. The app stores the issued client token with the saved connection.
 - `varin://` connection and Thread/branch links open the native app on Android and iOS. Android declares a

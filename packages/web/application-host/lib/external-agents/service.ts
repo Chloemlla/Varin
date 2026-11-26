@@ -100,6 +100,7 @@ export class ExternalAgentsService {
   private readonly disconnecting = new Map<string, Promise<void>>();
   private readonly connectionControllers = new Map<string, AbortController>();
   private readonly running = new Map<string, Promise<void>>();
+  private readonly liveUses = new Map<string, number>();
   private readonly observers = new Map<string, Set<(event: ExternalObservation) => boolean>>();
   private readonly observationEpoch = randomUUID();
   private readonly structuralRevisions = new Map<string, number>();
@@ -132,7 +133,13 @@ export class ExternalAgentsService {
     owner.bindExternalPathCapture?.(async (identity, key, selectedPath, signal) => {
       const { conversation } = await this.read(identity.id, undefined, signal);
       if (this.retiring.has(identity.id)) throw new ExternalAgentError('conversation_busy', 'The original conversation is being deleted');
-      if(conversation.executionSource?.resource_owner.kind==='managed_host'){const live=await this.connection(conversation.id);if(!live.capture)throw new Error('Original target capture owner is unavailable');return live.capture(key,selectedPath,signal);}
+      if (conversation.executionSource?.resource_owner.kind === 'managed_host') {
+        return this.withLiveUse(conversation.id, async () => {
+          const live = await this.connection(conversation.id);
+          if (!live.capture) throw new Error('Original target capture owner is unavailable');
+          return live.capture(key, selectedPath, signal);
+        });
+      }
       const retained = await restoreExternalCapture(this.deps.kernel, conversation, key, selectedPath, signal);
       if (retained) return retained;
       const source = await this.executionSource(conversation, signal ?? new AbortController().signal);
@@ -495,11 +502,25 @@ export class ExternalAgentsService {
     this.cacheWrites.add(work);
     return work;
   }
+  /** A native operation may begin after its connection has finished preparing. */
+  private async withLiveUse<T>(id: string, work: () => Promise<T>): Promise<T> {
+    if (this.stopping) throw new ExternalAgentError('conversation_busy', 'Application Host is stopping');
+    this.liveUses.set(id, (this.liveUses.get(id) ?? 0) + 1);
+    this.touchActivity(id);
+    try {
+      return await work();
+    } finally {
+      const remaining = this.liveUses.get(id)! - 1;
+      if (remaining) this.liveUses.set(id, remaining);
+      else this.liveUses.delete(id);
+      this.touchActivity(id);
+    }
+  }
   private idleBlocked(id: string, live: Live): boolean {
     // A retained binding cannot be replaced with a new native session. Keep a non-resumable
     // connection alive: automatic reclamation would otherwise destroy the only continuation.
     return Boolean(!live.connection.capabilities.resume || this.stopping || live.closing || live.failure || live.peer.disconnected || live.connection.failure ||
-      this.observers.get(id)?.size || this.connecting.has(id) || this.running.has(id) || this.retiring.has(id) ||
+      this.observers.get(id)?.size || this.liveUses.has(id) || this.connecting.has(id) || this.running.has(id) || this.retiring.has(id) ||
       this.authenticating.has(id) || this.inputAdmissions.get(id)?.size || this.attachmentPreparations.has(id) ||
       live.interactions.size || live.connection.backgroundTasks ||
       [...this.childTasks.values()].some(task => task.conversationId === id));
@@ -527,7 +548,7 @@ export class ExternalAgentsService {
         this.retiring.add(id);
         const reclaim = Promise.resolve().then(async () => {
           // An observer can arrive between reservation and this microtask. Do not close then.
-          if (this.observers.get(id)?.size || live.connection.backgroundTasks || live.idleSince !== idleSince) return;
+          if (this.observers.get(id)?.size || this.liveUses.has(id) || live.connection.backgroundTasks || live.idleSince !== idleSince) return;
           live.closing = true;
           await live.connection.close();
           for (const dispose of live.dispose) dispose();
@@ -873,14 +894,16 @@ export class ExternalAgentsService {
     };
   }
   async connect(id: string) {
-    const previous = this.connections.get(id);
-    const live = await this.connection(id);
-    if (previous === live && live.connection.capabilities.modelsError && live.connection.capabilities.modelsRefresh) {
-      await live.connection.refreshCapabilities?.();
-      await this.cacheCapabilities(live);
-    }
-    this.notify(id, true);
-    return live.connection.capabilities;
+    return this.withLiveUse(id, async () => {
+      const previous = this.connections.get(id);
+      const live = await this.connection(id);
+      if (previous === live && live.connection.capabilities.modelsError && live.connection.capabilities.modelsRefresh) {
+        await live.connection.refreshCapabilities?.();
+        await this.cacheCapabilities(live);
+      }
+      this.notify(id, true);
+      return live.connection.capabilities;
+    });
   }
   disconnect(id: string): Promise<void> {
     const pending = this.disconnecting.get(id);
@@ -889,6 +912,7 @@ export class ExternalAgentsService {
     this.retiring.add(id);
     const work = Promise.resolve().then(async () => {
       const snapshot = await this.read(id);
+      if (this.liveUses.has(id)) throw new ExternalAgentError('conversation_busy', 'Wait for the active external connection operation before disconnecting');
       if (snapshot.conversation.activeTurn || snapshot.turns.some((turn) => !ended(turn)) || this.inputAdmissions.get(id)?.size)
         throw new ExternalAgentError('turn_active', 'Stop active or queued turns before disconnecting');
       this.connectionControllers.get(id)?.abort(new ExternalAgentError('connection_cancelled', 'External connection preparation cancelled'));
@@ -912,10 +936,12 @@ export class ExternalAgentsService {
     return work;
   }
   async continueConversation(id: string) {
-    const live = await this.connection(id);
-    await this.command({ action: 'reconnected', id, sessionId: live.connection.sessionId });
-    this.advance(id);
-    this.notify(id, true);
+    await this.withLiveUse(id, async () => {
+      const live = await this.connection(id);
+      await this.command({ action: 'reconnected', id, sessionId: live.connection.sessionId });
+      this.advance(id);
+      this.notify(id, true);
+    });
   }
   async authenticate(id: string, methodId: string) {
     if (this.authenticating.has(id) || this.retiring.has(id) || this.running.has(id))

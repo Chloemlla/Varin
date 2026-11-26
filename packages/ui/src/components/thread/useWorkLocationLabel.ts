@@ -16,7 +16,7 @@ export function useWorkLocationLabel(
   React.useEffect(() => {
     if (!visible) return;
     const request = new AbortController();
-    void sources.list(null, request.signal).then(value => {
+    void sources.list(null, request.signal, {refresh:false}).then(value => {
       if (!request.signal.aborted) setDirectory({ host, value });
     }, () => { /* The bound path remains visible if discovery is unavailable. */ });
     return () => request.abort();

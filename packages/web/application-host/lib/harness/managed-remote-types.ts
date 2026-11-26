@@ -297,6 +297,8 @@ export type SourceServiceResponse<Operation extends SourceServiceOperation> = So
 export interface ManagedRemoteIdentity {
   protocolVersion: typeof MANAGED_REMOTE_PROTOCOL_VERSION;
   requestHostIdentity?: boolean;
+  /** Dedicated service peers are not experiment/process placement targets. */
+  role?: 'browser' | 'computer';
   hostId: string;
   capabilities: string[];
   machine: ResourceMachineView;

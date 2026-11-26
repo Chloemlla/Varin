@@ -224,8 +224,9 @@ describe("computer service (BC4)", () => {
       remoteHosts: async () => [{ id: 'target', label: 'VM', apiUrl }] }).service;
     const a = source(), b = source();
     try {
-      const remoteId = (await a.list()).desktops.find(desktop => desktop.remote)?.id;
-      expect(remoteId).toBeDefined(); await b.list();
+      expect((await a.list()).desktops.some(desktop => desktop.remote)).toBe(false);
+      const remoteId = (await a.list({ refresh: true })).desktops.find(desktop => desktop.remote)?.id;
+      expect(remoteId).toBeDefined(); await b.list({ refresh: true });
       const id = remoteId!;
       const call = <T>(service: typeof a, access: 'control' | 'observe', run: () => Promise<T>) => service.automation.authorize(nativeWork('main'), access, id, run);
       const control = await call(a, 'control', () => a.control(id));
@@ -998,7 +999,7 @@ describe("computer service (BC6 remote hosts)", () => {
         return jsonResponse(remoteCatalog);
       }),
     });
-    const catalog = await withRemote.list();
+    const catalog = await withRemote.list({ refresh: true });
     const remoteMachine = catalog.machines.find((m) => m.id === "remote:r1");
     expect(remoteMachine?.provider).toBe("remote");
     expect(remoteMachine?.platform).toBe("linux");
@@ -1078,7 +1079,7 @@ describe("computer service (BC6 remote hosts)", () => {
       remoteHosts: async () => [remoteHost],
       fetch: remoteFetch(() => { throw new Error("connect ECONNREFUSED"); }),
     });
-    const catalog = await service.list();
+    const catalog = await service.list({ refresh: true });
     const remoteMachine = catalog.machines.find((m) => m.id === "remote:r1");
     expect(remoteMachine?.status).toBe("unavailable");
     expect(remoteMachine?.statusDetail).toContain("ECONNREFUSED");

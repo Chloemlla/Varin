@@ -5,19 +5,17 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
-import { patchTriviumArm64Loader } from './patch-trivium-arm64-loader.mjs';
+import release from '../../../scripts/trivium-release.json' with { type: 'json' };
+import { windowsMsvcEnvironment } from '../../../scripts/windows-msvc.cjs';
 
 const require = createRequire(import.meta.url);
 const { detectKernelBinaryIdentity, normalizeKernelArchitecture } = require('../../../scripts/kernel-binary-identity.cjs');
-const packages = [
-  { name: 'triviumdb', version: '0.9.1', commit: '46f767f8c5befeb7da091267f2b19052f3cba8d9' },
-  { name: 'triviumdb-upgrade-0.8', version: '0.8.10', commit: '221a628209838483e20296d29bcf35fc3e2dd156' },
-];
+const { version: VERSION, revision: COMMIT } = release;
 const TARGET = 'aarch64-pc-windows-msvc';
 const BINARY = 'triviumdb.win32-arm64-msvc.node';
 const RECIPE = 1;
 const sha256 = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
-const run = (command, args, cwd) => execFileSync(command, args, { cwd, stdio: 'inherit', windowsHide: true });
+const run = (command, args, cwd, env = process.env) => execFileSync(command, args, { cwd, env, stdio: 'inherit', windowsHide: true });
 const assertTarget = (file) => {
   const identity = detectKernelBinaryIdentity(fs.readFileSync(file));
   if (identity.platform !== 'win32' || identity.arch !== 'arm64') {
@@ -29,13 +27,8 @@ export function prepareTriviumRuntime() {
   const platform = process.env.VARIN_TARGET_PLATFORM || process.platform;
   const architecture = normalizeKernelArchitecture(process.env.VARIN_TARGET_ARCH || process.arch);
   if (platform !== 'win32' || architecture !== 'arm64') return;
-  for (const recipe of packages) preparePackage(recipe);
-  patchTriviumArm64Loader();
-}
-
-function preparePackage({ name, version: VERSION, commit: COMMIT }) {
   const webRequire = createRequire(new URL('../../web/package.json', import.meta.url));
-  const packageRoot = path.dirname(webRequire.resolve(`${name}/package.json`));
+  const packageRoot = path.dirname(webRequire.resolve('triviumdb/package.json'));
   const installedVersion = JSON.parse(fs.readFileSync(path.join(packageRoot, 'package.json'), 'utf8')).version;
   if (installedVersion !== VERSION) {
     throw new Error(`TriviumDB source recipe is for ${VERSION}, but the installed package is ${installedVersion}.`);
@@ -53,7 +46,7 @@ function preparePackage({ name, version: VERSION, commit: COMMIT }) {
     try {
       const source = path.join(temporary, 'source');
       run('git', ['init', source], temporary);
-      run('git', ['-C', source, 'fetch', '--depth=1', 'https://github.com/YoKONCy/TriviumDB.git', COMMIT], temporary);
+      run('git', ['-C', source, 'fetch', '--depth=1', 'https://github.com/Astrmira/TriviumDB.git', COMMIT], temporary);
       run('git', ['-C', source, 'checkout', '--detach', 'FETCH_HEAD'], temporary);
       const revision = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: source, encoding: 'utf8' }).trim();
       if (revision !== COMMIT) throw new Error(`Unexpected TriviumDB source revision: ${revision}`);
@@ -61,7 +54,7 @@ function preparePackage({ name, version: VERSION, commit: COMMIT }) {
       run('cargo', [
         'build', '--locked', '--release', '--lib', '--features', 'nodejs',
         '--package', 'triviumdb', '--target', TARGET, '--target-dir', targetDirectory,
-      ], source);
+      ], source, process.platform === 'win32' ? windowsMsvcEnvironment('arm64') : process.env);
       const built = path.join(targetDirectory, TARGET, 'release', 'triviumdb.dll');
       assertTarget(built);
       fs.mkdirSync(path.dirname(payload), { recursive: true });

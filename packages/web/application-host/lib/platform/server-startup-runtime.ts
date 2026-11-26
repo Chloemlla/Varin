@@ -70,7 +70,7 @@ export const createServerStartupRuntime = (dependencies: {
         activePort = typeof addressInfo === 'object' && addressInfo ? addressInfo.port : port;
 
         try {
-          process.send?.({ type: 'varin:ready', port: activePort });
+          if (process.connected !== false) process.send?.({ type: 'varin:ready', port: activePort }, () => undefined);
         } catch {
           // ignore
         }

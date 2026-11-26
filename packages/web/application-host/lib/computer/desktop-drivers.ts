@@ -15,11 +15,14 @@ export function createDesktopDriverPool(options: {
   const captures = new Map<string, ComputerDriverSession>();
   const loading = new Map<string, Promise<{ driver: ComputerDriverSession; desktop: ComputerDesktop }>>();
   const resetting = new Map<string, Promise<void>>();
+  const closingCaptures = new Map<string, Promise<void>>();
   let closed = false;
   const acquire = (desktopId: string, purpose: 'input' | 'capture' = 'input', joiningStartup = false): Promise<{ driver: ComputerDriverSession; desktop: ComputerDesktop }> => {
     if (closed) return Promise.reject(new Error('Desktop driver owner has stopped'));
     const reset = resetting.get(desktopId);
     if (reset && !joiningStartup) return reset.then(() => acquire(desktopId, purpose));
+    const closing = purpose === 'capture' ? closingCaptures.get(desktopId) : undefined;
+    if (closing) return closing.catch(() => undefined).then(() => acquire(desktopId, purpose));
     const key = `${purpose}:${desktopId}`;
     const pending = loading.get(key);
     if (pending) return pending;
@@ -64,11 +67,26 @@ export function createDesktopDriverPool(options: {
     void task.finally(() => { if (loading.get(key) === task) loading.delete(key); }).catch(() => {});
     return task;
   };
+  const releaseCapture = (desktopId: string): Promise<void> => {
+    const current = closingCaptures.get(desktopId);
+    if (current) return current;
+    if (!captures.has(desktopId) && !loading.has(`capture:${desktopId}`)) return Promise.resolve();
+    const retiring = (async () => {
+      await Promise.allSettled([loading.get(`capture:${desktopId}`)]);
+      const driver = captures.get(desktopId);
+      if (!driver) return; // Shared authorization belongs to the input/session owner.
+      captures.delete(desktopId);
+      await driver.dispose();
+    })();
+    closingCaptures.set(desktopId, retiring);
+    void retiring.finally(() => { if (closingCaptures.get(desktopId) === retiring) closingCaptures.delete(desktopId); }).catch(() => undefined);
+    return retiring;
+  };
   const reset = (desktopId: string): Promise<void> => {
     const existing = resetting.get(desktopId);
     if (existing) return existing;
     const pending = (async () => {
-      await Promise.allSettled([loading.get(`input:${desktopId}`), loading.get(`capture:${desktopId}`)]);
+      await Promise.allSettled([loading.get(`input:${desktopId}`), loading.get(`capture:${desktopId}`), closingCaptures.get(desktopId)]);
       const drivers = [inputs.get(desktopId), captures.get(desktopId)];
       inputs.delete(desktopId); captures.delete(desktopId); options.onInputReset(desktopId);
       await Promise.allSettled(drivers.map((driver) => driver?.dispose()));
@@ -80,10 +98,10 @@ export function createDesktopDriverPool(options: {
   return {
     inputs, acquire: (desktopId: string, purpose: 'input' | 'capture' = 'input') => acquire(desktopId, purpose),
     inputOwnerId: (driver: ComputerDriverSession) => inputIdentities.get(driver),
-    reset,
+    reset, releaseCapture,
     async dispose() {
       closed = true;
-      await Promise.allSettled([...loading.values(), ...resetting.values()]);
+      await Promise.allSettled([...loading.values(), ...resetting.values(), ...closingCaptures.values()]);
       await Promise.allSettled([...inputs.values()].map(async (driver) => {
         try {
           if (driver.interrupt) await driver.interrupt();

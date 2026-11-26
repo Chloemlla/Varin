@@ -29,7 +29,7 @@ interface RemoteExternalReviewTarget {
   registry(coordinator: KernelClient): ReturnType<typeof createManagedRemoteTargetRegistry>;
   close(): Promise<void>;
 }
-export async function remoteExternalReviewTarget(root:string): Promise<RemoteExternalReviewTarget> {
+export async function remoteExternalReviewTarget(root:string, options: {coordinatorHostId?:string; allowDelete?:boolean} = {}): Promise<RemoteExternalReviewTarget> {
   const hostId='remote-external-review',directory=path.join(root,'target-work');await fs.mkdir(directory,{recursive:true});
   const workspaceOwner: { current?: NativeWorkspaceOwner } = {};
   const documents=createDocumentAuthority({hostId,dataDir:path.join(root,'target-documents'),isAllowedRoot:async()=>true,isTrusted:async()=>true,
@@ -76,14 +76,14 @@ if(m.method==='turn/start'){reply({turn:{id:'target-turn'}});writeFileSync('exte
       return ['code_capture','code_apply','external_code_apply','code_release'].includes(operation.kind)?exchange(scope,operation,signal):query(scope,operation,signal);}});
   const app=express();registerCommonRequestMiddleware(app,{express});registerManagedRemoteRoutes(app,{service:{hostId,sources:()=>source,
     identity:async()=>({protocolVersion:1,hostId,capabilities:['sources'],machine:{machineId:'managed:'+hostId,kind:'managed-remote',state:'available'}})} as never,
-    resolveAuthContext:async()=>({type:'client',clientId:'paired-parent',client:{capabilities:['filesystem:read','filesystem:write','terminal:use','process:control','logs:read']}} as never)});
+    resolveAuthContext:async()=>({type:'client',clientId:'paired-parent',client:{capabilities:['filesystem:read','filesystem:write',...(options.allowDelete?['filesystem:delete']:[]),'terminal:use','process:control','logs:read']}} as never)});
   const server=await new Promise<import('node:http').Server>(resolve=>{const server=app.listen(0,'127.0.0.1',()=>resolve(server));});
   terminalOwner.current=createTerminalRuntime({app,server,fs:fsNative,path,documents,loadPtyProvider:async()=>processes.ptyProvider,
     buildAugmentedPath:()=>process.env.PATH??'',searchPathFor:(name,paths)=>paths.split(path.delimiter).map(dir=>path.join(dir,name+(process.platform==='win32'?'.exe':''))).find(file=>fsNative.existsSync(file))??null,
     isExecutable:file=>{try{fsNative.accessSync(file,process.platform==='win32'?fsNative.constants.F_OK:fsNative.constants.X_OK);return true;}catch{return false;}},
     isRequestOriginAllowed:async()=>true,rejectWebSocketUpgrade:socket=>socket.destroy(),TERMINAL_INPUT_WS_HEARTBEAT_INTERVAL_MS:30_000});
   const endpoint=`http://127.0.0.1:${(server.address() as import('node:net').AddressInfo).port}`;
-  return {directory,documents,kernel,nativeWorkspaces,operations,script,registry:(coordinator:KernelClient)=>createManagedRemoteTargetRegistry({coordinatorHostId:'child-review-host',kernel:coordinator,resources:{} as never,
+  return {directory,documents,kernel,nativeWorkspaces,operations,script,registry:(coordinator:KernelClient)=>createManagedRemoteTargetRegistry({coordinatorHostId:options.coordinatorHostId ?? 'child-review-host',kernel:coordinator,resources:{} as never,
     readSettings:async()=>({desktopHosts:[{id:'target-review',apiUrl:endpoint}]})}),
     async close(){await external.close();await terminalOwner.current?.shutdown();await processes.dispose();await query.dispose();await new Promise<void>((resolve,reject)=>{server.close(e=>e?reject(e):resolve());server.closeAllConnections();});await native.dispose();await documents.dispose();}};
 }

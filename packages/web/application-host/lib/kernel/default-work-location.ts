@@ -29,7 +29,9 @@ export function preferredWorkLocation(settings: { workspaceLocations?: unknown; 
   return workspaceLocationSource(selected, projects);
 }
 
-type WorkLocation = { resourceOwner: SourceResourceOwner; path: string; workspaceId?: string | null; selection?: ProjectSourceSelection };
+type WorkLocation = { resourceOwner: SourceResourceOwner; path: string; workspaceId?: string | null; selection?: ProjectSourceSelection; requiresProjectContext?: boolean };
+export type LazyDefaultWorkLocation = { resourceOwner: SourceResourceOwner; path: string; workspaceId?: string };
+export type DefaultWorkLocationSelection = ThreadPreparedSource['source'] | { lazyWorkLocation: LazyDefaultWorkLocation } | null;
 
 async function resolveWorkLocation(location: WorkLocation, directory: Pick<SourceDirectory, 'resolve'>, signal?: AbortSignal) {
   const selected = location.selection?.mode === 'native_workspace'
@@ -72,7 +74,7 @@ export function createConversationWorkLocation({ agentRuntime, sourceDirectory, 
 }) {
   async function creationLocation(thread: ThreadSummary, signal?: AbortSignal): Promise<WorkLocation> {
     const defaults = await agentRuntime.organizationCreationDefaults(thread.thread_id, signal);
-    if (defaults?.source) return defaults.source;
+    if (defaults?.source) return { ...defaults.source, ...(defaults.projectId ? { requiresProjectContext: true } : {}) };
     if (defaults?.projectId) {
       const project = (await readWorkspaceSettings()).projects.find(project => project.id === defaults.projectId);
       if (!project) throw new Error('The conversation’s original default project is no longer registered. Select a source explicitly.');
@@ -87,17 +89,27 @@ export function createConversationWorkLocation({ agentRuntime, sourceDirectory, 
     return preferred ?? { resourceOwner: { kind: 'local' }, path: servicePath };
   }
 
-  return async (identity: ThreadIdentity, thread: ThreadSummary, signal?: AbortSignal) => {
+  return async (identity: ThreadIdentity, thread: ThreadSummary, signal?: AbortSignal): Promise<DefaultWorkLocationSelection> => {
     const latest = thread.branches.find(branch => branch.branch_id === identity.branchId)?.latest_run;
     const checkpoint = await agentRuntime.context(identity.branchId, signal);
-    const inherited = checkpoint?.resources ? checkpoint.resources.source : (latest ? (await agentRuntime.launch(latest.id, signal))?.selection.source : null);
+    const prior = latest ? (await agentRuntime.launch(latest.id, signal))?.selection : undefined;
+    const inherited = checkpoint?.resources ? checkpoint.resources.source : prior?.source;
     if (inherited) {
       const source = resourceThreadSource(inherited);
       if (!source) throw new Error('The inherited execution source is unavailable');
       return { ...source, tools: await agentRuntime.sourceTools(source.mode, signal) };
     }
-    if (latest || checkpoint?.resources || thread.parent_thread_id || !await agentRuntime.principalCanUseHostResources?.(thread.principal_id)) return null;
-    const location = await resolveWorkLocation(await creationLocation(thread, signal), sourceDirectory, signal);
+    if (thread.parent_thread_id || !await agentRuntime.principalCanUseHostResources?.(thread.principal_id)) return null;
+    if (prior?.lazy_work_location && !inherited) {
+      const { resource_owner: resourceOwner, path, workspace_id: workspaceId } = prior.lazy_work_location;
+      return { lazyWorkLocation: { resourceOwner, path, ...(workspaceId ? { workspaceId } : {}) } };
+    }
+    if (latest || checkpoint?.resources) return null;
+    const saved = await creationLocation(thread, signal);
+    if (!saved.selection && !saved.requiresProjectContext) {
+      return { lazyWorkLocation: { resourceOwner: saved.resourceOwner, path: saved.path, ...(saved.workspaceId ? { workspaceId: saved.workspaceId } : {}) } };
+    }
+    const location = await resolveWorkLocation(saved, sourceDirectory, signal);
     const key = `creation-location:${identity.threadId}:${identity.branchId}`;
     return (await prepare({ ...identity, key, ...location, content: { mode: 'saved-files' }, captureScopes: [] }, signal)).source;
   };

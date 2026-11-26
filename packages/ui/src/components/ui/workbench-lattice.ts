@@ -22,6 +22,8 @@ export const LATTICE_COVER_CELL_MS = 150;
 export const LATTICE_REVEAL_CELL_MS = 170;
 /** Reduced motion: the cover fades in and out instead. */
 export const LATTICE_REDUCED_MS = 160;
+/** Settings opens and returns with a shorter wave than a full Profile switch. */
+export const SETTINGS_WAVE_SCALE = 0.7;
 /**
  * Declared durations are Core's hard clock for a phase, armed after the scene mounts. The scene
  * completes each phase itself when its animations finish; the headroom keeps a slow first frame

@@ -65,7 +65,7 @@ export function createStorageService(options: Options) {
       }
       if (relative[0] === 'worktrees') return { category: 'copies' };
       if (relative[0] === 'knowledge' && relative[1] === options.hostId) {
-        const workspace = relative[2]?.replace(/\.tdb(?:[.-].*)?$/, '');
+        const workspace = relative[2]?.replace(/(?:\.tdb(?:[.-].*)?|\.store)$/, '');
         return { category: 'other', ...(workspace !== undefined && ids.has(workspace) ? { workspace } : {}) };
       }
       return { category: 'other' };

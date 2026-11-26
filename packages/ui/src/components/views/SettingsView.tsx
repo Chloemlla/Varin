@@ -8,6 +8,7 @@ import { McpIcon } from '@/components/icons/McpIcon';
 import { useUIStore } from '@/stores/useUIStore';
 import { activationPoint, type RecentPointer } from '@/lib/motion/pointer';
 import { useDeviceInfo } from '@/lib/device';
+import { isMobileSurfaceRuntime } from '@/lib/runtimeSurface';
 import { isDesktopLocalOriginActive, isDesktopShell, isWebRuntime } from '@/lib/desktop';
 import { useI18n } from '@/lib/i18n';
 import { cn, getModifierLabel } from '@/lib/utils';
@@ -76,7 +77,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onClose, forceMobile
 
   const runtimeCtx = React.useMemo<SettingsRuntimeContext>(() => {
     const isDesktop = isDesktopShell();
-    return { isWeb: !isDesktop && isWebRuntime(), isDesktop, isMobile: phone, mcpInstalled: true };
+    return { isWeb: !isDesktop && isWebRuntime(), isDesktop, isMobile: phone || isMobileSurfaceRuntime(), mcpInstalled: true };
   }, [phone]);
   const visiblePages = React.useMemo(() => {
     const allowed = visiblePageSlugs ? new Set(visiblePageSlugs) : null;
@@ -263,7 +264,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onClose, forceMobile
   let resultIndex = -1;
   const nav = <nav className="sk-nav" aria-label={t('settings.shell.navigation')}>
     {phone ? <div className="sk-hstack" style={{ padding: '4px 10px 0' }}>
-      {onClose ? <Btn kind="ghost" icon="arrow-left-s" tip={t('settings.view.actions.closeSettings')} onClick={event => close(activationPoint(event))} /> : null}
+      {onClose ? <Btn data-varin-settings-origin="return" kind="ghost" icon="arrow-left-s" tip={t('settings.view.actions.closeSettings')} onClick={event => close(activationPoint(event))} /> : null}
     </div> : null}
     <span className="sk-nav-title">{t('settings.view.home.title')}</span>
     <div className="sk-search">

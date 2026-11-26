@@ -66,9 +66,12 @@ pub(crate) fn supports_frozen_builtin(original: &ToolSchema, current: &ToolSchem
         || (original.version == "1" && current.version == "2"
             && ToolKind::all().any(|kind| kind.name() == original.name)))
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildFileRoute { Existing, Project, Deferred }
 pub(crate) fn select_frozen(
     selected: &varin_runtime::catalog::dispatch::ChildDispatchSelection,
     names: &[String],
+    route: ChildFileRoute,
 ) -> Result<Vec<ToolSchema>, varin_runtime::RuntimeError> {
     let has_host_binding = |name: &str| selected.extension_bindings.iter().any(|binding| binding.tool.name == name)
         || selected.mcp_binding.iter().any(|binding| binding.tools.iter().any(|tool| tool.name == name));
@@ -87,12 +90,23 @@ pub(crate) fn select_frozen(
             let catalogued = || selected.catalog.native_capabilities.iter()
                 .any(|capability| capability.name == current.name && capability.version == current.version);
             let original = selected.frozen.allowed_delegation.iter().find(|tool| &tool.name == name);
+            if route == ChildFileRoute::Deferred && varin_runtime::catalog::dispatch::lazy_child_file_tool(name) {
+                if original.is_some_and(|tool| crate::work_locations::wraps_lazy_native(tool, current)) && catalogued() {
+                    return Ok(crate::work_locations::child_schema(current.clone()));
+                }
+                return Err(unsupported());
+            }
             let granted = match original {
+                Some(tool) if selected.frozen.source.is_some() && catalogued()
+                    && crate::work_locations::wraps_lazy_native(tool, current) => Some(current),
                 Some(tool) if supports_frozen_builtin(tool, current)
                     || *tool == crate::memory::bot_schema(true) || *tool == crate::memory::bot_schema(false) => Some(tool),
                 // Keep the actual v3 declaration frozen in the parent. A child can inherit
                 // only the wrapped ordinary reader already present in its own frozen catalog.
                 Some(tool) if crate::work_locations::wraps_native(tool, current) && catalogued() => Some(current),
+                Some(tool) if catalogued() && (current.name == "file_read" || route == ChildFileRoute::Project)
+                    && (crate::work_locations::wraps_lazy_native(tool, current)
+                        || *tool == crate::work_locations::child_schema(current.clone())) => Some(current),
                 // Configured profiles and explicit isolated writes can select a native
                 // capability absent from the parent's directory, never replace a stale one.
                 None if catalogued() => Some(current),
@@ -111,7 +125,8 @@ pub(crate) fn delegated(parent: &[ToolSchema]) -> Vec<ToolSchema> {
         .map(|definition| definition.schema.name).collect::<std::collections::BTreeSet<_>>();
     parent
         .iter()
-        .filter(|tool| !crate::work_locations::is_control(&tool.name) && !main_only.contains(&tool.name))
+        .filter(|tool| !crate::work_locations::is_control(&tool.name) && !main_only.contains(&tool.name)
+            && !crate::agent_runtime::managed_process_commands::dormant_script_tool(tool))
         .cloned()
         .collect()
 }
@@ -289,7 +304,7 @@ pub(crate) fn discovery(
     let unsupported = |tools: &[String]| {
         tools
             .iter()
-            .filter(|name| select_frozen(selected, std::slice::from_ref(*name)).is_err())
+            .filter(|name| select_frozen(selected, std::slice::from_ref(*name), ChildFileRoute::Existing).is_err())
             .cloned()
             .collect::<Vec<_>>()
     };
@@ -330,11 +345,21 @@ pub(crate) fn discovery(
         });
         json!({"id":preset.id,"name":preset.name,"description":preset.description,"tools":tools,"tools_source":preset.tools_source,"work_focus":preset.work_focus,"unavailable":failure})
     }).collect::<Vec<_>>();
+    let deferred_file_tools = selected.frozen.lazy_work_location.as_ref().map(|_| {
+        normal.iter().filter(|name| varin_runtime::catalog::dispatch::lazy_child_file_tool(name)
+            && select_frozen(selected, std::slice::from_ref(*name), ChildFileRoute::Deferred).is_ok())
+            .cloned().collect::<Vec<_>>()
+    });
     json!({"kind":"child_dispatch_configuration","catalog_identity":selected.catalog.identity,"normal":{"allowed_delegation":normal,"unavailable":selected.catalog.normal_unavailable,"default_unavailable":normal_failure,"selection":"Without tools, the full delegation is selected. Explicit tools may narrow it; unsupported selected tools are rejected."},"presets":presets,
         "work_focus":{"default":selected.frozen.work_focus.as_deref().unwrap_or("general"),"available":varin_runtime::catalog::launches::WORK_FOCUS_IDS,
             "selection":"dispatch.workFocus selects native tool disclosure and the target scope for presets. Omit to inherit the caller's focus. A preset's empty work_focus list means all focuses. This does not expand tool permissions or change workMode."},
         "work_modes":{"shared":"default: works in the selected source's actual files; permitted changes apply there immediately","isolated_write":"works on an independent copy of the selected source; changes return through the code exchange","read_only":"reads the selected source without file-changing tools"},
-        "source_notice":"Source-dependent tools require an actual selected file source. Select a source or narrow tools to source-independent capabilities. A process cwd is not an OS sandbox. Model final reports and process lifetime are independent."})
+        "deferred_file_tools":deferred_file_tools,
+        "source_notice":if deferred_file_tools.is_some() {
+            "A native dispatch with explicit tools and workMode shared/read_only may use these deferred file tools on this Run's recorded default. Omit projectId, sourceAgent and sourcePath. Read-only excludes mutations. Other source-dependent tools require an actual selected Source."
+        } else {
+            "Source-dependent tools require an actual selected file source. Select a source or narrow tools to source-independent capabilities. A process cwd is not an OS sandbox. Model final reports and process lifetime are independent."
+        }})
 }
 
 #[cfg(test)]

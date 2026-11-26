@@ -1664,6 +1664,8 @@ export const settingsDict = {
   'settings.remoteInstances.clientAuth.qrDialogTitle': 'Scanner pour se connecter',
 'settings.remoteInstances.clientAuth.actions.addDevice': 'Ajouter un appareil',
   'settings.remoteInstances.clientAuth.actions.copied': 'Copié',
+  'settings.remoteInstances.clientAuth.field.lanAddress': 'Adresse du réseau local',
+  'settings.remoteInstances.clientAuth.actions.copyAddress': 'Copier l’adresse',
   'settings.remoteInstances.clientAuth.addDevice.transportLabel': 'Où utiliserez-vous cet appareil ?',
   'settings.remoteInstances.clientAuth.addDevice.subtitle': 'Créez un code QR à usage unique qui connecte un autre appareil à ce serveur.',
   'settings.remoteInstances.clientAuth.addDevice.transport.local': 'Cet ordinateur uniquement',

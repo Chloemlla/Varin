@@ -189,7 +189,7 @@ export function createDictationRuntime({
 
     const manager = new DictationStreamManager({
       emit: ({ type, payload }) => send({ type, ...payload }),
-      createSttSession: (options) => service.createSttSession(options),
+      createSttSession: (options, signal) => service.createSttSession(options, signal),
     });
 
     send({ type: 'ready' });
@@ -309,7 +309,7 @@ export function createDictationRuntime({
 
   server.on('upgrade', upgradeHandler);
 
-  const stop = (): void => {
+  const stop = async (): Promise<void> => {
     server.off('upgrade', upgradeHandler);
     for (const client of wsServer.clients) {
       try {
@@ -323,8 +323,8 @@ export function createDictationRuntime({
     } catch {
       // ignore
     }
-    service.shutdown();
+    await service.shutdown();
   };
 
-  return { stop };
+  return { stop, activity: service.activity };
 }

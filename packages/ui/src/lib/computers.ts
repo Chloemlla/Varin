@@ -33,6 +33,10 @@ export const listComputers = async (signal?: AbortSignal): Promise<ComputerCatal
   readJson<ComputerCatalog>(await runtimeFetch('/api/computers', { signal }), 'Unable to list computers')
 );
 
+export const refreshComputers = async (signal?: AbortSignal): Promise<ComputerCatalog> => (
+  readJson<ComputerCatalog>(await runtimeFetch('/api/computers/refresh', { method: 'POST', signal }), 'Unable to refresh computers')
+);
+
 /** Re-probe a desktop's driver; the response carries the real capability table. */
 export const probeComputerDesktop = async (desktopId: string): Promise<ComputerDesktop> => {
   const result = await readJson<{ desktop: ComputerDesktop }>(

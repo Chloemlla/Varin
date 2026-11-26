@@ -1,12 +1,13 @@
-import React, { useRef, useEffect } from 'react';
-import { animate, motion, useMotionValue } from 'motion/react';
+import React from 'react';
+import { MobileWorkspaceFrame } from './MobileWorkspaceFrame';
+import { varinSurfaceRuntime } from '@/lib/extensions/surface-runtime';
+import { useI18n } from '@/lib/i18n';
 import { Header } from './Header';
-import { useDesktopSettingsTransition } from './useDesktopSettingsTransition';
+import { useSettingsTransition } from './useSettingsTransition';
 import { Sidebar } from './Sidebar';
 import { ProjectContextPanel } from './RightSidebarTabs';
 import { ContextPanel } from './ContextPanel';
 import { ContextPanelRail } from './ContextPanelRail';
-import { MobileBottomSheet } from './MobileBottomSheet';
 import { ErrorBoundary } from '../ui/ErrorBoundary';
 import { CommandPalette } from '../ui/CommandPalette';
 import { HelpDialog } from '../ui/HelpDialog';
@@ -19,7 +20,6 @@ import { WorktreesView } from '@/components/views/WorktreesView';
 import { DiffWorkerProvider } from '@/contexts/DiffWorkerProvider';
 import { MultiRunLauncher } from '@/components/multirun';
 import { TerminalView } from '@/components/views/TerminalView';
-import { DrawerProvider } from '@/contexts/DrawerContext';
 import { WorkspaceOverlays } from '@/components/workspace/WorkspaceOverlays';
 import {
     WorkbenchContributionSlot,
@@ -47,40 +47,38 @@ const GitView = lazyWithChunkRecovery(() => import('@/components/views/GitView')
 const DiffView = lazyWithChunkRecovery(() => import('@/components/views/DiffView').then(m => ({ default: m.DiffView })));
 const FilesView = lazyWithChunkRecovery(() => import('@/components/views/FilesView').then(m => ({ default: m.FilesView })));
 const DiagramView = lazyWithChunkRecovery(() => import('@/components/views/DiagramView').then(m => ({ default: m.DiagramView })));
-const SettingsView = lazyWithChunkRecovery(() => import('@/components/views/SettingsView').then(m => ({ default: m.SettingsView })));
 
 interface MainLayoutProps {
     renderConversation?: (active: boolean) => React.ReactNode;
     renderNavigator?: (isVisible: boolean) => React.ReactNode;
     /**
      * A workbench's own secondary panel. On desktop it replaces the context panel and its rail
-     * and must render an `aside` beside the main canvas; on mobile it fills a bottom sheet.
+     * and must render an aside beside the main canvas. Mobile shows the same content on its detail page.
      */
     renderSecondaryPanel?: (placement: 'docked' | 'drawer', visible: boolean) => React.ReactNode;
     secondaryPanelFocus?: string | null;
+    onMobileDetailClose?(): void;
     /** Accessible names for that panel and its mobile header toggle. */
     secondaryPanelLabel?: string;
-    secondaryPanelToggleLabels?: { open: string; close: string };
     navigationTitle?: string;
+    mobileConversationKey?: string | null;
+    mobileIdentity?: import('@varin/application-client').ThreadIdentity | null;
     navigationSubtitle?: string;
     headerPanelControl?: React.ReactNode;
     sidebarAttention?: 'info' | 'warn' | null;
     /** The sidebar opens over the work area; pressing outside it closes it. */
     floatingSidebar?: boolean;
-    /** Mobile title-bar centre that opens and closes the secondary panel's bottom sheet. */
+    /** Conversation identity and its entry to details on mobile. */
     renderMobileTitle?: (panel: { open: boolean; toggle(): void }) => React.ReactNode;
     scheduledTasksGroup?: BotGroupSummary;
 }
 
-export const MainLayout: React.FC<MainLayoutProps> = ({ renderConversation, renderNavigator, renderSecondaryPanel, secondaryPanelLabel, secondaryPanelToggleLabels, secondaryPanelFocus, navigationTitle, navigationSubtitle, headerPanelControl, sidebarAttention, floatingSidebar = false, renderMobileTitle, scheduledTasksGroup }) => {
+export const MainLayout: React.FC<MainLayoutProps> = ({ renderConversation, renderNavigator, renderSecondaryPanel, secondaryPanelLabel, secondaryPanelFocus, onMobileDetailClose, navigationTitle, navigationSubtitle, headerPanelControl, sidebarAttention, floatingSidebar = false, renderMobileTitle, scheduledTasksGroup, mobileConversationKey, mobileIdentity }) => {
     const shellActive = useWorkbenchShellActive();
     const isSidebarOpen = useUIStore((state) => state.isSidebarOpen);
     const isContextRailOpen = useUIStore((state) => state.isContextRailOpen);
     const activeMainTab = useUIStore((state) => state.activeMainTab);
     const setIsMobile = useUIStore((state) => state.setIsMobile);
-    const isSessionSwitcherOpen = useUIStore((state) => state.isSessionSwitcherOpen);
-    const isSettingsDialogOpen = useUIStore((state) => state.isSettingsDialogOpen);
-    const setSettingsDialogOpen = useUIStore((state) => state.setSettingsDialogOpen);
     const isMultiRunLauncherOpen = useUIStore((state) => state.isMultiRunLauncherOpen);
     const setMultiRunLauncherOpen = useUIStore((state) => state.setMultiRunLauncherOpen);
     const multiRunLauncherPrefillPrompt = useUIStore((state) => state.multiRunLauncherPrefillPrompt);
@@ -108,122 +106,11 @@ export const MainLayout: React.FC<MainLayoutProps> = ({ renderConversation, rend
             unsubscribeTab();
         };
     }, [shellActive]);
-    const { isMobile } = useDeviceInfo();
-    const settings = useDesktopSettingsTransition(shellActive && !isMobile);
-    const mobilePanelsResetRef = React.useRef(false);
-
-    // Mobile drawer state
-    const [mobileLeftDrawerOpen, setMobileLeftDrawerOpen] = React.useState(false);
-    const [mobileRightSidebarOpen, setMobileRightSidebarOpen] = React.useState(false);
-    React.useEffect(() => { if (isMobile && secondaryPanelFocus) setMobileRightSidebarOpen(true); }, [isMobile, secondaryPanelFocus]);
-    const [mobileLeftDrawerVisible, setMobileLeftDrawerVisible] = React.useState(false);
-    const [mobileRightDrawerVisible, setMobileRightDrawerVisible] = React.useState(false);
+    const { t } = useI18n();
+    const device = useDeviceInfo();
+    const isMobile = device.isMobile || varinSurfaceRuntime.surface === 'mobile';
+    const settings = useSettingsTransition(shellActive && !isMobile);
     const [directoryDialogOpen, setDirectoryDialogOpen] = React.useState(false);
-    const setMobileSessionPanelOpen = React.useCallback((open: boolean) => {
-        setMobileLeftDrawerOpen(open);
-        useUIStore.getState().setSessionSwitcherOpen(open);
-    }, []);
-    const initialDrawerWidthRef = React.useRef(typeof window === 'undefined' ? 0 : window.innerWidth);
-
-    // Left drawer motion value
-    const leftDrawerX = useMotionValue(-initialDrawerWidthRef.current);
-    const leftDrawerWidth = useRef(0);
-
-    // Right drawer motion value
-    const rightDrawerX = useMotionValue(initialDrawerWidthRef.current);
-    const rightDrawerWidth = useRef(0);
-
-    // Compute drawer width
-    useEffect(() => {
-        if (isMobile) {
-            leftDrawerWidth.current = window.innerWidth;
-            rightDrawerWidth.current = window.innerWidth;
-        }
-    }, [isMobile]);
-
-    // Sync left drawer state and motion value
-    useEffect(() => {
-        if (!isMobile) {
-            setMobileLeftDrawerVisible(false);
-            return;
-        }
-        if (mobileLeftDrawerOpen) {
-            setMobileLeftDrawerVisible(true);
-        }
-        animate(leftDrawerX, mobileLeftDrawerOpen ? 0 : -leftDrawerWidth.current, {
-            type: 'spring',
-            stiffness: 400,
-            damping: 35,
-            mass: 0.8,
-        });
-    }, [mobileLeftDrawerOpen, isMobile, leftDrawerX]);
-
-    // Sync right drawer state and motion value
-    useEffect(() => {
-        if (!isMobile) {
-            setMobileRightDrawerVisible(false);
-            return;
-        }
-        if (mobileRightSidebarOpen) {
-            setMobileRightDrawerVisible(true);
-        }
-        animate(rightDrawerX, mobileRightSidebarOpen ? 0 : rightDrawerWidth.current, {
-            type: 'spring',
-            stiffness: 400,
-            damping: 35,
-            mass: 0.8,
-        });
-    }, [isMobile, mobileRightSidebarOpen, rightDrawerX]);
-
-    useEffect(() => {
-        if (!isMobile) return;
-        return leftDrawerX.on('change', (value) => {
-            const width = leftDrawerWidth.current || initialDrawerWidthRef.current;
-            const visible = mobileLeftDrawerOpen || value > -width + 0.5;
-            setMobileLeftDrawerVisible((previous) => previous === visible ? previous : visible);
-        });
-    }, [isMobile, leftDrawerX, mobileLeftDrawerOpen]);
-
-    useEffect(() => {
-        if (!isMobile) return;
-        return rightDrawerX.on('change', (value) => {
-            const width = rightDrawerWidth.current || initialDrawerWidthRef.current;
-            const visible = mobileRightSidebarOpen || value < width - 0.5;
-            setMobileRightDrawerVisible((previous) => previous === visible ? previous : visible);
-        });
-    }, [isMobile, mobileRightSidebarOpen, rightDrawerX]);
-
-    // Sync session switcher close events to left drawer.
-    useEffect(() => {
-        if (isMobile && !isSessionSwitcherOpen && mobileLeftDrawerOpen) {
-            setMobileSessionPanelOpen(false);
-        }
-    }, [isSessionSwitcherOpen, isMobile, mobileLeftDrawerOpen, setMobileSessionPanelOpen]);
-
-    useEffect(() => {
-        if (!shellActive || !isMobile) {
-            mobilePanelsResetRef.current = false;
-            return;
-        }
-
-        if (mobilePanelsResetRef.current) {
-            return;
-        }
-
-        mobilePanelsResetRef.current = true;
-        setMobileSessionPanelOpen(false);
-        setMobileRightSidebarOpen(false);
-    }, [shellActive, isMobile, setMobileSessionPanelOpen]);
-
-    // Ensure mobile drawers are closed when opening full-screen settings
-    useEffect(() => {
-        if (!shellActive || !isMobile || !isSettingsDialogOpen) {
-            return;
-        }
-
-        setMobileSessionPanelOpen(false);
-        setMobileRightSidebarOpen(false);
-    }, [shellActive, isMobile, isSettingsDialogOpen, setMobileSessionPanelOpen]);
 
     useUpdatePolling(shellActive);
 
@@ -239,12 +126,6 @@ export const MainLayout: React.FC<MainLayoutProps> = ({ renderConversation, rend
         }
     }, [shellActive, isMobile, setIsMobile]);
 
-    const handleToggleMobileRightDrawer = React.useCallback(() => {
-        if (mobileLeftDrawerOpen) {
-            setMobileSessionPanelOpen(false);
-        }
-        setMobileRightSidebarOpen(!mobileRightSidebarOpen);
-    }, [mobileLeftDrawerOpen, mobileRightSidebarOpen, setMobileSessionPanelOpen]);
 
     const secondaryView = React.useMemo(() => {
         // Desktop surfaces live in the context panel; the only full-view
@@ -257,7 +138,7 @@ export const MainLayout: React.FC<MainLayoutProps> = ({ renderConversation, rend
             case 'plan':
                 return <React.Suspense fallback={null}><PlanView /></React.Suspense>;
             case 'git':
-                return <React.Suspense fallback={null}><GitView isActive={!mobileRightSidebarOpen} /></React.Suspense>;
+                return <React.Suspense fallback={null}><GitView isActive /></React.Suspense>;
             case 'diff':
                 return <React.Suspense fallback={null}><DiffView /></React.Suspense>;
             case 'terminal':
@@ -271,12 +152,12 @@ export const MainLayout: React.FC<MainLayoutProps> = ({ renderConversation, rend
             default:
                 return null;
         }
-    }, [activeMainTab, isMobile, mobileRightSidebarOpen]);
+    }, [activeMainTab, isMobile]);
 
     const isChatActive = activeMainTab === 'chat';
     // Desktop settings is an overlay: keep the conversation and editor alive
     // underneath it. Mobile settings replaces the page and can suspend it.
-    const conversationActive = shellActive && isChatActive && !(isMobile && isSettingsDialogOpen) && !isSurfacePageOpen;
+    const conversationActive = shellActive && isChatActive && !isSurfacePageOpen;
     const conversation = renderConversation
         ? renderConversation(conversationActive)
         : <RegularChatView active={conversationActive} />;
@@ -288,7 +169,7 @@ export const MainLayout: React.FC<MainLayoutProps> = ({ renderConversation, rend
                 data-workbench-chrome={isMobile ? undefined : 'agent'}
                 className={cn(
                     'main-content-safe-area',
-                    isMobile ? 'flex h-[100dvh] flex-col' : 'workbench-frame relative flex h-[100dvh] flex-col',
+                    isMobile ? 'relative flex h-[100dvh] flex-col' : 'workbench-frame relative flex h-[100dvh] flex-col',
                     'bg-background'
                 )}
             >
@@ -302,136 +183,17 @@ export const MainLayout: React.FC<MainLayoutProps> = ({ renderConversation, rend
                 />
 
                 {isMobile ? (
-                <DrawerProvider value={{
-                    leftDrawerOpen: mobileLeftDrawerOpen,
-                    rightDrawerOpen: mobileRightSidebarOpen,
-                    toggleLeftDrawer: () => {
-                        const nextOpen = !mobileLeftDrawerOpen;
-                        if (mobileRightSidebarOpen) {
-                            setMobileRightSidebarOpen(false);
-                        }
-                        setMobileSessionPanelOpen(nextOpen);
-                    },
-                    toggleRightDrawer: handleToggleMobileRightDrawer,
-                    leftDrawerX,
-                    rightDrawerX,
-                    leftDrawerWidth,
-                    rightDrawerWidth,
-                    setMobileLeftDrawerOpen: setMobileSessionPanelOpen,
-                    setRightSidebarOpen: setMobileRightSidebarOpen,
-                }}>
-                    {/* Mobile: header + drawer mode */}
-                    {!isSettingsDialogOpen && <Header
-                        navigationTitle={navigationTitle}
-                        navigationSubtitle={navigationSubtitle}
-                        rightDrawerLabels={secondaryPanelToggleLabels}
-                        panelControl={headerPanelControl}
-                        mobileTitle={renderMobileTitle?.({ open: mobileRightSidebarOpen, toggle: handleToggleMobileRightDrawer })}
-                        onToggleLeftDrawer={() => {
-                            const nextOpen = !mobileLeftDrawerOpen;
-                            if (mobileRightSidebarOpen) {
-                                setMobileRightSidebarOpen(false);
-                            }
-                            setMobileSessionPanelOpen(nextOpen);
-                        }}
-                        onToggleRightDrawer={() => {
-                            handleToggleMobileRightDrawer();
-                        }}
-                        leftDrawerOpen={mobileLeftDrawerOpen}
-                        rightDrawerOpen={mobileRightSidebarOpen}
-                    />}
-
-                    {/* Main content area (fixed) */}
-                    <div
-                        data-page-scroll-lock="true"
-                        className={cn(
-                            'flex flex-1 overflow-hidden relative',
-                            isSettingsDialogOpen && 'hidden'
-                        )}
-                    >
-                        <main className="w-full h-full overflow-hidden bg-background relative" data-page-scroll-lock="true">
-                            <div className={cn('absolute inset-0', (!isChatActive || isSurfacePageOpen) && 'invisible')}>
-                                <ErrorBoundary>{conversation}</ErrorBoundary>
-                            </div>
-                            {secondaryView && (
-                                <div className={cn('absolute inset-0', isSurfacePageOpen && 'invisible')}>
-                                    <ErrorBoundary>{secondaryView}</ErrorBoundary>
-                                </div>
-                            )}
-                            {isMultiRunLauncherOpen && (
-                                <div className="absolute inset-0 z-10 bg-background">
-                                    <ErrorBoundary>
-                                        <MultiRunLauncher
-                                            initialPrompt={multiRunLauncherPrefillPrompt}
-                                            onCreated={() => setMultiRunLauncherOpen(false)}
-                                            onCancel={() => setMultiRunLauncherOpen(false)}
-                                        />
-                                    </ErrorBoundary>
-                                </div>
-                            )}
-                            <ErrorBoundary><ScheduledTasksDialog activeGroup={scheduledTasksGroup} /></ErrorBoundary>
-                            <ErrorBoundary><ArchiveView /></ErrorBoundary>
-                            <ErrorBoundary><WorktreesView /></ErrorBoundary>
-                            {/* Always mount SessionSidebar on mobile to match desktop behavior.
-                                Conditional mount (mobileLeftDrawerVisible && ...) caused a
-                                data-loading cascade on every drawer open: paginated sessions
-                                fetch, worktree discovery, repo status, PR status, and 10+ memo
-                                recomputations. On Android PWA this manifested as a >10s delay
-                                before the drawer became interactive (issue #1695). Visibility is
-                                controlled by the leftDrawerX transform (off-screen when closed).
-                                The invisible class matters when fully hidden: leftDrawerWidth is
-                                not recomputed on resize/rotation, so a closed drawer translated by
-                                the old width could otherwise peek into the viewport; it also keeps
-                                the off-screen sidebar out of the tab order and skips painting it. */}
-                            <motion.div
-                                className={cn(
-                                    'absolute inset-0 z-20 bg-sidebar',
-                                    !mobileLeftDrawerVisible && 'pointer-events-none invisible',
-                                )}
-                                data-page-scroll-lock="true"
-                                style={{ x: leftDrawerX }}
-                                aria-hidden={!mobileLeftDrawerOpen}
-                            >
-                                <ErrorBoundary>
-                                    <WorkbenchReplacement
-                                        target={WORKBENCH_REPLACEMENT_TARGETS.sessionNavigator}
-                                        fallback={renderNavigator ? renderNavigator(mobileLeftDrawerVisible) : <ThreadSidebar mobileVariant isVisible={mobileLeftDrawerVisible} />}
-                                    />
-                                </ErrorBoundary>
-                            </motion.div>
-                            {renderSecondaryPanel ? (
-                                <MobileBottomSheet open={mobileRightSidebarOpen} onOpenChange={setMobileRightSidebarOpen} label={secondaryPanelLabel ?? ''} full={Boolean(secondaryPanelFocus)} keepMounted={secondaryPanelFocus !== undefined}>
-                                    <ErrorBoundary>{renderSecondaryPanel('drawer', mobileRightSidebarOpen)}</ErrorBoundary>
-                                </MobileBottomSheet>
-                            ) : mobileRightDrawerVisible && (
-                                <motion.div className="absolute inset-0 z-20 bg-sidebar" data-page-scroll-lock="true" style={{ x: rightDrawerX }} aria-hidden={!mobileRightSidebarOpen}>
-                                    <ErrorBoundary>
-                                        <React.Suspense fallback={null}><GitView isActive={mobileRightSidebarOpen} /></React.Suspense>
-                                    </ErrorBoundary>
-                                </motion.div>
-                            )}
-                        </main>
-                    </div>
-
-                    {/* Mobile settings: full screen */}
-                    {isSettingsDialogOpen && (
-                        <div
-                            className="absolute inset-0 z-10 bg-background"
-                            style={{ paddingTop: 'var(--varin-safe-area-top, 0px)' }}
-                        >
-                            <ErrorBoundary>
-                                <WorkbenchReplacement
-                                    target={WORKBENCH_REPLACEMENT_TARGETS.settings}
-                                    fallback={(
-                                        <React.Suspense fallback={null}>
-                                            <SettingsView onClose={() => setSettingsDialogOpen(false)} />
-                                        </React.Suspense>
-                                    )}
-                                />
-                            </ErrorBoundary>
-                        </div>
-                    )}
-                </DrawerProvider>
+                <MobileWorkspaceFrame scope={renderNavigator ? "bot" : "workbench"} conversationKey={mobileConversationKey} identity={mobileIdentity} scheduledGroup={scheduledTasksGroup} actions={headerPanelControl} detailFocus={secondaryPanelFocus} onDetailClose={onMobileDetailClose}
+                    title={panel => renderMobileTitle?.(panel) ?? <strong className="truncate">{navigationTitle}</strong>}
+                    directory={visible => <ErrorBoundary><WorkbenchReplacement target={WORKBENCH_REPLACEMENT_TARGETS.sessionNavigator}
+                        fallback={renderNavigator ? renderNavigator(visible) : <ThreadSidebar mobileVariant />} /></ErrorBoundary>}
+                    detailLabel={secondaryPanelLabel ?? t('mobile.menu.files')}
+                    detail={() => <ErrorBoundary>{renderSecondaryPanel ? renderSecondaryPanel('drawer', true) : <React.Suspense fallback={null}><GitView isActive /></React.Suspense>}</ErrorBoundary>}>
+                      <main className="relative isolate min-h-0 flex-1 overflow-hidden" data-page-scroll-lock="true">
+                        <div className={cn('absolute inset-0', (!isChatActive || isSurfacePageOpen) && 'invisible')}><ErrorBoundary>{conversation}</ErrorBoundary></div>
+                        {secondaryView && <div className={cn('absolute inset-0', isSurfacePageOpen && 'invisible')}><ErrorBoundary>{secondaryView}</ErrorBoundary></div>}
+                      </main>
+                </MobileWorkspaceFrame>
             ) : (
                 <>
                     <Header navigationTitle={navigationTitle} navigationSubtitle={navigationSubtitle} panelControl={headerPanelControl} sidebarAttention={sidebarAttention} settingsVisible={settings.open} />

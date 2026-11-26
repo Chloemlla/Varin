@@ -24,7 +24,7 @@ export function useBotWorkspaces(model: BotPanelModel | null, enabled: boolean, 
   React.useEffect(() => {
     if (!enabled || !apis) return;
     const controller = new AbortController();
-    void Promise.allSettled([apis.sources.list(null, controller.signal), listComputers()]).then(([files, desktops]) => {
+    void Promise.allSettled([apis.sources.list(null, controller.signal, {refresh:false}), listComputers()]).then(([files, desktops]) => {
       if (controller.signal.aborted) return;
       if (files.status === 'fulfilled') setSources(files.value);
       if (desktops.status === 'fulfilled') setComputers(desktops.value);

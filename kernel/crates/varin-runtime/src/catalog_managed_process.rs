@@ -87,6 +87,24 @@ impl Catalog {
         context: &ToolExecutionContext,
         kind: ManagedProcessKind,
     ) -> Result<Operation> {
+        self.bind_managed_process_source(context, kind, None)
+    }
+    /// Record the exact selected local view of one deferred builtin script
+    /// environment before the Host dispatches its process. The Run stays dormant.
+    pub fn bind_deferred_script_environment(
+        &mut self,
+        context: &ToolExecutionContext,
+        node: NodeBinding,
+        source: launches::SourceSelection,
+    ) -> Result<Operation> {
+        self.bind_managed_process_source(context, ManagedProcessKind::ScriptEnvironment { node }, Some(source))
+    }
+    fn bind_managed_process_source(
+        &mut self,
+        context: &ToolExecutionContext,
+        kind: ManagedProcessKind,
+        prepared: Option<launches::SourceSelection>,
+    ) -> Result<Operation> {
         let tx = self.db.transaction()?;
         let mut op: Operation = record(&tx, "operations", &context.operation_id)?;
         let run: Run = record(&tx, "runs", &op.run_id)?;
@@ -103,11 +121,30 @@ impl Catalog {
             ));
         }
         let launch: launch_content::LaunchMetadata = record(&tx, "run_launches", &op.run_id)?;
-        if !launch
-            .selection
-            .source
-            .as_ref()
-            .is_some_and(|source| source.mode != SourceMode::FixedBranch || matches!(kind,ManagedProcessKind::ProcessJob))
+        if let Some(source) = prepared.as_ref() {
+            let default = launch.selection.lazy_work_location.as_ref()
+                .ok_or_else(|| RuntimeError::Conflict("Original deferred script location is missing".into()))?;
+            source.validate()?;
+            let delegated: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM child_tasks WHERE child_thread_id=?1)",
+                [&run.thread_id], |row| row.get(0))?;
+            if !matches!(kind, ManagedProcessKind::ScriptEnvironment { .. })
+                || !matches!(context.origin, crate::execution::ToolOrigin::ModelStep { .. })
+                || context.origin.operation_id(&intent.call().call_id) != op.id
+                || op.executor.as_deref() != Some("script_open") || intent.call().name != "script_open"
+                || !matches!(op.execution_owner, Some(ExecutorOwner::External { .. }))
+                || op.epoch != run.epoch || op.epoch != self.epoch || op.call_completion.is_some()
+                || !principals::thread_has_host_authority(&tx, &run.thread_id)? || delegated
+                || launch.selection.source.is_some() || !default.resource_owner.is_local()
+                || source.resource_owner != default.resource_owner || source.mode != SourceMode::LiveRoot
+                || source.live_root.as_ref().is_none_or(|root| root.canonical_root != default.path)
+                || source.execution_workspace_id != source.workspace_id
+                || default.workspace_id.as_ref().is_some_and(|workspace| *workspace != source.workspace_id)
+                || op.resource_source.as_ref().is_some_and(|old| old != source)
+            {
+                return Err(RuntimeError::Conflict("Deferred script source differs from the original admitted invocation".into()));
+            }
+        } else if !matches!(kind, ManagedProcessKind::ProcessJob)
+            && !launch.selection.source.as_ref().is_some_and(|source| source.mode != SourceMode::FixedBranch)
         {
             return Err(RuntimeError::Conflict(
                 "Managed process requires its admitted source; script environments require a physical source".into(),
@@ -116,7 +153,8 @@ impl Catalog {
         if matches!(kind, ManagedProcessKind::ProcessJob) {
             // ProcessJob's first command may still be preparing its original
             // fixed source view in Storage. Binding records ownership, not cwd readiness.
-            let source = launch.selection.source.as_ref().expect("source checked");
+            let source = op.resource_source.as_ref().or(launch.selection.source.as_ref())
+                .ok_or_else(|| RuntimeError::Conflict("Process has no admitted execution source".into()))?;
             let matching = match (&source.resource_owner, &op.execution_owner) {
                 (launches::SourceResourceOwner::Local, Some(ExecutorOwner::Kernel)) => true,
                 (launches::SourceResourceOwner::ManagedHost{host_id,..}, Some(ExecutorOwner::External{identity,epoch})) => !epoch.is_empty() && identity.strip_prefix(&format!("source:{host_id}:source-authority:")).is_some_and(|suffix|!suffix.is_empty()),
@@ -132,6 +170,9 @@ impl Catalog {
             }
             require_process(&op)?;
             return Ok(op);
+        }
+        if let Some(source) = prepared {
+            op.resource_source = Some(source);
         }
         op.managed_process = Some(ManagedProcess {
             purpose: kind,

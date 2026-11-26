@@ -579,7 +579,7 @@ impl Catalog {
             }
         };
         let parent: launch_content::LaunchMetadata = record(&tx, "run_launches", &run.id)?;
-        if !user_dispatch && prepared.project.is_none(){super::dispatch::validate_agent_source(&tx,&run,prepared.source_agent.as_deref(),handoff.as_ref())?;}
+        if !user_dispatch && prepared.project.is_none(){super::dispatch::validate_agent_source(&tx,&run,prepared.source_agent.as_deref(),handoff.as_ref(),op.resource_source.as_ref())?;}
         if parent.selection.tool_schema_generation != child_launch.tool_schema_generation
             || parent.selection.tools_ref != prepared.parent_tools_ref
         {
@@ -965,6 +965,20 @@ impl Catalog {
         }
         self.execution_task(&operation_id)
     }
+    /// A deferred file grant belongs to the exact original native dispatch;
+    /// a child Thread or matching path by itself proves nothing.
+    pub fn require_lazy_child_launch(&self, run_id: &str, location: &launches::LazyWorkLocation) -> Result<()> {
+        self.require_child_launch(run_id)?
+            .ok_or_else(|| RuntimeError::Invalid("missing lazy child admission".into()))?;
+        let run = self.run(run_id)?;
+        let execution = self.delegated_execution_for_run(run_id)?
+            .ok_or_else(|| RuntimeError::Invalid("missing original lazy child execution".into()))?;
+        validate_lazy_dispatch(&self.db, &run.thread_id, &run.branch_id, &execution, location)?;
+        if execution.receipt.as_ref().is_none_or(|r| r.run_id != run_id) {
+            return Err(RuntimeError::Conflict("lazy child Run differs from its admitted receipt".into()));
+        }
+        Ok(())
+    }
     pub fn require_child_launch(&self, run_id: &str) -> Result<Option<ChildTask>> {
         let run = self.run(run_id)?;
         let Some(execution) = self.delegated_execution_for_run(run_id)? else {
@@ -993,6 +1007,43 @@ impl Catalog {
         Ok(Some(self.execution_task(&execution.execution_id)?))
     }
 }
+pub(super) fn validate_lazy_dispatch(
+    db: &Connection,
+    thread: &str,
+    branch: &str,
+    execution: &delegated::DelegatedExecution,
+    location: &launches::LazyWorkLocation,
+) -> Result<()> {
+    let relation = delegated::relation(db, &execution.child_operation_id)?;
+    let operation: Operation = record(db, "operations", &relation.operation_id)?;
+    let parent: Run = record(db, "runs", &relation.parent_run_id)?;
+    let launch: launch_content::LaunchMetadata = record(db, "run_launches", &parent.id)?;
+    if !matches!(execution.trigger, delegated::DelegatedTrigger::Dispatch)
+        || execution.execution_id != execution.child_operation_id
+        || !matches!(execution.source, Some(ChildSource::Absent))
+        || execution.source_basis.is_some()
+        || execution.launch.source.is_some()
+        || execution.launch.lazy_work_location.as_ref() != Some(location)
+        || execution.cancel_requested || execution.report.is_some()
+        || relation.child_thread_id != thread || relation.child_branch_id != branch
+        || relation.operation_id != execution.child_operation_id
+        || !matches!(relation.origin, Some(crate::execution::ToolOrigin::ModelStep { .. }))
+        || relation.call_id.as_ref().is_none_or(|id| {
+            relation.origin.as_ref().is_none_or(|origin| origin.operation_id(id) != operation.id)
+        })
+        || operation.executor.as_deref() != Some("dispatch")
+        || operation.cancel_requested || operation.run_id != parent.id
+        || relation.parent_thread_id != parent.thread_id || relation.parent_branch_id != parent.branch_id
+        || launch.selection.lazy_work_location.as_ref() != Some(location)
+        || !principals::thread_has_host_authority(db, thread)?
+        || !principals::thread_has_host_authority(db, &parent.thread_id)?
+        || principals::thread(db, thread)? != parent.principal_id
+    {
+        return Err(RuntimeError::Conflict("lazy resource differs from the original native child dispatch".into()));
+    }
+    Ok(())
+}
+
 pub struct ChildPreparation {
     attachment_delivery: Option<super::attachments::AttachmentDelivery>,
     bot: bool,

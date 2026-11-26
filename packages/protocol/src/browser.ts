@@ -5,6 +5,8 @@ export interface BrowserProviderStatus {
   state: BrowserConnectionState;
   capabilities: BrowserResourceCapability[];
   operations?: string[];
+  /** What this owner can acquire without inventing a new resource. */
+  activation?: 'connect' | 'existing-session' | 'start-owned' | 'restore-profile';
 }
 export interface BrowserResource extends BrowserProviderStatus {
   browserId: string;
@@ -170,7 +172,12 @@ export interface BrowserRenderResult {
 /** Trusted embedding port. Files are transferred by the Host's original resource owner. */
 export interface BrowserOwner {
   readonly browserId: string;
+  /** Cached metadata only; never connect, launch or probe here. */
   resource?(): Promise<BrowserProviderStatus>;
+  /** Explicit owner acquisition. Caller cancellation does not revoke another consumer. */
+  prepareResource?(): Promise<void>;
+  /** Optional owner-affine viewer claim; shall not grant page input. */
+  holdPage?(pageId: string, viewer: string, signal?: AbortSignal): Promise<() => Promise<void>>;
   forScope?(scope: BrowserUseScope, binding: BrowserResourceBinding): BrowserOwner;
   pageUsage?(pageId: string): Promise<BrowserPageUsage>;
   controlPage?(pageId: string, action: 'takeover' | 'resume' | 'activate'): Promise<BrowserPageUsage>;

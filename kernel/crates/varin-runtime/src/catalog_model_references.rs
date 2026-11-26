@@ -639,6 +639,13 @@ impl Catalog {
             target: serde_json::from_str(&target)?,
         })
     }
+    pub fn holds_model_reference(&self, reference: &str, holder: &str) -> Result<bool> {
+        let (kind, number) = parse(reference)?;
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM model_reference_holders h JOIN model_references r ON r.id=h.reference_id WHERE r.id=?1 AND r.kind=?2 AND h.holder=?3)",
+            params![sql_number(number)?, kind.prefix(), holder], |row| row.get(0),
+        )?)
+    }
     pub fn retain_model_reference(&mut self, reference: &str, holder: &str) -> Result<()> {
         let (kind, number) = parse(reference)?;
         self.resolve_model_reference(kind, reference)?;

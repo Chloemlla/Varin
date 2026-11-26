@@ -112,14 +112,22 @@ describe("computer routes (BC4)", () => {
     expect(response.body.code).toBe("unavailable");
   });
 
-  it("setting the default target probes the desktop first and persists the id", async () => {
+  it("setting the default target persists the identity without probing", async () => {
     const { app, computers } = fixture();
     const response = await request(app)
       .post("/api/computers/default-target")
       .send({ desktopId: "local-console" });
     expect(response.status).toBe(200);
-    expect(computers.probe).toHaveBeenCalledWith("local-console");
+    expect(computers.probe).not.toHaveBeenCalled();
     expect(computers.setDefaultDesktop).toHaveBeenCalledWith("local-console");
+  });
+
+  it('only explicit catalog refresh forwards remote discovery intent', async () => {
+    const { app, computers } = fixture();
+    await request(app).get('/api/computers').expect(200);
+    await request(app).post('/api/computers/refresh').expect(200);
+    expect(computers.list!.mock.calls).toEqual([[undefined], [{ refresh: true }]]);
+    expect(computers.probe).not.toHaveBeenCalled();
   });
 
   it("default-target rejects a malformed body", async () => {

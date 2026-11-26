@@ -27,6 +27,7 @@ import { ThreadAdapter, ThreadPreAdmissionError } from './thread-adapter.js';
 import { WorkspaceBackendUnavailableError } from './native-workspaces.js';
 import { listThreadSourceRoutes, putThreadSourceRoute, removeThreadSourceRoute, putThreadArrangement, controlThreadBacklog, listThreadFollowupJobs, pendingThreadFollowupRegistrations, cancelThreadFollowupRegistration, updateThreadFollowup, controlThreadFollowup, getThreadFollowup, getThreadFollowupOccurrence, listThreadFollowupOccurrences, listThreadFollowups, registerThreadFollowup } from './thread-followups.js';
 import { controlThreadGoal, listThreadGoals, startThreadGoal, updateThreadGoal } from './thread-goals.js';
+import { isAllowedWhileDraining, type ThreadWriteAdmission } from '../draining-admission.js';
 
 const object = (value: unknown): Record<string, unknown> => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Request must be an object');
@@ -162,7 +163,8 @@ export async function authorizeThreadRoute(method: string, body: Record<string, 
 /** Mounted in the existing authenticated Application Host, shared by Web and Electron. */
 export function registerThreadRoutes(app: Express, adapter: ThreadAdapter, requireAuth: RequestHandler, research?: ThreadResearchAPI, computer?: ThreadComputerAPI, materials?: ThreadMaterialsAPI,
   integrations?: Pick<ReturnType<typeof import('./thread-integrations.js').createThreadIntegrations>, 'submit'>,
-  eventSources?: Pick<import('../extensions/event-sources.js').PluginEventSources, 'discover' | 'validateArrangement'>): void {
+  eventSources?: Pick<import('../extensions/event-sources.js').PluginEventSources, 'discover' | 'validateArrangement'>,
+  writeAdmission?: ThreadWriteAdmission): void {
   const fields: Record<string, readonly string[]> = {
     'observe/interests': ['observationId', 'threadIds'],
     'next-step': ['runtime', 'threadId', 'branchId', 'runId', 'headId'],
@@ -198,7 +200,7 @@ export function registerThreadRoutes(app: Express, adapter: ThreadAdapter, requi
     'source/set-default': ['runtime', 'threadId', 'branchId', 'source', 'expectedRevision'],
     'source/files': ['runtime', 'threadId', 'branchId', 'source', 'query', 'type', 'limit', 'cursor'],
     'source/draft-files': ['source', 'query', 'type', 'limit', 'cursor'],
-    'source/list': ['runtime', 'threadId', 'branchId'],
+    'source/list': ['runtime', 'threadId', 'branchId', 'refresh'],
     'source/resolve': ['runtime', 'threadId', 'branchId', 'resourceOwner', 'path'],
     'source/prepare': ['selection', 'resourceOwner', 'runtime', 'threadId', 'branchId', 'key', 'workspaceId', 'mode', 'content', 'captureScopes'],
     'context/compact': ['runtime', 'threadId', 'branchId', 'key', 'throughId', 'expectedRevision', 'model'],
@@ -279,7 +281,16 @@ export function registerThreadRoutes(app: Express, adapter: ThreadAdapter, requi
   fields['operation/retrieval-trace'] = ['operationId', 'headId', 'beforeId'];
   fields['operation/retrieval-file'] = ['operationId', 'itemId', 'path'];
   const post = (method: string, mode: 'read' | 'write', action: (body: Record<string, unknown>, signal: AbortSignal) => Promise<unknown>) => {
-    app.post(`/api/threads/${method}`, requireAuth, async (request, response) => {
+    const route = `/api/threads/${method}`;
+    const gate = mode === 'write' && !isAllowedWhileDraining('POST', route) ? writeAdmission : undefined;
+    app.post(route, requireAuth, async (request, response) => {
+      if (gate && (response.destroyed || response.writableEnded)) return;
+      const release = gate?.begin();
+      if (gate && !release) {
+        response.setHeader('Retry-After', '1');
+        response.status(503).json({ code:'host-draining', admission:'not_started', error:'Host is draining; new work is not accepted' });
+        return;
+      }
       const controller = new AbortController();
       const closed = () => { if (!response.writableEnded) controller.abort(new DOMException('Request closed', 'AbortError')); };
       response.once('close', closed);
@@ -336,7 +347,7 @@ export function registerThreadRoutes(app: Express, adapter: ThreadAdapter, requi
         response.status(status).json({ code, error: code === 'extension-host-unavailable' ? 'The local extension process is unavailable. Restart Varin; if it persists, reinstall the application.'
           : code === 'agent-profile-unavailable' ? 'The selected Agent is unavailable. Choose an enabled Agent for this work focus.' : 'Thread request could not be completed',
           ...admission });
-      } finally { response.removeListener('close', closed); }
+      } finally { response.removeListener('close', closed); release?.(); }
     });
   };
   const selection = (body: Record<string, unknown>): ThreadResearchSelection => ({ ...identity(body), sourceRunId: text(body.sourceRunId) });
@@ -672,7 +683,11 @@ export function registerThreadRoutes(app: Express, adapter: ThreadAdapter, requi
   post('navigate', 'write', (body, signal) => adapter.navigate({ ...identity(body), key: text(body.key), expectedHeadId: body.expectedHeadId === null ? null : text(body.expectedHeadId), targetHeadId: body.targetHeadId === null ? null : text(body.targetHeadId), ...(body.undoOf === undefined ? {} : { undoOf: text(body.undoOf) }) }, signal));
   post('fork', 'write', (body, signal) => adapter.fork({ ...identity(body), key: text(body.key), headId: body.headId === null ? null : text(body.headId) }, signal));
   post('branch/delete', 'write', (body, signal) => adapter.deleteBranch({ ...identity(body), key: text(body.key) }, signal));
-  post('source/list', 'read', (body, signal) => adapter.listSourceTargets(Object.keys(body).length ? identity(body) : null, signal));
+  post('source/list', 'read', (body, signal) => {
+    const {refresh,...selection} = body;
+    if (refresh !== undefined && typeof refresh !== 'boolean') throw new Error('Invalid source refresh mode');
+    return adapter.listSourceTargets(Object.keys(selection).length ? identity(selection) : null, signal, refresh !== false);
+  });
   post('source/set-default', 'write', (body, signal) => adapter.setBranchWorkspace(identity(body),
     revision(body.expectedRevision), body.source === null ? null : threadSource(body.source), signal));
   post('source/resolve', 'read', (body, signal) => adapter.resolveSource(identity(body), { resourceOwner: parseSourceResourceOwner(body.resourceOwner), path: text(body.path) }, signal));

@@ -68,6 +68,7 @@ export interface WebUiServerController {
   expressApp: Express;
   getPort(): number;
   getQuitRiskStatus(): Promise<QuitRiskStatus>;
+  getHostActivity(signal?: AbortSignal): Promise<import('./lib/lifecycle/host-activity.js').HostActivity>;
   getTunnelUrl(): string | null;
   getExternalIngressStatus(): { origin: string; host: string; port: number; enabled: boolean; error?: string } | null;
   setExternalIngressEnabled(enabled: boolean): Promise<void>;

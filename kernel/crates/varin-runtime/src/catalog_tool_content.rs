@@ -500,6 +500,25 @@ impl Catalog {
     }
 }
 
+impl Catalog {
+    /// A model's disclosure gateway retains model authority. Script callbacks
+    /// and policy graphs retain their own origins.
+    pub fn model_tool_origin(&self, run_id: &str, origin: &ToolOrigin) -> Result<bool> {
+        match origin {
+            ToolOrigin::ModelStep { .. } => Ok(true),
+            ToolOrigin::NestedCall { parent_operation_id } => {
+                let parent = self.operation(parent_operation_id)?;
+                Ok(parent.run_id == run_id
+                    && parent.phase == OperationPhase::Running
+                    && !parent.cancel_requested
+                    && parent.executor.as_deref() == Some(crate::tool_disclosure::INVOKE)
+                    && matches!(ToolIntent::from_operation(&parent)?.origin(), ToolOrigin::ModelStep { .. }))
+            }
+            _ => Ok(false),
+        }
+    }
+}
+
 /// Resolve a nested caller through canonical Operation intents. The original model/graph
 /// boundary remains the only frozen directory/source authority; IDs are never parsed.
 pub(super) fn root_tool_context(

@@ -29,6 +29,7 @@ import { threadComposerKey, threadHostKey, useThreadStore } from '@/stores/useTh
 import { useThreadDraftStore } from '@/stores/useThreadDraftStore';
 import { useUIStore } from '@/stores/useUIStore';
 import { useDeviceInfo } from '@/lib/device';
+import { varinSurfaceRuntime } from '@/lib/extensions/surface-runtime';
 import { noteSwitchDirection } from '@/lib/motion/switchDirection';
 import { activationPoint, type RecentPointer } from '@/lib/motion/pointer';
 import { BotNameDialog } from '@/components/sections/bots/BotNameDialog';
@@ -50,8 +51,8 @@ import { useBotStage } from './useBotStage';
 import { BotFigure } from './BotFigure';
 import { BotMobileTitle } from './BotMobileTitle';
 import { BotNavigator } from './BotNavigator';
-import { BotGroupChat, GroupChatCreate, GroupFaces } from './BotGroupChat';
-import { groupLabel, useBotGroupChats } from './botGroupChatModel';
+import { BotGroupChat, GroupChatCreate } from './BotGroupChat';
+import { groupLabel, groupMemberCount, useBotGroupChats } from './botGroupChatModel';
 import type { BotSessionAction } from './BotSessionMenu';
 import { BotPanel } from './BotPanel';
 import { useBotWorkspaces } from './useBotWorkspaces';
@@ -147,7 +148,8 @@ const BotWorkspace: React.FC<{ committed: boolean }> = ({ committed }) => {
   const [conversationPanelMounted, setConversationPanelMounted] = React.useState(Boolean(conversationTab));
   React.useEffect(() => { if (conversationTab) setConversationPanelMounted(true); }, [conversationTab]);
   const closeConversationPanel = () => useUIStore.getState().closeContextPanel(BOT_CONVERSATION_PANEL_SCOPE);
-  const { isMobile } = useDeviceInfo();
+  const device = useDeviceInfo();
+  const isMobile = device.isMobile || varinSurfaceRuntime.surface === 'mobile';
   const { threads, bots: botsAPI } = useRuntimeAPIs();
   const navigation = useBotNavigation();
   const selectedDraftKey = useThreadStore(state => state.selectedDraftKey);
@@ -461,8 +463,8 @@ const BotWorkspace: React.FC<{ committed: boolean }> = ({ committed }) => {
     if (returned.focus) focusTab(returned.focus.tab, returned.focus.id);
   }, [committed, returned, selectedId, focusTab]);
 
-  const openSession = React.useCallback((identity: ThreadIdentity) => {
-    if (!selected) return;
+  const openSession = React.useCallback((identity: ThreadIdentity, botId = selected?.id) => {
+    if (!botId) return;
     dismissDraft();
     opening.current?.abort();
     setBusy(false);
@@ -471,7 +473,7 @@ const BotWorkspace: React.FC<{ committed: boolean }> = ({ committed }) => {
     noteSwitchDirection(order.indexOf(identity.threadId) - order.indexOf(selectedEntry?.threadId ?? ''));
     if (floating) setNarrowPanelOpen(false);
     if (floatingSidebar) useUIStore.getState().setSidebarOpen(false);
-    void openBotConversation(selected.id, identity).catch((cause: unknown) => setError(message(cause)));
+    void openBotConversation(botId, identity).catch((cause: unknown) => setError(message(cause)));
   }, [selected, sessionsWithWork, selectedEntry, floating, floatingSidebar, dismissDraft]);
 
   const openWork = React.useCallback((identity: ThreadIdentity, origin?: BotReturnPoint['focus']) => {
@@ -647,11 +649,10 @@ const BotWorkspace: React.FC<{ committed: boolean }> = ({ committed }) => {
     }
   }, [selectedId, focusTab]);
 
-  const newSession = React.useCallback(async () => {
-    if (!selected) return;
+  const newSession = React.useCallback(async (bot = selected) => {
+    if (!bot) return;
     dismissDraft();
     const host = getRuntimeEndpointGeneration();
-    const bot = selected;
     setActionBusy(`session:${bot.id}`);
     setError(null);
     try {
@@ -660,6 +661,7 @@ const BotWorkspace: React.FC<{ committed: boolean }> = ({ committed }) => {
       setSessionResult(current => current?.botId === bot.id && 'items' in current ? { botId: bot.id, items: [...current.items, session] } : current);
       noteSwitchDirection(1);
       await openBotConversation(bot.id, session.identity);
+      useUIStore.getState().setSessionSwitcherOpen(false);
       void useThreadStore.getState().loadCatalog().catch(() => {});
       refreshWork();
     } catch (cause) {
@@ -753,9 +755,10 @@ const BotWorkspace: React.FC<{ committed: boolean }> = ({ committed }) => {
 
   const navigator = () => <BotNavigator bots={bots} organization={organization} selectedId={selectedId} sessions={sessionsWithWork} current={!currentGroup && !activeDraftKey && ownsConversation ? selectedEntry : null}
     figures={figures} busy={busy || actionBusy !== null} showArchived={showArchived} isMobile={isMobile} sessionTitle={sessionTitleOf}
-    groupChats={groupChats.groups} currentGroup={currentGroup?.id ?? null} onGroup={id => { useUIStore.getState().closeMainSurfaces(); setGroupId(id); }}
+    groupChats={groupChats.groups} currentGroup={currentGroup?.id ?? null} onGroup={id => { useUIStore.getState().closeMainSurfaces(); useUIStore.getState().setSessionSwitcherOpen(false); setGroupId(id); }}
     onCreateGroup={() => setCreatingGroup(true)}
-    onSelectBot={id => { setGroupId(null); selectBot(id); }} onSelectSession={identity => { setGroupId(null); openSession(identity); }} onNewSession={() => { setGroupId(null); void newSession(); }}
+    onSelectBot={id => { setGroupId(null); selectBot(id); }} onSelectSession={(identity, botId) => { setGroupId(null); openSession(identity, botId); }}
+    onNewSession={bot => { setGroupId(null); void newSession(bot); }}
     onSessionAction={(session, identity, action) => { void sessionAction(session, identity, action); }}
     onBotAction={(bot, action) => { void mutateBot(bot, action); }} onCreateBot={openCreateDialog}
     onToggleArchived={() => setShowArchived(value => !value)} onRefresh={refresh} onOpenSettings={openSettings} />;
@@ -826,11 +829,6 @@ const BotWorkspace: React.FC<{ committed: boolean }> = ({ committed }) => {
       refresh();
     }} /> : null}
     {details ? <React.Suspense fallback={null}><BotDetailsDialog bot={details} onClose={() => { setDetails(null); refresh(); }} /></React.Suspense> : null}
-    {isMobile && <Dialog open={Boolean(conversationTab)} onOpenChange={open => { if (!open) closeConversationPanel(); }}>
-      <DialogContent showCloseButton={false} className="flex h-[85dvh] max-w-full flex-col gap-0 p-0"><DialogHeader className="sr-only"><DialogTitle>{t('conversationTools.title')}</DialogTitle></DialogHeader>
-        <div className="min-h-0 flex-1"><React.Suspense fallback={null}>{conversationTools(true)}</React.Suspense></div>
-      </DialogContent>
-    </Dialog>}
   </div>;
 
   const workspaceArea = (visible: boolean) => shownPanel && <BotWorkspaceArea model={shownPanel} active={committed && !settingsOpen && visible} expanded={spaceExpanded} onExpand={() => setSpaceExpanded(value => !value)} />;
@@ -841,23 +839,27 @@ const BotWorkspace: React.FC<{ committed: boolean }> = ({ committed }) => {
         <div ref={setGroupPanelTarget} className="h-full min-h-0" />
       </BotPanel>
     : placement === 'drawer'
-    ? <div className="flex h-full min-h-0 flex-col bg-background">{workspaceArea(visible)}</div>
+    ? conversationTab ? <React.Suspense fallback={null}>{conversationTools(true)}</React.Suspense> : <div className="flex h-full min-h-0 flex-col bg-background">{workspaceArea(visible)}</div>
     : <><BotPanel model={panelModel} open={!conversationTab && panelVisible && panelModel !== null} floating={floating}
       workspace={Boolean(spaces.activeKey)} expanded={Boolean(spaces.activeKey) && spaceExpanded}
       onOpenChange={open => { if (floating) setNarrowPanelOpen(open); else setPanelOpen(open); }}>{workspaceArea(!conversationTab && panelVisible)}</BotPanel>
       {conversationPanelMounted && !isMobile && <React.Suspense fallback={null}>{conversationTools()}</React.Suspense>}</>;
 
   return <ConversationToolsContext.Provider value={{ identity: !currentGroup && ownsConversation && !activeDraftKey ? selectedEntry : null, target: conversationTarget, mode: selectedConversationTab?.mode, bots: bots ?? [], bot: selected ?? undefined }}><BotWorkspaceNavigationContext.Provider value={spaces}><MainLayout renderNavigator={navigator} renderConversation={conversation} renderSecondaryPanel={secondaryPanel}
-    scheduledTasksGroup={currentGroup}
-    secondaryPanelFocus={!currentGroup && spaces.activeKey ? `${spaces.activeKey}:${spaces.focusRevision}` : null}
-    secondaryPanelLabel={currentGroup?.name ?? t('bot.panel.aria')} secondaryPanelToggleLabels={{ open: t('bot.panel.open'), close: t('bot.panel.close') }}
+    scheduledTasksGroup={currentGroup} mobileConversationKey={currentGroup?.id ?? activeDraftKey ?? (selectedEntry && workKey(selectedEntry))} mobileIdentity={!currentGroup && !activeDraftKey && ownsConversation ? selectedEntry : null}
+    secondaryPanelFocus={!currentGroup && conversationTab ? conversationTab.id : !currentGroup && spaces.activeKey ? `${spaces.activeKey}:${spaces.focusRevision}` : null}
+    onMobileDetailClose={conversationTab ? closeConversationPanel : undefined}
+    secondaryPanelLabel={currentGroup?.name ?? t(conversationTab ? 'conversationTools.title' : 'bot.panel.aria')}
     navigationTitle={currentGroup?.name ?? navigationTitle} navigationSubtitle={currentGroup ? currentGroup.members.map(member => member.name).join('、') : navigationSubtitle}
     headerPanelControl={panelControl} sidebarAttention={sidebarAttention}
     floatingSidebar={floatingSidebar}
-    renderMobileTitle={isMobile && currentGroup ? panel => <button className="flex min-w-0 items-center gap-2" type="button" aria-expanded={panel.open} onClick={panel.toggle}><GroupFaces group={currentGroup} bots={bots ?? []} /><span className="truncate">{currentGroup.name}</span></button>
-      : isMobile && selected && line ? panel => <BotMobileTitle bot={selected} model={shownPanel} figure={figure} line={line} open={panel.open} onToggle={panel.toggle} /> : undefined} />
+    renderMobileTitle={panel => currentGroup
+      ? <BotMobileTitle title={currentGroup.name} caption={groupMemberCount(currentGroup.members.length)} label={groupLabel('openPanel')} open={panel.open} onToggle={panel.toggle}
+          members={currentGroup.members.map(m => ({ id: m.botId, name: m.name, bot: bots?.find(b => b.id === m.botId) }))} />
+      : selected && <BotMobileTitle title={navigationTitle} caption={selected.name} label={t('bot.panel.aria')} open={panel.open} onToggle={panel.toggle}
+          members={[{ id: selected.id, name: selected.name, bot: selected }]} />} />
     <GroupChatCreate bots={bots ?? []} open={creatingGroup} onClose={() => setCreatingGroup(false)} onCreated={group => {
-      setCreatingGroup(false); setGroupId(group.id); groupChats.refresh();
+      setCreatingGroup(false); setGroupId(group.id); useUIStore.getState().setSessionSwitcherOpen(false); groupChats.refresh();
     }} />
     {currentGroup && details ? <React.Suspense fallback={null}><BotDetailsDialog bot={details} onClose={() => { setDetails(null); refresh(); }} /></React.Suspense> : null}
   </BotWorkspaceNavigationContext.Provider></ConversationToolsContext.Provider>;

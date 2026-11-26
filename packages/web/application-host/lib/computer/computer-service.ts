@@ -192,6 +192,7 @@ const parseDesktop = (record: KernelRecordResult): ComputerDesktop | null => {
       status: (["available", "unavailable", "stopped"].includes(record.state) ? record.state : "unavailable") as ComputerDesktop["status"],
       ...(asString(raw.statusDetail) ? { statusDetail: raw.statusDetail as string } : {}),
       ...(isObject(raw.capabilities) ? { capabilities: raw.capabilities as unknown as ComputerCapabilities } : {}),
+      ...(asString(raw.probedAt) ? { probedAt: raw.probedAt as string } : {}),
       // Remote mirror (BC6): calls route to the owning Host, never a local driver.
       ...(isObject(raw.remote) && asString(raw.remote.connectionId) && asString(raw.remote.desktopId) && asString(raw.remote.hostId)
         ? { remote: { connectionId: raw.remote.connectionId as string, desktopId: raw.remote.desktopId as string, hostId: raw.remote.hostId as string } }
@@ -556,7 +557,7 @@ export interface ComputerService {
   prepareDesktop(params: ComputerDesktopPrepareParams, dispatch?: ComputerDesktopDispatch): Promise<ComputerDesktopChangeResult>;
   desktopLifecycle(desktopId: string, action: "start" | "stop", dispatch?: ComputerDesktopDispatch): Promise<ComputerDesktopChangeResult>;
   mediaTarget(desktopId: string): Promise<{ socketPath: string } | { url: string; headers: Record<string, string> }>;
-  list(options?: { localOnly?: boolean }): Promise<ComputerListResult>;
+  list(options?: { localOnly?: boolean; refresh?: boolean }): Promise<ComputerListResult>;
   /** Read known driver support without launching or warming desktop helpers. */
   applicationToolAvailability(): Promise<{ browser: boolean; office: boolean }>;
   workDesktops(scopeId: string): Promise<ComputerDesktop[]>;
@@ -721,7 +722,7 @@ export function createComputerService(options: ComputerServiceOptions): Computer
   let disposed = false;
   const serviceLifetime = new AbortController();
   let localReady: Promise<{ machine: ComputerMachine; desktop: ComputerDesktop }> | null = null;
-  let localProbe: Promise<ComputerDesktop> | null = null;
+  const capabilityProbes = new Map<string, Promise<ComputerDesktop>>();
   /** Retained semantic references; screenshot freshness is tracked independently below. */
   const observations = new Map<string, Map<string, ComputerObservation>>();
   const coordinateObservations = new Map<string, string>();
@@ -1428,6 +1429,7 @@ export function createComputerService(options: ComputerServiceOptions): Computer
               kind: "remote-session",
               ...(remoteDesktop.statusDetail ? { statusDetail: remoteDesktop.statusDetail } : {}),
               ...(remoteDesktop.capabilities ? { capabilities: remoteDesktop.capabilities as unknown as Record<string, unknown> } : {}),
+              ...(remoteDesktop.probedAt ? { probedAt: remoteDesktop.probedAt } : {}),
               remote: { connectionId: host.id, desktopId: remoteDesktop.id, hostId: primary.coordinatorHostId },
               ...(mirroredUsage ? { usage: mirroredUsage } : {}),
               ...(mirroredWork ? { work: mirroredWork } : {}),
@@ -1618,8 +1620,7 @@ export function createComputerService(options: ComputerServiceOptions): Computer
   };
   const prewarm = async (desktopId?: string): Promise<void> => {
     const id = await resolveDesktopId(desktopId);
-    if (await remoteTargetFor(id)) { await probe(id); return; }
-    await Promise.all([driverPool.acquire(id), driverPool.acquire(id, 'capture')]);
+    await probe(id);
   };
 
   const applicationToolAvailability: ComputerService['applicationToolAvailability'] = async () => {
@@ -1634,14 +1635,12 @@ export function createComputerService(options: ComputerServiceOptions): Computer
   };
   const list: ComputerService["list"] = async (listOptions) => {
     await ensureLocal();
-    await refreshManagedDesktop();
-    // Refresh remote mirrors before reading the catalog — remote truth wins
-    // status, and an unreachable Host leaves an unavailable mirror (BC6).
-    if (!listOptions?.localOnly) await syncRemote();
-    localProbe ??= probe(LOCAL_DESKTOP_ID);
-    // Probe failures are stored in the catalog and presented as unavailable.
-    // Reading a catalog does not require the user to visit Settings first.
-    await localProbe.catch(() => undefined);
+    // Directory reads are local metadata. A deliberate refresh can discover
+    // peer catalogs and managed status without driving any desktop helper.
+    if (listOptions?.refresh) {
+      await refreshManagedDesktop();
+      if (!listOptions.localOnly) await syncRemote();
+    }
     const [machines, desktops] = await Promise.all([
       listRecords("computer.machine"),
       listRecords("computer.desktop"),
@@ -1693,19 +1692,25 @@ export function createComputerService(options: ComputerServiceOptions): Computer
   const setDefaultDesktop: ComputerService["setDefaultDesktop"] = async (desktopId) => {
     if (!targetFile) return;
     if (desktopId) {
+      await ensureLocal();
       await desktopRecord(desktopId); // never persist a target that doesn't exist
     }
     await mkdir(options.dataDir as string, { recursive: true });
     const temp = `${targetFile}.${randomUUID()}.tmp`;
     await writeFile(temp, JSON.stringify({ desktopId: desktopId ?? null }), "utf8");
     await rename(temp, targetFile);
-    if (desktopId) void prewarm(desktopId).catch(error => console.error('[Computer] Desktop preparation failed:', error instanceof Error ? error.message : String(error)));
   };
 
   const resolveDesktopId = async (requested?: string, frozenDefault?: string | null): Promise<string> => {
-    if (requested) return requested;
-    const configured = frozenDefault === undefined ? await defaultDesktop() : frozenDefault;
-    if (configured) return configured;
+    const selected = requested || (frozenDefault === undefined ? await defaultDesktop() : frozenDefault);
+    if (selected) {
+      if (selected.startsWith('remote:') && options.remoteHosts) {
+        await ensureLocal();
+        const known = await (await scoped()).getRecord(COMPUTER_CATALOG_WORKSPACE_ID, `computer.desktop:${selected}`);
+        if (!known) await syncRemote();
+      }
+      return selected;
+    }
     const { desktops } = await list();
     const ready = desktops.filter((desktop) => desktop.status === "available");
     if (ready.length === 1) return ready[0]!.id;
@@ -1729,12 +1734,13 @@ export function createComputerService(options: ComputerServiceOptions): Computer
     });
     const desktopState = "unavailable";
     const detail = driverAvailable
-      ? "Desktop capabilities have not been probed in this Host process."
+      ? "Desktop capabilities have not been probed."
       : "No platform driver found for this machine.";
     const priorDesktop = await (await scoped())
       .getRecord(COMPUTER_CATALOG_WORKSPACE_ID, `computer.desktop:${LOCAL_DESKTOP_ID}`)
       .catch(() => null);
-    const priorUsage = priorDesktop ? parseDesktop(priorDesktop)?.usage : undefined;
+    const previous = priorDesktop ? parseDesktop(priorDesktop) : null;
+    const priorUsage = previous?.usage;
     if (priorDesktop) {
       const raw = JSON.parse(priorDesktop.payloadJson) as Record<string, unknown>;
       if (isObject(raw.control) && raw.control.owner === "human") {
@@ -1745,13 +1751,15 @@ export function createComputerService(options: ComputerServiceOptions): Computer
         };
       }
     }
-    const desktopResult = await putRecord(`computer.desktop:${LOCAL_DESKTOP_ID}`, "computer.desktop", desktopState, {
+    const desktopResult = await putRecord(`computer.desktop:${LOCAL_DESKTOP_ID}`, "computer.desktop", previous?.status ?? desktopState, {
       id: LOCAL_DESKTOP_ID,
       machineId: LOCAL_MACHINE_ID,
       label: "Console session",
       kind: "console",
       ...(priorUsage ? { usage: priorUsage } : {}),
-      ...(detail ? { statusDetail: detail } : {}),
+      ...(previous?.capabilities ? { capabilities: previous.capabilities } : {}),
+      ...(previous?.probedAt ? { probedAt: previous.probedAt } : {}),
+      statusDetail: previous ? previous.statusDetail : detail,
     });
     const machineRecord = await (await scoped()).getRecord(COMPUTER_CATALOG_WORKSPACE_ID, `computer.machine:${LOCAL_MACHINE_ID}`);
     const machine = machineRecord ? parseMachine(machineRecord) : null;
@@ -1768,8 +1776,7 @@ export function createComputerService(options: ComputerServiceOptions): Computer
     return localReady;
   };
 
-  const probe: ComputerService["probe"] = async (desktopId) => {
-    const id = await resolveDesktopId(desktopId);
+  const probeDesktop = async (id: string): Promise<ComputerDesktop> => {
     const remote = await remoteTargetFor(id);
     if (remote) {
       const result = await remoteJson<{ desktop?: ComputerDesktop }>(
@@ -1785,6 +1792,7 @@ export function createComputerService(options: ComputerServiceOptions): Computer
           remote: { connectionId: remote.connection.id, desktopId: remote.remoteId, hostId: remote.desktop.remote!.hostId },
           ...(remoteDesktop?.statusDetail ? { statusDetail: remoteDesktop.statusDetail } : {}),
           ...(remoteDesktop?.capabilities ? { capabilities: remoteDesktop.capabilities as unknown as Record<string, unknown> } : {}),
+          ...(remoteDesktop?.probedAt ? { probedAt: remoteDesktop.probedAt } : {}),
           ...(remote.desktop.usage ? { usage: remote.desktop.usage } : {}),
           ...((remoteDesktop?.managed ?? remote.desktop.managed) ? { managed: remoteDesktop?.managed ?? remote.desktop.managed } : {}),
           ...((remoteDesktop?.media ?? remote.desktop.media) ? { media: remoteDesktop?.media ?? remote.desktop.media } : {}),
@@ -1806,6 +1814,7 @@ export function createComputerService(options: ComputerServiceOptions): Computer
           label: desktop.label,
           kind: desktop.kind,
           capabilities: capabilities as unknown as Record<string, unknown>,
+          probedAt: new Date().toISOString(),
           ...(capabilities.detail ? { statusDetail: capabilities.detail } : {}),
           ...(desktop.usage ? { usage: desktop.usage } : {}),
           ...(desktop.managed ? { managed: desktop.managed } : {}),
@@ -1821,6 +1830,8 @@ export function createComputerService(options: ComputerServiceOptions): Computer
         label: desktop.label,
         kind: desktop.kind,
         statusDetail: message,
+        probedAt: new Date().toISOString(),
+        ...(desktop.capabilities ? { capabilities: desktop.capabilities } : {}),
         ...(desktop.usage ? { usage: desktop.usage } : {}),
         ...(desktop.managed ? { managed: desktop.managed } : {}),
         ...(desktop.media ? { media: desktop.media } : {}),
@@ -1828,6 +1839,16 @@ export function createComputerService(options: ComputerServiceOptions): Computer
       if (error instanceof HarnessServiceError) throw error;
       throw new HarnessServiceError("unavailable", message);
     }
+  };
+
+  const probe: ComputerService['probe'] = async desktopId => {
+    const id = await resolveDesktopId(desktopId);
+    const current = capabilityProbes.get(id);
+    if (current) return current;
+    const reading = probeDesktop(id);
+    capabilityProbes.set(id, reading);
+    try { return await reading; }
+    finally { if (capabilityProbes.get(id) === reading) capabilityProbes.delete(id); }
   };
 
   const listApps: ComputerService["listApps"] = async (desktopId) => {
@@ -3183,6 +3204,11 @@ export function createComputerService(options: ComputerServiceOptions): Computer
   // --- BC5: frame subscription --------------------------------------------
 
   const FRAME_INTERVAL_MS = 250;
+  const retireCapture = (id: string, entry: DesktopViewers) => {
+    if (entry.frameViewers.size || entry.polling) return;
+    if (!entry.viewers.size && viewers.get(id) === entry) viewers.delete(id);
+    void driverPool.releaseCapture(id).catch(() => undefined);
+  };
   const pollFrame = async (desktopId: string): Promise<void> => {
     const entry = viewers.get(desktopId);
     if (!entry || entry.frameViewers.size === 0 || entry.polling) return;
@@ -3190,6 +3216,7 @@ export function createComputerService(options: ComputerServiceOptions): Computer
     try {
       const frame = await (async () => {
         const { driver } = await driverFor(desktopId, "capture");
+        if (!entry.frameViewers.size || viewers.get(desktopId) !== entry) throw new Error("Desktop capture no longer has an observer");
         const response = await driver.request({ tool: "capture_frame" });
         if (!response.ok || !response.frame) {
           throw new Error(response.error ?? "desktop capture produced no frame");
@@ -3201,7 +3228,7 @@ export function createComputerService(options: ComputerServiceOptions): Computer
         return { mime, base64: raw.base64, bounds, capturedAt: raw.capturedAt ?? new Date().toISOString() } satisfies ComputerDesktopFrame;
       })().catch((error: unknown): Error => (error instanceof Error ? error : new Error(String(error))));
       const current = viewers.get(desktopId);
-      if (!current) return;
+      if (current !== entry || !current.frameViewers.size) return;
       if (frame instanceof Error) {
         entry.failures += 1;
         if (entry.failures >= 2) {
@@ -3224,6 +3251,7 @@ export function createComputerService(options: ComputerServiceOptions): Computer
       }
     } finally {
       entry.polling = false;
+      retireCapture(desktopId, entry);
     }
   };
 
@@ -3292,6 +3320,7 @@ export function createComputerService(options: ComputerServiceOptions): Computer
       return () => { controller.abort(); };
     }
     await desktopRecord(id);
+    subscription?.signal?.throwIfAborted();
     const lane = laneFor(id);
     // A reconnecting holder gets its control marked reachable again.
     if (lane.control.owner === "human" && lane.control.holderId === viewerId && !lane.control.reachable) {
@@ -3341,6 +3370,7 @@ export function createComputerService(options: ComputerServiceOptions): Computer
         current.timer = null;
       }
       broadcastControl(id);
+      retireCapture(id, current);
     };
   };
 

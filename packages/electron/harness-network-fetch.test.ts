@@ -16,6 +16,7 @@ function pending(init: RequestInit = {}) {
 
 it('returns the status, byte-valued headers and streaming body of a Chromium response', async () => {
   const { outbound, response } = pending();
+  outbound.emit('close'); // Electron finishes the writable before headers can arrive.
   const incoming = Object.assign(new PassThrough(), { statusCode: 401, headers: {
     'x-model': '\u6a21\u578b', 'x-label': 'caf\xe9', 'www-authenticate': 'Bearer realm="mcp"',
     '\u6a21': 'ignored', 'set-cookie': ['one=1', 'two=2'],
@@ -49,12 +50,15 @@ it.each(['response', 'redirect'])('rejects and closes when the %s cannot be cons
   expect(outbound.abort).toHaveBeenCalledOnce();
 });
 
-it("settles an early close and keeps the caller's abort reason when abort also emits close", async () => {
+it("propagates a Chromium error after upload and keeps the caller's abort reason", async () => {
   const first = pending();
+  const disconnected = new Error('net::ERR_CONNECTION_RESET');
   first.outbound.emit('close');
-  await expect(first.response).rejects.toThrow('closed before receiving a response');
+  first.outbound.emit('error', disconnected);
+  await expect(first.response).rejects.toBe(disconnected);
   const controller = new AbortController();
   const second = pending({ signal: controller.signal });
+  second.outbound.emit('close');
   const reason = new Error('cancelled');
   controller.abort(reason);
   await expect(second.response).rejects.toBe(reason);

@@ -55,8 +55,12 @@ export class ExtensionPackageManager {
   // Populated only after matching or materializing our own distribution, never by installation.
   readonly #distributionArtifacts = new Map<string, string>();
 
+  hasVerifiedDistributionArtifact(extensionId: string, integrity: string): boolean {
+    return this.#distributionArtifacts.get(extensionId) === integrity;
+  }
+
   async isDistributionArtifact(extensionId: string, integrity: string): Promise<boolean> {
-    if (this.#distributionArtifacts.get(extensionId) === integrity) return true;
+    if (this.hasVerifiedDistributionArtifact(extensionId, integrity)) return true;
     // Frozen child selections bypass reconciliation. Verify their original immutable index
     // against this distribution without installing or changing the selected package.
     const fingerprintFile = VARIN_BUILTIN_ARTIFACT_FINGERPRINT_FILE;

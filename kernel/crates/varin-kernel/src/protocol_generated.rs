@@ -1177,6 +1177,7 @@ pub(crate) struct ManagedProcessBeginParams {
     pub(crate) operation_id: String,
     pub(crate) execution_owner: varin_runtime::ExecutorOwner,
     pub(crate) node: varin_runtime::catalog::managed_process::NodeBinding,
+    pub(crate) prepared_source: Option<LaunchSource>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1910,6 +1911,7 @@ pub(crate) struct InputHandleParams {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct LaunchSelectParams {
+    pub(crate) lazy_work_location: Option<LazyWorkLocationParams>,
     pub(crate) run_id: String,
     #[serde(deserialize_with = "required_nullable")]
     pub(crate) source: RequiredNullable<LaunchSourceParams>,
@@ -4207,6 +4209,7 @@ pub(crate) struct InitialContext {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct SubmitLaunch {
+    pub(crate) lazy_work_location: Option<LazyWorkLocationParams>,
     pub(crate) agent: Option<varin_runtime::catalog::launches::AgentSelection>,
     pub(crate) inherit_source: Option<bool>,
     #[serde(deserialize_with = "required_nullable")]
@@ -4365,6 +4368,14 @@ pub(crate) struct UsageCurrentPrice {
     pub(crate) provider_id: String,
     pub(crate) model_id: String,
     pub(crate) pricing: varin_runtime::catalog::usage_ledger::UsagePricing,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct LazyWorkLocationParams {
+    pub(crate) resource_owner: varin_runtime::catalog::launches::SourceResourceOwner,
+    pub(crate) path: String,
+    pub(crate) workspace_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

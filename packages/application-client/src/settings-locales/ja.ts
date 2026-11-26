@@ -574,6 +574,8 @@ export const settingsDict = {
   'settings.remoteInstances.clientAuth.qrDialogTitle': 'スキャンして接続',
 'settings.remoteInstances.clientAuth.actions.addDevice': 'デバイスを追加',
   'settings.remoteInstances.clientAuth.actions.copied': 'コピーしました',
+  'settings.remoteInstances.clientAuth.field.lanAddress': 'ローカルネットワークアドレス',
+  'settings.remoteInstances.clientAuth.actions.copyAddress': 'アドレスをコピー',
   'settings.remoteInstances.clientAuth.addDevice.transportLabel': 'このデバイスをどこで使いますか?',
   'settings.remoteInstances.clientAuth.addDevice.subtitle': 'このサーバーに別のデバイスを接続する使い捨てQRコードを作成します。',
   'settings.remoteInstances.clientAuth.addDevice.transport.local': 'このコンピュータのみ',

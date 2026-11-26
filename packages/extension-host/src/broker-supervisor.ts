@@ -27,6 +27,7 @@ import {
   type VarinExtensionStorageSnapshot,
   type VarinExtensionStorageAddress,
   type VarinExtensionServiceRoutingContext,
+  type VarinExtensionServiceRoutingSnapshot,
   type VarinHostServiceComposition,
   type VarinHostServiceDependencyBinding,
   canonicalServiceComposition,
@@ -52,7 +53,7 @@ import {
 import { ServiceRoutingStore } from './service-routing-store.js';
 import { resolveDeclaredServiceRouting } from './runtime-contracts.js';
 import { compositionHash, compositionForNode, createHostCompositionPlan, restoreHostCompositionPlan, resolveHostRequirement,
-  type HostCompositionNode, type HostCompositionPlan } from './service-composition.js';
+  HostCompositionPreparationRequiredError, type HostCompositionNode, type HostCompositionPlan } from './service-composition.js';
 
 // One identity per actual process, never per recreated Runtime object.
 const HOST_PROCESS_ID = randomUUID();
@@ -676,6 +677,25 @@ export class BrokeredHostSupervisor {
       : await this.#directoryPlan(extensionId, scope, signal, selection);
     return this.prepareComposition(plan, signal, frozen === undefined);
   }
+
+  /** A directory shares its selection snapshot across roots. Only a package
+   * that still needs materialization or distribution verification plans afresh. */
+  async prepareDirectoryExtension(extensionId: string, scope: VarinExtensionServiceRoutingContext,
+    catalog: VarinExtensionCatalogSnapshot, routing: VarinExtensionServiceRoutingSnapshot, signal: AbortSignal): Promise<HostCompositionLease> {
+    signal.throwIfAborted();
+    let plan: HostCompositionPlan;
+    try { plan = createHostCompositionPlan(catalog, routing, extensionId, scope); }
+    catch (error) {
+      if (!(error instanceof HostCompositionPreparationRequiredError)) throw error;
+      return this.prepareExtension(extensionId, scope, signal);
+    }
+    if (plan.composition.nodes.some(node =>
+      catalog.extensions.find(entry => entry.manifest.id === node.extensionId)?.source.kind === 'builtin'
+      && !this.#packages.hasVerifiedDistributionArtifact(node.extensionId, node.artifactIntegrity))) {
+      return this.prepareExtension(extensionId, scope, signal);
+    }
+    return this.prepareComposition(plan, signal);
+  }
   #directoryPlan(extensionId: string, scope: VarinExtensionServiceRoutingContext, signal?: AbortSignal, selection?: { catalog: number; routing: number }): Promise<HostCompositionPlan> {
     if (!signal || !selection) return this.#plan(extensionId, scope);
     const group = this.#directoryPlans.get(signal) ?? new Map<string, Promise<HostCompositionPlan>>();
@@ -804,7 +824,7 @@ export class BrokeredHostSupervisor {
       const instance = await this.#prepareInstance(node.entry, {
         capabilityGrants: candidate?.capabilityGrants ?? node.entry.capabilityGrants,
         integrity: node.node.artifactIntegrity, manifest, slot: node.slot, version: node.node.extensionVersion,
-      }, await this.#catalog.snapshot(), { instanceKey, dependencies, dependencyPins,
+      }, { instanceKey, dependencies, dependencyPins,
         composition: compositionForNode(node), signal });
       // A selected package depending on an unpublished candidate is itself unpublished.
       const staged = node.slot === 'candidate' || dependencyPins.some(pin => this.#services.getSnapshot().providers
@@ -814,7 +834,10 @@ export class BrokeredHostSupervisor {
       });
       try {
         await this.#assertCurrent(instance);
-        if (!staged) { await this.#commitInstanceStorage(instance); await this.#assertCurrent(instance); }
+        if (!staged && [...instance.storages.values()].some(session => session.transaction)) {
+          await this.#commitInstanceStorage(instance);
+          await this.#assertCurrent(instance);
+        }
         publication.commit();
         instance.published = !staged;
         this.#active.set(instanceKey, instance);
@@ -1291,7 +1314,6 @@ export class BrokeredHostSupervisor {
       slot: "candidate" | "selected";
       version: string;
     },
-    snapshot: VarinExtensionCatalogSnapshot,
     composition: { instanceKey: string; composition: VarinHostServiceComposition; dependencies: VarinHostServiceDependencyBinding[]; dependencyPins: HostServicePin[]; signal: AbortSignal },
   ): Promise<BrokeredHostInstance> {
     this.#assertRunning();
@@ -1304,7 +1326,8 @@ export class BrokeredHostSupervisor {
     composition.signal.addEventListener('abort', abort, { once: true });
     if (composition.signal.aborted) abort();
     try {
-      const current = (await this.#catalog.snapshot()).extensions.find((value) => value.manifest.id === entry.manifest.id);
+      const snapshot = await this.#catalog.snapshot();
+      const current = snapshot.extensions.find((value) => value.manifest.id === entry.manifest.id);
       if (current) this.#restartAdmission(current, selection.slot);
       const currentSelection = selection.slot === "candidate" ? current?.candidate : current;
       if (!current?.desired.enabled || current.desired.revision !== entry.desired.revision

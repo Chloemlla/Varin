@@ -475,3 +475,41 @@ fn context_assembly_accepts_an_empty_host_directory_but_rejects_added_capabiliti
     drop(runtime);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn remembered_location_builds_native_routes_without_acquiring_a_source() {
+    let root = std::env::temp_dir().join(format!("lazy-location-{}", uuid::Uuid::new_v4()));
+    let mut catalog = varin_runtime::Catalog::open(&root).unwrap();
+    catalog.create_thread("thread", "branch").unwrap();
+    let receipt = catalog.submit(&varin_runtime::SubmitInput {
+        key: "input".into(), thread_id: "thread".into(), branch_id: "branch".into(),
+        expected_head: None, input: json!("Pure conversation"),
+        configuration: json!({"providerFamily":"openai-responses",
+            "endpoint":"https://fixture.invalid/responses","allowAnonymous":true,
+            "model":"fixture","configurationGeneration":1}),
+    }).unwrap();
+    let run = catalog.run(&receipt.run_id).unwrap();
+    let runtime = Arc::new(RunSupervisor::new(catalog));
+    let (assembly, _frames) = assembly(runtime.clone());
+    let prepare = || RunPreparation::new(serde_json::from_value(json!({"runId":run.id})).unwrap(), &run).unwrap();
+    let selected = |path: &str| serde_json::from_value(json!({
+        "runId":run.id, "source":null, "enabledTools":["file_read","file_list","file_write"],
+        "lazyWorkLocation":{"resourceOwner":{"kind":"local"},"path":path}
+    })).unwrap();
+    assert!(assembly.prepare(prepare(), Some(selected("not-absolute")), || false).is_err());
+    let PreparedLaunch::Selection(selected_receipt) = assembly.prepare(prepare(), Some(selected("/absent/remembered")), || false).unwrap()
+        else { panic!("selection receipt required") };
+    assert!(selected_receipt["selection"]["source"].is_null());
+    assert_eq!(selected_receipt["selection"]["lazy_work_location"], json!({"resource_owner":{"kind":"local"},"path":"/absent/remembered"}));
+    assert!(assembly.prepare(prepare(), Some(selected("/different")), || false).is_err());
+    let PreparedLaunch::Start(start) = assembly.prepare(prepare(), None, || false).unwrap()
+        else { panic!("native start required") };
+    assert!(start.binding.tools.iter().any(|tool| tool.name == "work_locations" && tool.version == "2"));
+    assert!(start.binding.tools.iter().any(|tool| tool.name == "file_write"
+        && tool.version == "3" && tool.requirements.is_none()));
+    let persisted = runtime.catalog().lock().unwrap().launch_intent(&run.id).unwrap().unwrap();
+    assert!(persisted.selection.source.is_none());
+    assert_eq!(persisted.selection.lazy_work_location.unwrap().path, "/absent/remembered");
+    drop(start); drop(assembly); drop(runtime);
+    std::fs::remove_dir_all(root).unwrap();
+}

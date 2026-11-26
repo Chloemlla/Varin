@@ -7,6 +7,7 @@ import type { KernelClient } from './kernel-client.js';
 import type { LaunchSource } from './protocol.generated.js';
 import type { AgentRuntimeClient } from './agent-runtime-client.js';
 import { createScriptRuntime } from './script-runtime.js';
+import * as nodeBinding from './script-node-binding.js';
 
 // Original declaration/routing/preparation/retention consumer. The provider snapshots
 // and pins are controlled; this fixture does not execute tools or issue source grants.
@@ -35,6 +36,12 @@ function fixture(warm: boolean, configuration: Pick<ExtensionToolOwnerOptions, '
       return { assertAvailable() {}, release() { pins--; }, revocationSignal: signal, async invoke() { throw new Error('Preparation must not execute'); } };
     } } as unknown as HostServiceBinding;
   };
+  const prepareService = async (request: { serviceId: string; routing: VarinExtensionServiceRoutingContext }) => {
+    routing.push(structuredClone(request.routing));
+    const provider = providers.find(candidate => candidate.providerId === request.serviceId)!;
+    if (!live.includes(provider)) live.push(provider);
+    return bind(request.serviceId);
+  };
   const runtime = {
     async state() { return { revision: 1, catalog: { authoritative: true, extensions: [{ desired: { enabled: true }, integrity: 'fixture-artifact',
       manifest: { id: extensionId, entrypoints: { host: {} }, provides: { services: descriptors } } }] },
@@ -48,15 +55,13 @@ function fixture(warm: boolean, configuration: Pick<ExtensionToolOwnerOptions, '
       return {routingRevision:0,services:[{providerKey:provider.providerKey,
         descriptor:descriptors.find(descriptor=>descriptor.id===request.serviceId),composition}]};
     },
-    async prepareService(request: { serviceId: string; routing: VarinExtensionServiceRoutingContext }) {
-      routing.push(structuredClone(request.routing));
-      const provider = providers.find(candidate => candidate.providerId === request.serviceId)!;
-      if (!live.includes(provider)) live.push(provider);
-      return bind(request.serviceId);
+    prepareService,
+    prepareDirectoryServices(slots: { serviceId: string }[], scope: VarinExtensionServiceRoutingContext) {
+      return Promise.allSettled(slots.map(slot => prepareService({ serviceId: slot.serviceId, routing: scope })));
     },
     subscribe: () => () => {},
   } as unknown as ApplicationExtensionRuntime;
-  return { prepare: createExtensionTools({ runtime, kernel: {} as KernelClient, currentPolicy: async () => ({ mode: 'normal', rules: [] }), ...configuration }), pins: () => pins, routing };
+  return { providers: () => live.length, prepare: createExtensionTools({ runtime, kernel: {} as KernelClient, currentPolicy: async () => ({ mode: 'normal', rules: [] }), ...configuration }), pins: () => pins, routing };
 }
 const source = (mode: LaunchSource['mode']): LaunchSource => ({ resource_owner: {kind:'local'}, mode, workspace_id: 'workspace', execution_workspace_id: 'execution',
   branch_id: mode === 'live_root' ? null : 'branch', revision: mode === 'live_root' ? null : 1, environment_run_id: null,
@@ -75,6 +80,7 @@ it('warm and cold/dynamic ordinary discovery project owning source dependencies 
       await vi.waitFor(() => expect(scope.inspect().filter(entry => entry.status === 'ready' || entry.status === 'unavailable')).toHaveLength(4));
       expect(scope.inspect().filter(entry => entry.status === 'ready').map(entry => entry.prepared!.tool.name).sort()).toEqual(expected);
       expect(f.pins()).toBe(expected.length);
+      if (!warm) expect(f.providers()).toBe(expected.length);
       expect(f.routing.length).toBeGreaterThan(0);
       for (const context of f.routing) expect(context).toEqual({ threadId: 'thread', branchId: 'history-branch', sourceRunId: 'run' });
       for (const entry of scope.inspect().filter(entry => entry.status === 'unavailable')) expect(entry.error).toContain('extension_tool_source_unavailable');
@@ -104,4 +110,33 @@ it('failed Node configuration is local to actual scripts and leaves unrelated so
     } finally { scope.close(); for (const lease of scope.initial) lease.lease.release(); }
     expect(f.pins()).toBe(0);
   } finally { Object.defineProperty(process, 'execPath', original); await scripts.dispose(); }
+});
+
+it('does not hash any evaluator for cold or fixed launches, and restores only the Catalog version when physical', async () => {
+  const restored = { executable: '/fixture/node', worker_path: '/fixture/worker.js', worker_identity: 'hash', configuration_identity: 'saved' };
+  const fresh = vi.spyOn(nodeBinding, 'resolveScriptNodeBinding').mockResolvedValue({ ...restored, configuration_identity: 'fresh' });
+  const restore = vi.spyOn(nodeBinding, 'restoreScriptNodeBinding').mockResolvedValue(restored);
+  const remote = vi.fn(() => { throw new Error('An absent or fixed Source cannot probe its Host'); });
+  const scripts = createScriptRuntime({ kernel: {} as KernelClient,
+    runtime: { onEvent: () => () => {}, onReady: () => () => {}, managedSource: remote } as unknown as AgentRuntimeClient,
+    resolveLiveSource: async () => { throw new Error('Preparation cannot acquire a Source'); }, onError: error => { throw error; } });
+  const declaration = SCRIPT_TOOL_DECLARATIONS[0]!;
+  const required = [{ extensionId: 'varin.builtin.scripts', serviceId: declaration.id, serviceVersion: declaration.version, configurationIdentity: 'saved' }] as never;
+  try {
+    for (const selected of [null, source('fixed_branch'), {
+      ...source('fixed_branch'),
+      resource_owner: { kind: 'managed_host' as const, hostId: 'fixed', connectionId: 'connection', endpointIdentity: 'endpoint' },
+    }]) {
+      const resolve = await scripts.prepareConfiguration(() => 'unrelated', selected, required);
+      expect(() => resolve(declaration, 'saved')).toThrow('Original script Node binding is unavailable');
+    }
+    expect(fresh).not.toHaveBeenCalled(); expect(restore).not.toHaveBeenCalled(); expect(remote).not.toHaveBeenCalled();
+    const resumed = await scripts.prepareConfiguration(() => 'unrelated', source('live_root'), required);
+    expect(resumed(declaration, 'saved')).toBe('saved');
+    expect(restore).toHaveBeenCalledExactlyOnceWith('saved');
+    expect(fresh).not.toHaveBeenCalled();
+    const opened = await scripts.prepareConfiguration(() => 'unrelated', source('live_root'));
+    expect(opened(declaration)).toBe('fresh');
+    expect(fresh).toHaveBeenCalledTimes(1);
+  } finally { fresh.mockRestore(); restore.mockRestore(); await scripts.dispose(); }
 });

@@ -15,6 +15,14 @@ ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
   CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
   AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar
 
+FROM kernel-toolchain AS knowledge-migrator
+ARG TARGETARCH
+COPY scripts/trivium-release.json /src/trivium-release.json
+RUN set -eu; \
+  case "$TARGETARCH" in amd64) target=x86_64-unknown-linux-gnu ;; arm64) target=aarch64-unknown-linux-gnu ;; *) exit 1 ;; esac; \
+  revision="$(sed -n 's/.*"revision": "\([a-f0-9]*\)".*/\1/p' /src/trivium-release.json)"; \
+  cargo install --git https://github.com/Astrmira/TriviumDB.git --rev "$revision" --locked --target "$target" --root /out triviumdb-migrate
+
 FROM kernel-toolchain AS kernel-planner
 COPY kernel ./
 RUN cargo chef prepare --recipe-path /tmp/kernel-recipe.json
@@ -89,23 +97,20 @@ RUN bun run build:frontend
 
 FROM web-build-inputs AS builder
 COPY --from=kernel-builder /out/varin-kernel /tmp/varin-kernel
+COPY --from=knowledge-migrator /out/bin/triviumdb-migrate /tmp/triviumdb-migrate
 # Revision and target affect packaging, not the shared workspace install.
 ARG VARIN_SOURCE_REVISION
 ARG TARGETARCH
 RUN VARIN_SOURCE_REVISION="${VARIN_SOURCE_REVISION}" \
   VARIN_KERNEL_PREBUILT=/tmp/varin-kernel \
+  VARIN_TDB_MIGRATOR_PREBUILT=/tmp/triviumdb-migrate \
   VARIN_TARGET_PLATFORM=linux \
   VARIN_TARGET_ARCH="${TARGETARCH}" \
   bun run build:cloud-runtime -- --output /app/artifacts/cloud-runtime --no-archive --prepared-frontend
 
-# Select the resource-only executable from the same versioned Host/kernel build.
-# The full frontend, Agent entrypoint and Application CLI do not enter the
-# node image. For now both roles share the canonical production dependency lock.
+# Compile once, then stage the closed resource import/dependency graph and its own lock.
 FROM builder AS resource-node-files
-RUN set -eu; \
-  cd /app/artifacts/cloud-runtime; \
-  test -f packages/web/server/resource-node.js; \
-  rm -rf packages/web/dist packages/web/bin packages/web/server/index.js verify-services.mjs
+RUN node scripts/build-resource-node.mjs /app/artifacts/cloud-runtime /app/artifacts/resource-node
 
 FROM ${RUNTIME_BASE_IMAGE} AS resource-node
 WORKDIR /home/varin/app
@@ -118,16 +123,68 @@ ENV HOME=/home/varin \
   VARIN_HOST=0.0.0.0 \
   VARIN_PORT=3000 \
   VARIN_RELEASE_ID=image-${VARIN_SOURCE_REVISION}
-COPY --from=resource-node-files --chown=varin:varin /app/artifacts/cloud-runtime/ ./
+COPY --from=resource-node-files --chown=varin:varin /app/artifacts/resource-node/ ./
 RUN --mount=type=cache,target=/home/varin/.cache/bun,uid=1000,gid=1000 \
   bun install --production --frozen-lockfile --cache-dir=/home/varin/.cache/bun \
-  && test -f packages/web/server/resource-node.js \
-  && test ! -e packages/web/dist \
-  && test ! -e packages/web/server/index.js
+  && node verify-resource-node-install.mjs
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=5 \
-  CMD curl --fail --silent --show-error http://127.0.0.1:3000/health || exit 1
+  CMD ["node", "-e", "fetch('http://127.0.0.1:' + process.env.VARIN_PORT + '/health', { signal: AbortSignal.timeout(4000) }).then(async r => { if (!r.ok || (await r.json()).role !== 'resources') process.exitCode = 1; }).catch(() => { process.exitCode = 1; })"]
 ENTRYPOINT ["node", "packages/web/server/resource-node.js"]
+CMD []
+
+FROM builder AS browser-node-files
+RUN node scripts/build-resource-node.mjs --role browser /app/artifacts/cloud-runtime /app/artifacts/browser-node
+
+FROM ${RUNTIME_BASE_IMAGE} AS browser-node
+WORKDIR /home/varin/app
+ARG VARIN_SOURCE_REVISION
+LABEL io.varin.image.role="browser"
+ENV HOME=/home/varin \
+  NODE_ENV=production \
+  VARIN_DATA_DIR=/home/varin/.config/varin \
+  VARIN_HOST=0.0.0.0 \
+  VARIN_PORT=3000 \
+  VARIN_RELEASE_ID=image-${VARIN_SOURCE_REVISION}
+COPY --from=browser-node-files --chown=varin:varin /app/artifacts/browser-node/ ./
+RUN --mount=type=cache,target=/home/varin/.cache/bun,uid=1000,gid=1000 \
+  bun install --production --frozen-lockfile --cache-dir=/home/varin/.cache/bun \
+  && node verify-resource-node-install.mjs
+EXPOSE 3000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=5 \
+  CMD ["node", "-e", "fetch('http://127.0.0.1:' + process.env.VARIN_PORT + '/health', { signal: AbortSignal.timeout(4000) }).then(async r => { if (!r.ok || (await r.json()).role !== 'browser') process.exitCode = 1; }).catch(() => { process.exitCode = 1; })"]
+ENTRYPOINT ["node", "packages/web/server/browser-node.js"]
+CMD []
+
+FROM builder AS computer-node-files
+RUN node scripts/build-resource-node.mjs --role computer /app/artifacts/cloud-runtime /app/artifacts/computer-node
+
+FROM ${RUNTIME_BASE_IMAGE} AS computer-node
+WORKDIR /home/varin/app
+# The Linux driver imports PyGObject/AT-SPI at startup and uses GDK for
+# X11 capture. Install these only on the dedicated Computer role. Desktop,
+# display credentials and the session bus still belong to the deployment.
+USER root
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends at-spi2-core gir1.2-atspi-2.0 gir1.2-gtk-3.0 python3-gi \
+  && rm -rf /var/lib/apt/lists/*
+USER varin
+ARG VARIN_SOURCE_REVISION
+LABEL io.varin.image.role="computer"
+ENV HOME=/home/varin \
+  NODE_ENV=production \
+  VARIN_DATA_DIR=/home/varin/.config/varin \
+  VARIN_HOST=0.0.0.0 \
+  VARIN_PORT=3000 \
+  VARIN_RELEASE_ID=image-${VARIN_SOURCE_REVISION}
+COPY --from=computer-node-files --chown=varin:varin /app/artifacts/computer-node/ ./
+RUN --mount=type=cache,target=/home/varin/.cache/bun,uid=1000,gid=1000 \
+  bun install --production --frozen-lockfile --cache-dir=/home/varin/.cache/bun \
+  && node verify-resource-node-install.mjs
+EXPOSE 3000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=5 \
+  CMD ["node", "-e", "fetch('http://127.0.0.1:' + process.env.VARIN_PORT + '/health', { signal: AbortSignal.timeout(4000) }).then(async r => { if (!r.ok || (await r.json()).role !== 'computer') process.exitCode = 1; }).catch(() => { process.exitCode = 1; })"]
+ENTRYPOINT ["node", "packages/web/server/computer-node.js"]
 CMD []
 
 # This stage runs on TARGETPLATFORM. Installing the canonical runtime tree here

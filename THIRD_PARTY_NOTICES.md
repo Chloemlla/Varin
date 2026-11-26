@@ -5,6 +5,11 @@ upstream portions and do not make Varin as a whole available under the MIT Licen
 fonts, icons, and other separately distributed components remain under the licenses shipped with
 their respective packages or source files.
 
+## TriviumDB migration tool
+
+Full Host distributions include the upstream `triviumdb-migrate` executable under Apache-2.0.
+The matching license is shipped beside it as `TriviumDB-LICENSE`. [TriviumDB source](https://github.com/Astrmira/TriviumDB)
+
 ## Native workspace filesystem bindings
 
 The optional `workspace-mount` source feature uses `winfsp` 0.13.2+winfsp-2.1 and

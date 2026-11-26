@@ -121,7 +121,7 @@ fn submit_input_with_original_source(
         .transpose()?;
     if !host_authority {
         if let Some(launch) = launch.as_mut() {
-            if launch.source.is_some() { return Err(KernelError::Authorization("Member work cannot acquire Host resources".into())); }
+            if launch.source.is_some() || launch.lazy_work_location.is_some() { return Err(KernelError::Authorization("Member work cannot acquire Host resources".into())); }
             launch.tools.clear();
             launch.child_dispatch = None;
         }
@@ -141,8 +141,10 @@ fn submit_input_with_original_source(
     // declarations. Old launches and already accepted requests stay immutable.
     let bot = preparation.scope().is_some_and(|scope| scope.mode == "bot");
     let mut available = if host_authority { crate::run_tools::builtin_schemas(&crate::tools::ToolKind::all().collect(), plan_eligible, true, bot) } else { Vec::new() };
-    if host_authority && crate::work_locations::eligible(preparation.inherited_tool_source(launch.as_ref())) {
-        crate::work_locations::add_schemas(&mut available);
+    let inherited = preparation.inherited_tool_source(launch.as_ref());
+    let lazy = inherited.is_none() && preparation.inherited_lazy_work_location(launch.as_ref()).is_some();
+    if host_authority && (crate::work_locations::eligible(inherited) || lazy) {
+        crate::work_locations::add_location_schemas(&mut available, lazy);
     }
     let prepared = preparation.with_tool_catalog(available).load(launch, inherit_source).map_err(domain)?;
     if cancelled.load(Ordering::Acquire) {
@@ -223,14 +225,18 @@ pub(super) fn selected_launch(
             })
         })
         .transpose()?;
-    if source.is_none() && kinds.iter().any(|kind| *kind!=crate::tools::ToolKind::FileRead) {
+    let lazy_work_location = selected.lazy_work_location.map(crate::work_locations::lazy_location).transpose()?;
+    if lazy_work_location.is_some() && (source.is_some() || !kinds.contains(&crate::tools::ToolKind::FileRead)) {
+        return Err(KernelError::Protocol("lazy work requires only routed native tools and no concrete source".into()));
+    }
+    if source.is_none() && lazy_work_location.is_none() && kinds.iter().any(|kind| *kind!=crate::tools::ToolKind::FileRead) {
         return Err(KernelError::Protocol(
             "selected tools require a source owner".into(),
         ));
     }
     let mut tools = crate::run_tools::builtin_schemas(&kinds, plan_eligible, true, bot);
-    if kinds.contains(&crate::tools::ToolKind::FileRead) && crate::work_locations::eligible(source.as_ref()) {
-        crate::work_locations::add_schemas(&mut tools);
+    if kinds.contains(&crate::tools::ToolKind::FileRead) && (crate::work_locations::eligible(source.as_ref()) || lazy_work_location.is_some()) {
+        crate::work_locations::add_location_schemas(&mut tools, lazy_work_location.is_some());
     }
     Ok::<_, KernelError>(varin_runtime::catalog::launches::LaunchSelection {
             driver: varin_runtime::driver::DriverSelection::default(),
@@ -245,7 +251,7 @@ pub(super) fn selected_launch(
         provider_family: configuration.provider_family,
         model: configuration.model,
         configuration_generation: configuration.configuration_generation,
-        tool_schema_generation: if source.is_some() {
+        tool_schema_generation: if source.is_some() || lazy_work_location.is_some() {
             configuration.configuration_generation
         } else {
             0
@@ -253,6 +259,7 @@ pub(super) fn selected_launch(
         tools,
         policy: crate::observations::default_policy_identity(),
         source,
+        lazy_work_location,
     })
 }
 

@@ -178,6 +178,7 @@ export function ThreadComposer({ editorRef, value, onChange, interactions, model
   const settings = (section?: string) => { const ui = useUIStore.getState(); ui.setSettingsDialogOpen(true); if (section) ui.setSettingsPage(section as Parameters<typeof ui.setSettingsPage>[0]); };
   const chooseModel = async (provider: string, model: string, thinking: ThreadThinkingLevel, complete = false) => {
     const capturedScope = scope;
+    setCommandError(undefined);
     try { await onModelChange(provider, model, thinking); if (complete && capturedScope === currentIdentity.current) consumeFragment(); }
     catch (cause) { if (capturedScope === currentIdentity.current) setCommandError(cause instanceof Error ? cause.message : String(cause)); }
   };
@@ -238,16 +239,24 @@ export function ThreadComposer({ editorRef, value, onChange, interactions, model
   const languageContext = React.useMemo(() => ({ inputMode: 'normal' as const, knownAgentNames, confirmedMentions,
     knownSlashNames: new Set([...skills.map(name => `skill:${name}`), ...varinCommands.map(command => command.name)]), attachmentFilenames: attachmentNames, imageReferences }), [knownAgentNames, confirmedMentions, skills, varinCommands, attachmentNames, imageReferences]);
   const modelControls = <div className="conversation-composer-configuration flex min-w-0 flex-wrap items-center justify-end gap-x-2 gap-y-0.5">
-        {external && <ExternalModelControls key={backendIdentity} options={external} />}
-        {backendControls ?? <>
-        {(selected?.thinkingLevels?.length ?? 0) > 1 && <DropdownMenu><DropdownMenuTrigger asChild>
-          <button type="button" disabled={modelDisabled} className="flex items-center gap-1.5 rounded-md px-2 py-1 typography-meta text-muted-foreground hover:bg-interactive-hover" aria-label={t('chat.modelControls.thinking')}>
-            <Icon name="brain" className="size-3.5" /><SwapText text={t(`settings.agents.thinking.${thinkingLevel}`)} hold={0} resize />
-          </button>
-        </DropdownMenuTrigger><DropdownMenuContent side="top" align="end">
-          {selected!.thinkingLevels!.map(level => <DropdownMenuItem key={level} onSelect={() => void chooseModel(providerId, modelId, level)}>{t(`settings.agents.thinking.${level}`)}{level === thinkingLevel && <Icon name="check" className="ml-auto size-3.5" />}</DropdownMenuItem>)}
-        </DropdownMenuContent></DropdownMenu>}
-        {selected?.thinkingLevels?.length === 1 && thinkingLevel !== 'off' ? <span className="flex items-center gap-1.5 px-2 typography-meta text-muted-foreground"><Icon name="brain" className="size-3.5" />{t(`settings.agents.thinking.${thinkingLevel}`)}</span> : null}
+    {external && <ExternalModelControls key={backendIdentity} options={external} />}
+    {backendControls ?? <>
+      <div className={isMobile ? 'flex min-w-0 max-w-full items-center gap-0.5' : 'contents'}>
+        {(selected?.thinkingLevels?.length ?? 0) > 1 && <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <button type="button" disabled={modelDisabled} className="flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 typography-meta text-muted-foreground hover:bg-interactive-hover" aria-label={t('chat.modelControls.thinking')}>
+              <Icon name="brain" className="size-3.5" /><SwapText text={t(`settings.agents.thinking.${thinkingLevel}`)} hold={0} resize />
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent side="top" align="end">
+            {selected!.thinkingLevels!.map(level => <DropdownMenuItem key={level} onSelect={() => void chooseModel(providerId, modelId, level)}>
+              {t(`settings.agents.thinking.${level}`)}{level === thinkingLevel && <Icon name="check" className="ml-auto size-3.5" />}
+            </DropdownMenuItem>)}
+          </DropdownMenuContent>
+        </DropdownMenu>}
+        {selected?.thinkingLevels?.length === 1 && thinkingLevel !== 'off' ? <span className="flex shrink-0 items-center gap-1.5 px-2 typography-meta text-muted-foreground">
+          <Icon name="brain" className="size-3.5" />{t(`settings.agents.thinking.${thinkingLevel}`)}
+        </span> : null}
         <ModelSelector providerId={providerId} modelId={modelId} variant="composer" disabled={modelDisabled} allowNone={false}
           open={modelPickerOpen} onOpenChange={setModelPickerOpen}
           placeholder={t('chat.modelControls.selectModel')} dropdownPortalToBody
@@ -255,8 +264,9 @@ export function ThreadComposer({ editorRef, value, onChange, interactions, model
             const levels = models.find(item => item.providerId === provider && item.modelId === model)?.thinkingLevels ?? ['off'];
             void chooseModel(provider, model, levels.includes(thinkingLevel) ? thinkingLevel : levels[0] ?? 'off');
           }} />
-        {agentControls}
-        </>}
+      </div>
+      {agentControls}
+    </>}
   </div>;
   const groupMentions = groupDelivery?.members.filter(member => member.label.toLocaleLowerCase().includes(autocomplete?.query.toLocaleLowerCase() ?? ''));
   const groupComposer = Boolean(groupDelivery);
@@ -421,11 +431,6 @@ export function ThreadComposer({ editorRef, value, onChange, interactions, model
           {t(external.delivery.mode === 'steer' ? 'external.sendCurrentTurn' : 'external.sendNextTurn')} · {t('external.nextTurnOptionsHint')}
         </p>}
 
-          {isMobile && !groupDelivery ? (
-            <div className="flex min-w-0 items-center justify-end border-b border-border/40 px-2 py-1">
-              {modelControls}
-            </div>
-          ) : null}
           <ComposerEditor
             key={identityKey}
             ref={bindEditor}
@@ -518,7 +523,8 @@ export function ThreadComposer({ editorRef, value, onChange, interactions, model
             onFileSelect={handleFileSelect} onClose={closeMenu} /> : null}
           </AnimatePresence>
 
-          <motion.div layout={reducedMotion ? false : 'position'} layoutDependency={isExpandedInput} transition={COMPOSER_LAYOUT_TRANSITION} data-chat-input-footer="true" className="conversation-composer-footer px-2 pb-2 pt-0.5">
+          <motion.div layout={reducedMotion ? false : 'position'} layoutDependency={isExpandedInput} transition={COMPOSER_LAYOUT_TRANSITION} data-chat-input-footer="true"
+            data-mobile-model-toolbar={isMobile && !groupDelivery ? '' : undefined} className="conversation-composer-footer px-2 pb-2 pt-0.5">
             <div className="conversation-composer-options">
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
@@ -564,7 +570,7 @@ export function ThreadComposer({ editorRef, value, onChange, interactions, model
               <WorkbenchContributionSlot kind="composer-action" slot={VARIN_CONVERSATION_SLOTS.composerLeading} props={{ identityKey, workspacePath, text: value, onChange, onSend: submit }} />
             </div>
 
-            {groupDelivery ? <div className="group-composer-delivery">{groupDelivery.control}</div> : !isMobile ? <div className="conversation-composer-models">{modelControls}</div> : null}
+            {groupDelivery ? <div className="group-composer-delivery">{groupDelivery.control}</div> : <div className="conversation-composer-models">{modelControls}</div>}
             <div className="conversation-composer-actions">
               <WorkbenchContributionSlot kind="composer-action" slot={VARIN_CONVERSATION_SLOTS.composerTrailing} props={{ identityKey, workspacePath, text: value, onChange, onSend: submit }} />
               <ComposerDictation

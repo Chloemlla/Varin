@@ -108,7 +108,7 @@ const maxScrollTop = (node: HTMLElement): number => Math.max(0, node.scrollHeigh
 
 export const ChatTimeline: React.FC<ChatTimelineProps> = (props) => {
   const { t } = useI18n();
-  const promptNavigatorEnabled = useUIStore(state => state.promptNavigatorEnabled);
+  const showTurnNavigator = useUIStore(state => state.promptNavigatorEnabled && !state.isMobile);
   const renderMode = useUIStore(state => state.chatRenderMode);
   const sortedMessages = renderMode === 'sorted';
   const dialogueMessages = renderMode === 'dialogue';
@@ -1164,9 +1164,9 @@ export const ChatTimeline: React.FC<ChatTimelineProps> = (props) => {
     <ToolTargetScope entries={props.entries} executions={props.toolExecutions}>
     <ChatToolDisclosureScope key={props.sessionId} sessionId={props.sessionId}><ChatContextMenu {...props} projection={projection} onRevealEntry={revealEntry}>
     <div ref={surfaceRef} className="conversation-timeline-surface relative isolate flex min-h-0 flex-1">
-      {promptNavigatorEnabled && props.navigation ? <ChatTurnNavigator ref={turnNavigatorRef} runs={props.navigation.runs}
+      {showTurnNavigator && props.navigation ? <ChatTurnNavigator ref={turnNavigatorRef} runs={props.navigation.runs}
         initialRunId={props.navigation.runs.at(-1)?.runId} readPreview={readRunPreview} onSelect={selectRun} /> : null}
-      {promptNavigatorEnabled && props.navigation?.error && <button type="button" className="absolute left-2 top-2 z-20 text-muted-foreground"
+      {showTurnNavigator && props.navigation?.error && <button type="button" className="absolute left-2 top-2 z-20 text-muted-foreground"
         aria-label={t('chat.promptNavigator.unavailable')} title={t('chat.promptNavigator.unavailable')} onClick={() => void props.navigation?.retry()}>
         <Icon name="error-warning" className="size-3.5" />
       </button>}

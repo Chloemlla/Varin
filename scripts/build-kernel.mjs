@@ -32,19 +32,6 @@ const prebuilt = process.env.VARIN_KERNEL_PREBUILT?.trim();
 const targetTriple = target ?? defaultKernelTargetTriple(platform, arch);
 const expectedTriple = defaultKernelTargetTriple(platform, arch);
 if (targetTriple !== expectedTriple) throw new Error(`Kernel target triple ${targetTriple} does not match ${platform}/${arch} (${expectedTriple}).`);
-const windowsQuote = (value) => `"${String(value).replaceAll('"', '""')}"`;
-const locateVsDevCmd = () => {
-  if (process.platform !== 'win32' || process.env.INCLUDE) return null;
-  const roots = [process.env['ProgramFiles(x86)'], process.env.ProgramFiles]
-    .filter(Boolean)
-    .flatMap((base) => [
-      path.join(base, 'Microsoft Visual Studio', '2022', 'BuildTools', 'Common7', 'Tools', 'VsDevCmd.bat'),
-      path.join(base, 'Microsoft Visual Studio', '2022', 'Community', 'Common7', 'Tools', 'VsDevCmd.bat'),
-      path.join(base, 'Microsoft Visual Studio', '2022', 'Professional', 'Common7', 'Tools', 'VsDevCmd.bat'),
-      path.join(base, 'Microsoft Visual Studio', '2022', 'Enterprise', 'Common7', 'Tools', 'VsDevCmd.bat'),
-    ]);
-  return roots.find((candidate) => fs.existsSync(candidate)) ?? null;
-};
 const executable = platform === 'win32' ? 'varin-kernel.exe' : 'varin-kernel';
 let source;
 if (prebuilt) {
@@ -57,26 +44,14 @@ if (prebuilt) {
   const cargoTarget = target || platform !== process.platform || arch !== hostArch ? targetTriple : undefined;
   const cargoArgs = ['build', '--manifest-path', path.join(root, 'kernel', 'Cargo.toml'), '--release', '--bin', 'varin-kernel', '--locked'];
   if (cargoTarget) cargoArgs.push('--target', cargoTarget);
-  const vsDevCmd = locateVsDevCmd();
-  const useWindowsEnvironment = process.platform === 'win32' && vsDevCmd;
-  const command = useWindowsEnvironment ? 'cmd.exe' : (process.platform === 'win32' ? 'cargo.exe' : 'cargo');
-  const commandArgs = useWindowsEnvironment
-    ? ['/d', '/s', '/c', `set "VARIN_KERNEL_BUILD_IDENTITY=${buildIdentity.replaceAll('"', '')}" && set "VARIN_KERNEL_TARGET=${targetTriple.replaceAll('"', '')}" && set "VARIN_KERNEL_ARCH=${arch.replaceAll('"', '')}" && call ${windowsQuote(vsDevCmd)} -arch=${arch} -host_arch=${hostArch} && cargo.exe ${cargoArgs.map(windowsQuote).join(' ')}`]
-    : cargoArgs;
-  const result = useWindowsEnvironment
-    ? spawnSync(commandArgs[3], {
-      cwd: root,
-      stdio: 'inherit',
-      windowsHide: true,
-      env: { ...rustEnvironment, VARIN_KERNEL_BUILD_IDENTITY: buildIdentity, VARIN_KERNEL_TARGET: targetTriple, VARIN_KERNEL_ARCH: arch },
-      shell: true,
-    })
-    : spawnSync(command, commandArgs, {
-      cwd: root,
-      stdio: 'inherit',
-      windowsHide: true,
-      env: { ...rustEnvironment, VARIN_KERNEL_BUILD_IDENTITY: buildIdentity, VARIN_KERNEL_TARGET: targetTriple, VARIN_KERNEL_ARCH: arch },
-    });
+  const environment = process.platform === 'win32' && platform === 'win32'
+    ? require('./windows-msvc.cjs').windowsMsvcEnvironment(arch, rustEnvironment)
+    : rustEnvironment;
+  const result = spawnSync(process.platform === 'win32' ? 'cargo.exe' : 'cargo', cargoArgs, {
+    cwd: root, stdio: 'inherit', windowsHide: true,
+    env: { ...environment, VARIN_KERNEL_BUILD_IDENTITY: buildIdentity, VARIN_KERNEL_TARGET: targetTriple, VARIN_KERNEL_ARCH: arch },
+  });
+  if (result.error) throw result.error;
   if (result.status !== 0) process.exit(result.status ?? 1);
   const targetDirectory = process.env.CARGO_TARGET_DIR ? path.resolve(root, process.env.CARGO_TARGET_DIR) : path.join(root, 'kernel', 'target');
   source = path.join(targetDirectory, ...(cargoTarget ? [cargoTarget] : []), 'release', executable);

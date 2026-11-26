@@ -2,12 +2,16 @@ import { originalToolOutput } from './model-reference.test-helper.js';
 import { toolOperationId } from './protocol.generated.js';
 import { guardProviderReply } from './provider-response.test-helper.js';
 import { responsesMetadataText } from './responses-wire.test-helper.js';
+import { responsesToolResult } from './provider-tool-result.test-helper.js';
+import { remoteExternalReviewTarget } from './remote-external-review.test-helper.js';
+import { createManagedSourceConsumers } from './managed-source-consumers.js';
 import { resourceScopeFixture } from './resource-scope.test-helper.js';
 import { bindFixtureMemory } from './bot-memory-fixture.test-helper.js';
 import { createLiveSourceOwner } from './live-source.js';
 import { createThreadContext } from './thread-context.js';
 import { createAgentPersonalization } from '../memory/agent-personalization.js';
 import { createModelWorkLocations } from './model-work-locations.js';
+import { admitRunSourceAuthority, savedSourceLaunch } from './source-launch.js';
 import { createBotWorkingDirectoryResolver, createConversationWorkLocation, listWorkLocations } from './default-work-location.js';
 import { createThreadSourceDirectory, createThreadSourcePreparer } from './thread-sources.js';
 import { createDocumentAuthority } from '../documents/authority.js';
@@ -115,6 +119,15 @@ async function fixture(reply: (body: Record<string, unknown>, response: ServerRe
 }
 
 const model = { providerId: 'fixture-provider', modelId: 'fixture-model' };
+async function expectCompletion(f: Awaited<ReturnType<typeof fixture>>, runId: string) {
+  await expect.poll(async () => (await f.api.run(runId)).state, { timeout: 15_000 }).toMatch(/completed|failed|cancelled/);
+  const run = await f.api.run(runId);
+  if (run.state !== 'completed') {
+    const events = await f.runtime.events(0, 200);
+    const failures = events.filter(event => event.subject === runId && event.kind.endsWith('failed'));
+    throw new Error(JSON.stringify({ state: run.state, errors: f.launchErrors.map(String), failures }));
+  }
+}
 const messages = (body: Record<string, unknown>) => body.input as Array<{ role?: string; content?: unknown }>;
 const system = (body: Record<string, unknown>) => messages(body).filter(value => value.role === 'system');
 function tool(response: ServerResponse, name: string, args: Record<string, unknown>, serial: number) {
@@ -135,6 +148,7 @@ it('accepts a Bot greeting and uses the restricted Host workspace for file and p
     if (++turn === 1) return done(response);
     if (!output) return tool(response, 'file_read', { path: 'expense-handoff/receipts.csv' }, turn);
     const result = JSON.parse(responsesMetadataText(output.output));
+    expect(result.error, JSON.stringify(result)).toBeUndefined();
     const call = String(output.call_id);
     if (call.startsWith('file_read-')) {
       expect(JSON.stringify(result.content)).toContain('train,18');
@@ -153,6 +167,14 @@ it('accepts a Bot greeting and uses the restricted Host workspace for file and p
   await fs.writeFile(path.join(project, 'receipts.csv'), 'category,amount\ntrain,18\n');
   await f.documents.resolveWorkspace({ path: project });
   const directory = createThreadSourceDirectory({ documents: f.documents });
+  const resolveLocation = vi.spyOn(directory, 'resolve');
+  const locations = createModelWorkLocations({
+    kernel: f.kernel, runtime: f.runtime, directory, prepare: f.prepare,
+    openProcessView: (source, runId, processId, signal) => admitRunSourceAuthority(f.kernel, f.runtime,
+      savedSourceLaunch(runId, source, ['process_inspect', 'process_read']),
+      { operationId: processId, purpose: 'process_view', retention: 'caller', resolveLiveSource: f.liveSources.validate, signal }),
+  });
+  f.kernel.setModelWorkLocationOwner(locations.query);
   const botDirectory = createBotWorkingDirectoryResolver(f.workspaceConfig, f.guard);
   f.runtime.deviceFileAccess = !f.workspaceConfig.lockdown;
   f.runtime.principalCanUseHostResources = async () => true;
@@ -165,13 +187,74 @@ it('accepts a Bot greeting and uses the restricted Host workspace for file and p
     code: 'path-escape', status: 403, message: expect.stringContaining('outside the workspace') });
   await expect(f.api.sources.resolve(identity, { resourceOwner: { kind: 'local' }, path: path.join(project, 'missing') })).rejects.toMatchObject({
     status: 404, message: expect.stringContaining('does not exist') });
+  resolveLocation.mockClear();
   const first = await f.api.submit({ ...identity, key: 'hello', expectedHead: null, text: 'Hello', model });
-  await expect.poll(async () => (await f.api.run(first.run_id)).state, { timeout: 15_000 }).toBe('completed');
+  await expectCompletion(f, first.run_id);
+  expect(resolveLocation).not.toHaveBeenCalled();
+  expect((await f.runtime.launch(first.run_id))?.selection).toMatchObject({
+    source:null,lazy_work_location:{resource_owner:{kind:'local'},path:f.workspace},
+  });
   const head = (await f.runtime.thread(identity.threadId)).branches[0]!.head;
   const next = await f.api.submit({ ...identity, key: 'expenses', expectedHead: head, text: 'Summarize the receipts', model });
-  await expect.poll(async () => (await f.api.run(next.run_id)).state, { timeout: 15_000 }).toBe('completed');
+  await expectCompletion(f, next.run_id);
+  expect(resolveLocation).toHaveBeenCalled();
   expect(await fs.readFile(path.join(project, 'checked.csv'), 'utf8')).toBe('category,total\ntrain,18\n');
   expect(await fs.readdir(home)).toEqual([]);
+}, 45_000);
+
+it.each(['local','managed'] as const)('uses the original PTY for input and resize, and restores files on a dormant %s host', async placement => {
+  let step = 0, processId = '';
+  const outputs: Array<Record<string, unknown>> = [];
+  const f = await fixture(async (body, response) => {
+    const output = lastOutput(body);
+    if (output) outputs.push(responsesToolResult(body)!);
+    switch (++step) {
+      case 1: return tool(response, 'file_write', { path: 'restore-me.txt', content: 'created this turn' }, step);
+      case 2: return tool(response, 'tool_invoke', {name:'recovery_points',arguments:{point:'current:before',paths:['restore-me.txt']}}, step);
+      case 3: return tool(response, 'tool_invoke', {name:'file_restore',arguments:{point:'current:before',paths:['restore-me.txt']}}, step);
+      case 4: return tool(response, 'process_spawn', { command: process.execPath, mode: 'pty', waitMs: 300,
+        args: ['-e', "require('node:readline').createInterface({input:process.stdin}).once('line',line=>{require('node:fs').writeFileSync('terminal.txt',line.trim());process.exit()})"] }, step);
+      case 5:
+        processId = String(outputs[3]?.operation_id);
+        return tool(response, 'tool_invoke', {name:'process_resize', arguments:{processId, cols:96, rows:30}}, step);
+      case 6: return tool(response, 'tool_invoke', {name:'process_write', arguments:{processId,text:'received-input',submit:true}}, step);
+      default: return done(response);
+    }
+  });
+  const target = placement === 'managed' ? await remoteExternalReviewTarget(f.root,{coordinatorHostId:'live-source-review',allowDelete:true}) : undefined;
+  if (target) cleanups.push(() => target.close());
+  const targetPath = target?.directory ?? f.workspace;
+  const registry = target?.registry(f.kernel);
+  if (registry) {
+    f.runtime.bindManagedSources(registry);
+    f.kernel.setManagedSourceOwner(owner=>f.runtime.managedSource(owner),()=>f.runtime.coordinatorHostId);
+  }
+  const remote = registry && createManagedSourceConsumers({coordinatorHostId:()=>f.runtime.coordinatorHostId,registry,
+    withRunAuthority:(runId,source,consume,signal)=>f.runtime.withManagedSourceAuthority(runId,source,consume,signal)}).threads;
+  const resourceOwner = registry ? (await registry.sourceTargets()).targets[0]!.resourceOwner : {kind:'local' as const};
+  const directory = createThreadSourceDirectory({documents:f.documents,...(remote?{remote}:{})});
+  f.kernel.setModelWorkLocationOwner(createModelWorkLocations({ kernel: f.kernel, runtime: f.runtime, directory, prepare: remote?.prepare ?? f.prepare,
+    openProcessView: (source, runId, id, signal) => admitRunSourceAuthority(f.kernel, f.runtime,
+      savedSourceLaunch(runId, source, ['process_inspect','process_read']),
+      { operationId: id, purpose: 'process_view', retention: 'caller', resolveLiveSource: f.liveSources.validate, signal }),
+  }).query);
+  f.runtime.principalCanUseHostResources = async () => true;
+  f.adapter.bindDefaultDeviceSource(async () => ({lazyWorkLocation: {resourceOwner, path: targetPath}}));
+  const identity = await f.api.create('on-demand-terminal-and-restore');
+  const receipt = await f.api.submit({...identity, key:'tools', expectedHead:null, text:'use the terminal and restore the file', model});
+  await expectCompletion(f, receipt.run_id).catch(async error => {
+    const events = (await f.runtime.events(0,300)).filter(e=>e.kind.includes('interrupted') || e.kind.includes('failed'));
+    throw new Error(JSON.stringify({step,outputs:outputs.map(o=>({kind:o.kind,error:o.error,reason:o.reason,content:o.kind==='job_accepted'?undefined:o.content})),events}), {cause:error});
+  });
+  expect(outputs.slice(4,6), JSON.stringify(outputs)).toMatchObject([
+    {outcome:'succeeded',content:{state:'applied'}}, {outcome:'succeeded',content:{state:'applied'}},
+  ]);
+  await expect.poll(() => fs.readFile(path.join(targetPath, 'terminal.txt'), 'utf8')).toBe('received-input');
+  expect(outputs[1], JSON.stringify(outputs[1])).toMatchObject({outcome:'succeeded'});
+  expect(JSON.stringify(outputs[1])).toContain('restore-me.txt');
+  expect(outputs[2], JSON.stringify(outputs[2])).toMatchObject({outcome:'succeeded',content:{status:'applied'}});
+  await expect(fs.stat(path.join(targetPath, 'restore-me.txt'))).rejects.toMatchObject({code:'ENOENT'});
+  if (target) await expect(fs.stat(path.join(f.workspace,'terminal.txt'))).rejects.toMatchObject({code:'ENOENT'});
 }, 45_000);
 
 it('explicit live source reads current disk and shares actual root with list, search, conditional edits and processes', async () => {
@@ -506,7 +589,7 @@ it('confined live read and discovery do not authorize a returned path that escap
   expect(await fs.readFile(path.join(outside, 'private.txt'), 'utf8')).toBe('UNAUTHORIZED OUTSIDE CONTENT');
 }, 30_000);
 
-it('ordinary live sources allow device reads through links and explicitly selected outside search paths', async () => {
+it.each(['explicit', 'on demand'] as const)('%s local sources allow device reads through links and outside search paths', async placement => {
   const returned: Array<Record<string, unknown>> = []; let serial = 0;
   const f = await fixture((body, response) => {
     const output = lastOutput(body); if (output) returned.push(JSON.parse(responsesMetadataText(output.output)) as Record<string, unknown>);
@@ -519,12 +602,17 @@ it('ordinary live sources allow device reads through links and explicitly select
   await fs.writeFile(path.join(outside, 'device.txt'), 'AUTHORIZED DEVICE CONTENT');
   await fs.symlink(outside, path.join(f.workspace, 'outside'), process.platform === 'win32' ? 'junction' : 'dir');
   const identity = await f.api.create('live-device-access');
-  const prepared = await f.api.prepareSource({ ...identity, key: 'live', resourceOwner: { kind: 'local' as const }, workspaceId: (await f.documents.resolveWorkspace({ path: f.workspace })).workspaceId, content: { mode: 'saved-files' }, captureScopes: [], mode: 'live_root' });
-  const receipt = await f.api.submit({ ...identity, key: 'device-access', expectedHead: null, text: 'read the device file and search the selected directory', model, source: prepared.source });
-  await expect.poll(async () => (await f.api.run(receipt.run_id)).state, { timeout: 15_000 }).toBe('completed');
+  const directory = createThreadSourceDirectory({ documents: f.documents });
+  const locations = createModelWorkLocations({ kernel: f.kernel, runtime: f.runtime, directory, prepare: f.prepare });
+  f.kernel.setModelWorkLocationOwner(locations.query);
+  f.runtime.principalCanUseHostResources = async () => true;
+  f.adapter.bindDefaultDeviceSource(async () => ({ lazyWorkLocation: { resourceOwner: { kind: 'local' }, path: f.workspace } }));
+  const prepared = placement === 'explicit' ? await f.api.prepareSource({ ...identity, key: 'live', resourceOwner: { kind: 'local' }, workspaceId: (await f.documents.resolveWorkspace({ path: f.workspace })).workspaceId, content: { mode: 'saved-files' }, captureScopes: [], mode: 'live_root' }) : undefined;
+  const receipt = await f.api.submit({ ...identity, key: 'device-access', expectedHead: null, text: 'read the device file and search the selected directory', model, ...(prepared ? {source: prepared.source} : {}) });
+  await expectCompletion(f, receipt.run_id);
   expect(returned).toHaveLength(2);
   for (const result of returned) {
-    expect(result).toMatchObject({ outcome: 'succeeded' });
+    expect(result, JSON.stringify(result)).toMatchObject({ outcome: 'succeeded' });
     expect(JSON.stringify(result)).toContain('AUTHORIZED DEVICE CONTENT');
   }
   expect(JSON.stringify(returned[1])).toContain('device.txt');

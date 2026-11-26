@@ -667,6 +667,8 @@ export const settingsDict = {
   "settings.remoteInstances.clientAuth.qrDialogTitle": "Сканувати для підключення",
 "settings.remoteInstances.clientAuth.actions.addDevice": "Додати пристрій",
   "settings.remoteInstances.clientAuth.actions.copied": "Скопійовано",
+  "settings.remoteInstances.clientAuth.field.lanAddress": "Адреса в локальній мережі",
+  "settings.remoteInstances.clientAuth.actions.copyAddress": "Копіювати адресу",
   "settings.remoteInstances.clientAuth.addDevice.transportLabel": "Де ви будете користуватись цим пристроєм?",
   "settings.remoteInstances.clientAuth.addDevice.subtitle": "Створіть одноразовий QR-код, який підключить інший пристрій до цього сервера.",
   "settings.remoteInstances.clientAuth.addDevice.transport.local": "Лише цей компʼютер",

@@ -184,3 +184,29 @@ it('logs only safe owner codes even when an exception contains provider secrets 
   expect(calendarErrorCode(forged)).toBe('calendar_preparation:context:unavailable');
   expect(calendarErrorCode(new Error(secret))).toBe('calendar_owner_unavailable');
 });
+
+it('projects wake deadlines and delivered work without returning Catalog records', async () => {
+  const signal = new AbortController().signal;
+  const pending = { ...definition, id: 'future', next_at_ms: 200 };
+  const earlier = { ...definition, id: 'earlier', next_at_ms: 100, calculation_pending: true };
+  const deleted = { ...definition, id: 'deleted', next_at_ms: 10, deleted: true };
+  const disabled = { ...definition, id: 'disabled', next_at_ms: 20, enabled: false };
+  const client = {
+    onExit: () => () => {}, onReady: () => () => {}, onEvent: () => () => {},
+    calendarProjects: vi.fn(async () => ['proj']),
+    calendar: async () => ({ definitions: [pending, earlier, deleted, disabled] }),
+    calendarOccurrences: vi.fn(async ({ definitionId }: { definitionId: string }) => definitionId === 'earlier'
+      ? [{ ...occurrence, state: 'queued' }, { ...occurrence, state: 'held' }, { ...occurrence, state: 'skipped' }]
+      : definitionId === 'deleted' ? [{ ...occurrence, state: 'delivered' }] : []),
+  };
+  const owner = new CalendarOwner({ runtime: client as unknown as AgentRuntimeClient, projects: async () => [],
+    prepare: async () => occurrence, onChanged() {}, onError(error) { throw error; } });
+  try {
+    await expect(owner.activity(true, signal)).resolves.toEqual({
+      nextWakeAtMs: 100, activeOccurrences: 3, pendingDelivery: 1, pendingPreparation: 1,
+      unresolvedSchedules: 1, watchingAssets: true,
+    });
+    expect(client.calendarProjects).toHaveBeenCalledWith(signal);
+    expect(client.calendarOccurrences).toHaveBeenCalledWith({ definitionId: 'earlier' }, signal);
+  } finally { owner.stop(); }
+});

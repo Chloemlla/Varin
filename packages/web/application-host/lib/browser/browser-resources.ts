@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { waitWithSignal } from '../cancellation.js';
 import {
   BrowserExecutionError, isBrowserExecutionError, type BrowserOwner, type BrowserPageUsage,
   type BrowserResource, type BrowserResourceBinding, type BrowserResourceCapability, type BrowserUseScope,
@@ -14,6 +15,7 @@ interface Provider {
   dispose: boolean;
   source?: BrowserResource['source'];
   device?: BrowserResource['device'];
+  preparing?: Promise<void>;
 }
 interface PageLane {
   human: boolean;
@@ -84,15 +86,24 @@ export class BrowserResources {
       remote: options.remote ?? false, dispose: options.dispose ?? true, source: options.source, device: options.device });
   }
   hasProviders() { return this.providers.size > 0; }
+  activity() {
+    const lanes = [...this.lanes.values()];
+    return {
+      preparing: [...this.providers.values()].filter(provider => provider.preparing).length,
+      activePageWrites: lanes.filter(lane => lane.active).length,
+      waitingPageWrites: lanes.reduce((n, lane) => n + lane.waiting.length, 0),
+      outstandingStopConfirmations: lanes.filter(lane => lane.stopUnconfirmed).length,
+    };
+  }
   private async describe(provider: Provider): Promise<BrowserResource> {
     const { owner, label, deviceName, fallbackInstance } = provider;
     const status = await owner.resource?.() ?? { state: 'online' as const, instanceId: fallbackInstance,
       capabilities: [...builtInCapabilities, ...(owner.activate ? ['activate' as const] : [])] };
     return { browserId: owner.browserId, label, deviceName, ...(provider.source ? { source: provider.source } : {}), ...status };
   }
-  async list({ localOnly = false, threadId, includeDevice = false }: { localOnly?: boolean; threadId?: string; includeDevice?: boolean } = {}) {
+  async list({ localOnly = false, threadId, includeDevice = false, refresh = false }: { localOnly?: boolean; threadId?: string; includeDevice?: boolean; refresh?: boolean } = {}) {
     await this.refreshLocal?.();
-    if (!localOnly) await this.refresh?.();
+    if (refresh && !localOnly) await this.refresh?.();
     const preferences = threadId ? await this.preferences?.(threadId) : undefined;
     const selected = preferences?.task ?? (threadId ? this.bindings.get(threadId)?.browserId : undefined) ?? preferences?.default;
     return Promise.all([...this.providers.values()].filter(provider => !localOnly || !provider.remote).map(async provider => ({
@@ -100,6 +111,36 @@ export class BrowserResources {
       ...(threadId ? { preferred: provider.owner.browserId === selected } : {}),
       ...(includeDevice && provider.device ? { device: provider.device } : {}),
     })));
+  }
+  private async prepare(provider: Provider, signal?: AbortSignal) {
+    signal?.throwIfAborted();
+    if (!provider.owner.prepareResource) return;
+    if (!provider.preparing) {
+      const work = Promise.resolve().then(() => provider.owner.prepareResource!());
+      provider.preparing = work;
+      void work.finally(() => { if (provider.preparing === work) delete provider.preparing; }).catch(() => undefined);
+    }
+    await waitWithSignal(provider.preparing, signal);
+    signal?.throwIfAborted();
+  }
+
+  async acquire(browserId: string, signal?: AbortSignal, localOnly = false): Promise<BrowserResource> {
+    await this.refreshLocal?.();
+    if (!localOnly && !this.providers.has(browserId)) await this.refresh?.();
+    const provider = this.providers.get(browserId);
+    if (!provider || localOnly && provider.remote) throw missing('Browser resource not found on its owner');
+    await this.prepare(provider, signal);
+    if (this.providers.get(browserId) !== provider) throw missing('Browser configuration changed while connecting');
+    const result = await this.describe(provider);
+    return { ...result, ...(provider.device ? { device: provider.device } : {}) };
+  }
+  async holdPage(binding: BrowserResourceBinding & { pageId: string }, signal: AbortSignal) {
+    const viewer = `browser-viewer:${randomUUID()}`;
+    return this.use(binding, { signal }, async owner => {
+      if (owner.holdPage) return owner.holdPage(binding.pageId, viewer, signal);
+      owner.retainForThread(binding.pageId, viewer);
+      return () => owner.releaseThread(viewer);
+    });
   }
   private key(binding: BrowserResourceBinding) { return JSON.stringify([binding.browserId, binding.instanceId, binding.pageId ?? null]); }
   private lane(binding: BrowserResourceBinding) {
@@ -131,10 +172,12 @@ export class BrowserResources {
     const provider = browserId ? this.providers.get(browserId) : undefined;
     if (!provider) throw missing(browserId ? 'Browser resource not found' : 'Choose a browser from browser_resources');
     let status = await this.describe(provider);
-    if (provider.remote && status.state !== 'online') {
-      await this.refresh?.();
+    if (status.state !== 'online' && !target.pageId) {
+      if (provider.owner.prepareResource) await this.prepare(provider, scope.signal);
+      else if (provider.remote) await this.refresh?.();
       status = await this.describe(provider);
     }
+    if (this.providers.get(browserId!) !== provider) throw missing('Browser configuration changed before dispatch');
     if (status.state !== 'online' || !status.instanceId) throw missing(`Browser is ${status.state}; wait for its owner to reconnect`);
     const expected = target.instanceId ?? (!target.browserId && last && last.browserId === browserId ? last.instanceId : undefined);
     if (expected && expected !== status.instanceId) throw missing('The original browser instance ended. List its current pages before choosing another.');
@@ -146,7 +189,7 @@ export class BrowserResources {
     const execute = async () => {
       scope.signal?.throwIfAborted();
       const live = await this.describe(provider);
-      if (live.state !== 'online' || live.instanceId !== binding.instanceId) throw missing('Browser instance changed before dispatch');
+      if (this.providers.get(binding.browserId) !== provider || live.state !== 'online' || live.instanceId !== binding.instanceId) throw missing('Browser instance changed before dispatch');
       scope.signal?.throwIfAborted();
       if (options.writes && (lane.human || lane.ownerPaused || lane.epoch !== admittedEpoch)) {
         throw missing(lane.human || lane.ownerPaused ? 'The user is controlling this page' : 'Page control changed while the operation was waiting');

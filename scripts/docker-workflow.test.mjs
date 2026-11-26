@@ -198,3 +198,38 @@ test('real Compose merge selects standard or toolbelt while retaining deployment
   assert.equal(toolbelt.stop_grace_period, standard.stop_grace_period);
   assert.equal(toolbelt.user, standard.user);
 });
+
+test('real Linux role checks are manual-only and consume an exact validation kernel', () => {
+  const option = validation.on.workflow_dispatch.inputs.real_linux_roles;
+  assert.equal(option.type, 'boolean');
+  assert.equal(option.default, false);
+  assert(!('real_linux_roles' in validation.on.workflow_call.inputs), 'Ordinary CI may not incur real desktop setup');
+  const steps = validation.jobs.verify.steps;
+  const bun = steps.find(step => step.name === 'Set up Bun for opt-in native roles');
+  const prepare = steps.find(step => step.id === 'native_role_prerequisites');
+  const browser = steps.find(step => step.name === 'Exercise the real Chromium Browser role');
+  const computer = steps.find(step => step.name === 'Exercise the real Computer X11 role');
+  assert(bun && prepare && browser && computer);
+  const manual = "github.event_name == 'workflow_dispatch' && inputs.real_linux_roles";
+  assert.equal(bun.if, manual);
+  assert.equal(prepare.if, manual);
+  assert.equal(prepare.env.BROWSER_IMAGE, '${{ steps.images.outputs.browser_node }}');
+  assert.match(prepare.run, /localhost:5000\/varin-browser-node@sha256/);
+  assert.match(prepare.run, /org\.opencontainers\.image\.revision/);
+  assert.match(prepare.run, /verifyKernelBundle/);
+  assert.match(prepare.run, /docker create --platform linux\/amd64/);
+  assert.doesNotMatch(prepare.run, /build-kernel|cargo build|sudo.*chmod/, 'Use the exact artifact, not a new or less restricted build');
+  for (const step of [browser, computer]) {
+    assert.match(step.if, /!cancelled\(\).*native_role_prerequisites\.outcome == 'success'/u);
+    assert.equal(step.env.VARIN_TEST_KERNEL_PATH, '${{ steps.native_role_prerequisites.outputs.kernel }}');
+  }
+  assert.match(browser.run, /--vitest-file=browser-node-chromium\.native\.test\.ts/u);
+  assert.doesNotMatch(browser.run, /--no-sandbox|apt-get|curl/u);
+  assert.match(computer.run, /bash scripts\/test-computer-role-x11\.sh/u);
+  if (process.platform !== 'win32') {
+    for (const step of [prepare, browser, computer]) {
+      const syntax = spawnSync('bash', ['-n'], { input: step.run, encoding: 'utf8' });
+      assert.equal(syntax.status, 0, syntax.stderr);
+    }
+  }
+});

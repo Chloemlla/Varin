@@ -158,7 +158,7 @@ fn routed_parent_grants_only_the_original_native_reader_to_retrieval_and_normal_
     let (_, tools) = crate::collaboration::resolve_selection(&selected, &f.input).unwrap();
     assert_eq!(tools, with_disclosure(vec![read.clone()]));
     assert!(!supports_frozen_builtin(routed, &read), "a child cannot rebind v3 by name");
-    assert!(select_frozen(&selected, &[crate::work_locations::NAME.into()]).is_err());
+    assert!(select_frozen(&selected, &[crate::work_locations::NAME.into()], ChildFileRoute::Existing).is_err());
 
     let mut normal = f.input.clone();
     normal.preset = None;
@@ -561,5 +561,82 @@ fn durable_tree_cancel_reaches_original_binding_token_before_physical_notificati
     assert!(cancel.is_cancelled(), "binding rejection must propagate the original durable cancellation before Engine handles its error");
     drop(hook);
     drop(catalog);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn lazy_file_child_admission_is_explicit_and_belongs_to_its_original_dispatch() {
+    use varin_runtime::catalog::dispatch::ChildWorkMode;
+    use varin_runtime::catalog::launches::{LazyWorkLocation, SourceResourceOwner};
+    let native = schemas();
+    let get = |name: &str| native.iter().find(|t| t.name == name).unwrap().clone();
+    let location = LazyWorkLocation { resource_owner: SourceResourceOwner::Local,
+        path: "/remembered".into(), workspace_id: None };
+    let mut f = fixture::Fixture::new_parent_custom(0, get("file_read"), get("dispatch"),
+        false, false, false, |input, launch| {
+            input.tools = Some(vec!["file_read".into()]);
+            input.work_mode = Some(ChildWorkMode::ReadOnly);
+            launch.source = None;
+            launch.lazy_work_location = Some(location.clone());
+        });
+    let frozen = f.db.capture_child_dispatch_invocation(&f.context).unwrap().load().unwrap();
+    assert_eq!(frozen.frozen.lazy_work_location.as_ref(), Some(&location));
+    assert_eq!(frozen.resolve(&f.input).unwrap().lazy_work_location.as_ref(), Some(&location));
+
+    let mut unselected = f.input.clone();
+    unselected.work_mode = None;
+    assert!(frozen.resolve(&unselected).unwrap().lazy_work_location.is_none());
+    unselected.work_mode = Some(ChildWorkMode::IsolatedWrite);
+    assert!(frozen.resolve(&unselected).unwrap().lazy_work_location.is_none());
+
+    let mut launch = f.launch.clone();
+    launch.source = None;
+    let expected = frozen.resolve(&f.input).unwrap();
+    launch.tools = expected.profile.tools.iter().map(|name| {
+        if name == "file_read" { crate::work_locations::child_schema(get(name)) }
+        else { get(name) }
+    }).collect();
+    let mut wrong = location.clone();
+    wrong.path = "/foreign".into();
+    launch.lazy_work_location = Some(wrong.clone());
+    assert!(f.db.prepare_child_launch(&f.context.run_id, launch.clone(), expected).unwrap().load().is_err());
+    launch.lazy_work_location = Some(location.clone());
+    let mut wrong_tool = launch.clone();
+    wrong_tool.tools.retain(|t| t.name != "file_read");
+    wrong_tool.tools.push(crate::work_locations::child_schema(get("file_write")));
+    assert!(f.db.prepare_child_launch(&f.context.run_id, wrong_tool, frozen.resolve(&f.input).unwrap()).unwrap().load().is_err());
+    let wrong_context = ToolExecutionContext { operation_id: "foreign-dispatch".into(), ..f.context.clone() };
+    let wrong_attempt = f.db.prepare_child_launch(&f.context.run_id, launch.clone(), frozen.resolve(&f.input).unwrap()).unwrap().load().unwrap();
+    assert!(f.db.prepare_child_admission(&wrong_context, f.input.clone(), None, wrong_attempt)
+        .and_then(|prepared| prepared.load()).is_err());
+    let child_launch = f.db.prepare_child_launch(&f.context.run_id, launch, frozen.resolve(&f.input).unwrap()).unwrap().load().unwrap();
+    let child = f.db.prepare_child_admission(&f.context, f.input.clone(), None, child_launch).unwrap().load().unwrap();
+    let child = f.db.accept_child_references(child).unwrap();
+    let proposal = varin_runtime::catalog::context::ContextProposal {
+        key: "lazy-context".into(), branch_id: child.child_branch_id.clone(), through_id: None,
+        expected_revision: 0, summary: String::new(), effective_system_prompt: "Child".into(),
+        instruction_sources: vec![], memory_checkpoint: None,
+    };
+    let basis = serde_json::from_value(serde_json::json!({
+        "mode":"agent","threadRole":"worker","revision":0,
+        "configurationDigest":"lazy-child","memorySnapshot":{"revision":0,"memories":[]},
+        "threadId":child.child_thread_id,"projectId":child.project_id,
+        "originalSections":[{"name":"system","content":"Child"}],"instructionSources":[]
+    })).unwrap();
+    let prepared = f.db.capture_child_preparation(&child.operation_id, None, proposal, basis).unwrap().load().unwrap();
+    let admitted = f.db.admit_child(prepared).unwrap();
+    let run = &admitted.receipt.as_ref().unwrap().run_id;
+    assert!(f.db.require_lazy_child_launch(run, &location).is_ok());
+    assert!(f.db.require_lazy_child_launch(run, &wrong).is_err());
+    assert!(f.db.require_lazy_child_launch(&f.context.run_id, &location).is_err());
+    assert!(admitted.launch.source.is_none());
+    assert!(admitted.launch.tools_ref.is_object());
+    let selected = f.db.launch_intent(run).unwrap().unwrap().selection;
+    assert!(selected.tools.iter().all(|tool| !crate::work_locations::is_control(&tool.name)));
+    let reader = selected.tools.iter().find(|t|t.name=="file_read").unwrap();
+    assert_eq!(reader.version, "4");
+    assert!(reader.schema["oneOf"].as_array().unwrap().iter().all(|variant|variant["properties"].get("location").is_none()));
+    let root = f.root.clone();
+    drop(frozen); drop(f);
     std::fs::remove_dir_all(root).unwrap();
 }

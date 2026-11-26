@@ -14,7 +14,7 @@ describe('startup pipeline runtime', () => {
         beginDraining: () => {},
         shutdown: async () => {},
       }),
-      createDictationRuntime: () => ({ stop: () => {} }),
+      createDictationRuntime: () => ({ stop: async () => {}, activity: () => ({ state: 'cold', pendingRequests: 0, sessions: 0, warm: false }) }),
       createServerStartupRuntime: () => ({
         resolveBindHost: () => '127.0.0.1',
         startListeningAndMaybeTunnel: async () => {

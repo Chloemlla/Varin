@@ -14,6 +14,7 @@ import { resolveSemanticSearchOptions, type BlockPayload, type DocumentPayload, 
   type SemanticDocumentState, type SemanticSourceMetadataUpdate, type SemanticDocumentExpectation,
   type SemanticDocumentScore, type SemanticDocumentScores, type SemanticPublishedReader } from "./store-contract.js";
 import { openKnowledgeDatabase } from '../database.js';
+import { knowledgeDatabaseExistsSync, knowledgeDatabasePath } from '../database-files.js';
 import type { TriviumDB } from 'triviumdb';
 const FLUSH_QUIET_MS = 250;
 const FLUSH_MAX_DEFER_MS = 30_000;
@@ -62,6 +63,7 @@ export function createSemanticStoreEngine(options: SemanticStoreOpenOptions & {
   let lifecycle: SemanticIndexLifecycle = checkpoint?.lifecycle ?? "idle";
   let coverage: SemanticQueryCoverage = checkpoint?.coverage ?? "empty";
   const dbFile = () => join(semanticGenerationDir(options.dataDir, options.hostId, options.scope, spaceId, generation), "index.tdb");
+  const physicalFile = () => knowledgeDatabasePath(dbFile());
   const publicationsDirectory = join(semanticGenerationDir(options.dataDir, options.hostId, options.scope, spaceId, generation), "publications");
   const publications = createSemanticPublishedReaders({
     directory: publicationsDirectory,
@@ -71,7 +73,7 @@ export function createSemanticStoreEngine(options: SemanticStoreOpenOptions & {
   const maximumLookupResults = (db: InstanceType<typeof TriviumDB>): number => Math.max(1, db.nodeCount());
   let writer: InstanceType<typeof TriviumDB> | null = null;
   const countStoredDocuments = (): number => {
-    if (!existsSync(dbFile()) && !existsSync(`${dbFile()}.wal`)) return 0;
+    if (!knowledgeDatabaseExistsSync(dbFile())) return 0;
     // Host is the sole writer. A previous process may have left WAL recovery
     // pending, which readOnly rejects, so recover once here and keep this writer
     // for the scan's revision lookups instead of reopening the database per file.
@@ -109,7 +111,7 @@ export function createSemanticStoreEngine(options: SemanticStoreOpenOptions & {
   const persistence = createStorePersistence({
     flush: () => {
       if (writer) {
-        publications.publish(writer, dbFile(), refreshCheckpoint());
+        publications.publish(writer, physicalFile(), refreshCheckpoint());
         notifyPublished();
       }
     },
@@ -309,7 +311,7 @@ export function createSemanticStoreEngine(options: SemanticStoreOpenOptions & {
     if (writer) {
       writer = trackStoreMutations(writer, persistence);
       removeSemanticPublications(publicationsDirectory);
-      publications.publish(writer, dbFile(), refreshCheckpoint());
+      publications.publish(writer, physicalFile(), refreshCheckpoint());
       notifyPublished();
     }
   } catch (error) {
@@ -444,7 +446,7 @@ export function createSemanticStoreEngine(options: SemanticStoreOpenOptions & {
     },
     async publishedRevision(documentId: string): Promise<{ revision: string; recipeId: string } | null> {
       return enqueue(() => {
-        if (!existsSync(dbFile()) && !writer) return null;
+        if (!writer && !existsSync(physicalFile())) return null;
         const db = writer ?? openDb(dbFile(), space.dim, writer ? "readWrite" : "readOnly");
         try {
           const ids = lookupDocuments(db, documentId);
@@ -490,7 +492,7 @@ export function createSemanticStoreEngine(options: SemanticStoreOpenOptions & {
     },
     async listDocumentIds(): Promise<string[]> {
       return enqueue(() => {
-        if (!existsSync(dbFile()) && !writer) return [];
+        if (!writer && !existsSync(physicalFile())) return [];
         const db = writer ?? openDb(dbFile(), space.dim, writer ? "readWrite" : "readOnly");
         try {
           const ids = new Set<string>();
@@ -509,7 +511,7 @@ export function createSemanticStoreEngine(options: SemanticStoreOpenOptions & {
       latestPublish.set(documentId, Math.max(latestPublish.get(documentId) ?? 0, token));
       await enqueue(() => {
         if ((latestPublish.get(documentId) ?? 0) > token) return;
-        if (!existsSync(dbFile()) && !writer) return;
+        if (!writer && !existsSync(physicalFile())) return;
         const db = ensureWriter();
         const operations: import("triviumdb").TransactionOperation[] = [];
         const oldDocuments = lookupDocuments(db, documentId);
@@ -561,7 +563,7 @@ export function createSemanticStoreEngine(options: SemanticStoreOpenOptions & {
     publishedReaderStats: () => publications.stats(),
     search(query: number[], limit: number, searchOptions?: readonly string[] | SemanticSearchOptions): Promise<SemanticHit[]> {
       return enqueue(() => {
-        if (!writer && !existsSync(dbFile())) return searchDatabase(null, () => new Map(), query, limit, searchOptions);
+        if (!writer && !existsSync(physicalFile())) return searchDatabase(null, () => new Map(), query, limit, searchOptions);
         const db = writer ?? openDb(dbFile(), space.dim, "readOnly");
         try { return searchDatabase(db, () => documentBlockIds(db), query, limit, searchOptions); }
         finally { if (db !== writer) db.close(); }

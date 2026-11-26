@@ -97,7 +97,9 @@ it('manages the selected device configuration through its original mounted conne
 
 it('discovers local peer resources through existing mounted authenticated Host connections, never imported peers', async () => {
   const f = fixture();
-  const discovered = await f.resources.list();
+  expect(await f.resources.list()).toEqual([]);
+  expect(f.fetch).not.toHaveBeenCalled();
+  const discovered = await f.resources.list({ refresh: true });
   expect(discovered).toHaveLength(1);
   expect(discovered[0]).toMatchObject({ browserId: f.binding.browserId, label: 'Chrome', deviceName: 'Office · Browser device', state: 'online' });
   expect(await f.resources.use(f.binding, {}, owner => owner.list())).toEqual([page(f.binding.browserId)]);
@@ -110,7 +112,7 @@ it('discovers local peer resources through existing mounted authenticated Host c
 
 it('keeps different connections and mounts distinct even when Host and browser IDs match', async () => {
   const f = fixture('embedded'); f.addConnection();
-  const discovered = await f.resources.list({ includeDevice: true });
+  const discovered = await f.resources.list({ includeDevice: true, refresh: true });
   expect(discovered).toHaveLength(2);
   expect(new Set(discovered.map(item => item.browserId)).size).toBe(2);
   expect(discovered.map(item => item.device)).toEqual(expect.arrayContaining([
@@ -122,27 +124,27 @@ it('keeps different connections and mounts distinct even when Host and browser I
 });
 
 it('rejects changed endpoint or Host identity before dispatch without falling back to another connection', async () => {
-  const f = fixture(); await f.resources.list(); f.addConnection(); f.replaceEndpoint();
+  const f = fixture(); await f.resources.list({ refresh: true }); f.addConnection(); f.replaceEndpoint();
   await expect(f.resources.use(f.binding, {}, owner => owner.act('tab', { action: 'reload' }), { writes: true })).rejects.toMatchObject({ effect: 'none' });
   expect(f.owner.act).not.toHaveBeenCalled();
   expect(f.fetch.mock.calls.some(([url]) => String(url).includes('replacement.example'))).toBe(false);
-  const other = fixture(); await other.resources.list(); other.replaceHost();
+  const other = fixture(); await other.resources.list({ refresh: true }); other.replaceHost();
   await expect(other.resources.use(other.binding, {}, owner => owner.act('tab', { action: 'reload' }), { writes: true })).rejects.toMatchObject({ effect: 'none' });
   expect(other.owner.act).not.toHaveBeenCalled();
 });
 
 it('retains offline registrations and rejects a replacement instance instead of reusing the old page binding', async () => {
-  const f = fixture(); await f.resources.list(); f.setOffline(true);
-  expect(await f.resources.list()).toMatchObject([{ browserId: f.binding.browserId, instanceId: 'browser-session', state: 'interrupted' }]);
+  const f = fixture(); await f.resources.list({ refresh: true }); f.setOffline(true);
+  expect(await f.resources.list({ refresh: true })).toMatchObject([{ browserId: f.binding.browserId, instanceId: 'browser-session', state: 'interrupted' }]);
   await expect(f.resources.use(f.binding, {}, owner => owner.list())).rejects.toThrow('interrupted');
   f.setOffline(false); f.replaceInstance();
-  expect(await f.resources.list()).toMatchObject([{ browserId: f.binding.browserId, instanceId: 'new-browser-session', state: 'online' }]);
+  expect(await f.resources.list({ refresh: true })).toMatchObject([{ browserId: f.binding.browserId, instanceId: 'new-browser-session', state: 'online' }]);
   await expect(f.resources.use(f.binding, {}, owner => owner.act('tab', { action: 'reload' }), { writes: true })).rejects.toThrow('original browser instance ended');
   expect(f.owner.act).not.toHaveBeenCalled();
 });
 
 it('forwards observations and file bytes from the original owner with a foreign Thread namespace and no local Run authority', async () => {
-  const f = fixture(); await f.resources.list();
+  const f = fixture(); await f.resources.list({ refresh: true });
   const scope = { threadId: 'work', runId: 'never-a-local-run', operationId: 'operation' };
   const observed = await f.resources.use(f.binding, scope, owner => owner.read({ pageId: 'tab' }), { observes: true });
   expect(observed.page.browserId).toBe(f.binding.browserId);
@@ -157,7 +159,7 @@ it('forwards observations and file bytes from the original owner with a foreign 
 });
 
 it('rejects unsupported file transfer and invalid methods or scope injection before touching the owner', async () => {
-  const f = fixture(); f.restrict(); await f.resources.list();
+  const f = fixture(); f.restrict(); await f.resources.list({ refresh: true });
   await expect(f.resources.use(f.binding, {}, owner => owner.readDownload('tab', 'file'))).rejects.toMatchObject({ effect: 'none' });
   expect(f.owner.readDownload).not.toHaveBeenCalled();
   for (const input of [ { ...call, method: '__proto__' }, { ...call, runId: 'local-run' },
@@ -173,7 +175,7 @@ it('rejects unsupported file transfer and invalid methods or scope injection bef
 });
 
 it('remote takeover and handback govern the canonical page lane, with a fresh task observation required', async () => {
-  const f = fixture(); await f.resources.list();
+  const f = fixture(); await f.resources.list({ refresh: true });
   expect(await f.resources.control(f.binding, 'takeover')).toMatchObject({ controller: 'human' });
   expect(await f.resources.currentUsage(f.binding)).toMatchObject({ controller: 'human' });
   const originalBinding = { ...f.binding, browserId: 'local-browser' };
@@ -187,18 +189,18 @@ it('remote takeover and handback govern the canonical page lane, with a fresh ta
 });
 
 it('does not replay an action when its response is lost, including after peer rediscovery', async () => {
-  const f = fixture(); await f.resources.list(); f.loseReceipt();
+  const f = fixture(); await f.resources.list({ refresh: true }); f.loseReceipt();
   await expect(f.resources.use(f.binding, { threadId: 'work' }, owner => owner.act('tab', { action: 'reload' }), { writes: true }))
     .rejects.toMatchObject({ effect: 'unknown', executorStopped: false });
   expect(f.owner.act).toHaveBeenCalledTimes(1);
-  await f.resources.list(); await f.resources.list();
+  await f.resources.list({ refresh: true }); await f.resources.list({ refresh: true });
   expect(f.owner.act).toHaveBeenCalledTimes(1);
   await expect(f.resources.use(f.binding, { threadId: 'work' }, owner => owner.act('tab', { action: 'reload' }), { writes: true })).rejects.toThrow('has not confirmed that input stopped');
   expect(f.owner.act).toHaveBeenCalledTimes(1);
 });
 
 it('does not abort a dispatched mutation or free its page lane when the caller stops observing', async () => {
-  const f = fixture(); await f.resources.list();
+  const f = fixture(); await f.resources.list({ refresh: true });
   let started!: () => void, finish!: () => void;
   const entered = new Promise<void>(resolve => { started = resolve; });
   const completion = new Promise<void>(resolve => { finish = resolve; });
@@ -216,14 +218,14 @@ it('does not abort a dispatched mutation or free its page lane when the caller s
 });
 
 it('preserves a provider rejection before input as effect none', async () => {
-  const f = fixture(); await f.resources.list();
+  const f = fixture(); await f.resources.list({ refresh: true });
   vi.mocked(f.owner.act).mockRejectedValueOnce(new BrowserExecutionError('Original page reference expired', 'none'));
   await expect(f.resources.use(f.binding, { threadId: 'work' }, owner => owner.act('tab', { action: 'reload' }), { writes: true }))
     .rejects.toMatchObject({ effect: 'none', executorStopped: true });
 });
 
 it('honors precise provider action capabilities instead of upgrading them to generic input', async () => {
-  const f = fixture(); f.operations(['list', 'act:click:point', 'act:type:focused']); await f.resources.list();
+  const f = fixture(); f.operations(['list', 'act:click:point', 'act:type:focused']); await f.resources.list({ refresh: true });
   await f.resources.use(f.binding, {}, owner => owner.list());
   await f.resources.use(f.binding, { threadId: 'work' }, owner => owner.act('tab', { action: 'click', point: { x: 2, y: 3 }, observationId: 'observed' }), { writes: true });
   await f.resources.use(f.binding, { threadId: 'work' }, owner => owner.act('tab', { action: 'type', text: 'hello' }), { writes: true });
@@ -233,14 +235,14 @@ it('honors precise provider action capabilities instead of upgrading them to gen
 });
 
 it('does not accept another browser page as the receipt of a dispatched mutation', async () => {
-  const f = fixture(); await f.resources.list(); f.corruptReceipt();
+  const f = fixture(); await f.resources.list({ refresh: true }); f.corruptReceipt();
   await expect(f.resources.use(f.binding, { threadId: 'work' }, owner => owner.act('tab', { action: 'reload' }), { writes: true }))
     .rejects.toMatchObject({ effect: 'unknown', executorStopped: false });
   expect(f.owner.act).toHaveBeenCalledTimes(1);
 });
 
 it('releases the original local browser binding without re-registering it or recursively releasing peers', async () => {
-  const f = fixture(); await f.resources.list();
+  const f = fixture(); await f.resources.list({ refresh: true });
   const threadId = managedBrowserThread('paired-coordinator', 'coordinator', 'work');
   await f.resources.use(f.binding, { threadId: 'work' }, owner => owner.read({ pageId: 'tab' }), { observes: true });
   expect(await f.original.use({}, { threadId }, async (_owner, binding) => binding.browserId)).toBe('local-browser');

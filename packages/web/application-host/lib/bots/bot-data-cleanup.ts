@@ -37,7 +37,9 @@ export function createBotDataCleanup(options: {
     for (const ownedScope of stores) {
       const storeKey = knowledgeStoreKeyForScope(ownedScope);
       await options.closeMemory(ownedScope, storeKey);
-      for (const name of names.filter(name => name.startsWith(`${storeKey}.`))) await options.files.remove(identity, path.join(knowledgeDir, name), { force: true });
+      for (const name of names.filter(name => name.startsWith(`${storeKey}.`))) {
+        await options.files.remove(identity, path.join(knowledgeDir, name), { force: true, ...(name === storeKey + '.store' && { recursive: true }) });
+      }
       const vectorScope = knowledgeVectorScopeKey(scopeOfScopeId(ownedScope), ownedScope);
       await options.files.remove(identity, path.join(knowledgeDir, 'semantic', vectorScope.scopeKind, vectorScope.scopeId), { recursive: true, force: true });
     }

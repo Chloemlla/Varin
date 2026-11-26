@@ -17,6 +17,7 @@
 import { buildWindowsComputerHelper } from '../../computer-driver/windows/build-helper.mjs';
 import { buildMacComputerHelper } from '../../computer-driver/macos/build-helper.mjs';
 import { pruneLegacyHostArtifacts } from '../../../scripts/host-production-boundary.mjs';
+import { prepareTriviumMigrator } from '../../../scripts/prepare-trivium-migrator.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -67,7 +68,12 @@ if (process.argv.includes('--clean')) {
 
 // ── Step 1: Compile to a staging directory ───────────────────────────────
 
-const stagingDir = path.join(webRoot, `.application-host-staging-${process.pid}`);
+// Publish on the destination volume. In particular, packaging a Host with native
+// binaries must not rename a watched Web source directory into a separate build tree.
+const outputParent = path.dirname(outputDir);
+fs.mkdirSync(outputParent, { recursive: true });
+if (outputParent !== webRoot) reclaimAbandonedHostGenerations(outputParent);
+const stagingDir = path.join(outputParent, `.application-host-staging-${process.pid}`);
 const buildDir = stagingDir;
 
 const cleanBuildDir = () => {
@@ -118,6 +124,7 @@ try {
   // (e.g., HTML templates, static fixtures). Copy them to staging.
   const copyAssets = (srcDir, destDir) => {
     if (!fs.existsSync(srcDir)) return;
+    if (srcDir === path.join(sourceDir, 'lib', 'knowledge', 'fixtures')) return;
     // Local inference is an explicitly installed component. Cached development
     // model weights must not enter a normal Host build or desktop installer.
     if (srcDir === path.join(sourceDir, 'lib', 'knowledge', 'semantic', 'runtime')) return;
@@ -142,6 +149,7 @@ try {
     }
   };
   copyAssets(sourceDir, buildDir);
+  prepareTriviumMigrator(path.join(buildDir, 'lib/knowledge/native'));
   // The small browser extension is delivered by the Host settings page on every platform.
   fs.cpSync(path.join(repoRoot, 'packages/browser-connector/extension'), path.join(buildDir, 'browser-connector'), { recursive: true });
   const connectorManifestPath = path.join(buildDir, 'browser-connector/manifest.json');
@@ -218,7 +226,7 @@ try {
   // then remove the backup. If the rename fails, restore the backup.
   // The UUID prevents PID reuse from overwriting the last valid generation
   // preserved by an earlier interrupted publication.
-  const backupDir = path.join(webRoot, `.server-backup-${process.pid}-${randomUUID()}`);
+  const backupDir = path.join(outputParent, `.server-backup-${process.pid}-${randomUUID()}`);
 
   if (fs.existsSync(outputDir)) {
     fs.renameSync(outputDir, backupDir);

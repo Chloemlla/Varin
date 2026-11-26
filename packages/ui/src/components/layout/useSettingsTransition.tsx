@@ -1,13 +1,11 @@
 import React from 'react';
 import { LatticeStage } from '@/components/ui/workbench-lattice-stage';
-import { latticeOrigin, type LatticePoint } from '@/components/ui/workbench-lattice';
+import { latticeOrigin, SETTINGS_WAVE_SCALE, type LatticePoint } from '@/components/ui/workbench-lattice';
 import { useMotionLevel } from '@/hooks/usePrefersReducedMotion';
 import { importWithChunkRecovery, lazyWithChunkRecovery } from '@/lib/chunkLoadRecovery';
 import { WorkbenchReplacement, WORKBENCH_REPLACEMENT_TARGETS } from '@/lib/extensions/workbench-registry';
 import { useUIStore } from '@/stores/useUIStore';
 
-// Give each wave time to travel from the button across the content area.
-const SETTINGS_WAVE_SCALE = 0.7;
 let SettingsWindow: typeof import('@/components/views/SettingsWindow').SettingsWindow | undefined;
 const loadWindow = async () => {
   const module = await import('@/components/views/SettingsWindow');
@@ -26,8 +24,8 @@ function originInContent(root: HTMLElement, shell: HTMLElement, open: boolean, p
   return latticeOrigin(root.getBoundingClientRect(), null, point);
 }
 
-/** Replaces the visible row only once the lattice covers it. The Shell stays mounted. */
-export function useDesktopSettingsTransition(enabled: boolean) {
+/** Swap settings under the same lattice on a desktop content row or the whole mobile page. */
+export function useSettingsTransition(enabled: boolean, surface: 'window' | 'page' = 'window') {
   const requested = useUIStore(state => state.isSettingsDialogOpen);
   const point = useUIStore(state => state.settingsTransitionOrigin);
   const setOpen = useUIStore(state => state.setSettingsDialogOpen);
@@ -62,17 +60,19 @@ export function useDesktopSettingsTransition(enabled: boolean) {
     const sheet = sheetRef.current;
     const shell = root?.parentElement;
     const titlebar = shell?.querySelector(':scope > [data-startup-part="header"]');
-    if (!enabled || mode === 'off' || !root || !field || !sheet || !shell || !titlebar) {
+    if (!enabled || mode === 'off' || !root || !field || !sheet || !shell) {
       setVisible(requested);
       return;
     }
-    root.style.top = `${Math.max(0, titlebar.getBoundingClientRect().bottom - shell.getBoundingClientRect().top)}px`;
+    root.style.top = surface === 'window' && titlebar ? `${Math.max(0, titlebar.getBoundingClientRect().bottom - shell.getBoundingClientRect().top)}px` : '0px';
     root.hidden = false;
     root.dataset.covering = '';
     const stage = new LatticeStage(root, field, sheet, mode, SETTINGS_WAVE_SCALE);
     const wave = { stage, origin: originInContent(root, shell, requested, point), target: requested, covered: false };
     waveRef.current = wave;
-    const prepared = requested && !SettingsWindow ? importWithChunkRecovery(loadWindow).catch(() => undefined) : undefined;
+    const prepared = !requested ? undefined : surface === 'page'
+      ? importWithChunkRecovery(() => import('@/components/views/SettingsView')).catch(() => undefined)
+      : !SettingsWindow ? importWithChunkRecovery(loadWindow).catch(() => undefined) : undefined;
     void Promise.all([stage.cover(wave.origin), prepared]).then(() => {
       if (waveRef.current !== wave) return;
       stage.close();
@@ -87,13 +87,13 @@ export function useDesktopSettingsTransition(enabled: boolean) {
       delete root.dataset.covering;
       root.hidden = true;
     };
-  }, [enabled, mode, point, requested]);
+  }, [enabled, mode, point, requested, surface]);
 
   const open = enabled && mode !== 'off' ? visible : requested;
   const Window = SettingsWindow ?? LazySettingsWindow;
   return {
-    open,
-    content: enabled && open ? <WorkbenchReplacement target={WORKBENCH_REPLACEMENT_TARGETS.settings}
+    open, close,
+    content: enabled && open && surface === 'window' ? <WorkbenchReplacement target={WORKBENCH_REPLACEMENT_TARGETS.settings}
       fallback={<React.Suspense fallback={null}><Window onClose={close} /></React.Suspense>} /> : null,
     layer: enabled ? <div ref={rootRef} className="wb-lattice workbench-settings-lattice" hidden aria-hidden="true">
       <div ref={fieldRef} className="wb-lattice-field" />

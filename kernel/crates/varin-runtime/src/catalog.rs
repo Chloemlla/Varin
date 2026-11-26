@@ -532,6 +532,17 @@ impl Catalog {
                 "branch head or execution owner changed".into(),
             ));
         }
+        if let Some(location) = launch.as_ref().and_then(|selection| selection.lazy_work_location.as_ref()) {
+            match origin {
+                submissions::SubmissionOrigin::Child { operation_id, .. } => {
+                    let selected: delegated::DelegatedExecution = record(tx, "delegated_executions", operation_id)?;
+                    collaboration::validate_lazy_dispatch(tx, &command.thread_id, &command.branch_id, &selected, location)?;
+                }
+                submissions::SubmissionOrigin::User { .. } | submissions::SubmissionOrigin::Ingress { .. }
+                    if child_operation.is_none() && principals::thread_has_host_authority(tx, &command.thread_id)? => {}
+                _ => return Err(RuntimeError::Invalid("lazy work location needs its exact native admission".into())),
+            }
+        }
         let branch_default = if matches!(origin, submissions::SubmissionOrigin::User { .. } | submissions::SubmissionOrigin::Ingress { .. }) {
             branch_workspace::read(tx, &command.branch_id)?
         } else { None };
@@ -569,6 +580,9 @@ impl Catalog {
                 let inherits_existing = previous.selection.source.is_some();
                 if branch_default.is_none() {
                     selection.source = previous.selection.source.or_else(|| selection.source.take());
+                    selection.lazy_work_location = if selection.source.is_none() {
+                        previous.selection.lazy_work_location.or_else(|| selection.lazy_work_location.take())
+                    } else { None };
                 }
                 if let Some(source) = selection.source.as_mut().filter(|_| inherits_existing) {
                     if source.mode == crate::SourceMode::Materialized
@@ -576,6 +590,10 @@ impl Catalog {
                     {
                         source.environment_run_id = Some(previous_run);
                     }
+                }
+                if (inherits_existing && selection.source.is_some())
+                    || (selection.lazy_work_location.is_some() && prepared.inherited_tools.is_some())
+                {
                     let tools = if let Some((expected, current)) = &prepared.inherited_tools {
                         if expected != &previous.selection.base_tools_ref {
                             return Err(RuntimeError::Conflict("inherited tool selection changed during preparation".into()));

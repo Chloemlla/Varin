@@ -3,7 +3,7 @@
  * only retain its native handle. Never hardlink files that the writer can edit. */
 import { copyFileSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, rmdirSync, unlinkSync, type Dirent } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { join, toNamespacedPath } from "node:path";
+import { basename, join, toNamespacedPath } from "node:path";
 import type { TriviumDB } from "triviumdb";
 import type { SemanticCheckpoint, SemanticPublishedReader, SemanticPublishedReaderStats } from "./store-contract.js";
 
@@ -100,6 +100,7 @@ export function createSemanticPublishedReaders(options: {
       }
       mkdirSync(directory, { recursive: true });
       const candidate = mkdtempSync(join(directory, "publication-"));
+      const publishedFile = join(candidate, basename(file));
       let backing: Backing | null = null;
       try {
         for (const entry of manifest.files) {
@@ -107,11 +108,11 @@ export function createSemanticPublishedReaders(options: {
             || (entry.suffix !== "" && !entry.suffix.startsWith("."))) {
             throw new Error("Invalid semantic publication member");
           }
-          copyFileSync(`${file}${entry.suffix}`, join(candidate, `index.tdb${entry.suffix}`));
+          copyFileSync(`${file}${entry.suffix}`, publishedFile + entry.suffix);
         }
-        copyFileSync(`${file}.manifest.json`, join(candidate, "index.tdb.manifest.json"));
+        copyFileSync(`${file}.manifest.json`, publishedFile + ".manifest.json");
         // Native immutable open validates the manifest, dimensions and CRCs.
-        const db = options.open(join(candidate, "index.tdb"));
+        const db = options.open(publishedFile);
         backing = { db, directory: candidate, references: 0, closed: false, documentBlockIds: null };
         backings.add(backing);
         install({ id, checkpoint: { ...checkpoint }, backing });

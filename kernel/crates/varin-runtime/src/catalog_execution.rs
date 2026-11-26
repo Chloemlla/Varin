@@ -391,6 +391,7 @@ impl Persistence for Mutex<Catalog> {
         };
         let content_identity =
             crate::content::ContentStore::output_reference(content).map_err(policy_error)?;
+        let raw_identity = unprojected_reference(content).map_err(policy_error)?;
         let catalog = self
             .lock()
             .map_err(|_| ExecutionError::new("catalog_poisoned", "catalog owner failed"))?;
@@ -408,7 +409,8 @@ impl Persistence for Mutex<Catalog> {
             && admitted.origin() == &context.origin
             && operation.id == context.operation_id
             && operation.executor.as_deref() == Some(admitted.call().name.as_str())
-            && confirmed_no_effect_receipt(&operation, *outcome, &content_identity))
+            && (confirmed_no_effect_receipt(&operation, *outcome, &content_identity)
+                || raw_identity.as_ref().is_some_and(|raw| confirmed_no_effect_receipt(&operation, *outcome, raw))))
     }
 
     fn task_family(&self, run: &str, epoch: u64) -> std::result::Result<String, ExecutionError> {
@@ -970,6 +972,7 @@ pub(super) struct PreparedExecutionBodies {
     output: Option<Value>,
     receipts: std::collections::HashMap<String, ToolReceiptMetadata>,
     completion: Option<ToolCompletionMetadata>,
+    raw_result_ref: Option<Value>,
     results: std::collections::HashMap<String, OperationResultMetadata>,
 }
 impl ExecutionBodyPreparation {
@@ -980,6 +983,10 @@ impl ExecutionBodyPreparation {
         let original_completion = match (record, projected_record.as_ref()) {
             (ExecutionRecord::ToolSettled { completion, .. }, Some(_)) =>
                 Some(ToolCompletionMetadata::write(&self.content, completion)?),
+            _ => None,
+        };
+        let raw_result_ref = match record {
+            ExecutionRecord::ToolSettled { completion: ToolCompletion::Result { content, .. }, .. } => unprojected_reference(content)?,
             _ => None,
         };
         let record=projected_record.as_ref().unwrap_or(record);
@@ -1210,7 +1217,7 @@ impl ExecutionBodyPreparation {
             output,
             receipts,
             results,
-            completion,
+            completion, raw_result_ref,
         })
     }
 }
@@ -1296,7 +1303,7 @@ impl Catalog {
             output: prepared_output,
             receipts: prepared_receipts,
             results: prepared_results,
-            completion: prepared_completion,
+            completion: prepared_completion, raw_result_ref,
         } = prepared;
         // A receipt retry confirms the original completion. Keep exact request/owner fencing,
         // reject altered output, and never rewrite history or resubmit a provider request.
@@ -1919,16 +1926,15 @@ impl Catalog {
                 let receipt = prepared_completion.as_ref().ok_or_else(|| {
                     RuntimeError::Invalid("prepared tool completion missing".into())
                 })?;
-                if matches!(completion, ToolCompletion::JobAccepted { .. })
-                    && matches!(
-                        op.execution_owner,
-                        Some(crate::ExecutorOwner::External { .. })
-                    )
-                    && op.call_completion.is_none()
-                {
-                    return Err(RuntimeError::Conflict(
-                        "Host job requires original trusted domain acceptance".into(),
-                    ));
+                if let (ToolCompletion::JobAccepted { operation_id, .. }, Some(crate::ExecutorOwner::External { epoch, .. }))
+                    = (completion, &op.execution_owner) {
+                    let accepted_process = op.managed_process.as_ref().is_some_and(|process|
+                        !process.is_environment() && process.kernel_epoch.as_ref() == Some(epoch) && operation_id == &op.id);
+                    if op.call_completion.is_none() && !accepted_process {
+                        return Err(RuntimeError::Conflict(
+                            "Host job requires original trusted domain acceptance".into(),
+                        ));
+                    }
                 }
                 if let Some(previous) = &op.call_completion {
                     if previous != receipt {
@@ -1975,11 +1981,10 @@ impl Catalog {
                         // Dispatched work may prove a genuine no-effect terminal result (for
                         // example an owner's CAS conflict). Only the already authenticated
                         // executor receipt can supply that evidence; tool JSON alone cannot.
-                        let confirmed_no_effect = confirmed_no_effect_receipt(
-                            &op,
-                            *outcome,
-                            prepared_result.reference()?,
-                        );
+                        let projected_ref = prepared_result.reference()?;
+                        let evidence_ref = raw_result_ref.as_ref().filter(|raw| op.external_receipt.as_ref()
+                            .is_some_and(|receipt| receipt.result_ref == **raw)).unwrap_or(projected_ref);
+                        let confirmed_no_effect = confirmed_no_effect_receipt(&op, *outcome, evidence_ref);
                         // A handed-off domain can finish before its waiting native
                         // tool returns. Accept only the exact authenticated receipt;
                         // phase alone is not evidence of an un-dispatched success.
@@ -1987,7 +1992,7 @@ impl Catalog {
                             receipt.executor_stopped && receipt.identity==op.id
                             && op.executor.as_deref()==Some(receipt.executor.as_str())
                             && receipt.outcome==*outcome && receipt.effect==*effect
-                            && prepared_result.reference().is_ok_and(|content|receipt.result_ref==*content));
+                            && receipt.result_ref == *evidence_ref);
                         let dispatch_proven = match op.phase {
                             OperationPhase::Running => true,
                             // An observer can lose its response after the executor
@@ -2008,7 +2013,7 @@ impl Catalog {
                         op.phase = OperationPhase::Terminal;
                         op.outcome = Some(*outcome);
                         op.effect = *effect;
-                        op.result = Some(prepared_result.clone());
+                        op.result = Some(OperationResultMetadata::Content { reference: evidence_ref.clone() });
                         if *effect == Effect::Unknown && *outcome != Outcome::Indeterminate {
                             return Err(RuntimeError::Invalid(
                                 "unknown effects require reconciliation".into(),
@@ -2760,6 +2765,13 @@ impl Catalog {
     }
 }
 
+/// The executor signs its output before the coordinator adds model-facing references.
+fn unprojected_reference(body: &crate::output::OutputBody) -> Result<Option<Value>> {
+    if body.model_data.is_none() { return Ok(None); }
+    let mut raw = body.clone();
+    raw.model_data = None;
+    crate::content::ContentStore::output_reference(&raw).map(Some)
+}
 fn confirmed_no_effect_receipt(operation: &Operation, outcome: Outcome, content: &Value) -> bool {
     operation.external_receipt.as_ref().is_some_and(|receipt| {
         receipt.identity == operation.id

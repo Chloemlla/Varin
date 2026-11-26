@@ -100,7 +100,7 @@ export function ChatPage() {
         </Row>
         <Row label={t('settings.chatx.collapseMine')} item="chat.collapsible-user-messages"><Sw checked={s.collapsibleUserMessages} label={t('settings.chatx.collapseMine')} onChange={value => save('collapsibleUserMessages', value, ui.setCollapsibleUserMessages)} /></Row>
         <Row label={t('settings.chatx.sticky')} description={t('settings.chatx.stickyHint')} item="chat.sticky-user-header"><Sw checked={s.stickyUserHeader} label={t('settings.chatx.sticky')} onChange={value => save('stickyUserHeader', value, ui.setStickyUserHeader)} /></Row>
-        <Row label={t('settings.chatx.navigator')} description={t('settings.chatx.navigatorHint')} item="chat.prompt-navigator"><Sw checked={s.promptNavigatorEnabled} label={t('settings.chatx.navigator')} onChange={value => save('promptNavigatorEnabled', value, ui.setPromptNavigatorEnabled)} /></Row>
+        {!isMobile && <Row label={t('settings.chatx.navigator')} description={t('settings.chatx.navigatorHint')} item="chat.prompt-navigator"><Sw checked={s.promptNavigatorEnabled} label={t('settings.chatx.navigator')} onChange={value => save('promptNavigatorEnabled', value, ui.setPromptNavigatorEnabled)} /></Row>}
       </Section>
     </div>
 

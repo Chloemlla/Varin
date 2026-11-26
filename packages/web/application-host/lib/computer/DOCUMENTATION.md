@@ -46,9 +46,65 @@ Thread-scoped UI routes (`/api/threads/computer/state`, `/decide`, `/stop`) are 
 - **Physical-control barrier (`runtimeVersion: 5`)**: `computer-records.ts` / `computer-service.ts` persist a `physicalControl` marker (Host control generation, helper identity, holder) before sending input. Malformed/obsolete records remain fenced (never auto-migrated or erased). Clearing the barrier requires the original helper's release ACK + callback/process drain (or managed desktop stop); a crashed local-console helper leaves release unconfirmed.
 - **Receipts**: `ComputerActionReceipt` separates `effect` (`none`, `dispatched`, `partial`, `verified`, `unknown`) from `inputWriterStopped`. OS acceptance is not application completion; only value readback confirms `set_value`. Lost responses remain `unknown` even if later cancellation confirms writer drain.
 
+## Catalog discovery and on-demand acquisition
+
+Catalog reads and changing the default target do not start native helpers or
+probe capabilities. The catalog keeps the owning Host's last observation and
+probe time; before a probe it reports the absence of capability evidence. The
+explicit catalog refresh discovers remote machines and refreshes managed status
+without capturing a frame. The individual Probe command acquires the selected
+driver and reports its observed capabilities. A new active operation may
+discover its explicitly selected remote Host if no local mirror exists yet.
+
+## Dedicated Computer node
+
+The built Application Host includes a standalone `computer-node.js` entry.
+Set an absolute private `VARIN_DATA_DIR`; the optional
+`VARIN_COMPUTER_DRIVER_DIR` points to the same platform driver assets as the
+full Host. This role starts the resource kernel and the existing Computer
+owner only. It does not expose Agent, UI, file/command node, VM provisioning
+or general Host configuration endpoints. Default listen address is loopback.
+Use a trusted encrypted tunnel or reverse proxy for cross-device deployment.
+
+Create a coordinator credential while the node is stopped:
+`node computer-node.js pair --output /private/computer-client.json`.
+It grants desktop observation, not input. Add `--allow-control` to allow
+control of the selected desktop and `--allow-system` (which also requires
+control) for managed lifecycle, recipe installation, artifacts writes and
+explicit app binary, path or command selection. Store the token in the
+coordinator's existing desktop Host connection. `revoke CLIENT_ID` is also
+offline. The node accepts bearer credentials only; it does not issue UI
+sessions. Assignment leases are bound to both the authenticated peer and the
+owning process. Reconnect after restart must reacquire leases; durable
+device identity and the last observed capabilities remain in the private
+state directory. Live views use the original owner frame or read-only RFB
+media lane without a second input authority.
+
+Use platform-specific drivers and operating-system authorization as before.
+A Linux service with no permitted graphical session has control-plane health
+but no verified capture/input capability until its driver and session are
+available. Windows and macOS helpers live on their respective native hosts,
+not inside the Linux resource image.
+
+For a real X11 role acceptance on a Linux developer/CI worker, build the
+release kernel first (or set `VARIN_TEST_KERNEL_PATH` to that binary), install
+the usual workspace dependencies, then run
+`./scripts/test-computer-role-x11.sh`. On Debian-family distributions the
+additional test dependencies are `xvfb xauth x11-xserver-utils dbus python3-gi
+gir1.2-atspi-2.0 gir1.2-gtk-3.0`. Use a `python3` on PATH that sees those
+system typelibs. The script fails immediately if requirements are missing.
+It creates a private Xauthority-protected Xvfb display and D-Bus session,
+paints a synthetic root window, and verifies actual PNG fixture pixels through
+a separate coordinator's binary stream, before and after role restart.
+The role and original desktop IDs must survive; the previous control lease
+must fail before dispatch, and a new lease must reach action validation.
+The invalid action used for that check does not emit keyboard or pointer input.
+This does not certify capture on Wayland, Windows or macOS, or the packaged
+Docker image.
+
 ## Native drivers, capture sessions and visual feedback
 
-- **Windows**: Launches version/build-verified `VarinComputer.exe` directly; a same-user local named pipe fences/releases input independently of the MTA UIA worker. Interrupt retires the input helper permanently (awaited until process exit) while capture runs in a separate read-only process.
+- **Windows**: Launches version/build-verified `VarinComputer.exe` directly; a same-user local named pipe fences/releases input independently of the MTA UIA worker. Interrupt retires the input helper permanently (awaited until process exit) while capture runs in a separate read-only process. The final frame subscriber drains in-flight capture before retiring that helper; a new subscriber waits for retirement if it has already started. This does not stop the input helper.
 - **macOS & Wayland**: Drivers advertise `sharedDesktopSession` to `desktop-drivers.ts`: controller observations/input keep one ordered lane while viewer `capture_frame` uses a separate correlated read-only lane on the same process. Closing a viewer preserves platform authorization; desktop reset or Host disposal closes the helper after owner cleanup.
 - **Gestures & viewer streams**: Helpers emit coordinate/operation NDJSON gestures (never typed text). Updated peers negotiate a binary stream on the desktop event route (older peers keep SSE) with unchanged-frame suppression, single-newest-frame backpressure, and paused capture for hidden views.
 - **Overlays & UI**: On Windows, Electron renders click-through, nonfocusable overlays excluded from capture via `setContentProtection` (applied only to overlays, never product windows) plus a bottom control bar (Take control / Return to Varin / Cancel). Linux/macOS show feedback in the viewer. `useComputerAutomation` projects Host snapshots + stream invalidations without polling or probing desktops.

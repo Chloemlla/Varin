@@ -24,7 +24,7 @@ struct ReadHandle {
     mode: crate::process::text::Mode,
     encoding: Option<String>,
 }
-fn interacts(name: &str) -> bool {
+pub(crate) fn interacts(name: &str) -> bool {
     matches!(name, "process_write" | "process_resize")
 }
 fn observes(name: &str) -> bool {
@@ -74,12 +74,7 @@ pub(crate) fn declarations(
     resources: KernelResourceClient,
 ) -> Vec<varin_runtime::composition::tools::ToolDeclaration> {
     let selected = crate::tools::KernelToolExecutor::selected_schemas(&binding.enabled_tools);
-    let resources = resources.with_reference_catalog(catalog.clone());
-    let endpoint = Arc::new(ProcessWaitTools {
-        catalog,
-        binding,
-        resources,
-    });
+    let endpoint = endpoint(catalog, binding, resources);
     schemas(selected)
         .into_iter()
         .filter(|schema| {
@@ -89,6 +84,10 @@ pub(crate) fn declarations(
             varin_runtime::composition::tools::ToolDeclaration::new(schema, endpoint.clone())
         })
         .collect()
+}
+pub(crate) fn endpoint(catalog: Arc<Mutex<Catalog>>, binding: ToolBinding, resources: KernelResourceClient) -> Arc<dyn ToolExecutor> {
+    let resources = resources.with_reference_catalog(catalog.clone());
+    Arc::new(ProcessWaitTools { catalog, binding, resources })
 }
 struct ProcessWaitTools {
     catalog: Arc<Mutex<Catalog>>,
@@ -174,8 +173,10 @@ impl ProcessWaitTools {
             .launch_metadata(&c.run_id)
             .map_err(error)?
             .ok_or_else(|| error("process observation requires saved launch"))?;
-        if launch.selection.source.as_ref()
-            != Some(&self.binding.source_selection().map_err(error)?)
+        let expected = if launch.selection.lazy_work_location.is_some() && source.run_id == c.run_id {
+            source.resource_source.as_ref()
+        } else { launch.selection.source.as_ref() };
+        if expected != Some(&self.binding.source_selection().map_err(error)?)
         {
             return Err(error("process observation source changed"));
         }
@@ -378,6 +379,7 @@ impl ToolExecutor for ProcessWaitTools {
         _: &CancellationToken,
     ) -> Result<Box<dyn PreparedToolCall>, ExecutionError> {
         Ok(Box::new(ProcessCall {
+            source: self.binding.source_selection().map_err(error)?,
             owner: self,
             call: call.clone(),
             frozen: frozen.clone(),
@@ -592,24 +594,7 @@ impl ToolExecutor for ProcessWaitTools {
             self.authorize(c, call, contract, cancel)?;
             let id = self.handle(c, call)?;
             if call.name == STOP_TOOL {
-                let operation = self.catalog.lock().map_err(error)?
-                    .request_cancel_operation(&id).map_err(error)?;
-                let already_stopped = operation.external_receipt.as_ref().is_some_and(|receipt| receipt.executor_stopped);
-                let delivery = if already_stopped { Ok(true) } else {
-                    self.resources.cancel_process(&id, &operation.run_id).map_err(ExecutionError::from)
-                };
-                let observed = self.catalog.lock().map_err(error)?.operation(&id).map_err(error)?;
-                let stopped = observed.external_receipt.as_ref().is_some_and(|receipt| receipt.executor_stopped);
-                let mut content = json!({"processId":id,"cancelRequested":observed.cancel_requested,
-                    "status":if stopped {"stopped"} else {"stop_requested"},"stopConfirmed":stopped,
-                    "signalDelivered":if already_stopped { Some(false) } else { delivery.as_ref().ok().copied() },
-                    "outcome":observed.outcome});
-                if let Err(failure) = &delivery { content["error"] = json!(failure); }
-                return Ok(ToolCompletion::Result {
-                    outcome: if delivery.is_ok() { Outcome::Succeeded } else { Outcome::Failed },
-                    effect: Effect::Confirmed,
-                    content: content.into(),
-                });
+                return stop(&self.catalog, &self.resources, &id);
             }
             self.catalog
                 .lock()
@@ -632,12 +617,154 @@ impl ToolExecutor for ProcessWaitTools {
     }
 }
 
+fn stop(catalog: &Mutex<Catalog>, resources: &KernelResourceClient, id: &str) -> Result<ToolCompletion, ExecutionError> {
+    let operation = catalog.lock().map_err(error)?
+        .request_cancel_operation(id).map_err(error)?;
+    let already_stopped = operation.external_receipt.as_ref().is_some_and(|receipt| receipt.executor_stopped);
+    let delivery = if already_stopped { Ok(true) } else {
+        resources.cancel_process(id, &operation.run_id).map_err(ExecutionError::from)
+    };
+    let observed = catalog.lock().map_err(error)?.operation(id).map_err(error)?;
+    let stopped = observed.external_receipt.as_ref().is_some_and(|receipt| receipt.executor_stopped);
+    let mut content = json!({"processId":id,"cancelRequested":observed.cancel_requested,
+        "status":if stopped {"stopped"} else {"stop_requested"},"stopConfirmed":stopped,
+        "signalDelivered":if already_stopped { Some(false) } else { delivery.as_ref().ok().copied() },
+        "outcome":observed.outcome});
+    if let Err(failure) = &delivery { content["error"] = json!(failure); }
+    Ok(ToolCompletion::Result {
+        outcome: if delivery.is_ok() { Outcome::Succeeded } else { Outcome::Failed },
+        effect: Effect::Confirmed,
+        content: content.into(),
+    })
+}
+
+/// Operations from lazy launches retain their concrete execution view on the
+/// original receipt, not on the launch. Observing them never acquires the
+/// caller's current default or gives authority to a different Run.
+pub(crate) fn lazy_declarations(
+    tools: &[ToolSchema], run_id: String, catalog: Arc<Mutex<Catalog>>, resources: KernelResourceClient,
+) -> Vec<varin_runtime::composition::tools::ToolDeclaration> {
+    tools.iter().filter(|s| matches!(s.name.as_str(), STOP_TOOL | WAIT_TOOL | "process_inspect" | "process_read"))
+        .map(|schema| varin_runtime::composition::tools::ToolDeclaration::new(schema.clone(),
+            Arc::new(LazyProcess { schema: schema.clone(), run_id: run_id.clone(), catalog: catalog.clone(), resources: resources.clone() })))
+        .collect()
+}
+
+struct LazyProcess {
+    schema: ToolSchema,
+    run_id: String,
+    catalog: Arc<Mutex<Catalog>>,
+    resources: KernelResourceClient,
+}
+impl LazyProcess {
+    fn operation(&self, c: &ToolExecutionContext, call: &ToolCall, cancel: &CancellationToken)
+        -> Result<(String, varin_runtime::OperationMetadata, varin_runtime::catalog::launches::SourceSelection, Value), ExecutionError>
+    {
+        if cancel.is_cancelled() || c.run_id != self.run_id {
+            return Err(error("process control requires the original active Run"));
+        }
+        let db = self.catalog.lock().map_err(error)?;
+        db.validate_resource_snapshot_owner(&c.run_id, db.epoch(), &c.origin).map_err(error)?;
+        let run = db.run(&c.run_id).map_err(error)?;
+        if !db.model_tool_origin(&c.run_id, &c.origin).map_err(error)?
+            || !db.thread_has_host_authority(&run.thread_id).map_err(error)?
+            || !db.launch_metadata(&c.run_id).map_err(error)?.is_some_and(|l| l.selection.lazy_work_location.is_some())
+        {
+            return Err(error("process control requires an admitted lazy launch"));
+        }
+        let mut args = call.arguments.clone();
+        if let Some(reference) = args["ref"].as_str() {
+            if args.as_object().is_none_or(|o| o.len() != 1) {
+                return Err(error("Use the process continuation ref alone"));
+            }
+            let target: crate::resource_references::ReadTarget = crate::resource_references::resolve(
+                &db, varin_runtime::catalog::model_references::ReferenceKind::Read, reference)?;
+            if target.tool != call.name { return Err(error("Use the original tool from nextRead")); }
+            args = target.arguments;
+        }
+        let model_id = args["processId"].as_str().ok_or_else(|| error("processId required"))?;
+        let id = crate::resource_references::process(&db, model_id)?;
+        let original = db.require_process_observation(&c.run_id, &id).map_err(error)?;
+        if original.run_id != run.id || original.managed_process.as_ref().is_none_or(|p| p.is_environment()) {
+            return Err(error("Use a native process of the original Run"));
+        }
+        let original = db.operation(&id).map_err(error)?;
+        let source = db.original_operation_source(&original).map_err(error)?
+            .filter(|s| crate::work_locations::eligible(Some(s)))
+            .ok_or_else(|| error("The original process has no available live location"))?;
+        Ok((run.thread_id, original, source, args))
+    }
+    fn result(&self, c: &ToolExecutionContext, call: &ToolCall, cancel: &CancellationToken, auth: bool)
+        -> Result<ToolCompletion, ExecutionError>
+    {
+        let (thread, process, source, args) = self.operation(c, call, cancel)?;
+        if call.name == STOP_TOOL {
+            return if auth { Ok(ToolCompletion::Result { outcome: Outcome::Succeeded, effect: Effect::None, content: Value::Null.into() }) }
+                else { stop(&self.catalog, &self.resources, &process.id) };
+        }
+        if call.name == WAIT_TOOL && !auth {
+            self.catalog.lock().map_err(error)?.wait_for_process(c, &process.id).map_err(error)?;
+            return Ok(ToolCompletion::JobAccepted { operation_id: c.operation_id.clone(), phase: "awaiting_process".into(),
+                effect: Effect::None, lifetime: Lifetime::Thread, content: None });
+        }
+        let page = if call.name == "process_read" {
+            let h: ReadHandle = serde_json::from_value(args.clone()).map_err(error)?;
+            crate::process::text::validate_encoding(h.encoding.as_deref()).map_err(error)?;
+            Some(crate::process::text::ReadPage { cursor: h.cursor, max_bytes: h.max_bytes, mode: h.mode, encoding: h.encoding })
+        } else { None };
+        let mut result = crate::work_locations::observe_original_process(
+            &self.resources, c, call, &thread, &process, &source, page.clone(), auth, cancel)?;
+        if !auth {
+            if let Some(page) = page {
+                crate::process::text::project(&mut result, &page.mode, page.encoding.as_deref());
+                let mut db = self.catalog.lock().map_err(error)?;
+                let owner = crate::resource_references::owner(&source);
+                let reference = args["processId"].as_str().unwrap_or_default();
+                crate::tools::references::project_process_page(&mut db, &owner, reference, &mut result, &c.run_id)?;
+                if let Some(cursor) = result["nextCursor"].as_u64() {
+                    let mut next = args;
+                    next["cursor"] = json!(cursor);
+                    result["nextRead"] = crate::resource_references::continuation(
+                        &mut db, &owner, "process_read", None, next, &c.run_id)?;
+                }
+            }
+        }
+        Ok(ToolCompletion::Result { outcome: Outcome::Succeeded, effect: Effect::None, content: result.into() })
+    }
+}
+impl ToolExecutor for LazyProcess {
+    fn plan(&self, call: &ToolCall, frozen: &FrozenToolContext, cancel: &CancellationToken) -> Result<ToolPreparation, ExecutionError> {
+        self.prepare(call, frozen, cancel).map(ToolPreparation::Ready)
+    }
+    fn prepare(&self, call: &ToolCall, frozen: &FrozenToolContext, _: &CancellationToken) -> Result<ToolContract, ExecutionError> {
+        if frozen.run_id != self.run_id || frozen.source.is_some() || !frozen.tools.contains(&self.schema)
+            || call.name != self.schema.name || call.schema_version != self.schema.version
+        {
+            return Err(error("process capability differs from the frozen lazy launch"));
+        }
+        Ok(ToolContract { name: call.name.clone(), schema_version: call.schema_version.clone(),
+            read_only: call.name != STOP_TOOL,
+            completion: if call.name == WAIT_TOOL { CompletionKind::Job } else { CompletionKind::Result },
+            lifetime: if call.name == WAIT_TOOL { Lifetime::Thread } else { Lifetime::Run }, resources: vec![] })
+    }
+    fn authorize(&self, ctx: &ToolExecutionContext, call: &ToolCall, _: &ToolContract, cancel: &CancellationToken) -> Result<(), ExecutionError> {
+        self.result(ctx, call, cancel, true).map(|_| ())
+    }
+    fn execute(&self, ctx: &ToolExecutionContext, call: &ToolCall, _: &ToolContract, cancel: &CancellationToken) -> ToolCompletion {
+        self.result(ctx, call, cancel, false).unwrap_or_else(ToolCompletion::not_dispatched)
+    }
+}
+
 struct ProcessCall {
+    source: varin_runtime::catalog::launches::SourceSelection,
     owner: Arc<ProcessWaitTools>,
     call: ToolCall,
     frozen: FrozenToolContext,
 }
 impl PreparedToolCall for ProcessCall {
+    fn resource_source(&self) -> Option<&varin_runtime::catalog::launches::SourceSelection> {
+        interacts(&self.call.name).then_some(&self.source)
+    }
     fn executor_owner(&self) -> varin_runtime::ExecutorOwner {
         if interacts(&self.call.name) {
             if let Some(remote) = &self.owner.binding.remote_authority {

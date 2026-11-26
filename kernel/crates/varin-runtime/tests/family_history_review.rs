@@ -576,7 +576,8 @@ fn captured_reader_is_cancelled_without_cancelling_target_and_gc_and_epoch_are_f
             Some("branch:parent"),
         )
         .unwrap();
-    // A captured reader participates in the existing content publication protocol.
+    // Readers allow the mark to finish and fence the actual unlink.
+    drop(f.db.prepare_result_content().write_data(&json!("unpublished orphan")).unwrap());
     assert_eq!(
         f.db.prepare_content_collection(Default::default())
             .run()
@@ -664,6 +665,7 @@ fn paused_read_worker_does_not_own_catalog_and_append_fork_cancel_preserve_its_v
     let newest = append(&mut f, &target, "concurrent new tail");
     f.db.fork_branch("branch:parent", "family-fork", Some(&item.id))
         .unwrap();
+    drop(f.db.prepare_result_content().write_data(&json!("unpublished orphan")).unwrap());
     let owner = Arc::new(Mutex::new(f.db));
     assert_eq!(
         owner

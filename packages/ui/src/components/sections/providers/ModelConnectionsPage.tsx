@@ -9,7 +9,7 @@ import { parseModelRetrySettings } from '@varin/protocol';
 import { ConnectionSettings } from './ConnectionSettings';
 import { accountSignInProviders } from './account-sign-in';
 import { ModelConfigurationDrawer } from './ModelConfiguration';
-import { ModelPicker, ModelSelection } from './ModelSelection';
+import { ModelPicker, ModelSelection, type ModelDiscoveryResult } from './ModelSelection';
 import { addModels, editModel, followModel, modelCandidates } from './model-edits';
 import { useModelConnectionWrites } from './useModelConnectionWrites';
 import { requestSettingsNavigation } from '@/lib/settings/drafts';
@@ -25,6 +25,7 @@ import { useUIStore } from '@/stores/useUIStore';
 import { cn } from '@/lib/utils';
 
 type ConnectionDraft = Pick<ModelChannel, 'name' | 'baseUrl' | 'authentication' | 'parameters' | 'connection'>;
+type ModelServiceAction = 'test' | 'discover' | 'save' | 'other';
 const connectionDraft = ({ name, baseUrl, authentication, parameters, connection }: ModelChannel): ConnectionDraft => structuredClone({ name, baseUrl, authentication, parameters, connection });
 const discoveryConfiguration = (channel: ModelChannel) => JSON.stringify([channel.type, channel.baseUrl, channel.connection, channel.authentication, channel.parameters]);
 const providerEndpoint = (baseUrl: string) => { try { const url = new URL(baseUrl); return `${url.host}${url.pathname.replace(/\/$/, '')}`; } catch { return baseUrl; } };
@@ -54,11 +55,13 @@ function ModelConnectionsEditor({ host }: { host: number }) {
   const [drawerOpen, setDrawerOpen] = React.useState(false);
   const [secret, setSecret] = React.useState('');
   const [candidates, setCandidates] = React.useState<DiscoveredModel[]>([]);
+  const [modelDiscovery, setModelDiscovery] = React.useState<ModelDiscoveryResult | null>(null);
   const [catalog, setCatalog] = React.useState<{ key: string; models: ChannelModel[] }>({ key: '', models: [] });
   const [connectionResult, setConnectionResult] = React.useState<string | null>(null);
   const [connectionFailure, setConnectionFailure] = React.useState<string | null>(null);
   const [passed, setPassed] = React.useState<Record<string, string>>({});
-  const [working, setWorking] = React.useState(false);
+  const [activity, setActivity] = React.useState<ModelServiceAction | null>(null);
+  const working = activity !== null;
   const [authorization, setAuthorization] = React.useState<AuthorizationState | null>(null);
   const [invalidFields, setInvalidFields] = React.useState<Set<string>>(() => new Set());
   const [editorGeneration, setEditorGeneration] = React.useState(0);
@@ -67,7 +70,7 @@ function ModelConnectionsEditor({ host }: { host: number }) {
   const alive = React.useRef(true);
   const connectionGeneration = React.useRef(0);
   const actionGeneration = React.useRef(0);
-  const discoveryController = React.useRef<AbortController | null>(null);
+  const connectionRequest = React.useRef<AbortController | null>(null);
   const focus = useUIStore(state => state.settingsModelFocus);
   const savedChannel = snapshot?.channels.find(channel => channel.id === selectedId);
   const channel = step !== null ? newChannel : savedChannel;
@@ -84,17 +87,22 @@ function ModelConnectionsEditor({ host }: { host: number }) {
 
   const cancelAuthorization = () => { const id = activeAuthorization.current; activeAuthorization.current = undefined; if (id) void api.cancelAuthorization(id).catch(() => {}); setAuthorization(null); };
   const invalidateConnection = () => {
-    ++connectionGeneration.current; discoveryController.current?.abort(); setCandidates([]); setConnectionResult(null); setConnectionFailure(null);
+    ++connectionGeneration.current;
+    connectionRequest.current?.abort();
+    setCandidates([]);
+    setModelDiscovery(null);
+    setConnectionResult(null);
+    setConnectionFailure(null);
   };
   const choose = (value: ModelChannel, details = true) => {
-    ++actionGeneration.current; setWorking(false);
+    ++actionGeneration.current; setActivity(null);
     cancelAuthorization(); invalidateConnection(); setSelectedId(value.id); setStep(null); setNewChannel(null);
     const next = connectionDraft(value); setDraft(next); setBaseDraft(JSON.stringify(next)); setSecret('');
     setSelectedModelId(null); setInvalidFields(new Set()); setEditorGeneration(value => value + 1); setRetrySelected(false); setError(null);
     if (details) shell.setCatalogStage('detail');
   };
   const close = () => {
-    ++actionGeneration.current; setWorking(false); cancelAuthorization(); invalidateConnection();
+    ++actionGeneration.current; setActivity(null); cancelAuthorization(); invalidateConnection();
     setDraft(null); setSelectedId(null); setSelectedModelId(null); setDrawerOpen(false); setSecret(''); setStep(null); setNewChannel(null);
   };
   const selectRetry = () => { close(); setRetrySelected(true); shell.setCatalogStage('detail'); };
@@ -124,7 +132,7 @@ function ModelConnectionsEditor({ host }: { host: number }) {
       activeAuthorization.current = undefined;
       if (alive.current) setAuthorization(null);
     });
-    return () => { alive.current = false; controller.abort(); discoveryController.current?.abort(); stop(); stopSwitch(); const id = activeAuthorization.current; activeAuthorization.current = undefined; if (id) void api.cancelAuthorization(id).catch(() => {}); };
+    return () => { alive.current = false; controller.abort(); connectionRequest.current?.abort(); stop(); stopSwitch(); const id = activeAuthorization.current; activeAuthorization.current = undefined; if (id) void api.cancelAuthorization(id).catch(() => {}); };
   }, [api, refresh, setError]);
   React.useEffect(() => {
     if (!snapshot || !focus) return;
@@ -164,31 +172,52 @@ function ModelConnectionsEditor({ host }: { host: number }) {
     if (previous.has(key) === !valid) return previous;
     const next = new Set(previous); if (valid) next.delete(key); else next.add(key); return next;
   }), []);
-  const run = async (work: () => Promise<void>) => {
+  const run = async <T,>(kind: Exclude<ModelServiceAction, 'save'>, work: () => Promise<T>): Promise<T | undefined> => {
     const generation = connectionGeneration.current;
     const action = ++actionGeneration.current;
-    setWorking(true); setConnectionFailure(null);
-    try { await work(); return alive.current && generation === connectionGeneration.current; }
-    catch (cause) { if (alive.current && generation === connectionGeneration.current) setConnectionFailure(cause instanceof Error ? cause.message : String(cause)); return false; }
-    finally { if (alive.current && actionGeneration.current === action) setWorking(false); }
+    const current = () => alive.current && generation === connectionGeneration.current && actionGeneration.current === action;
+    setActivity(kind);
+    if (kind === 'discover') setModelDiscovery(null); else setConnectionFailure(null);
+    try {
+      const result = await work();
+      return current() ? result : undefined;
+    } catch (cause) {
+      if (current()) {
+        const message = cause instanceof Error ? cause.message : String(cause);
+        if (kind === 'discover') setModelDiscovery({ error: message }); else setConnectionFailure(message);
+      }
+    } finally {
+      if (alive.current && actionGeneration.current === action) setActivity(null);
+    }
   };
+  const nextConnectionSignal = () => {
+    connectionRequest.current?.abort();
+    const controller = new AbortController();
+    connectionRequest.current = controller;
+    return controller.signal;
+  };
+  const fetchModels = (channel: ModelChannel, signal: AbortSignal) =>
+    api.discoverDraft({ channel, ...(secret ? { secret } : {}) }, signal);
   const save = async (entries?: DiscoveredModel[]) => {
     if (!preview || !draft) return false;
     const originalId = preview.id;
     const originalDraft = draft;
     let connection = draft;
-    setWorking(true);
+    const action = ++actionGeneration.current;
+    const currentAction = () => alive.current && actionGeneration.current === action;
+    setActivity('save');
+    setConnectionFailure(null);
     const ok = await enqueue(async current => {
       if (secret && connection.authentication.kind === 'credential') {
         const { reference } = await api.storeCredential(secret);
         connection = { ...connection, authentication: { kind: 'credential', reference } };
-        if (alive.current) { setDraft(connection); setSecret(''); }
+        if (currentAction()) { setDraft(connection); setSecret(''); }
       }
       const latest = current.channels.find(value => value.id === originalId) ?? preview;
       return api.save({ ...latest, ...connection, ...(entries && type ? { models: addModels([], entries, type) } : {}) }, current.revision);
     });
-    if (alive.current) {
-      setWorking(false);
+    if (currentAction()) {
+      setActivity(null);
       if (ok) { setBaseDraft(JSON.stringify(connection)); setDraft(previous => previous === originalDraft ? connection : previous); setStep(null); setNewChannel(null); setSelectedId(originalId); setConnectionResult(null); }
     }
     return ok;
@@ -203,7 +232,7 @@ function ModelConnectionsEditor({ host }: { host: number }) {
     }, project);
   };
   const mutateModels = (transform: (models: ChannelModel[]) => ChannelModel[]) => mutateChannel(channel => ({ ...channel, models: transform(channel.models) }));
-  const signIn = (provider: string) => { if (preview) void run(async () => {
+  const signIn = (provider: string) => { if (preview) void run('other', async () => {
     const generation = connectionGeneration.current;
     const reference = preview.authentication.kind === 'credential' && preview.authentication.reference || `model:${preview.id}`;
     const pending = api.signIn(provider, reference); pendingAuthorization.current = pending;
@@ -215,23 +244,34 @@ function ModelConnectionsEditor({ host }: { host: number }) {
     const next = await api.authorization(state.id);
     if (alive.current && activeAuthorization.current === state.id) setAuthorization(next);
   }); };
-  const discover = () => run(async () => {
-    if (!preview || !type) return;
-    const generation = connectionGeneration.current;
-    const controller = new AbortController(); discoveryController.current?.abort(); discoveryController.current = controller;
-    if (type.discovery) {
-      const result = await api.discoverDraft({ channel: preview, ...(secret ? { secret } : {}) }, controller.signal);
-      if (!alive.current || generation !== connectionGeneration.current) return;
-      setCandidates(result.models); setConnectionResult(t('settings.models.discoveryPassed').replace('{count}', String(result.models.length)));
-    } else {
+  const testConnection = async () => {
+    if (!preview || !type) return false;
+    setConnectionResult(null);
+    const result = await run('test', async () => {
+      const signal = nextConnectionSignal();
+      if (type.discovery) {
+        const { models } = await fetchModels(preview, signal);
+        return { models, message: t('settings.models.discoveryPassed').replace('{count}', String(models.length)) };
+      }
       const model = preview.models.find(model => model.enabled);
       if (!model) throw new Error(t('settings.models.testNeedsModel'));
-      const result = await api.test({ key: crypto.randomUUID(), channel: preview, ...(secret ? { secret } : {}), modelId: model.id }, controller.signal);
-      if (!alive.current || generation !== connectionGeneration.current) return;
-      setConnectionResult(`${t('settings.models.testPassed')} · ${(result.elapsedMs / 1000).toFixed(1)} s`);
-    }
+      const result = await api.test({ key: crypto.randomUUID(), channel: preview, ...(secret ? { secret } : {}), modelId: model.id }, signal);
+      return { message: `${t('settings.models.testPassed')} · ${(result.elapsedMs / 1000).toFixed(1)} s` };
+    });
+    if (!result) return false;
+    if (result.models) setCandidates(result.models);
+    setConnectionResult(result.message);
     setPassed(previous => ({ ...previous, [preview.id]: discoveryConfiguration(preview) }));
-  });
+    return true;
+  };
+  const discoverModels = async () => {
+    if (!preview || !type?.discovery) return;
+    const result = await run('discover', () => fetchModels(preview, nextConnectionSignal()));
+    if (!result) return;
+    setCandidates(result.models);
+    setModelDiscovery(result);
+    setPassed(previous => ({ ...previous, [preview.id]: discoveryConfiguration(preview) }));
+  };
   const begin = () => requestSettingsNavigation(() => { close(); setRetrySelected(false); setStep(0); shell.setCatalogStage('detail'); setProviderQuery(''); });
   const selectType = (id: string) => {
     const selected = snapshot!.types.find(type => type.id === id)!;
@@ -277,7 +317,7 @@ function ModelConnectionsEditor({ host }: { host: number }) {
   const connectionValid = !invalidFields.size && Boolean(draft?.name.trim()) && authorization?.status !== 'pending';
   const connectionControls = preview && type && <ConnectionSettings draft={preview} type={type} busy={working} secret={secret} authorization={authorization} edit={edit} editConnection={editConnection} validity={validity}
     setSecret={value => { invalidateConnection(); setSecret(value); }} cancelAuthorization={cancelAuthorization} onSignIn={signIn}
-    onSignOut={() => { void run(async () => { if (preview.authentication.kind === 'credential') await api.removeCredential(preview.authentication.reference); if (alive.current) edit({ authentication: { kind: 'credential', reference: '' } }); }); }}
+    onSignOut={() => { void run('other', async () => { if (preview.authentication.kind === 'credential') await api.removeCredential(preview.authentication.reference); if (alive.current) edit({ authentication: { kind: 'credential', reference: '' } }); }); }}
     onAuthorizationReply={value => api.replyAuthorization(authorization!.id, value)} onAuthorizationCancel={async () => { await api.cancelAuthorization(authorization!.id); if (alive.current) { activeAuthorization.current = undefined; setAuthorization(null); } }} />;
   const channels = snapshot?.channels ?? [];
   const filter = query.trim().toLowerCase();
@@ -301,7 +341,7 @@ function ModelConnectionsEditor({ host }: { host: number }) {
     filter={{ value: query, onChange: setQuery, placeholder: t('settings.models.filterServices') }}
     headActions={snapshot && <>
       <Button variant="ghost" size="icon" aria-label={t('settings.models.addChannel')} onClick={begin}><Icon name="add" className="size-4" /></Button>
-      <DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon" aria-label={t('settings.models.serviceActions')} />}><Icon name="more" className="size-4" /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuItem disabled={snapshot.directory?.refreshing} onClick={() => { void run(async () => { await api.refreshDirectory(); await refresh(); }); }}>{t('settings.models.refreshDirectory')}</DropdownMenuItem></DropdownMenuContent></DropdownMenu>
+      <DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon" aria-label={t('settings.models.serviceActions')} />}><Icon name="more" className="size-4" /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuItem disabled={working || snapshot.directory?.refreshing} onClick={() => { void run('other', async () => { await api.refreshDirectory(); await refresh(); }); }}>{t('settings.models.refreshDirectory')}</DropdownMenuItem></DropdownMenuContent></DropdownMenu>
     </>}
     items={<>
       <CatalogItem pinned selected={retrySelected} opensDetail={false} onSelect={() => requestSettingsNavigation(selectRetry)}
@@ -341,19 +381,19 @@ function ModelConnectionsEditor({ host }: { host: number }) {
             actions={step === null ? <><Switch aria-label={t('settings.models.enabled')} checked={channel!.enabled} onCheckedChange={enabled => { void mutateChannel(channel => ({ ...channel, enabled })); }} /><DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon" aria-label={t('settings.models.serviceActions')} />}><Icon name="more" className="size-4" /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuItem onClick={remove}>{t('settings.models.removeService')}</DropdownMenuItem></DropdownMenuContent></DropdownMenu></> : null} />
           <div hidden={step === 2}><Section title={t('settings.models.connection')} description={t('settings.models.connectionDraft')}>
             <div className="sk-pad">{connectionControls}</div>
-            <div className="sk-pad flex flex-wrap items-center gap-3"><Button variant="outline" disabled={working || !connectionValid} onClick={() => { if (step === 1 && !type.discovery) setStep(2); else void discover().then(ok => { if (ok && step === 1) setStep(2); }); }}><Icon name={working ? 'loader-4' : 'play'} className={cn('size-3.5', working && 'animate-spin')} />{t(step === 1 ? type.discovery ? 'settings.models.connectAndDiscover' : 'settings.models.chooseModels' : 'settings.models.testConnection')}</Button>
+            <div className="sk-pad flex flex-wrap items-center gap-3"><Button variant="outline" disabled={working || !connectionValid} aria-busy={activity === 'test'} onClick={() => { if (step === 1 && !type.discovery) setStep(2); else void testConnection().then(ok => { if (ok && step === 1) setStep(2); }); }}><Icon name={activity === 'test' ? 'loader-4' : 'play'} className={cn('size-3.5', activity === 'test' && 'animate-spin')} />{t(step === 1 ? type.discovery ? 'settings.models.connectAndDiscover' : 'settings.models.chooseModels' : 'settings.models.testConnection')}</Button>
               {step === 1 ? <Button variant="ghost" disabled={working || !connectionValid} onClick={() => setStep(2)}>{t('settings.models.skipValidation')}</Button> : null}
               {connectionResult ? <span role="status" className="typography-micro text-muted-foreground">{connectionResult}</span> : null}
             </div>
             {connectionFailure ? <Note kind="err" inPanel>{connectionFailure}</Note> : null}
-            <SettingsActionBar placement="inline" dirty={dirty} saving={working && !authorization} onSave={step === null ? () => save() : undefined} onCancel={() => { if (savedChannel && step === null) choose(savedChannel); else { close(); shell.setCatalogStage('list'); } }} saveDisabled={!connectionValid || step !== null} saveLabel={t('settings.models.save')} />
+            <SettingsActionBar placement="inline" dirty={dirty} saving={activity === 'save'} onSave={step === null ? () => save() : undefined} onCancel={() => { if (savedChannel && step === null) choose(savedChannel); else { close(); shell.setCatalogStage('list'); } }} saveDisabled={working || !connectionValid || step !== null} saveLabel={t('settings.models.save')} />
           </Section></div>
           {step === 2 && connectionFailure ? <Note kind="err">{connectionFailure}</Note> : null}
-          {step === 2 ? <><Button variant="ghost" size="sm" className="mb-4" disabled={working} onClick={() => setStep(1)}><Icon name="arrow-left-s" className="size-4" />{t('settings.models.connection')}</Button><ModelPicker available={modelCandidates(type, candidates)} initialIds={type.defaultModelIds} busy={working || saving} confirmLabel={t('settings.models.addChannel')} onConfirm={entries => { void save(entries); }} /></> : null}
+          {step === 2 ? <><Button variant="ghost" size="sm" className="mb-4" disabled={working} onClick={() => setStep(1)}><Icon name="arrow-left-s" className="size-4" />{t('settings.models.connection')}</Button><ModelPicker available={modelCandidates(type, candidates)} initialIds={type.defaultModelIds} busy={working || saving} allowEmpty confirmLabel={t('settings.models.addChannel')} onConfirm={entries => { void save(entries); }} /></> : null}
           {step === null ? <>
-            <ModelSelection models={models} type={type} candidates={candidates} busy={working || saving} usages={usages} onConfigure={id => { setSelectedModelId(id); setDrawerOpen(true); }}
+            <ModelSelection models={models} type={type} candidates={candidates} busy={working || saving} discovering={activity === 'discover'} discovery={modelDiscovery} usages={usages} onConfigure={id => { setSelectedModelId(id); setDrawerOpen(true); }}
               onToggle={(id, enabled) => { void mutateModels(models => models.map(model => model.id === id ? { ...model, enabled } : model)); }}
-              onAdd={entries => mutateModels(models => addModels(models, entries, type))} onDiscover={discover} />
+              onAdd={entries => mutateModels(models => addModels(models, entries, type))} onDiscover={discoverModels} />
             <Button variant="ghost" size="sm" className="text-destructive" disabled={saving || working} onClick={remove}>{t('settings.models.removeService')}</Button>
           </> : null}
         </div> : null}

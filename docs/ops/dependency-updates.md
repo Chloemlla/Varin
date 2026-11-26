@@ -19,7 +19,7 @@ Configured in [.github/dependabot.yml](../../.github/dependabot.yml):
 | GitHub Actions `/` | Monday 02:00 | 3d |
 
 - Coupled ecosystems (React, PDF.js/canvas, CodeMirror/Lezer, Vite, Vitest, ESLint, Electron, Capacitor, SQLite, tree-sitter/Wasmtime/Cranelift, artifact actions) are grouped for joint review; auth, network, native, compiler, and risky `0.x` packages stay ungrouped.
-- `triviumdb-upgrade-0.8` is a legacy migration reader pinned on the `0.8` line — never bump it alongside current `triviumdb`.
+- Update `scripts/trivium-release.json` with the current npm version and its verified release commit. Full Host builds use that revision for the migration executable and the Windows ARM64 addon.
 - Security updates bypass normal cooldowns, but note that Dependabot does not yet generate automated security PRs for Bun — handle urgent Bun advisories proactively. Auto-merge stays off.
 
 ## PR Preflight, Reports & Cloud Lockfile

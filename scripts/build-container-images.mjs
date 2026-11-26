@@ -9,9 +9,10 @@ const repository = 'Astrmira/Varin';
 const digestPattern = /^sha256:[a-f0-9]{64}$/;
 const shaPattern = /^[a-f0-9]{40}$/;
 const names = { slim_base: 'varin-runtime-slim', toolbelt_base: 'varin-runtime-toolbelt',
-  standard_app: 'varin', toolbelt_app: 'varin-toolbelt', resource_node: 'varin-node' };
+  standard_app: 'varin', toolbelt_app: 'varin-toolbelt', resource_node: 'varin-node', browser_node: 'varin-browser-node', computer_node: 'varin-computer-node' };
 const baseTargets = { slim_base: 'slim', toolbelt_base: 'toolbelt' };
 const baseForApp = { standard_app: 'slim_base', toolbelt_app: 'toolbelt_base' };
+const roleTargets = { resource_node: 'resource-node', browser_node: 'browser-node', computer_node: 'computer-node' };
 
 export function containerBuildConfig(input) {
   if (!['check', 'release', 'commit'].includes(input.publication)) throw new Error('Unknown container publication channel');
@@ -43,6 +44,8 @@ export function containerBuildConfig(input) {
     registry: input.publication === 'check' ? 'localhost:5000' : imageRegistry,
     sourceDirectory: path.resolve(input.sourceDirectory), outputDirectory: path.resolve(input.outputDirectory),
     resourceNode: input.publication !== 'commit' && input.resourceNode === true,
+    browserNode: input.publication === 'check' && input.browserNode === true,
+    computerNode: input.publication === 'check' && input.computerNode === true,
     tag: `candidate-${input.runId}-${input.runAttempt}` };
 }
 
@@ -71,14 +74,15 @@ function cache(config, phase) {
 export function containerBakePlan(config, phase, bases = {}) {
   if (!['bases', 'applications'].includes(phase)) throw new Error('Unknown container build phase');
   const targets = {}, caching = cache(config, phase);
-  const keys = phase === 'bases' ? Object.keys(baseTargets) : [...Object.keys(baseForApp), ...(config.resourceNode ? ['resource_node'] : [])];
+  const roles = [config.resourceNode && 'resource_node', config.browserNode && 'browser_node', config.computerNode && 'computer_node'].filter(Boolean);
+  const keys = phase === 'bases' ? Object.keys(baseTargets) : [...Object.keys(baseForApp), ...roles];
   for (const key of keys) {
     if (!config.toolbelt && key.startsWith('toolbelt_')) continue;
     if (phase === 'bases' && config.overrides[key]) continue;
-    const base = phase === 'applications' ? bases[key === 'resource_node' ? 'slim_base' : baseForApp[key]] : null;
+    const base = phase === 'applications' ? bases[Object.hasOwn(roleTargets, key) ? 'slim_base' : baseForApp[key]] : null;
     if (phase === 'applications' && !/^.+@sha256:[a-f0-9]{64}$/.test(base ?? '')) throw new Error(`Missing immutable base for ${key}`);
     targets[key] = { context: config.sourceDirectory, dockerfile: phase === 'bases' ? 'Dockerfile.base' : 'Dockerfile',
-      ...(phase === 'bases' ? { target: baseTargets[key] } : key === 'resource_node' ? { target: 'resource-node' } : {}),
+      ...(phase === 'bases' ? { target: baseTargets[key] } : Object.hasOwn(roleTargets, key) ? { target: roleTargets[key] } : {}),
       platforms: config.platforms, pull: true, tags: [`${config.registry}/${names[key]}:${config.tag}`],
       labels: labels(config, base), attest: ['type=provenance,mode=max', 'type=sbom'],
       output: ['type=registry'], 'cache-from': caching.from,
@@ -180,6 +184,8 @@ function environmentConfig(env) {
     localCache: env.CONTAINER_LOCAL_CACHE === 'true',
     toolbelt: env.CONTAINER_TOOLBELT === 'true', multiPlatform: env.CONTAINER_MULTI_PLATFORM === 'true',
     resourceNode: fs.existsSync(path.join(sourceDirectory, 'packages/web/application-host/resource-node.ts')),
+    browserNode: fs.existsSync(path.join(sourceDirectory, 'packages/web/application-host/browser-node.ts')),
+    computerNode: fs.existsSync(path.join(sourceDirectory, 'packages/web/application-host/computer-node.ts')),
     slimBase: env.CONTAINER_SLIM_BASE, toolbeltBase: env.CONTAINER_TOOLBELT_BASE });
 }
 
@@ -205,6 +211,10 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     // independent complete source-quality workflow still owns qualification.
     execFileSync(process.execPath, [path.join(config.sourceDirectory, 'scripts/build-cloud-runtime.mjs'), '--check-lock'],
       { cwd: config.sourceDirectory, stdio: 'inherit' });
+    for (const [enabled, role] of [[config.browserNode, 'browser'], [config.computerNode, 'computer']]) {
+      if (enabled) execFileSync(process.execPath, [path.join(config.sourceDirectory, 'scripts/build-resource-node.mjs'), '--check-lock', '--role', role],
+        { cwd: config.sourceDirectory, stdio: 'inherit' });
+    }
     console.log(`Accepted ${config.publication} container inputs at ${config.sourceSha}`);
   } else {
     const registry = createImageRegistry(dockerCommand());

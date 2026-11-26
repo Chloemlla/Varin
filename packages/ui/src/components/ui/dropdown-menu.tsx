@@ -85,6 +85,7 @@ function DropdownMenuTrigger({
 
 type ContentProps = {
   sideOffset?: number;
+  collisionBoundary?: React.ComponentProps<typeof BaseMenu.Positioner>["collisionBoundary"];
   align?: "start" | "center" | "end";
   side?: "top" | "right" | "bottom" | "left";
   alignOffset?: number;
@@ -99,6 +100,7 @@ type ContentProps = {
 function DropdownMenuContent({
   className,
   sideOffset = 4,
+  collisionBoundary,
   align,
   side,
   alignOffset,
@@ -115,6 +117,7 @@ function DropdownMenuContent({
   return (
     <BaseMenu.Portal container={portalToBody ? undefined : portalContext?.portalContainer || undefined}>
       <BaseMenu.Positioner
+        collisionBoundary={collisionBoundary}
         sideOffset={sideOffset}
         align={align}
         side={side}

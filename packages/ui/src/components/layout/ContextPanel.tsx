@@ -857,7 +857,7 @@ export const ContextPanel: React.FC<{
         : activeTab?.mode === 'threads'
             ? <ThreadFamilyPanel active={isOpen} owner={contextOwner?.identity} source={activeTab.thread} member={activeTab.member} navigationKey={activeTab.touchedAt} />
         : activeTab?.mode === 'tree'
-            ? <ConversationTreePanel active={isOpen} />
+            ? <ConversationTreePanel active={isOpen} onRevealTurn={embedded ? handleClose : undefined} />
         : activeTab?.mode === 'ui' && activeTab.targetPath
             ? <InteractiveUiPanel sessionKey={activeTab.targetPath} identity={activeTab.thread} contentRef={activeTab.contentRef} directory={panelKey} onReturn={() => closeContextPanelTab(panelKey, activeTab.id)} />
         : activeTab?.mode === 'material' && activeTab.targetPath && activeTab.thread

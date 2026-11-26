@@ -82,6 +82,7 @@ pub(super) fn execute(
         tool_schema_generation: resolved.tool_schema_generation,
         tools,
         policy: crate::observations::default_policy_identity(),
+        lazy_work_location: None,
         source: None,
     };
     let mcp_binding = resolved.mcp_binding.clone();

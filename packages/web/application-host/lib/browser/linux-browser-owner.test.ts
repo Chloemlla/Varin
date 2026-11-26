@@ -42,6 +42,9 @@ describe('original Linux browser resource adapter', () => {
     const found = await discovery.discover();
     expect(found).toHaveLength(1);
     expect(found[0]!.owner).toBe((await discovery.discover())[0]!.owner);
+    expect(await f.owner.resource()).toMatchObject({ state: 'disconnected', activation: 'existing-session' });
+    expect(f.browser).not.toHaveBeenCalled();
+    await f.owner.prepareResource();
     const status = await f.owner.resource();
     expect(status.instanceId).toBe('actual-instance');
     expect(JSON.stringify(status)).not.toContain('ws://');

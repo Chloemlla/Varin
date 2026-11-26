@@ -72,12 +72,16 @@ const render = () => act(async () => root.render(<ConversationTreePanel />));
 const row = (id: string) => container.querySelector<HTMLElement>(`[data-tree-node="${id}"]`)!;
 
 it('opens another route at its original message without recovering or submitting work', async () => {
-  await render();
+  const key = threadComposerKey(threadHostKey(), { ...identity, branchId: 'saved' });
+  const onRevealTurn = vi.fn(() => useConversationTreeStore.getState().navigation[key]);
+  await act(async () => root.render(<ConversationTreePanel onRevealTurn={onRevealTurn} />));
+  expect(onRevealTurn).not.toHaveBeenCalled();
   expect(services.api.historyPage).not.toHaveBeenCalled();
   await act(async () => row('saved-turn').querySelector<HTMLButtonElement>('button')!.click());
   expect(openThreadFromNavigation).toHaveBeenCalledWith({ ...identity, branchId: 'saved' });
-  const key = threadComposerKey(threadHostKey(), { ...identity, branchId: 'saved' });
   expect(useConversationTreeStore.getState().navigation[key]).toMatchObject({ kind: 'reveal', entryId: 'saved-turn', runId: 'old-second' });
+  expect(onRevealTurn).toHaveBeenCalledOnce();
+  expect(onRevealTurn).toHaveReturnedWith(useConversationTreeStore.getState().navigation[key]);
   expect(services.api.navigate).not.toHaveBeenCalled(); expect(services.api.fork).not.toHaveBeenCalled();
   await act(async () => row('saved-turn').querySelector<HTMLButtonElement>('[aria-label="chat.tree.expand"]')!.click());
   expect(services.api.historyPage).toHaveBeenCalledWith({ ...identity, branchId: 'saved' }, { headId: 'saved-end', beforeId: undefined }, expect.any(AbortSignal));

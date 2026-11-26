@@ -246,7 +246,7 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
                     title={isUnavailable ? `${providerError} · ${t('settings.harness.retry')}` : undefined}
                     className={cn(
                         variant === 'composer'
-                            ? 'flex h-8 min-w-0 flex-1 items-center justify-between gap-1.5 overflow-hidden px-1 typography-meta text-foreground transition-opacity hover:opacity-70'
+                            ? 'flex h-8 min-w-0 max-w-full items-center gap-1.5 overflow-hidden px-1 typography-meta text-foreground transition-opacity hover:opacity-70'
                             : dropdownTriggerVariants(),
                         variant === 'field' && 'w-full',
                         className,

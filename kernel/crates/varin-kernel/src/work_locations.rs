@@ -1,6 +1,5 @@
 //! Per-call workspace routing. The Catalog stores location observations, never permits.
 //! Resolve the target in the physical preparation lane and delegate to the native resource executor.
-#[cfg(test)]
 use crate::tools::ToolKind;
 use crate::tools::{KernelResourceClient, KernelToolExecutor, ToolBinding};
 use serde::{Deserialize, Serialize};
@@ -9,7 +8,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, OnceLock};
 use varin_runtime::{
     catalog::{
-        launches::{SourceResourceOwner, SourceSelection},
+        launches::{LazyWorkLocation, SourceResourceOwner, SourceSelection},
         model_references::ReferenceKind,
     },
     composition::tools::ToolDeclaration,
@@ -22,15 +21,18 @@ fn denied(reason: impl ToString) -> ExecutionError {
     ExecutionError::new("work_location_unavailable", reason.to_string())
 }
 pub(crate) fn alternate_tool(name: &str) -> bool {
-    grant_capabilities(name).is_some()
+    matches!(name, "file_read" | "file_list" | "file_search" | "file_write" | "file_edit" | "process_spawn")
 }
 pub(crate) fn grant_capabilities(name: &str) -> Option<&'static [&'static str]> {
     match name {
         "file_read" | "file_list" | "file_search" => Some(&["storage.read"]),
         "file_write" | "file_edit" => Some(&["storage.read", "storage.write"]),
-        "process_spawn" => Some(&["storage.read", "storage.write", "process"]),
+        "process_spawn" | "process_write" | "process_resize" => Some(&["storage.read", "storage.write", "process"]),
         _ => None,
     }
+}
+pub(crate) fn binds_location(name: &str) -> bool {
+    ToolKind::all().any(|kind| kind.name() == name) && !matches!(name, "process_inspect" | "process_read")
 }
 fn routed_schema(mut original: ToolSchema) -> ToolSchema {
     if original.name == "file_read" {
@@ -69,6 +71,13 @@ pub(crate) fn schema() -> ToolSchema {
         "Find work locations by name, device or path. To resolve an unsaved directory, pass a returned device reference and a path on that device. Pass a location to a resource tool for this request or to work_location_switch for the next run.".into(),
         schema:json!({"type":"object","additionalProperties":false,"properties":{"query":{"type":"string"},"device":{"type":"string"},"path":{"type":"string"}},"dependentRequired":{"device":["path"],"path":["device"]}}),
         output_schema:None, requirements:None, metadata:None }
+}
+fn discovery_schema() -> ToolSchema {
+    let mut schema = schema();
+    schema.version = "2".into();
+    schema.description.push_str(" Use refresh:true to discover unobserved devices.");
+    schema.schema["properties"]["refresh"] = json!({"type":"boolean"});
+    schema
 }
 pub(crate) fn switch_schema() -> ToolSchema {
     ToolSchema {
@@ -114,18 +123,77 @@ pub(crate) fn wraps_native(routed: &ToolSchema, native: &ToolSchema) -> bool {
         && *routed == routed_schema(native.clone())
 }
 pub(crate) fn add_schemas(tools: &mut Vec<ToolSchema>) {
+    add_location_schemas(tools, false);
+}
+pub(crate) fn add_location_schemas(tools: &mut Vec<ToolSchema>, lazy: bool) {
     if !tools.iter().any(|tool| tool.name == "file_read") {
         return;
     }
-    for tool in tools.iter_mut().filter(|tool| alternate_tool(&tool.name)) {
-        *tool = routed_schema(tool.clone());
+    for tool in tools.iter_mut().filter(|tool| alternate_tool(&tool.name) || lazy && binds_location(&tool.name)) {
+        *tool = route_schema(tool.clone(), lazy);
     }
-    tools.push(schema());
+    if lazy {
+        for schema in tools.iter_mut().filter(|t| matches!(t.name.as_str(), "process_inspect" | "process_read")) {
+            schema.requirements = None;
+        }
+    }
+    tools.push(if lazy { discovery_schema() } else { schema() });
     tools.push(switch_schema());
     if tools.iter().any(|tool| tool.name == "file_write") {
         tools.push(transfer_schema());
     }
     tools.sort_by(|a, b| a.name.cmp(&b.name));
+}
+
+fn route_schema(native: ToolSchema, lazy: bool) -> ToolSchema {
+    let mut routed = if alternate_tool(&native.name) { routed_schema(native) } else { native };
+    if crate::process_wait::interacts(&routed.name) {
+        routed.requirements = None;
+        return routed;
+    }
+    // The outer declaration resolves a physical tool before it runs. Keep the
+    // original requirement on the exact inner executor selected after binding.
+    if lazy {
+        add_context_revision(&mut routed);
+    }
+    routed
+}
+
+fn add_context_revision(schema: &mut ToolSchema) {
+    schema.requirements = None;
+    let context = json!({
+        "type":"string", "minLength":1,
+        "description":"Opaque context revision returned by the default resource. Include it on a retry after reading the returned instructions."
+    });
+    if schema.schema.get("properties").is_some() {
+        schema.schema["properties"]["resource_context"] = context;
+    } else {
+        schema.schema["oneOf"][0]["properties"]["resource_context"] = context;
+    }
+}
+pub(crate) fn wraps_lazy_native(routed: &ToolSchema, native: &ToolSchema) -> bool {
+    if native.version != "2" || routed.name != native.name { return false; }
+    if matches!(native.name.as_str(), "process_inspect" | "process_read") {
+        let mut dormant = native.clone();
+        dormant.requirements = None;
+        *routed == dormant
+    } else {
+        binds_location(&native.name) && *routed == route_schema(native.clone(), true)
+    }
+}
+pub(crate) fn child_schema(mut native: ToolSchema) -> ToolSchema {
+    native.version = "4".into();
+    add_context_revision(&mut native);
+    native
+}
+pub(crate) fn lazy_location(input: crate::protocol_generated::LazyWorkLocationParams) -> Result<LazyWorkLocation, crate::error::KernelError> {
+    let location = LazyWorkLocation {
+        resource_owner: input.resource_owner,
+        path: input.path,
+        workspace_id: input.workspace_id,
+    };
+    location.validate().map_err(|error| crate::error::KernelError::Protocol(error.to_string()))?;
+    Ok(location)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,6 +232,8 @@ struct Device {
 #[serde(deny_unknown_fields)]
 struct Search {
     query: Option<String>,
+    #[serde(default)]
+    refresh: bool,
     device: Option<String>,
     path: Option<String>,
 }
@@ -189,9 +259,13 @@ struct Transfer {
 
 struct Owner {
     run_id: String,
-    default: SourceSelection,
+    child: bool,
+    default: Option<SourceSelection>,
+    lazy: Option<LazyWorkLocation>,
     catalog: Arc<Mutex<Catalog>>,
     resources: KernelResourceClient,
+    retrieval: Option<Arc<crate::agent_runtime::control_commands::ControlCommands>>,
+    language: crate::language::LanguageBridge,
 }
 impl Owner {
     fn scope(
@@ -199,33 +273,33 @@ impl Owner {
         ctx: &ToolExecutionContext,
         cancel: &CancellationToken,
     ) -> Result<String, ExecutionError> {
-        if ctx.run_id != self.run_id
-            || cancel.is_cancelled()
-            || !matches!(ctx.origin, ToolOrigin::ModelStep { .. })
-        {
+        if ctx.run_id != self.run_id || cancel.is_cancelled() {
             return Err(denied(
                 "Location selection requires an active ordinary native model request",
             ));
         }
         let c = self.catalog.lock().map_err(denied)?;
         let run = c.run(&ctx.run_id).map_err(denied)?;
-        if run.state.terminal()
+        if run.state.terminal() || !c.model_tool_origin(&ctx.run_id, &ctx.origin).map_err(denied)?
             || !c
                 .thread_has_host_authority(&run.thread_id)
                 .map_err(denied)?
             || c.child_task_for_thread(&run.thread_id)
                 .map_err(denied)?
-                .is_some()
+                .is_some() != self.child
             || c.is_context_job(&run.id).map_err(denied)?
-            || c.launch_metadata(&run.id)
-                .map_err(denied)?
-                .and_then(|l| l.selection.source)
-                .as_ref()
-                != Some(&self.default)
+            || !c.launch_metadata(&run.id).map_err(denied)?.is_some_and(|l| {
+                l.selection.source == self.default
+                    && l.selection.lazy_work_location == self.lazy
+            })
         {
             return Err(denied(
                 "Location selection is unavailable for this task or source",
             ));
+        }
+        if self.child {
+            c.require_lazy_child_launch(&run.id, self.lazy.as_ref().ok_or_else(|| denied("missing lazy child location"))?)
+                .map_err(denied)?;
         }
         c.validate_resource_snapshot_owner(&run.id, c.epoch(), &ctx.origin)
             .map_err(denied)?;
@@ -240,6 +314,9 @@ impl Owner {
         let thread = self.scope(ctx, cancel)?;
         let search: Search = serde_json::from_value(call.arguments.clone()).map_err(denied)?;
         let mut query = json!({"kind":"work_locations","runId":ctx.run_id,"threadId":thread,"callId":call.call_id,"origin":ctx.origin});
+        if search.refresh && call.schema_version == "2" {
+            query["refresh"] = json!(true);
+        }
         if let Some(q) = search.query {
             query["query"] = json!(q);
         }
@@ -399,23 +476,32 @@ fn device_owner(run: &str) -> String {
 pub(crate) fn route_declarations(
     declarations: &mut Vec<ToolDeclaration>,
     run_id: String,
-    default: SourceSelection,
+    default: Option<SourceSelection>,
+    lazy: Option<LazyWorkLocation>,
+    lazy_native_schemas: Vec<ToolSchema>,
+    retrieval: Arc<crate::agent_runtime::control_commands::ControlCommands>,
+    language: crate::language::LanguageBridge,
     catalog: Arc<Mutex<Catalog>>,
     resources: KernelResourceClient,
 ) {
     let owner = Arc::new(Owner {
         run_id,
+        child: false,
+        retrieval: Some(retrieval),
+        language,
         default,
+        lazy,
         catalog,
         resources,
     });
     let mut routed = Vec::new();
     for declaration in std::mem::take(declarations) {
         if alternate_tool(&declaration.schema.name) {
-            let schema = routed_schema(declaration.schema.clone());
+            let schema = route_schema(declaration.schema.clone(), false);
             let router = Router {
                 schema: schema.clone(),
-                native: declaration,
+                native_schema: declaration.schema,
+                native: Some(declaration.implementation),
                 owner: owner.clone(),
             };
             routed.push(ToolDeclaration::new(schema, Arc::new(router)));
@@ -423,13 +509,32 @@ pub(crate) fn route_declarations(
             routed.push(declaration);
         }
     }
-    routed.push(ToolDeclaration::new(self::schema(), owner.clone()));
+    for native_schema in lazy_native_schemas {
+        let schema = route_schema(native_schema.clone(), true);
+        let router = Router { schema: schema.clone(), native_schema, native: None, owner: owner.clone() };
+        routed.push(ToolDeclaration::new(schema, Arc::new(router)));
+    }
+    let discovery = if owner.lazy.is_some() { discovery_schema() } else { schema() };
+    routed.push(ToolDeclaration::new(discovery, owner.clone()));
     routed.push(ToolDeclaration::new(switch_schema(), owner.clone()));
     if routed.iter().any(|tool| tool.schema.name == "file_write") {
         routed.push(ToolDeclaration::new(transfer_schema(), owner));
     }
     *declarations = routed;
 }
+pub(crate) fn child_declarations(
+    run_id: String, location: LazyWorkLocation, native_schemas: Vec<ToolSchema>,
+    language: crate::language::LanguageBridge,
+    catalog: Arc<Mutex<Catalog>>, resources: KernelResourceClient,
+) -> Vec<ToolDeclaration> {
+    let owner = Arc::new(Owner { run_id, child: true, default: None, lazy: Some(location), catalog, resources, retrieval: None, language });
+    native_schemas.into_iter().map(|native_schema| {
+        let schema = child_schema(native_schema.clone());
+        let router = Router { schema: schema.clone(), native_schema, native: None, owner: owner.clone() };
+        ToolDeclaration::new(schema, Arc::new(router))
+    }).collect()
+}
+
 impl ToolExecutor for Owner {
     fn plan(
         &self,
@@ -446,15 +551,15 @@ impl ToolExecutor for Owner {
         _: &CancellationToken,
     ) -> Result<ToolContract, ExecutionError> {
         let expected = match c.name.as_str() {
-            NAME => schema(),
+            NAME if c.schema_version == "1" => schema(),
+            NAME => discovery_schema(),
             SWITCH => switch_schema(),
             TRANSFER => transfer_schema(),
             _ => return Err(denied("Unknown workspace tool")),
         };
         if c.schema_version != expected.version
             || !f.tools.contains(&expected)
-            || f.source.as_ref() != Some(&self.default)
-            || !matches!(f.origin, ToolOrigin::ModelStep { .. })
+            || f.source != self.default
         {
             return Err(denied("Work locations are not selected for this request"));
         }
@@ -527,13 +632,16 @@ impl ToolExecutor for Owner {
 }
 struct Router {
     schema: ToolSchema,
-    native: ToolDeclaration,
+    native_schema: ToolSchema,
+    native: Option<Arc<dyn ToolExecutor>>,
     owner: Arc<Owner>,
 }
 struct Alternate {
     expected: Option<SourceSelection>,
     owner: Arc<Owner>,
     location: Option<String>,
+    resource_context: Option<String>,
+    process_id: Option<String>,
     call: ToolCall,
     frozen: FrozenToolContext,
 }
@@ -543,6 +651,7 @@ struct Routed {
     prepared: OnceLock<Box<dyn PreparedToolCall>>,
     lease: OnceLock<ReadLease>,
     native_version: String,
+    routed_version: String,
 }
 struct ReadLease {
     resources: KernelResourceClient,
@@ -559,11 +668,7 @@ pub(crate) fn observe_original_process(
     authorize_only: bool,
     cancel: &CancellationToken,
 ) -> Result<Value, ExecutionError> {
-    if !matches!(caller.origin, ToolOrigin::ModelStep { .. }) {
-        return Err(denied(
-            "Cross-workspace process observation requires the conversation model",
-        ));
-    }
+
     let view = format!("process-view:{}", uuid::Uuid::new_v4());
     let result = resources.source_query(
         json!({"kind":"work_location_process_view","runId":caller.run_id,
@@ -616,7 +721,7 @@ impl ToolExecutor for Router {
         if c.name != self.schema.name
             || c.schema_version != self.schema.version
             || !f.tools.contains(&self.schema)
-            || f.source.as_ref() != Some(&self.owner.default)
+            || f.source != self.owner.default
         {
             return Err(denied("Workspace tool differs from its frozen request"));
         }
@@ -624,22 +729,57 @@ impl ToolExecutor for Router {
         let mut frozen = f.clone();
         // Delegate to the exact retained native v2 tool. Targets, including
         // older full Hosts, never receive the coordinator selector or this outer schema version.
-        call.schema_version = self.native.schema.version.clone();
+        call.schema_version = self.native_schema.version.clone();
         let schemas = Arc::make_mut(&mut frozen.tools);
-        *schemas.iter_mut().find(|s| *s == &self.schema).unwrap() = self.native.schema.clone();
+        *schemas.iter_mut().find(|s| *s == &self.schema).unwrap() = self.native_schema.clone();
         let location = call
             .arguments
             .as_object_mut()
             .and_then(|args| args.remove("location"));
+        let resource_context = call.arguments.as_object_mut()
+            .and_then(|args| args.remove("resource_context"))
+            .map(|value| value.as_str().filter(|s| !s.is_empty() && s.len() <= 512)
+                .map(str::to_owned).ok_or_else(|| denied("Invalid resource context revision")))
+            .transpose()?;
+        if self.owner.child && (location.is_some() || call.arguments.get("files")
+            .and_then(Value::as_array).is_some_and(|files| files.iter().any(|item| item.get("ref").is_some())))
+        {
+            return Err(denied("Child file tools may use only their admitted default and retained single references"));
+        }
         let original = call.arguments["ref"]
             .as_str()
             .map(|reference| {
                 let catalog = self.owner.catalog.lock().map_err(denied)?;
+                if self.owner.child && !catalog.holds_model_reference(reference, &f.run_id).map_err(denied)? {
+                    return Err(denied("File reference is not retained by this child"));
+                }
                 referenced_source(&catalog, reference, &call)
             })
             .transpose()?
             .flatten();
-        let selection = if let Some(explicit) = location {
+        if location.is_some() && !alternate_tool(&call.name) {
+            return Err(denied("This tool uses its original location"));
+        }
+        let process = if crate::process_wait::interacts(&call.name) {
+            let catalog = self.owner.catalog.lock().map_err(denied)?;
+            let handle = call.arguments["processId"].as_str().ok_or_else(|| denied("processId required"))?;
+            let id = crate::resource_references::process(&catalog, handle)?;
+            let operation = catalog.require_process_observation(&f.run_id, &id).map_err(denied)?;
+            if operation.run_id != f.run_id || operation.managed_process.as_ref().is_none_or(|p| p.is_environment()) {
+                return Err(denied("Process input requires a process started by this Run"));
+            }
+            let source = catalog.original_operation_source(&operation).map_err(denied)?
+                .filter(|s| eligible(Some(s))).ok_or_else(|| denied("Original process source unavailable"))?;
+            Some((id, source))
+        } else { None };
+        let selection = if let Some((_, source)) = &process {
+            Some((None, Some(source.clone())))
+        } else if self.owner.child {
+            if call.arguments.get("ref").is_some() && original.is_none() {
+                return Err(denied("File reference has no original live location"));
+            }
+            Some((None, original))
+        } else if let Some(explicit) = location {
             let location = explicit
                 .as_str()
                 .filter(|v| !v.is_empty())
@@ -652,24 +792,31 @@ impl ToolExecutor for Router {
             Some((Some(location.to_owned()), original))
         } else if original
             .as_ref()
-            .is_some_and(|source| source != &self.owner.default && eligible(Some(source)))
+            .is_some_and(|source| Some(source) != self.owner.default.as_ref() && eligible(Some(source)))
         {
             Some((None, original))
+        } else if self.owner.lazy.is_some() {
+            if original.is_some() {
+                return Err(denied("The file reference does not name an available live location"));
+            }
+            Some((None, None))
         } else {
             None
         };
+        if resource_context.is_some() && (self.owner.lazy.is_none()
+            || !(matches!(&selection, Some((None, None))) || self.owner.child))
+        {
+            return Err(denied("Resource context only applies to the recorded default"));
+        }
         let (default, alternate) = if let Some((location, expected)) = selection {
-            if !matches!(f.origin, ToolOrigin::ModelStep { .. }) {
-                return Err(denied(
-                    "Location selection requires an ordinary model request",
-                ));
-            }
             (
                 None,
                 Some(Alternate {
                     owner: self.owner.clone(),
                     location,
                     expected,
+                    resource_context,
+                    process_id: process.map(|(id, _)| id),
                     call,
                     frozen,
                 }),
@@ -678,8 +825,8 @@ impl ToolExecutor for Router {
             (
                 Some(
                     self.native
-                        .implementation
                         .clone()
+                        .ok_or_else(|| denied("No prepared default location"))?
                         .bind_call(&call, &frozen, t)?,
                 ),
                 None,
@@ -690,7 +837,8 @@ impl ToolExecutor for Router {
             alternate,
             prepared: OnceLock::new(),
             lease: OnceLock::new(),
-            native_version: self.native.schema.version.clone(),
+            native_version: self.native_schema.version.clone(),
+            routed_version: self.schema.version.clone(),
         }))
     }
     fn plan(
@@ -798,6 +946,39 @@ fn relative(path: &str) -> bool {
         && !path.contains(':')
         && !path.split(['/', '\\']).any(|part| part == "..")
 }
+fn instruction_directories(tool: &str, args: &Value) -> BTreeSet<String> {
+    fn directory(path: &str, file: bool) -> Option<String> {
+        if !relative(path) { return None; }
+        let mut parts = path.split(['/', '\\'])
+            .filter(|part| !part.is_empty() && *part != ".").collect::<Vec<_>>();
+        if file { parts.pop(); }
+        (!parts.is_empty()).then(|| parts.join("/"))
+    }
+    if args.get("ref").is_some() { return BTreeSet::new(); }
+    let mut result = BTreeSet::new();
+    let mut push = |value: &Value, file| {
+        if let Some(path) = value.as_str().and_then(|p| directory(p, file)) { result.insert(path); }
+    };
+    match tool {
+        "file_read" | "file_edit" | "file_write" => {
+            push(&args["path"], true);
+            if let Some(files) = args["files"].as_array().filter(|items| {
+                items.iter().all(|item| item.get("ref").is_none() && item["path"].as_str().is_some())
+            }) {
+                for item in files { push(&item["path"], true); }
+            }
+        }
+        "file_list" | "file_search" => {
+            if let Some(paths) = args["paths"].as_array() {
+                for path in paths { push(path, false); }
+            }
+        }
+        "process_spawn" => push(&args["cwd"], false),
+        _ => {}
+    }
+    result
+}
+
 fn validate_explicit(args: &Value) -> Result<(), ExecutionError> {
     let fields = args
         .as_object()
@@ -825,6 +1006,10 @@ fn validate_explicit(args: &Value) -> Result<(), ExecutionError> {
 }
 
 impl Routed {
+    fn outer(&self, mut contract: ToolContract) -> ToolContract {
+        contract.schema_version.clone_from(&self.routed_version);
+        contract
+    }
     fn physical(&self, contract: &ToolContract) -> ToolContract {
         let mut contract = contract.clone();
         contract.schema_version.clone_from(&self.native_version);
@@ -843,39 +1028,64 @@ impl Routed {
             operation_id: a.frozen.origin.operation_id(&a.call.call_id),
         };
         let thread = a.owner.scope(&ctx, t)?;
-        let key: Key = if let Some(location) = &a.location {
+        let mut query = json!({"kind":"work_location_bind","runId":ctx.run_id,"threadId":thread,
+            "operationId":ctx.operation_id,"origin":ctx.origin,"callId":a.call.call_id,"tool":a.call.name});
+        let key = if let Some(location) = &a.location {
             let catalog = a.owner.catalog.lock().map_err(denied)?;
-            a.owner.current_key(&catalog, location)?
-        } else {
-            let source = a
-                .expected
-                .as_ref()
-                .ok_or_else(|| denied("File reference has no original source"))?;
-            let root = source
-                .live_root
-                .as_ref()
+            Some(a.owner.current_key(&catalog, location)?)
+        } else if let Some(source) = a.expected.as_ref().filter(|_| !a.owner.child) {
+            let root = source.live_root.as_ref()
                 .ok_or_else(|| denied("File reference has no live root"))?;
-            Key {
+            Some(Key {
                 id: None,
                 resource_owner: source.resource_owner.clone(),
                 workspace_id: Some(source.workspace_id.clone()),
                 path: root.canonical_root.clone(),
+            })
+        } else {
+            if a.owner.lazy.is_none() {
+                return Err(denied("No recorded default location"));
             }
+            None
         };
-        let query = json!({"kind":"work_location_bind","runId":ctx.run_id,"threadId":thread,"operationId":ctx.operation_id,
-            "origin":ctx.origin,"callId":a.call.call_id,"tool":a.call.name,"key":key});
+        if let Some(process_id) = &a.process_id {
+            query["processId"] = json!(process_id);
+        } else if let Some(key) = &key {
+            query["key"] = serde_json::to_value(key).map_err(denied)?;
+        } else {
+            query["default"] = json!(true);
+            query["toolVersion"] = json!(self.routed_version);
+            let directories = instruction_directories(&a.call.name, &a.call.arguments);
+            if !directories.is_empty() {
+                query["instructionDirectories"] = json!(directories);
+            }
+            if let Some(revision) = &a.resource_context {
+                query["resourceContext"] = json!(revision);
+            }
+        }
+        let (resource_owner, workspace_id) = key.as_ref().map(|k| (&k.resource_owner, &k.workspace_id))
+            .or_else(|| a.owner.lazy.as_ref().map(|k| (&k.resource_owner, &k.workspace_id)))
+            .ok_or_else(|| denied("No location selected"))?;
         let result = a.owner.resources.source_query(query, t)?;
+        if key.is_none() && result["kind"] == "work_location_context_required" {
+            let revision = result["revision"].as_str().filter(|s| !s.is_empty() && s.len() <= 512)
+                .ok_or_else(|| denied("Default resource returned an invalid context revision"))?;
+            let instructions = result.get("instructions")
+                .filter(|v| v.is_string() || v.is_array())
+                .ok_or_else(|| denied("Default resource returned invalid instructions"))?;
+            return Err(ExecutionError::new(
+                "work_location_context_required",
+                "No work was dispatched. Read the location instructions and retry with resource_context set to the returned revision.",
+            ).with_details(json!({"resource_context":revision,"instructions":instructions})));
+        }
         self.lease.set(ReadLease{resources:a.owner.resources.clone(),release:json!({"kind":"work_location_release","runId":ctx.run_id,"threadId":thread,"operationId":ctx.operation_id,"binding":result.clone()})}).map_err(|_|denied("Read was already prepared"))?;
         let binding: ToolBinding = serde_json::from_value(result).map_err(denied)?;
         let source = binding.source_selection().map_err(denied)?;
         if !eligible(Some(&source))
             || binding.run_id != ctx.run_id
             || binding.thread_id != thread
-            || binding.resource_owner != key.resource_owner
-            || key
-                .workspace_id
-                .as_ref()
-                .is_some_and(|ws| ws != &binding.workspace_id)
+            || &binding.resource_owner != resource_owner
+            || workspace_id.as_ref().is_some_and(|ws| ws != &binding.workspace_id)
             || binding
                 .enabled_tools
                 .iter()
@@ -907,15 +1117,20 @@ impl Routed {
         } else {
             resources
         };
-        let executor = Arc::new(KernelToolExecutor::new(binding, resources)?);
+        frozen.source = Some(source);
+        let executor: Arc<dyn ToolExecutor> = if a.process_id.is_some() {
+            crate::process_wait::endpoint(a.owner.catalog.clone(), binding, resources)
+        } else {
+            let mut executor = KernelToolExecutor::new(binding, resources)?.with_language(a.owner.language.clone());
+            if let Some(owner) = &a.owner.retrieval {
+                executor = executor.with_internal_retrieval(owner.clone());
+            }
+            Arc::new(executor)
+        };
         self.prepared
             .set(executor.bind_call(&a.call, &frozen, t)?)
             .map_err(|_| denied("Read was already prepared"))
     }
-}
-fn outer(mut c: ToolContract) -> ToolContract {
-    c.schema_version = "3".into();
-    c
 }
 impl PreparedToolCall for Routed {
     fn resource_source(&self) -> Option<&SourceSelection> {
@@ -944,6 +1159,11 @@ impl PreparedToolCall for Routed {
                 "file_list" | "file_search" => ("[\"discovery\",", Access::Read),
                 "file_write" | "file_edit" => ("[\"file\",", Access::Write),
                 "process_spawn" => ("[\"environment-writer-activity\",", Access::Read),
+                "process_write" => ("[\"process-input\",", Access::Write),
+                "process_resize" => ("[\"process-size\",", Access::Write),
+                "recovery_points" => ("[\"recovery-files\",", Access::Read),
+                "file_restore" => ("[\"recovery-files\",", Access::Write),
+                "code_retrieval" => ("[\"retrieval-view\",", Access::Read),
                 _ => ("[\"file\",", Access::Read),
             };
             return Ok(ToolPreparation::Resolve {
@@ -951,11 +1171,11 @@ impl PreparedToolCall for Routed {
                     key_prefix: prefix.into(),
                     access,
                 }],
-                class: ExecutionClass::Unmetered,
+                class: ToolKind::execution_class(&alternate.call.name),
             });
         }
         Ok(match self.inner()?.plan(t)? {
-            ToolPreparation::Ready(c) => ToolPreparation::Ready(outer(c)),
+            ToolPreparation::Ready(c) => ToolPreparation::Ready(self.outer(c)),
             p => p,
         })
     }
@@ -965,7 +1185,7 @@ impl PreparedToolCall for Routed {
                 self.resolve(a, t)?;
             }
         }
-        self.inner()?.prepare(t).map(outer)
+        self.inner()?.prepare(t).map(|contract| self.outer(contract))
     }
     fn execution_class(&self, c: &ToolContract) -> ExecutionClass {
         self.inner().map_or(ExecutionClass::Unmetered, |inner| {
@@ -1010,6 +1230,16 @@ impl PreparedToolCall for Routed {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn default_capture_uses_only_relative_unambiguous_instruction_directories() {
+        let dirs = |tool, args| instruction_directories(tool, &args).into_iter().collect::<Vec<_>>();
+        assert_eq!(dirs("file_read", json!({"files":[{"path":"docs/deep/x.md"},{"path":"docs/./deep/y.md"},{"path":"top.md"}]})), vec!["docs/deep"]);
+        assert_eq!(dirs("file_search", json!({"paths":["docs","../foreign","C:\\outside","lib\\api","./src/"]})), vec!["docs","lib/api","src"]);
+        assert_eq!(dirs("process_spawn", json!({"cwd":"apps/kernel/bin"})), vec!["apps/kernel/bin"]);
+        assert!(dirs("file_write", json!({"path":"src/a","ref":"file:42"})).is_empty());
+        assert!(dirs("file_read", json!({"files":[{"path":"docs/a"},{"ref":"file:42"}]})).is_empty());
+    }
+
     #[test]
     fn explicit_read_cannot_import_project_tools_or_cross_path_authority() {
         for path in [

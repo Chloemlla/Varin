@@ -144,6 +144,13 @@ impl ToolKind {
         ]
         .into_iter()
     }
+    pub(crate) fn execution_class(name: &str) -> varin_runtime::execution_capacity::ExecutionClass {
+        use varin_runtime::execution_capacity::ExecutionClass;
+        match name {
+            "file_search" => ExecutionClass::LocalCompute,
+            _ => ExecutionClass::Unmetered,
+        }
+    }
     fn from_name(name: &str) -> Option<Self> {
         Self::all().find(|kind| kind.name() == name)
     }
@@ -2345,12 +2352,7 @@ impl ToolExecutor for KernelToolExecutor {
         call: &ToolCall,
         _: &ToolContract,
     ) -> varin_runtime::execution_capacity::ExecutionClass {
-        use varin_runtime::execution_capacity::ExecutionClass;
-        if call.name == "file_search" {
-            ExecutionClass::LocalCompute
-        } else {
-            ExecutionClass::Unmetered
-        }
+        ToolKind::execution_class(&call.name)
     }
     fn supports_policy_read(
         &self,
@@ -2875,6 +2877,21 @@ impl PreparedToolCall for KernelCall {
                 .and_then(|value| {
                     let mut receipt: varin_runtime::execution::ToolExecutionReceipt = serde_json::from_value(value["result"].clone())
                         .map_err(|e| ExecutionError::new("source_receipt", e.to_string()))?;
+                    if matches!(self.operation, ResourceOperation::ProcessSpawn(_)) {
+                        if let ToolCompletion::JobAccepted { operation_id, content, .. } = &receipt.completion {
+                            let remote_epoch = &self.executor.binding.remote_authority.as_ref().expect("managed target").resource_epoch;
+                            let process = content.as_ref().map(|body| &body.data);
+                            if operation_id != &context.operation_id || !process.is_some_and(|data|
+                                data["processId"].as_str() == Some(operation_id) && data["kernelEpoch"].as_str() == Some(remote_epoch)) {
+                                return Err(ExecutionError::new("source_receipt", "Process acceptance differs from the original target"));
+                            }
+                            let catalog = self.executor.resources.journal_catalog.as_ref()
+                                .ok_or_else(|| ExecutionError::new("source_receipt", "Process Catalog unavailable"))?;
+                            catalog.lock().map_err(|e| ExecutionError::new("source_receipt", e.to_string()))?
+                                .confirm_process_epoch(operation_id, remote_epoch)
+                                .map_err(|e| ExecutionError::new("source_receipt", e.to_string()))?;
+                        }
+                    }
                     // Remote owners return raw receipts; only the coordinating
                     // Catalog assigns references in this conversation's space.
                     if let Err(error) = self.executor.project_resource_completion(context, &self.call, &self.operation, &mut receipt.completion) {

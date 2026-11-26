@@ -4,7 +4,12 @@ import { parseHTML } from 'linkedom';
 import { beforeEach, afterEach, expect, it, vi } from 'vitest';
 import type { DesktopHostsConfig } from '@varin/application-client';
 
-const fixture = vi.hoisted(() => ({ get: vi.fn(), set: vi.fn(), navigate: vi.fn(), t: (key: string) => key }));
+const fixture = vi.hoisted(() => ({
+  get: vi.fn(), set: vi.fn(), navigate: vi.fn(), t: (key: string) => key,
+  runtimeAPIs: vi.fn(), copy: vi.fn(),
+}));
+vi.mock('qrcode', () => ({ default: { toDataURL: async () => 'data:image/png;base64,qr' } }));
+vi.mock('@/lib/clipboard', () => ({ copyTextToClipboard: fixture.copy }));
 vi.mock('@varin/application-client', async importOriginal => ({ ...await importOriginal<typeof import('@varin/application-client')>(),
   createHostConnectionsHttpAPI: () => ({ assertOwner: () => {}, hosts: { get: fixture.get, set: fixture.set, probe: async () => ({ status: 'ok', latencyMs: 1 }) }, ssh: {
     get: async () => ({ instances: [] }), set: async () => {}, imports: async () => [], status: async () => [], connect: async () => {}, disconnect: async () => {}, logs: async () => [], clearLogs: async () => {},
@@ -23,7 +28,7 @@ vi.mock('@/lib/desktopSsh', () => {
   };
 });
 vi.mock('@/lib/varinEvents', () => ({ subscribeVarinEvents: () => () => {} }));
-vi.mock('@/hooks/useRuntimeAPIs', () => ({ useRuntimeAPIs: () => ({}) }));
+vi.mock('@/hooks/useRuntimeAPIs', () => ({ useRuntimeAPIs: fixture.runtimeAPIs }));
 vi.mock('@/stores/useUIStore', () => ({ useUIStore: (selector: (state: object) => unknown) => selector({ timeFormatPreference: '24h', settingsRemoteInstancesSelectedId: null, setSettingsRemoteInstancesSelectedId: () => {} }) }));
 vi.mock('@/lib/i18n', () => ({ useI18n: () => ({ t: fixture.t }) }));
 vi.mock('@/lib/settings/drafts', () => ({ requestSettingsNavigation: (proceed: () => void) => fixture.navigate(proceed) }));
@@ -49,6 +54,7 @@ const change = (placeholder: string, value: string) => {
 };
 beforeEach(() => {
   vi.clearAllMocks(); fixture.get.mockResolvedValue(structuredClone(existing)); fixture.set.mockResolvedValue(undefined);
+  fixture.runtimeAPIs.mockReturnValue({});
   const { window, document } = parseHTML('<!doctype html><html><body></body></html>');
   Object.defineProperty(window, 'location', { value: new URL('http://127.0.0.1:5181'), configurable: true });
   vi.stubGlobal('window', window); vi.stubGlobal('document', document); vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
@@ -86,4 +92,35 @@ it('keeps read failure distinct from an empty collection and preserves form text
   expect(container.querySelector<HTMLInputElement>('input[placeholder="settings.remoteInstances.direct.field.labelPlaceholder"]')?.value).toBe('Unsaved resource');
   expect(container.textContent).toContain('Host refused write');
   expect(container.textContent).toContain('Save draft');
+});
+
+it.each(['http://192.168.5.2:57123', null])('copies the Host-reported LAN address separately from the pairing link (%s)', async (lan) => {
+  fixture.copy.mockResolvedValue({ ok: true });
+  fixture.runtimeAPIs.mockReturnValue({
+    clientAuth: {
+      listClients: async () => [],
+      listPendingPairings: async () => [],
+      getPairingTransports: async () => ({ local: 'http://127.0.0.1:57123', lan, relayAvailable: false }),
+      createPairingSession: async () => ({
+        pairing: { id: 'test', secret: 'test-secret', expiresAt: new Date(Date.now() + 60000).toISOString() },
+        server: { label: 'Test Host', candidates: [{ type: 'lan', priority: 10, url: lan ?? 'http://127.0.0.1:57123' }] },
+      }),
+    },
+  });
+
+  await act(async () => root.render(<RemoteInstancesPage view="access" />));
+  await act(async () => button('settings.remoteInstances.clientAuth.actions.addDevice').click());
+  const form = container.querySelector('aside form')!;
+  await act(async () => form.dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true })));
+
+  const copyAddress = button('settings.remoteInstances.clientAuth.actions.copyAddress');
+  if (lan) {
+    expect(container.querySelector('aside')?.textContent).toContain(lan);
+    await act(async () => copyAddress.click());
+    expect(fixture.copy).toHaveBeenLastCalledWith(lan);
+  } else {
+    expect(copyAddress).toBeUndefined();
+  }
+  await act(async () => button('settings.common.actions.copyAll').click());
+  expect(fixture.copy).toHaveBeenLastCalledWith(expect.stringMatching(/^varin:\/\/connect\?/));
 });

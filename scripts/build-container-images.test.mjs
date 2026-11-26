@@ -242,3 +242,21 @@ test('lazy remote cache extraction is not a cook execution, and ambiguous progre
   assert.equal(executed.dependencyCookCacheHits, 0);
   assert.equal(executed.dependencyCookExecutions, 1);
 });
+
+test('dedicated Browser/Computer roles share immutable Linux inputs and never enter publication', () => {
+  const on = { browserNode: true, computerNode: true };
+  const check = containerBuildConfig({ ...input, ...on, publication: 'check', multiPlatform: true });
+  const apps = containerBakePlan(check, 'applications', bases);
+  assert.deepEqual(apps.group.default.targets, ['standard_app', 'browser_node', 'computer_node']);
+  for (const role of ['browser', 'computer']) {
+    const target = apps.target[role + '_node'];
+    assert.equal(target.target, role + '-node');
+    assert.equal(target.args.RUNTIME_BASE_IMAGE, bases.slim_base);
+    assert.deepEqual(target.tags, ['localhost:5000/varin-' + role + '-node:candidate-12-1']);
+    assert.deepEqual(target.platforms, ['linux/amd64', 'linux/arm64']);
+  }
+  for (const v of [input, { ...input, publication: 'release', sourceSha: tooling, ref: 'refs/tags/v0.9.39' }]) {
+    const release = containerBakePlan(containerBuildConfig({ ...v, ...on }), 'applications', bases);
+    assert(!release.target.browser_node && !release.target.computer_node);
+  }
+});

@@ -31,6 +31,7 @@ interface PendingWorkerRequest {
   reject(error: unknown): void;
   resolve(value: Record<string, unknown>): void;
   timeout: ReturnType<typeof setTimeout>;
+  onReply?(ok: boolean): void;
 }
 
 const asRecord = (value: unknown): Record<string, unknown> => (
@@ -59,23 +60,24 @@ export class DictationWorkerClient {
   private readonly sessionEmitters: Map<string, EventEmitter>;
   private worker: ChildProcess | null;
   private stderrTail: string;
-  private inFlightRequests: number;
   private idleTimer: ReturnType<typeof setTimeout> | null;
-  private readonly intentionalCloses: WeakSet<ChildProcess>;
+  private workerExit: Promise<void> | null = null;
+  private retiring: Promise<void> | null = null;
+  private stopping = false;
+  private readonly forkWorker: () => ChildProcess;
 
   /**
    * @param {{ requestTimeoutMs?: number, idleTtlMs?: number }} [options]
    */
-  constructor(options: { idleTtlMs?: number; requestTimeoutMs?: number } = {}) {
+  constructor(options: { idleTtlMs?: number; requestTimeoutMs?: number; forkWorker?: () => ChildProcess } = {}) {
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.idleTtlMs = options.idleTtlMs ?? DEFAULT_IDLE_TTL_MS;
     this.pendingRequests = new Map();
     this.sessionEmitters = new Map();
     this.worker = null;
     this.stderrTail = '';
-    this.inFlightRequests = 0;
     this.idleTimer = null;
-    this.intentionalCloses = new WeakSet();
+    this.forkWorker = options.forkWorker ?? forkDictationWorker;
   }
 
   /**
@@ -112,7 +114,8 @@ export class DictationWorkerClient {
     emitter: EventEmitter,
   ): Promise<{ requiredSampleRate: number; sessionId: string }> {
     const sessionId = randomUUID();
-    this.sessionEmitters.set(sessionId, emitter);
+    let abandoned = false;
+    let acknowledged = false;
     try {
       const result = await this.sendRequest({
         type: 'session.create',
@@ -120,6 +123,15 @@ export class DictationWorkerClient {
         modelsDir,
         modelId,
         ...(language ? { language } : {}),
+      }, {
+        onAdmission: () => this.sessionEmitters.set(sessionId, emitter),
+        onReply: (ok) => {
+          acknowledged = true;
+          // Do not race close against an unfinished native creation. If its
+          // caller timed out, retire precisely the new session once acknowledged.
+          if (abandoned && ok) this.closeSession(sessionId);
+          else if (abandoned) this.sessionEmitters.delete(sessionId);
+        },
       });
       return {
         sessionId,
@@ -128,117 +140,152 @@ export class DictationWorkerClient {
           : DEFAULT_LOCAL_SAMPLE_RATE,
       };
     } catch (err) {
-      this.sessionEmitters.delete(sessionId);
-      this.scheduleIdleShutdownIfReady();
+      abandoned = true;
+      if (acknowledged) {
+        this.sessionEmitters.delete(sessionId);
+        this.scheduleIdleShutdownIfReady();
+      }
       throw err;
     }
   }
 
   appendSessionAudio(sessionId: string, audio: Buffer): void {
-    void this.sendRequest({ type: 'session.append', sessionId, audio }).catch((err) => {
+    void this.sendSessionRequest(sessionId, { type: 'session.append', sessionId, audio }).catch((err) => {
       this.emitSessionError(sessionId, err);
     });
   }
 
   commitSession(sessionId: string): void {
-    void this.sendRequest({ type: 'session.commit', sessionId }).catch((err) => {
+    void this.sendSessionRequest(sessionId, { type: 'session.commit', sessionId }).catch((err) => {
       this.emitSessionError(sessionId, err);
     });
   }
 
   clearSession(sessionId: string): void {
-    void this.sendRequest({ type: 'session.clear', sessionId }).catch((err) => {
+    void this.sendSessionRequest(sessionId, { type: 'session.clear', sessionId }).catch((err) => {
       this.emitSessionError(sessionId, err);
     });
   }
 
+  private sendSessionRequest(sessionId: string, input: WorkerRequest): Promise<Record<string, unknown>> {
+    if (!this.sessionEmitters.has(sessionId) || !this.worker) {
+      return Promise.reject(new Error('Dictation session is no longer available'));
+    }
+    return this.sendRequest(input, { existingWorker: this.worker });
+  }
+
   closeSession(sessionId: string): void {
-    this.sessionEmitters.delete(sessionId);
-    void this.sendRequest({ type: 'session.close', sessionId }).catch(() => {
-      // Closing is best-effort; the parent already dropped the session.
-    });
+    if (!this.sessionEmitters.delete(sessionId)) return;
+    const worker = this.worker;
+    if (worker) {
+      void this.sendRequest({ type: 'session.close', sessionId }, { existingWorker: worker }).catch(() => {
+        // The original generation may already be gone; never start a worker for stale cleanup.
+      });
+    }
     this.scheduleIdleShutdownIfReady();
   }
 
-  shutdown(): void {
-    this.clearIdleTimer();
-    this.rejectAllPending(new Error('Dictation worker shut down'));
-    this.sessionEmitters.clear();
-    const worker = this.worker;
-    this.worker = null;
-    if (worker && !worker.killed) {
-      this.intentionalCloses.add(worker);
-      try {
-        worker.disconnect();
-      } catch {
-        // ignore
-      }
-      try {
-        worker.kill();
-      } catch {
-        // ignore
-      }
-    }
+  activity() {
+    return {
+      state: this.retiring ? 'retiring' as const : this.worker ? 'live' as const : 'cold' as const,
+      pendingRequests: this.pendingRequests.size,
+      sessions: this.sessionEmitters.size,
+      warm: this.idleTimer !== null,
+    };
   }
 
-  sendRequest(
-    input: WorkerRequest,
-    options: { timeoutMs?: number } = {},
-  ): Promise<Record<string, unknown>> {
-    const worker = this.ensureWorker();
-    const requestId = randomUUID();
-    const message = { ...input, requestId };
-    this.inFlightRequests += 1;
-    this.clearIdleTimer();
+  shutdown(): Promise<void> {
+    this.stopping = true;
+    return this.retireWorker(new Error('Dictation worker shut down'));
+  }
 
+  private retireWorker(reason?: Error): Promise<void> {
+    if (this.retiring) return this.retiring;
+    this.clearIdleTimer();
+    const worker = this.worker;
+    if (!worker) return Promise.resolve();
+    // Publish retirement before disconnect/kill: those requests don't prove physical exit.
+    const exited = this.workerExit!;
+    this.retiring = exited;
+    if (reason) this.failConsumers(reason);
+    try { if (worker.connected) worker.disconnect(); } catch { /* wait for exit */ }
+    try { if (!worker.killed) worker.kill(); } catch { /* wait for exit */ }
+    return exited;
+  }
+
+  private async sendRequest(
+    input: WorkerRequest,
+    options: { timeoutMs?: number; existingWorker?: ChildProcess; onAdmission?: () => void; onReply?: (ok: boolean) => void } = {},
+  ): Promise<Record<string, unknown>> {
+    if (this.worker && (!this.worker.connected || this.worker.killed)) {
+      void this.retireWorker(new Error('Dictation worker IPC disconnected'));
+    }
+    while (this.retiring) {
+      if (options.existingWorker) throw new Error('Dictation worker generation is closing');
+      await this.retiring;
+    }
+    if (this.stopping) throw new Error('Dictation worker shut down');
+    if (options.existingWorker && options.existingWorker !== this.worker)
+      throw new Error('Dictation worker generation changed');
+
+    const worker = this.worker ?? this.openWorker();
+    const requestId = randomUUID();
+    this.clearIdleTimer();
+    options.onAdmission?.();
     return new Promise<Record<string, unknown>>((resolve, reject) => {
       const timeout = setTimeout(() => {
-        this.pendingRequests.delete(requestId);
-        this.inFlightRequests = Math.max(0, this.inFlightRequests - 1);
-        this.scheduleIdleShutdownIfReady();
+        // Return the timeout to the caller, but retain native activity until the
+        // original worker acknowledges the request or physically exits.
         reject(new Error(`Dictation worker request timed out: ${input.type}`));
       }, options.timeoutMs ?? this.requestTimeoutMs);
-
-      this.pendingRequests.set(requestId, { resolve, reject, timeout });
-
-      if (!worker.send) {
-        reject(new Error('Dictation worker IPC is unavailable'));
-        return;
+      this.pendingRequests.set(requestId, { resolve, reject, timeout, ...(options.onReply ? { onReply: options.onReply } : {}) });
+      const sent = (error: Error | null) => {
+        if (error && this.pendingRequests.has(requestId)) {
+          void this.retireWorker(error);
+        }
+      };
+      try {
+        if (!worker.send) sent(new Error('Dictation worker IPC is unavailable'));
+        else worker.send({ ...input, requestId }, sent);
+      } catch (error) {
+        sent(error instanceof Error ? error : new Error(String(error)));
       }
-      worker.send(message, (error) => {
-        if (!error) {
-          return;
-        }
-        const pending = this.pendingRequests.get(requestId);
-        if (!pending) {
-          return;
-        }
-        clearTimeout(pending.timeout);
-        this.pendingRequests.delete(requestId);
-        this.inFlightRequests = Math.max(0, this.inFlightRequests - 1);
-        this.scheduleIdleShutdownIfReady();
-        pending.reject(error);
-      });
     });
   }
 
-  ensureWorker(): ChildProcess {
-    if (this.worker && !this.worker.killed && this.worker.connected) {
-      return this.worker;
-    }
-    const worker = forkDictationWorker();
+  private openWorker(): ChildProcess {
+    const worker = this.forkWorker();
     this.worker = worker;
     this.stderrTail = '';
+    this.workerExit = new Promise<void>((resolve) => {
+      const settle = (code: number | null, signal: NodeJS.Signals | null, spawnError?: Error) => {
+        resolve();
+        this.handleWorkerExit(worker, code, signal, spawnError);
+      };
+      // Retirement follows the process lifetime. After a parent-initiated
+      // disconnect and kill, Node may emit exit without emitting close.
+      worker.once('exit', settle);
+      worker.on('error', (error) => {
+        if (worker.pid === undefined) settle(null, null, error);
+        else if (worker === this.worker && !this.retiring) void this.retireWorker(error);
+      });
+    });
     worker.stderr?.on('data', (chunk) => {
+      if (worker !== this.worker) return;
       const text = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk);
       this.stderrTail = (this.stderrTail + text).slice(-STDERR_TAIL_MAX_CHARS);
     });
-    worker.on('message', (message) => this.handleWorkerMessage(message));
-    worker.on('close', (code, signal) => this.handleWorkerExit(worker, code, signal));
+    worker.on('message', (message) => {
+      if (worker === this.worker && !this.retiring) this.handleWorkerMessage(message);
+    });
+    worker.once('disconnect', () => {
+      if (worker === this.worker && !this.retiring)
+        void this.retireWorker(new Error('Dictation worker IPC disconnected'));
+    });
     return worker;
   }
 
-  handleWorkerMessage(message: unknown): void {
+  private handleWorkerMessage(message: unknown): void {
     const value = asRecord(message);
     if (value.type === 'response' && typeof value.requestId === 'string') {
       const pending = this.pendingRequests.get(value.requestId);
@@ -247,7 +294,7 @@ export class DictationWorkerClient {
       }
       clearTimeout(pending.timeout);
       this.pendingRequests.delete(value.requestId);
-      this.inFlightRequests = Math.max(0, this.inFlightRequests - 1);
+      pending.onReply?.(Boolean(value.ok));
       this.scheduleIdleShutdownIfReady();
       if (value.ok) {
         pending.resolve(asRecord(value.result));
@@ -275,33 +322,29 @@ export class DictationWorkerClient {
     }
   }
 
-  handleWorkerExit(worker: ChildProcess, code: number | null, signal: NodeJS.Signals | null): void {
-    const wasCurrentWorker = this.worker === worker;
-    const wasIntentional = this.intentionalCloses.has(worker);
-    this.intentionalCloses.delete(worker);
-    if (!wasCurrentWorker || wasIntentional) {
-      if (wasCurrentWorker) {
-        this.worker = null;
-      }
-      return;
-    }
-
-    const stderr = this.stderrTail.trim();
-    const error = new Error(
-      `Dictation worker exited (code ${code ?? 'null'}${signal ? `, signal ${signal}` : ''}).` +
-        (stderr ? ` Last stderr: ${stderr.slice(-500)}` : ''),
-    );
-
+  private handleWorkerExit(worker: ChildProcess, code: number | null, signal: NodeJS.Signals | null, spawnError?: Error): void {
+    if (this.worker !== worker) return;
+    const wasRetiring = this.retiring !== null;
     this.worker = null;
+    this.workerExit = null;
+    this.retiring = null;
     this.clearIdleTimer();
-    this.rejectAllPending(error);
-    for (const emitter of this.sessionEmitters.values()) {
-      if (emitter.listenerCount('error') > 0) {
-        emitter.emit('error', error);
-      }
+    if (!wasRetiring) {
+      const stderr = this.stderrTail.trim();
+      this.failConsumers(spawnError ?? new Error(
+        `Dictation worker exited (code ${code ?? 'null'}${signal ? `, signal ${signal}` : ''}).` +
+          (stderr ? ` Last stderr: ${stderr.slice(-500)}` : ''),
+      ));
     }
+  }
+
+  private failConsumers(error: Error): void {
+    this.rejectAllPending(error);
+    const emitters = [...this.sessionEmitters.values()];
     this.sessionEmitters.clear();
-    this.inFlightRequests = 0;
+    for (const emitter of emitters) {
+      if (emitter.listenerCount('error') > 0) emitter.emit('error', error);
+    }
   }
 
   rejectAllPending(error: Error): void {
@@ -319,16 +362,13 @@ export class DictationWorkerClient {
     }
   }
 
-  scheduleIdleShutdownIfReady(): void {
-    if (!this.worker || this.inFlightRequests > 0 || this.sessionEmitters.size > 0) {
-      return;
-    }
+  private scheduleIdleShutdownIfReady(): void {
+    if (!this.worker || this.retiring || this.stopping || this.pendingRequests.size || this.sessionEmitters.size) return;
     this.clearIdleTimer();
     this.idleTimer = setTimeout(() => {
-      if (this.inFlightRequests === 0 && this.sessionEmitters.size === 0) {
-        this.shutdown();
-      }
+      if (!this.pendingRequests.size && !this.sessionEmitters.size) void this.retireWorker();
     }, this.idleTtlMs);
+    this.idleTimer.unref();
   }
 
   clearIdleTimer(): void {
@@ -349,6 +389,7 @@ export class WorkerBackedTranscriptionSession extends EventEmitter {
   requiredSampleRate: number;
   private connectedSessionId: string | null;
   private connecting: Promise<void> | null;
+  private closed = false;
 
   /**
    * @param {DictationWorkerClient} client
@@ -364,6 +405,7 @@ export class WorkerBackedTranscriptionSession extends EventEmitter {
   }
 
   async connect(): Promise<void> {
+    if (this.closed) throw new Error('Local STT session closed');
     if (this.connectedSessionId) {
       return;
     }
@@ -371,6 +413,10 @@ export class WorkerBackedTranscriptionSession extends EventEmitter {
       this.connecting = (async () => {
         try {
           const result = await this.client.createSession(this.modelConfig, this);
+          if (this.closed) {
+            this.client.closeSession(result.sessionId);
+            throw new Error('Local STT session closed');
+          }
           this.connectedSessionId = result.sessionId;
           this.requiredSampleRate = result.requiredSampleRate;
         } finally {
@@ -404,6 +450,7 @@ export class WorkerBackedTranscriptionSession extends EventEmitter {
   }
 
   close(): void {
+    this.closed = true;
     const sessionId = this.connectedSessionId;
     this.connectedSessionId = null;
     if (sessionId) {

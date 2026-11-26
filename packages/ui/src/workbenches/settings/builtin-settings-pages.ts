@@ -1,0 +1,34 @@
+import { lazy } from 'react';
+
+// Register metadata synchronously. Page modules load only when their content mounts.
+export const GeneralPage = lazy(() => import('@/components/sections/preferences/GeneralPage').then(m => ({ default: m.GeneralPage })));
+export const AppearancePage = lazy(() => import('@/components/sections/preferences/AppearancePage').then(m => ({ default: m.AppearancePage })));
+export const ChatPage = lazy(() => import('@/components/sections/preferences/ChatPage').then(m => ({ default: m.ChatPage })));
+export const EditorPage = lazy(() => import('@/components/sections/preferences/EditorTerminalPages').then(m => ({ default: m.EditorPage })));
+export const TerminalPage = lazy(() => import('@/components/sections/preferences/EditorTerminalPages').then(m => ({ default: m.TerminalPage })));
+export const NotificationsPage = lazy(() => import('@/components/sections/preferences/PreferenceWrappers').then(m => ({ default: m.NotificationsPage })));
+export const ShortcutsPage = lazy(() => import('@/components/sections/preferences/PreferenceWrappers').then(m => ({ default: m.ShortcutsPage })));
+export const VoicePage = lazy(() => import('@/components/sections/preferences/PreferenceWrappers').then(m => ({ default: m.VoicePage })));
+export const DevicesPage = lazy(() => import('@/components/sections/devices/DevicesPage').then(m => ({ default: m.DevicesPage })));
+export const RemoteAccessPage = lazy(() => import('@/components/sections/devices/RemoteAccessPage').then(m => ({ default: m.RemoteAccessPage })));
+export const ProxyPage = lazy(() => import('@/components/sections/devices/ProxyPage').then(m => ({ default: m.ProxyPage })));
+export const WorkspacesPage = lazy(() => import('@/components/sections/devices/WorkspacesPage').then(m => ({ default: m.WorkspacesPage })));
+export const CodeIntelPage = lazy(() => import('@/components/sections/language-support/CodeIntelPage').then(m => ({ default: m.CodeIntelPage })));
+export const BrowserSettingsPage = lazy(() => import('@/components/sections/browsers/BrowserSettingsPage').then(m => ({ default: m.BrowserSettingsPage })));
+export const ExternalAgentsPage = lazy(() => import('@/components/sections/external-agents/ExternalAgentsPage').then(m => ({ default: m.ExternalAgentsPage })));
+export const HistorySettingsPage = lazy(() => import('@/components/sections/connections/SettingsUtilityPages').then(m => ({ default: m.HistorySettingsPage })));
+export const StorageSettingsPage = lazy(() => import('@/components/sections/storage/StorageSettingsPage').then(m => ({ default: m.StorageSettingsPage })));
+export const UsageSettingsPage = lazy(() => import('@/components/sections/usage/UsageSettingsPage').then(m => ({ default: m.UsageSettingsPage })));
+export const AgentMemoryPage = lazy(() => import('@/components/sections/assistant/AgentMemoryPage').then(m => ({ default: m.AgentMemoryPage })));
+export const AgentPromptPage = lazy(() => import('@/components/sections/assistant/AgentPromptPage').then(m => ({ default: m.AgentPromptPage })));
+export const ExtensionsPage = lazy(() => import('@/components/sections/extensions/ExtensionsPage').then(m => ({ default: m.ExtensionsPage })));
+export const GitPage = lazy(() => import('@/components/sections/git-identities/GitPage').then(m => ({ default: m.GitPage })));
+export const VarinSettingsPage = lazy(() => import('@/components/sections/varin/VarinSettingsPage').then(m => ({ default: m.VarinSettingsPage })));
+export const CompanionSettings = lazy(() => import('@/components/sections/varin/CompanionSettings').then(m => ({ default: m.CompanionSettings })));
+export const ProjectsPage = lazy(() => import('@/components/sections/projects/ProjectsPage').then(m => ({ default: m.ProjectsPage })));
+export const ProjectsSidebar = lazy(() => import('@/components/sections/projects/ProjectsSidebar').then(m => ({ default: m.ProjectsSidebar })));
+export const ModelRolesPage = lazy(() => import('@/components/sections/harness/ModelRolesPage').then(m => ({ default: m.ModelRolesPage })));
+export const ModelConnectionsPage = lazy(() => import('@/components/sections/providers/ModelConnectionsPage').then(m => ({ default: m.ModelConnectionsPage })));
+export const McpConnectionsPage = lazy(() => import('@/components/sections/mcp/McpConnectionsPage').then(m => ({ default: m.McpConnectionsPage })));
+export const SkillsPage = lazy(() => import('@/components/sections/skills/SkillsPage').then(m => ({ default: m.SkillsPage })));
+export const BuiltinAboutSettingsPage = lazy(() => import('./BuiltinAboutSettingsPage').then(m => ({ default: m.BuiltinAboutSettingsPage })));

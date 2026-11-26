@@ -64,11 +64,29 @@ export const browserResources = {
   async list(signal?: AbortSignal): Promise<BrowserResource[]> {
     return (await request<{ resources: BrowserResource[] }>('/api/browser-resources', 'GET', signal)).resources;
   },
+  async refresh(signal?: AbortSignal): Promise<BrowserResource[]> {
+    return (await request<{ resources: BrowserResource[] }>('/api/browser-resources/refresh', 'POST', signal)).resources;
+  },
+  async acquire(browserId: string, signal?: AbortSignal): Promise<BrowserResource> {
+    return (await request<{ resource: BrowserResource }>(`/api/browser-resources/${segment(browserId)}/acquire`, 'POST', signal)).resource;
+  },
   async pages(binding: BrowserResourceBinding, signal?: AbortSignal): Promise<BrowserPage[]> {
     return (await request<{ pages: BrowserPage[] }>(pagesPath(binding), 'GET', signal)).pages;
   },
   observe(binding: BrowserPageBinding, view: 'overview' | 'structure' | 'screenshot' = 'structure', signal?: AbortSignal): Promise<BrowserPageSnapshot> {
     return request(`${pagePath(binding)}?view=${view}`, 'GET', signal);
+  },
+  /** Hold the original page only for the lifetime of an explicitly opened viewer. */
+  async holdPage(binding: BrowserPageBinding, signal: AbortSignal): Promise<void> {
+    const response = await runtimeFetch(`${pagePath(binding)}/viewer`, { method: 'POST', signal });
+    if (!response.ok) {
+      const result = await response.json().catch(() => ({})) as { error?: string };
+      throw new BrowserResourceRequestError(response.status, result.error ?? 'Unable to retain browser viewer');
+    }
+    // Consume the live claim until unmount/Host switch aborts this exact stream.
+    const reader = response.body?.getReader();
+    if (reader) try { while (!(await reader.read()).done) { /* no view data */ } }
+    finally { reader.releaseLock(); }
   },
   control(binding: BrowserPageBinding, action: 'takeover' | 'resume' | 'activate', signal?: AbortSignal): Promise<{ usage: BrowserPageUsage }> {
     // Do not retry a mutation whose receipt may have been lost.

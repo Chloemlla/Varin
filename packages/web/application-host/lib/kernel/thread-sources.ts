@@ -25,6 +25,8 @@ type SourceTargets = Awaited<ReturnType<ThreadSourcesAPI['list']>> & {
 
 export interface SourceDirectory {
   list(signal?: AbortSignal): Promise<SourceTargets>;
+  /** Configured and last-observed metadata; never probes a device. */
+  describe?(signal?: AbortSignal): Promise<SourceTargets>;
   resolve(request: Parameters<ThreadSourcesAPI['resolve']>[1], signal?: AbortSignal): ReturnType<ThreadSourcesAPI['resolve']>;
   draftSkills?(request: Parameters<ThreadSourcesAPI['resolve']>[1], signal?: AbortSignal): Promise<import('@varin/application-client').ThreadSkillCatalog>;
 }
@@ -49,15 +51,17 @@ export function createThreadSourceDirectory(options: {
   documents: Pick<DocumentAuthority, 'resolveWorkspace' | 'admitWorkspaceRegistration'>;
   localLabel?: string;
   workspace?(): Promise<SourceTargets['workspace']>;
-  remote?: Pick<ThreadSourceRemoteOwner, 'list' | 'resolve' | 'draftSkills'>;
+  remote?: Pick<ThreadSourceRemoteOwner, 'list' | 'describe' | 'resolve' | 'draftSkills'>;
 }): SourceDirectory {
+  async function listing(signal: AbortSignal | undefined, refresh: boolean) {
+    signal?.throwIfAborted();
+    const [remote, workspace] = await Promise.all([refresh ? options.remote?.list(signal) : options.remote?.describe?.(signal), options.workspace?.()]);
+    return { ...(workspace ? { workspace } : {}), targets: [{ resourceOwner: { kind: 'local' as const }, label: options.localLabel ?? 'This Host', capabilities: [] }, ...(remote?.targets ?? [])],
+      unavailable: remote?.unavailable ?? [] };
+  }
   return {
-    async list(signal) {
-      signal?.throwIfAborted();
-      const [remote, workspace] = await Promise.all([options.remote?.list(signal), options.workspace?.()]);
-      return { ...(workspace ? { workspace } : {}), targets: [{ resourceOwner: { kind: 'local' }, label: options.localLabel ?? 'This Host', capabilities: [] }, ...(remote?.targets ?? [])],
-        unavailable: remote?.unavailable ?? [] };
-    },
+    list: signal => listing(signal, true),
+    describe: signal => listing(signal, false),
     async draftSkills(request, signal) {
       if (parseSourceResourceOwner(request.resourceOwner).kind !== 'managed_host' || !options.remote?.draftSkills) throw new SourceAdmissionError('source_unavailable');
       return options.remote.draftSkills(request, signal);

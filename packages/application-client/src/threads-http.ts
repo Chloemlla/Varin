@@ -205,7 +205,7 @@ export function createThreadsHttpAPI(): ThreadsAPI {
     sources: { setDefault: (identity, request, signal) => post('source/set-default', { ...identity, ...request }, signal),
       files: (identity, options, signal) => post('source/files', { ...identity, ...options }, signal),
       draftFiles: (options, signal) => post('source/draft-files', options, signal),
-      list: (identity, signal) => post('source/list', identity ?? {}, signal),
+      list: (identity, signal, options) => post('source/list', { ...identity, ...(options?.refresh === undefined ? {} : {refresh:options.refresh}) }, signal),
       resolve: (identity, request, signal) => post('source/resolve', { ...identity, ...request }, signal) },
     prepareSource: (input, signal) => post('source/prepare', input, signal),
     compact: input => post('context/compact', input),

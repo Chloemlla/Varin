@@ -5,6 +5,8 @@ const grants: Readonly<Record<string, readonly string[]>> = {
   file_write: ['storage.read', 'storage.write'],
   file_edit: ['storage.read', 'storage.write'],
   process_spawn: ['storage.read', 'storage.write', 'process'],
+  process_write: ['storage.read', 'storage.write', 'process'],
+  process_resize: ['storage.read', 'storage.write', 'process'],
 };
 
 export function workLocationCapabilities(tool: string): string[] | undefined {

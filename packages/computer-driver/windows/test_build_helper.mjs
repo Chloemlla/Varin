@@ -23,7 +23,7 @@ function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'varin-helper-build-'));
   for (const file of ['kernel/crates/varin-computer-windows/src/main.rs', 'kernel/Cargo.toml', 'kernel/Cargo.lock',
     'packages/computer-driver/windows/VarinComputer.manifest', 'packages/computer-driver/windows/build-helper.mjs',
-    'packages/electron/resources/icons/icon.ico', 'scripts/kernel-binary-identity.cjs']) {
+    'packages/electron/resources/icons/icon.ico', 'scripts/kernel-binary-identity.cjs', 'scripts/windows-msvc.cjs']) {
     fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true }); fs.writeFileSync(path.join(root, file), file);
   }
   fs.writeFileSync(path.join(root, 'kernel/rust-toolchain.toml'), '[toolchain]\nchannel = "1.90.0"\n');
@@ -61,10 +61,17 @@ test('Windows PE identity and imports reject wrong architecture and missing VC r
   assert.throws(() => artifact.inspectExecutable(pe().subarray(0, 180), 'x64'), /truncated|header/);
 });
 
-test('bootstraps the SDK through cmd from a batch path containing spaces', { skip: process.platform !== 'win32' }, () => {
+test('bootstraps registered and unregistered C++ tools through cmd from a path containing spaces', { skip: process.platform !== 'win32' }, () => {
   const f = fixture();
   try {
-    const installation = path.join(f.root, 'Visual Studio (fixture & tools)');
+    const installerRoot = path.join(f.root, 'installer');
+    const locator = path.join(installerRoot, 'Microsoft Visual Studio', 'Installer', 'vswhere.exe');
+    fs.mkdirSync(path.dirname(locator), { recursive: true });
+    fs.writeFileSync(locator, '');
+    const installation = path.join(f.root, 'Microsoft Visual Studio', '2022', '安装 (fixture & tools)');
+    const compiler = path.join(installation, 'VC', 'Tools', 'MSVC', '14', 'bin', `Host${process.arch}`, 'x64', 'cl.exe');
+    fs.mkdirSync(path.dirname(compiler), { recursive: true });
+    fs.writeFileSync(compiler, '');
     const script = path.join(installation, 'Common7', 'Tools', 'VsDevCmd.bat');
     fs.mkdirSync(path.dirname(script), { recursive: true });
     fs.writeFileSync(script, [
@@ -79,22 +86,22 @@ test('bootstraps the SDK through cmd from a batch path containing spaces', { ski
       'exit /b 0',
       '',
     ].join('\r\n'));
-    const environment = { ...process.env };
-    for (const name of ['INCLUDE', 'WindowsSdkDir', 'VSCMD_ARG_TGT_ARCH']) delete environment[name];
-    let bootstrapped = false;
-    const run = (command, args, options) => {
-      if (path.basename(command) === 'vswhere.exe') return installation;
-      if (command === 'cmd.exe') return execFileSync(command, args, options);
-      assert.equal(options.env.VARIN_FIXTURE_ARGS.trim(), `-arch=x64 -host_arch=${process.arch}`);
-      assert.equal(options.env.INCLUDE, 'fixture SDK include');
-      assert.equal(options.env.WindowsSdkDir, 'fixture SDK');
-      bootstrapped = true;
-      return f.options.run(command, args, options);
-    };
-    const identity = windowsHelperBuildIdentity({ ...f.options, environment, run });
-    assert.equal(bootstrapped, true);
-    assert.equal(identity.values.sdk, 'fixture SDK version');
-    assert.equal(identity.values.target, 'x86_64-pc-windows-msvc');
+    const environment = { ...process.env, 'ProgramFiles(x86)': installerRoot };
+    for (const name of ['INCLUDE', 'WindowsSdkDir', 'VSCMD_ARG_TGT_ARCH', 'VSINSTALLDIR']) delete environment[name];
+    for (const registered of [installation, '']) {
+      // Only the unregistered case exposes the installation under a default root.
+      environment.ProgramFiles = registered ? installerRoot : f.root;
+      const run = (command, args, options) => {
+        if (command === locator) return registered;
+        if (command === 'cmd.exe') return execFileSync(command, args, options);
+        assert.equal(options.env.VARIN_FIXTURE_ARGS.trim(), `-arch=x64 -host_arch=${process.arch}`);
+        assert.equal(options.env.INCLUDE, 'fixture SDK include');
+        return f.options.run(command, args, options);
+      };
+      const identity = windowsHelperBuildIdentity({ ...f.options, environment, run });
+      assert.equal(identity.values.sdk, 'fixture SDK version');
+      assert.equal(identity.values.target, 'x86_64-pc-windows-msvc');
+    }
   } finally { f.close(); }
 });
 

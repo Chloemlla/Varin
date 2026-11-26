@@ -21,14 +21,15 @@ import { followupStatus, followupTrigger, pendingFollowup } from '@/lib/followup
 import { formatSchedule } from '@/components/session/scheduleFormat';
 import { getCurrentIntlLocale, useI18n } from '@/lib/i18n';
 import { subscribeVarinEvents } from '@/lib/varinEvents';
-import { useOptionalDrawer } from '@/contexts/drawer-context-value';
+import { useMobilePages } from '@/contexts/mobile-pages';
 import { usePrefersReducedMotion } from '@/hooks/usePrefersReducedMotion';
 import { springTransition } from '@/lib/motion/tokens';
 import { BotFigure } from './BotFigure';
 import { GroupAvatar, GroupAvatarStack } from './GroupAvatar';
 import { BotGroupComposer } from './BotGroupComposer';
 import { useSegmentKnob } from './segmentKnob';
-import { groupLabel as L, groupChatError as messageError, groupMemberCount, emptyGroupDraft, groupDraftRecipients, placeGroupMention, type GroupDraftFile, type GroupQuote } from './botGroupChatModel';
+import { useGroupChatDraft } from './useGroupChatDraft';
+import { groupLabel as L, groupChatError as messageError, groupMemberCount, groupDraftRecipients, placeGroupMention } from './botGroupChatModel';
 import './bot-group-chat.css';
 
 const pathFor = (id: string) => '/' + encodeURIComponent(id);
@@ -73,10 +74,10 @@ export function BotGroupChat({ group, bots, api, sequence, panelTarget, onOpenPa
   onOpenPanel(): void; onRevealChat(): void; refresh(): void; onDelete(): void; onDirect(botId: string): void; onProfile(bot: BotSummary): void; onWake(bot: BotSummary): void;
 }) {
   const id = pathFor(group.id);
-  const drawer = useOptionalDrawer();
+  const drawer = useMobilePages();
   const reduced = usePrefersReducedMotion();
-  const revealChat = () => { drawer?.setRightSidebarOpen(false); onRevealChat(); };
-  const revealPanel = () => { if (drawer) drawer.setRightSidebarOpen(true); else onOpenPanel(); };
+  const revealChat = () => { drawer?.showDetails(false); onRevealChat(); };
+  const revealPanel = () => { if (drawer) drawer.showDetails(true); else onOpenPanel(); };
   const [page, setPage] = React.useState<BotGroupPage>();
   const [older, setOlder] = React.useState<BotGroupPost[]>([]);
   const [before, setBefore] = React.useState<string>();
@@ -84,11 +85,10 @@ export function BotGroupChat({ group, bots, api, sequence, panelTarget, onOpenPa
   const [spotlight, setSpotlight] = React.useState<string>();
   const [search, setSearch] = React.useState<string | null>(null);
   const [files, setFiles] = React.useState<GroupChatFile[]>();
-  const [draftFiles, setDraftFiles] = React.useState<GroupDraftFile[]>([]);
-  const [draft, setDraft] = React.useState(emptyGroupDraft);
-  const [quote, setQuote] = React.useState<GroupQuote>();
+  const compose = useGroupChatDraft(group.id);
+  const { message: draft, files: draftFiles, quote } = compose;
+  const busy = !!compose.sending;
   const [error, setError] = React.useState('');
-  const [busy, setBusy] = React.useState(false);
   const [tab, setTab] = React.useState<'members' | 'activity' | 'schedule'>('members');
   const [activityBefore, setActivityBefore] = React.useState<string>();
   const [activity, setActivity] = React.useState<BotGroupPage>();
@@ -109,7 +109,6 @@ export function BotGroupChat({ group, bots, api, sequence, panelTarget, onOpenPa
   const [streaming, setStreaming] = React.useState<Record<string, Record<string, string>>>({});
   const scroller = React.useRef<HTMLDivElement>(null);
   const composer = React.useRef<ComposerEditorHandle>(null);
-  const draftId = React.useRef<string | null>(null);
   const atEnd = React.useRef(true);
   const jumpTimer = React.useRef<number | undefined>(undefined);
   const members = page?.members ?? group.members;
@@ -171,22 +170,23 @@ export function BotGroupChat({ group, bots, api, sequence, panelTarget, onOpenPa
   };
   const change = async (input: GroupChange) => {
     setError('');
-    try { await botGroupRequest(id + '/change', input); if (input.kind === 'delete') onDelete(); refresh(); }
+    try { await botGroupRequest(id + '/change', input); if (input.kind === 'delete') { compose.clear(); onDelete(); } refresh(); }
     catch (error) { setError(messageError(error)); }
   };
   const send = async () => {
     const { addressed, replyId, gone } = groupDraftRecipients(draft, members, quote);
     if ((!draft.text.trim() && !draftFiles.length) || gone.length || busy) return;
-    setBusy(true); setError('');
-    draftId.current ??= crypto.randomUUID();
+    const sendId = compose.begin();
+    if (!sendId) return;
+    setError('');
     try {
       const uploads = await Promise.all(draftFiles.map(entry => uploadBotGroupFile(id, entry.id, entry.file)));
-      await botGroupRequest(id + '/post', { id: draftId.current, text: draft.text.trim(), addressed, quoteId: quote?.post.id, reply: Boolean(replyId), files: uploads.map(file => file.id) });
-      draftId.current = null; setDraft(emptyGroupDraft); setDraftFiles([]); setQuote(undefined); atEnd.current = true; refresh();
-    } catch (error) { setError(messageError(error)); }
-    finally { setBusy(false); composer.current?.focus(); }
+      await botGroupRequest(id + '/post', { id: sendId, text: draft.text.trim(), addressed, quoteId: quote?.post.id, reply: Boolean(replyId), files: uploads.map(file => file.id) });
+      compose.finish(sendId, true); atEnd.current = true; refresh();
+    } catch (error) { compose.finish(sendId, false); setError(messageError(error)); }
+    finally { composer.current?.focus(); }
   };
-  const cite = (post: BotGroupPost, reply: boolean) => { if (!busy) { setQuote({ post, reply }); composer.current?.focus(); } };
+  const cite = (post: BotGroupPost, reply: boolean) => { if (!busy) { compose.edit({ quote: { post, reply } }); composer.current?.focus(); } };
   const jump = (postId: string) => {
     window.clearTimeout(jumpTimer.current);
     setSpotlight(postId);
@@ -273,7 +273,11 @@ export function BotGroupChat({ group, bots, api, sequence, panelTarget, onOpenPa
           <small className="block truncate">{[memberState(member.botId), listenSource(member)].filter(Boolean).join(' · ')}</small>
         </span>
         <Icon name="arrow-right-s" className="size-3.5 shrink-0 text-muted-foreground" />
-      </button>{listen(member)}
+      </button>{drawer && <button type="button" className="mobile-page-action" disabled={busy} aria-label={'@' + displayName(member.botId)} onClick={() => {
+        revealChat();
+        placeGroupMention(composer.current, member.botId, displayName(member.botId));
+        requestAnimationFrame(() => composer.current?.focus());
+      }}>@</button>}{listen(member)}
     </div>)}
     {addable.length > 0 && <button type="button" className="bot-row text-muted-foreground" onClick={() => setAdding(true)}><Icon name="add" className="size-4" />{L('add')}</button>}
     <p className="group-chat-panel-note">{L('listeningHint')}</p>
@@ -299,7 +303,7 @@ export function BotGroupChat({ group, bots, api, sequence, panelTarget, onOpenPa
     {activity && !deliveries.length && !historyByDate.size && <p className="group-chat-panel-note">{L('emptyActivity')}</p>}
   </div>;
   const memberPane = <aside className="bot-panel-body group-chat-panel" aria-label={group.name} onKeyDown={event => {
-    if (event.key === 'Escape' && drawer) drawer.setRightSidebarOpen(false);
+    if (event.key === 'Escape' && drawer) drawer.showDetails(false);
   }}>
     {subpage ? <div className="group-chat-panel-back"><Button variant="ghost" size="sm" onClick={() => {
       setMemberDetail(undefined); setAdding(false); setFiles(undefined); setWork(undefined);
@@ -412,10 +416,10 @@ export function BotGroupChat({ group, bots, api, sequence, panelTarget, onOpenPa
           </motion.div>}
         </AnimatePresence>
         {error && <div className="chat-input-column"><div role="alert" className="group-chat-trouble">{error}</div></div>}
-        <BotGroupComposer groupId={group.id} editor={composer} draft={draft} onDraft={setDraft} quote={quote} onClearQuote={() => setQuote(undefined)}
+        <BotGroupComposer groupId={group.id} editor={composer} draft={draft} onDraft={message => compose.edit({ message })} quote={quote} onClearQuote={() => compose.edit({ quote: undefined })}
           members={members} bots={bots} displayName={displayName} files={draftFiles}
-          onFiles={files => { if (!busy) setDraftFiles(current => [...current, ...files.map(file => ({ file, id: crypto.randomUUID() }))]); }}
-          onRemoveFile={id => setDraftFiles(current => current.filter(file => file.id !== id))} busy={busy} onSend={() => void send()} onWake={onWake} />
+          onFiles={files => compose.edit({ files: [...draftFiles, ...files.map(file => ({ file, id: crypto.randomUUID() }))] })}
+          onRemoveFile={id => compose.edit({ files: draftFiles.filter(file => file.id !== id) })} busy={busy} onSend={() => void send()} onWake={onWake} />
       </div>
     </main>
     {panelTarget && createPortal(memberPane, panelTarget)}

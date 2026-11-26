@@ -160,10 +160,16 @@ export async function startResourceNode(options: NodeOptions) {
     const app = express();
     app.disable('x-powered-by');
     const observers = new Set<http.ServerResponse>();
-    app.get('/health', (_req, res) => {
-      const ready = !draining && Boolean(kernel.handshake);
+    let controlProbe: Promise<boolean> | undefined;
+    app.get('/health', async (_req, res) => {
+      if (!draining && kernel.handshake?.capabilities.includes('resourcesOnly')) {
+        controlProbe ??= kernel.probeControl(AbortSignal.timeout(1500)).catch(() => false)
+          .finally(() => { controlProbe = undefined; });
+      }
+      const responsive = await controlProbe;
+      const ready = !draining && responsive === true;
       res.status(ready ? 200 : 503).json({ status: ready ? 'ok' : 'unavailable', role: 'resources',
-        releaseId: options.releaseId ?? version });
+        control: ready ? 'ready' : 'unavailable', releaseId: options.releaseId ?? version });
     });
     app.use((req, res, next) => {
       if (draining) { res.status(503).json({ code: 'host-draining' }); return; }

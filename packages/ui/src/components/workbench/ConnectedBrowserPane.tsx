@@ -13,7 +13,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 
 /** An observation of the owner's exact page, never a second browser at the same URL. */
-export function ConnectedBrowserPage({ resource, binding, onObservedPage }: { resource: BrowserResource; binding: BrowserPageBinding; onObservedPage?(page: BrowserPage): void }) {
+export function ConnectedBrowserPage({ resource, binding, onObservedPage, retainViewer = false }: { resource: BrowserResource; binding: BrowserPageBinding; onObservedPage?(page: BrowserPage): void; retainViewer?: boolean }) {
   const { t } = useI18n();
   const { browserId, instanceId, pageId } = binding;
   const [snapshot, setSnapshot] = React.useState<BrowserPageSnapshot>();
@@ -25,6 +25,13 @@ export function ConnectedBrowserPage({ resource, binding, onObservedPage }: { re
   const pending = React.useRef(false);
   const lifetime = React.useRef<AbortController | null>(null);
   const connected = resource.state === 'online' && resource.instanceId === binding.instanceId;
+  React.useEffect(() => {
+    if (!connected || !retainViewer) return;
+    const controller = new AbortController();
+    void browserResources.holdPage({ browserId, instanceId, pageId }, controller.signal)
+      .catch(cause => { if (!controller.signal.aborted) setError(errorText(cause)); });
+    return () => controller.abort();
+  }, [browserId, instanceId, pageId, connected, retainViewer]);
   const canRead = resource.capabilities.includes(view === 'screenshot' ? 'screenshot' : 'read');
   const perform = React.useCallback(async (action?: 'takeover' | 'resume' | 'activate') => {
     if (pending.current || !connected || !lifetime.current) return;
@@ -89,6 +96,10 @@ export function ConnectedBrowserSurface({ binding, onBindingChange, onObservedPa
   const [error, setError] = React.useState('');
   const [loading, setLoading] = React.useState(false);
   const [refresh, setRefresh] = React.useState(0);
+  const [acquiringHost, setAcquiringHost] = React.useState<number>();
+  const acquiring = acquiringHost === host;
+  const selection = React.useRef<AbortController | null>(null);
+  React.useEffect(() => () => { selection.current?.abort(); selection.current = null; }, [host]);
   const resources = catalog?.host === host ? catalog.resources : [];
   const resource = resources.find(candidate => candidate.browserId === binding?.browserId);
   const pageListKey = binding ? JSON.stringify([host, binding.browserId, binding.instanceId]) : '';
@@ -122,7 +133,7 @@ export function ConnectedBrowserSurface({ binding, onBindingChange, onObservedPa
     }).catch(cause => { if (!controller.signal.aborted) setError(errorText(cause)); })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
-  }, [host, refresh]);
+  }, [host]);
   React.useEffect(() => {
     if (!browserId || !instanceId || resource?.state !== 'online' || resource.instanceId !== instanceId || !resource.capabilities.includes('tabs')) return;
     const controller = new AbortController();
@@ -131,20 +142,43 @@ export function ConnectedBrowserSurface({ binding, onBindingChange, onObservedPa
     }).catch(cause => { if (!controller.signal.aborted) setError(errorText(cause)); });
     return () => controller.abort();
   }, [browserId, instanceId, host, pageListKey, resource]);
+  const refreshDiscovery = async () => {
+    setLoading(true); setError('');
+    try {
+      const resources = await browserResources.refresh();
+      if (host === getRuntimeEndpointGeneration()) { setCatalog({ host, resources }); setRefresh(value => value + 1); }
+    } catch (cause) { if (host === getRuntimeEndpointGeneration()) setError(errorText(cause)); }
+    finally { if (host === getRuntimeEndpointGeneration()) setLoading(false); }
+  };
+  const acquireBrowser = async (next: BrowserResource) => {
+    selection.current?.abort();
+    const controller = new AbortController();
+    selection.current = controller;
+    setAcquiringHost(host); setError('');
+    try {
+      const ready = await browserResources.acquire(next.browserId, controller.signal);
+      if (controller.signal.aborted || host !== getRuntimeEndpointGeneration()) return;
+      setCatalog(previous => ({ host, resources: (previous?.host === host ? previous.resources : resources).map(item => item.browserId === ready.browserId ? ready : item) }));
+      if (ready.state !== 'online' || !ready.instanceId) throw new Error(t('browser.resource.offline'));
+      onBindingChange({ browserId: ready.browserId, instanceId: ready.instanceId });
+    } catch (cause) { if (!controller.signal.aborted) setError(errorText(cause)); }
+    finally { if (selection.current === controller) { selection.current = null; setAcquiringHost(undefined); } }
+  };
   return <div className="flex h-full min-h-0 flex-col bg-background">
     <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-border bg-[var(--surface-background)] px-2 py-1">
       <Icon name="global" className="size-3.5 shrink-0 text-muted-foreground" />
       <Select value={binding?.browserId ?? 'preview'} onValueChange={value => {
         const next = resources.find(candidate => candidate.browserId === value);
-        onBindingChange(next?.instanceId ? { browserId: next.browserId, instanceId: next.instanceId } : undefined);
+        if (next) { void acquireBrowser(next); }
+        else { selection.current?.abort(); selection.current = null; setAcquiringHost(undefined); onBindingChange(undefined); }
       }}>
-        <SelectTrigger className="h-7 min-w-0 flex-1 typography-micro" aria-label={t('browser.resource.select')}><SelectValue /></SelectTrigger>
+        <SelectTrigger className="h-7 min-w-0 flex-1 typography-micro" aria-label={t('browser.resource.select')} disabled={acquiring}><SelectValue /></SelectTrigger>
         <SelectContent><SelectItem value="preview">{t('browser.resource.separatePreview')}</SelectItem>
           {binding && !resource && <SelectItem value={binding.browserId}>{t('browser.resource.offline')}</SelectItem>}
-          {resources.map(item => <SelectItem key={item.browserId} value={item.browserId} disabled={!item.instanceId}>{browserDeviceLabel(item, t)} · {browserResourceLabel(item, t)} · {t(`browser.resource.state.${item.state}`)}</SelectItem>)}
+          {resources.map(item => <SelectItem key={item.browserId} value={item.browserId} disabled={!item.instanceId && !item.activation && item.source !== 'connector'}>{browserDeviceLabel(item, t)} · {browserResourceLabel(item, t)} · {t(`browser.resource.state.${item.state}`)}</SelectItem>)}
         </SelectContent>
       </Select>
-      <Button type="button" variant="ghost" size="sm" disabled={loading} onClick={() => setRefresh(value => value + 1)} aria-label={t('browser.resource.refresh')}><Icon name="refresh" className={loading ? 'size-3.5 animate-spin' : 'size-3.5'} /></Button>
+      <Button type="button" variant="ghost" size="sm" disabled={loading} onClick={() => void refreshDiscovery()} aria-label={t('browser.resource.refresh')}><Icon name="refresh" className={loading ? 'size-3.5 animate-spin' : 'size-3.5'} /></Button>
       <Button type="button" variant="ghost" size="sm" aria-label={t('browser.resource.manage')} onClick={() => { const ui = useUIStore.getState(); ui.setSettingsPage('browsers'); ui.setSettingsDialogOpen(true); }}><Icon name="settings-3" className="size-3.5" /></Button>
     </div>
     {threadId && task && <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b border-border/50 px-3 py-1 typography-micro text-muted-foreground">
@@ -154,6 +188,7 @@ export function ConnectedBrowserSurface({ binding, onBindingChange, onObservedPa
     </div>}
     {binding && <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-border/50 px-3 py-2">
       <span className="typography-micro text-muted-foreground">{resource ? `${browserDeviceLabel(resource, t)} · ${browserResourceLabel(resource, t)} · ${t(`browser.resource.state.${resource.state}`)}` : t('browser.resource.offline')}</span>
+      {resource?.activation && resource.state !== 'online' && <Button type="button" size="sm" variant="outline" disabled={acquiring} onClick={() => void acquireBrowser(resource)}>{t('browser.resource.refresh')}</Button>}
       {resource?.instanceId && resource.instanceId !== binding.instanceId && resource.state === 'online' && <Button type="button" size="sm" variant="outline" onClick={() => onBindingChange({ browserId: resource.browserId, instanceId: resource.instanceId! })}>{t('browser.resource.useCurrentInstance')}</Button>}
       <Select value={binding.pageId ?? 'choose'} onValueChange={value => onBindingChange({ ...binding, pageId: value === 'choose' ? undefined : value })}>
         <SelectTrigger className="h-7 min-w-0 flex-1 typography-micro" aria-label={t('browser.resource.page')}><SelectValue /></SelectTrigger>
@@ -164,7 +199,7 @@ export function ConnectedBrowserSurface({ binding, onBindingChange, onObservedPa
       </Select>
     </div>}
     {error && <p role="alert" className="shrink-0 break-words px-3 py-2 typography-meta text-destructive">{error}</p>}
-    {binding ? binding.pageId && resource ? <ConnectedBrowserPage key={`${host}:${bindingKey}`} resource={resource} binding={binding as BrowserPageBinding} onObservedPage={onObservedPage} />
+    {binding ? binding.pageId && resource ? <ConnectedBrowserPage key={`${host}:${bindingKey}`} resource={resource} binding={binding as BrowserPageBinding} onObservedPage={onObservedPage} retainViewer />
       : <p role="status" className="p-3 typography-meta text-muted-foreground">{t(resource ? 'browser.resource.choosePage' : loading ? 'common.loading' : 'browser.resource.offline')}</p>
       : <><p className="shrink-0 border-b border-border/50 px-3 py-1 typography-micro text-muted-foreground">{t('browser.resource.separatePreviewHint')}</p><div className="relative min-h-0 flex-1">{preview}</div></>}
   </div>;

@@ -228,6 +228,14 @@ impl SubmissionPreparation {
             self.inherited_launch.as_ref().and_then(|selection| selection.source.as_ref())
         }
     }
+    pub fn inherited_lazy_work_location<'a>(&'a self, launch: Option<&'a launches::LaunchSelection>) -> Option<&'a launches::LazyWorkLocation> {
+        if self.expected_workspace_revision > 0 {
+            launch.and_then(|selection| selection.lazy_work_location.as_ref())
+        } else {
+            self.inherited_launch.as_ref().and_then(|selection| selection.lazy_work_location.as_ref())
+                .or_else(|| launch.and_then(|selection| selection.lazy_work_location.as_ref()))
+        }
+    }
     pub fn with_input_preparation(
         mut self,
         preparation: Option<resources::InputResourcePreparation>,
@@ -269,6 +277,8 @@ impl SubmissionPreparation {
         if let Some(selected) = candidate.as_mut() {
             let saved = original.get("launch").ok_or_else(|| RuntimeError::Invalid("retained input launch missing".into()))?;
             selected.source = serde_json::from_value(saved.get("source").cloned().ok_or_else(|| RuntimeError::Invalid("retained input source missing".into()))?)?;
+            selected.lazy_work_location = saved.get("lazy_work_location").cloned()
+                .map(serde_json::from_value).transpose()?;
             selected.tools = serde_json::from_value(saved.get("tools").cloned().ok_or_else(|| RuntimeError::Invalid("retained input tools missing".into()))?)?;
             selected.tool_schema_generation = saved.get("tool_schema_generation").and_then(Value::as_u64).ok_or_else(|| RuntimeError::Invalid("retained source tool generation missing".into()))?;
         }
@@ -369,7 +379,7 @@ impl SubmissionPreparation {
         }
         let inherited_tools = if inherit_source {
             match (&self.inherited_launch, &self.current_tool_catalog) {
-                (Some(previous), Some(available)) if previous.source.is_some() => {
+                (Some(previous), Some(available)) if previous.source.is_some() || (previous.lazy_work_location.is_some() && self.inherited_lazy_work_location(launch.as_ref()).is_some()) => {
                     let old: Vec<crate::execution::ToolSchema> = serde_json::from_value(self.content.load(&previous.base_tools_ref)?)?;
                     let mode = self.inherited_tool_source(launch.as_ref()).map(|source| source.mode);
                     let mut tools = available.iter().filter(|tool| old.iter().any(|prior| prior.name == tool.name)

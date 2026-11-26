@@ -381,7 +381,9 @@ export class AgentRuntimeClient {
     const projectId = admittedScope?.projectId;
     const scope = await this.prepareExtensionOwner(
       { runId, threadId: run.thread_id, branchId: run.branch_id, source: launch?.selection.source ?? null,
-        workFocus: launch?.selection.agent?.workFocus ?? 'general', ...(projectId ? { projectId } : {}), ...(child ? { fixed: true } : {}) },
+        workFocus: launch?.selection.agent?.workFocus ?? 'general', ...(projectId ? { projectId } : {}),
+        ...(!child && launch?.selection.lazy_work_location && launch.selection.tools.some(tool => tool.name === 'process_spawn')
+          ? { lazyWorkLocation: launch.selection.lazy_work_location } : {}), ...(child ? { fixed: true } : {}) },
       required,
       AbortSignal.any([signal, state.controller.signal]),
     );

@@ -121,18 +121,7 @@ impl Catalog {
     /// Existing public work retains the legacy local Host authority. Authenticated members
     /// never inherit it: only the persisted authentication owner may use Host-wide resources.
     pub fn thread_has_host_authority(&self, thread_id: &str) -> Result<bool> {
-        let Some(principal) = thread(&self.db, thread_id)? else {
-            return Ok(true);
-        };
-        let owner: Option<String> = self
-            .db
-            .query_row(
-                "SELECT owner_principal_id FROM catalog_principal_owner WHERE id=1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(owner.as_deref() == Some(principal.as_str()))
+        thread_has_host_authority(&self.db, thread_id)
     }
     pub fn thread_principal(&self, thread_id: &str) -> Result<Option<String>> {
         thread(&self.db, thread_id)
@@ -405,3 +394,17 @@ mod tests {
         assert_eq!(public.principal_id, Some(None));
     }
 }
+
+pub(super) fn thread_has_host_authority(db: &Connection, thread_id: &str) -> Result<bool> {
+        let Some(principal) = thread(db, thread_id)? else {
+            return Ok(true);
+        };
+        let owner: Option<String> = db
+            .query_row(
+                "SELECT owner_principal_id FROM catalog_principal_owner WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(owner.as_deref() == Some(principal.as_str()))
+    }

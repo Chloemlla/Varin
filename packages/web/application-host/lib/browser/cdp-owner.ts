@@ -34,7 +34,6 @@ export class CdpBrowserOwner implements BrowserOwner {
   private state: BrowserConnectionState = 'disconnected';
   private instanceId?: string;
   private disposed = false;
-  private retryAfter = 0;
   private pages = new Map<string, Entry>();
   private listeners = new Set<(event: BrowserEvent) => void>();
   private downloadsById = new Map<string, BrowserDownload>();
@@ -45,19 +44,18 @@ export class CdpBrowserOwner implements BrowserOwner {
   private emit(event: BrowserEvent) { for (const listener of this.listeners) listener(event); }
   private connection(state: BrowserConnectionState) {
     this.state = state;
-    if (state === 'interrupted') this.retryAfter = Date.now() + 1_000;
     this.emit({ kind: 'connection', browserId: this.browserId, ...(this.instanceId ? { instanceId: this.instanceId } : {}), state });
   }
   async resource() {
-    if (!this.disposed && (this.state === 'disconnected' || this.state === 'interrupted' && Date.now() >= this.retryAfter)) try { await this.connect(); } catch { /* The registration remains discoverable offline. */ }
     const capabilities: BrowserResourceCapability[] = ['tabs', 'open', 'read', 'screenshot', 'act', 'activate'];
     if (this.fileTransfers) capabilities.push('upload', 'download');
-    return { ...(this.instanceId ? { instanceId: this.instanceId } : {}), state: this.state, capabilities, operations: ['list', 'open', 'read', 'activate', ...['navigate', 'back', 'forward', 'reload', 'close', 'click', 'double_click', 'hover', 'scroll', 'type', 'press', 'select', 'check', 'drag', 'dialog', 'evaluate', 'wait'].map(action => `act:${action}`), ...(this.fileTransfers ? ['upload', 'downloads', 'readDownload', 'releaseDownload'] : [])] };
+    return { ...(this.instanceId ? { instanceId: this.instanceId } : {}), state: this.state, activation: 'connect' as const, capabilities, operations: ['list', 'open', 'read', 'activate', ...['navigate', 'back', 'forward', 'reload', 'close', 'click', 'double_click', 'hover', 'scroll', 'type', 'press', 'select', 'check', 'drag', 'dialog', 'evaluate', 'wait'].map(action => `act:${action}`), ...(this.fileTransfers ? ['upload', 'downloads', 'readDownload', 'releaseDownload'] : [])] };
   }
+  prepareResource(): Promise<void> { return this.connect(); }
   async connect(): Promise<void> {
     if (this.disposed) throw new Error('This browser owner has ended');
-    if (this.transport) return;
     if (this.connecting) return this.connecting;
+    if (this.transport) return;
     this.connection('connecting');
     const connecting = (async () => {
       const transport = await CdpTransport.connect(this.options.endpoint, this.options.headers);

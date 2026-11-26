@@ -38,6 +38,7 @@ export function McpDropdownContent({
   hideHeader,
   hostLabel,
   onNavigate,
+  mobileListDensity = false,
 }: McpDropdownContentProps) {
   const { t } = useI18n();
   const [expanded, setExpanded] = React.useState<string>();
@@ -198,10 +199,10 @@ export function McpDropdownContent({
   return (
     <section
       aria-label={t("services.mcp.title")}
-      className={cn("py-4", className)}
+      className={cn(mobileListDensity ? "py-3" : "py-4", className)}
     >
       {!hideHeader && (
-        <div className="mb-4 flex items-center gap-3 px-5">
+        <div className={cn("flex items-center gap-3 px-5", mobileListDensity ? "mb-2" : "mb-4")}>
           <div className="min-w-0 flex-1">
             <h3 className="text-sm font-medium">{t("services.mcp.title")}</h3>
             <p
@@ -475,12 +476,12 @@ export function McpDropdownContent({
         </div>
       ) : null}
       {snapshot && !servers.length && (
-        <div className="px-6 py-7 text-center">
-          <span className="mx-auto mb-3 flex size-11 items-center justify-center rounded-xl bg-[var(--surface-muted)]">
+        <div className={cn("px-6 text-center", mobileListDensity ? "py-4" : "py-7")}>
+          <span className={cn("mx-auto flex items-center justify-center rounded-xl bg-[var(--surface-muted)]", mobileListDensity ? "mb-2 size-9" : "mb-3 size-11")}>
             <McpIcon className="size-5 text-muted-foreground" />
           </span>
           <p className="text-sm font-medium">{t("services.mcp.empty")}</p>
-          <p className="mx-auto mb-5 mt-2 max-w-64 text-xs leading-relaxed text-muted-foreground">
+          <p className={cn("mx-auto mt-2 max-w-64 text-xs leading-relaxed text-muted-foreground", mobileListDensity ? "mb-3" : "mb-5")}>
             {t("services.mcp.emptyHint")}
           </p>
           <Button size="sm" onClick={add}>

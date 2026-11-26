@@ -54,6 +54,10 @@ export function registerBrowserResourceRoutes(app: Express, resources: BrowserRe
     return controller.signal;
   };
   app.get(prefix, route(async (_req, res) => { res.json({ resources: await resources.list({ includeDevice: true }) }); }));
+  app.post(prefix + '/refresh', route(async (_req, res) => { res.json({ resources: await resources.list({ includeDevice: true, refresh: true }) }); }));
+  app.post(prefix + '/:browserId/acquire', route(async (req, res) => {
+    res.json({ resource: await resources.acquire(String(req.params.browserId), stopOnClose(res)) });
+  }));
   if (management) {
     const device = (req: Request) => {
       if (req.query.device === undefined || req.query.device === 'local') return undefined;
@@ -112,6 +116,23 @@ export function registerBrowserResourceRoutes(app: Express, resources: BrowserRe
       const { base64, ...image } = observation.image;
       res.type(BINARY_EVENT_CONTENT_TYPE).send(Buffer.from(encodeBinaryEvent({ observation: { ...observation, image }, usage }, Buffer.from(base64, 'base64'))));
     } else res.json({ observation, usage });
+  }));
+  // The open response is the observer's claim. Closing it releases only that
+  // claim, never a writer or another viewer using the original page.
+  app.post(pages + '/:pageId/viewer', route(async (req, res) => {
+    const binding = target(req);
+    const signal = stopOnClose(res);
+    const release = await resources.holdPage({ ...binding, pageId: binding.pageId! }, signal);
+    try {
+      if (signal.aborted) return;
+      res.type('text/event-stream');
+      res.flushHeaders();
+      res.write('event: retained\ndata: {}\n\n');
+      await new Promise<void>(resolve => {
+        signal.addEventListener('abort', () => resolve(), { once: true });
+        if (signal.aborted) resolve();
+      });
+    } finally { await release(); }
   }));
   app.post(pages + '/:pageId/:action', route(async (req, res) => {
     const action = req.params.action;

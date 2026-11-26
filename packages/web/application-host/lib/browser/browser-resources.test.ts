@@ -117,3 +117,28 @@ test('a late terminal exchange cannot disconnect a replacement instance', async 
   await expect(owner.resource()).resolves.toMatchObject({ state: 'ended', instanceId: 'replacement' });
   await owner.dispose();
 });
+
+test('cancelling one acquisition waiter cannot cancel the selected owner or dispatch that waiter', async () => {
+  const registry = new BrowserResources(), starting = latch(), accept = latch();
+  let calls = 0, ready = false, cancelledDispatch = false;
+  registry.register({
+    browserId: 'prepared',
+    resource: async () => ready ? { state: 'online', instanceId: 'new-instance', capabilities: ['tabs'] }
+      : { state: 'disconnected', activation: 'connect', capabilities: ['tabs'] },
+    prepareResource: async () => { calls++; starting.release(); await accept.wait; ready = true; },
+    subscribe: () => () => undefined,
+  } satisfies Pick<BrowserOwner, 'browserId' | 'resource' | 'prepareResource' | 'subscribe'> as unknown as BrowserOwner, 'Browser', 'Device');
+  await registry.list();
+  expect(calls).toBe(0);
+  const controller = new AbortController();
+  const cancelled = registry.use({ browserId: 'prepared' }, { signal: controller.signal }, async () => { cancelledDispatch = true; });
+  const rejected = expect(cancelled).rejects.toMatchObject({ name: 'AbortError' });
+  await starting.wait;
+  const live = registry.acquire('prepared');
+  controller.abort();
+  await rejected;
+  expect(cancelledDispatch).toBe(false);
+  accept.release();
+  await expect(live).resolves.toMatchObject({ browserId: 'prepared', instanceId: 'new-instance' });
+  expect(calls).toBe(1);
+});

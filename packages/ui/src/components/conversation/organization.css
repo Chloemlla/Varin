@@ -1,5 +1,5 @@
 .organization-row { position: relative; display: flex; align-items: center; min-height: 34px; gap: 4px; border-radius: var(--radius-md); padding: 0 6px; color: var(--muted-foreground); transition: color var(--motion-dur-snap) var(--motion-ease-snap), background var(--motion-dur-snap) var(--motion-ease-snap); }
-.organization-row:hover, .organization-row:focus-within, .organization-row:has([data-popup-open]), [data-popup-open] > .organization-row { background: var(--interactive-hover); color: var(--foreground); }
+.organization-row:where(:focus-visible, :has(:focus-visible, [data-popup-open])), :where([data-popup-open]) > .organization-row { background: var(--interactive-hover); color: var(--foreground); }
 .organization-row[data-current=true], .organization-row[aria-selected=true] { background: var(--interactive-selection); color: var(--foreground); }
 .organization-row:focus-visible { outline: 2px solid var(--interactive-focus-ring); outline-offset: -2px; }
 .organization-row-main { display: flex; align-items: center; gap: 7px; flex: 1; min-width: 0; min-height: 34px; text-align: left; }
@@ -9,18 +9,44 @@
 .organization-chevron { display: flex; width: 15px; flex-shrink: 0; align-items: center; justify-content: center; min-height: 28px; }
 .organization-icon-button { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; width: 25px; height: 25px; border-radius: 6px; color: var(--muted-foreground); }
 .organization-icon-button:hover { background: var(--interactive-hover); color: var(--foreground); }
-.organization-row-actions { position: absolute; right: 3px; top: 4px; display: flex; gap: 1px; align-items: center; padding-left: 4px; opacity: 0; pointer-events: none; border-radius: 6px; background: var(--sidebar); transition: opacity var(--motion-dur-snap) var(--motion-ease-snap); }
-.organization-row:hover .organization-row-actions, .organization-row:focus-within .organization-row-actions, .organization-row:has([data-popup-open]) .organization-row-actions, [data-popup-open] > .organization-row .organization-row-actions { opacity: 1; pointer-events: auto; background: var(--interactive-hover); }
-.organization-row[data-current=true] .organization-row-actions, .organization-row[aria-selected=true] .organization-row-actions { background: var(--interactive-selection); }
-.organization-row-trailing { --organization-swap-duration: calc(var(--motion-dur-snap) / 2); display: grid; flex: none; align-items: center; justify-items: end; min-height: 28px; }
-.organization-row-trailing > * { grid-area: 1 / 1; }
-.organization-row-time { white-space: nowrap; pointer-events: none; transition: opacity var(--organization-swap-duration) var(--motion-ease-snap) var(--organization-swap-duration); }
-.organization-row[data-recent=true] .organization-row-actions { position: static; padding-left: 0; background: transparent; transition-duration: var(--organization-swap-duration); transition-delay: 0s; }
-.organization-row[data-recent=true]:has(.organization-row-path) .organization-row-trailing { align-self: flex-start; margin-top: 2px; }
-.organization-row:is(:hover, :focus-within, :has([data-popup-open])) .organization-row-time, [data-popup-open] > .organization-row .organization-row-time { opacity: 0; transition-delay: 0s; }
-.organization-row[data-recent=true]:is(:hover, :focus-within, :has([data-popup-open])) .organization-row-actions, [data-popup-open] > .organization-row[data-recent=true] .organization-row-actions { transition-delay: var(--organization-swap-duration); }
-.organization-row-more { width: 28px; height: 28px; border-radius: 5px; background: transparent; transition: background-color var(--motion-dur-snap) var(--motion-ease-snap), color var(--motion-dur-snap) var(--motion-ease-snap); }
-.organization-row-more:is(:hover, :focus-visible, [data-popup-open]) { background: color-mix(in srgb, var(--foreground) 6%, transparent); color: var(--foreground); }
+.organization-row-trailing, .organization-row-actions, .organization-row-shortcuts { display: flex; flex: none; align-items: center; gap: 2px; }
+.organization-row-shortcuts:empty { display: none; }
+.organization-row-actions :is(.organization-drag, .organization-row-new) { display: none; }
+.organization-row-time { white-space: nowrap; pointer-events: none; }
+.organization-row-more { display: grid; place-items: center; width: 44px; height: 44px; cursor: pointer; touch-action: manipulation; color: var(--muted-foreground); border-radius: var(--radius-md); }
+.organization-row-more > span { display: grid; place-items: center; width: 23px; height: 23px; border-radius: 50%; transition: background-color var(--motion-dur-exit), transform var(--motion-dur-exit); }
+.organization-row-more:is(:active, [data-popup-open], :focus-visible) > span { background: var(--interactive-hover); color: var(--foreground); }
+.organization-row-more:active > span { transform: scale(.9); }
+.organization-row-more:focus-visible { outline: 2px solid var(--interactive-focus-ring); outline-offset: -3px; }
+.organization-row-menu [role="menuitem"] { min-height: 36px; }
+.organization-row-menu.motion-popover { transition-duration: var(--motion-dur-fade); }
+.organization-row-menu.motion-popover[data-ending-style] { transition-duration: var(--motion-dur-exit); pointer-events: none; }
+.organization-row-menu.motion-popover[data-open] [role="menuitem"] { animation: none; }
+@media (hover: hover) and (pointer: fine) {
+  .organization-row:where(:hover) { background: var(--interactive-hover); color: var(--foreground); }
+  .organization-row-more:hover > span { background: var(--interactive-hover); color: var(--foreground); }
+  .organization-row:not(:where([data-touch-directory] *)) {
+    & .organization-row-trailing { display: grid; justify-items: end; }
+    & .organization-row-trailing > * { grid-area: 1 / 1; }
+    & .organization-row-actions :is(.organization-drag, .organization-row-new) { display: inline-flex; }
+    /* Reserve just the ellipsis until this row's shortcuts are in use. */
+    & .organization-row-shortcuts { width: 0; overflow: clip; }
+    & .organization-row-more { width: 30px; height: 30px; }
+    & .organization-row-actions, & .organization-row-time { transition: opacity var(--motion-dur-exit) var(--motion-ease-out); }
+    & .organization-row-actions { opacity: 0; pointer-events: none; }
+    &:is(:hover, :focus-visible, :has(:focus-visible, [data-popup-open])) {
+      & .organization-row-shortcuts { width: auto; overflow: visible; }
+      & .organization-row-actions { opacity: 1; pointer-events: auto; }
+      & .organization-row-time { opacity: 0; }
+    }
+  }
+}
+@media (pointer: coarse) {
+  .organization-row-menu [role="menuitem"] { min-height: 44px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .organization-row-more:active > span { transform: none; }
+}
 .organization-tabs { display: flex; gap: 17px; align-items: center; height: 32px; }
 .organization-tabs button { position: relative; height: 100%; font-size: 12px; color: var(--muted-foreground); }
 .organization-tabs button[aria-selected=true] { color: var(--foreground); font-weight: 500; }
@@ -33,9 +59,3 @@
 .organization-picker-path { display: flex; flex-wrap: wrap; align-items: center; gap: 3px; min-height: 38px; padding: 7px 3px; font-size: 11px; color: var(--muted-foreground); }
 .organization-picker-path button { padding: 3px 5px; border-radius: 4px; }
 .organization-picker-path button:hover { color: var(--foreground); background: var(--interactive-hover); }
-@media (pointer: coarse) {
-  .organization-row-actions { position: static; opacity: 1; pointer-events: auto; padding-left: 0; background: transparent; }
-  .organization-row-actions .organization-drag, .organization-row-actions .organization-row-new { display: none; }
-  .organization-row-trailing { display: flex; gap: 4px; }
-  .organization-row[data-recent=true] .organization-row-time { opacity: 1; }
-}

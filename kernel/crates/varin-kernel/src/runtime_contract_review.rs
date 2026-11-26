@@ -640,6 +640,7 @@ fn exercise_child(
         tool_schema_generation: resolved.tool_schema_generation,
         tools: vec![schema.clone()],
         policy: DefaultAgentPolicy.identity(),
+        lazy_work_location: None,
         source: None,
     };
     let prepared = parent

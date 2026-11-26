@@ -53,6 +53,8 @@ export interface ComputerDesktop {
   statusDetail?: string;
   /** Last probed driver capabilities; absent until the first successful probe. */
   capabilities?: ComputerCapabilities;
+  /** When the owner last completed an explicit capability probe. */
+  probedAt?: string;
   /**
    * Remote binding (BC6): this catalog entry mirrors a desktop owned by
    * another Host reached through `connectionId`. Calls route to that Host —

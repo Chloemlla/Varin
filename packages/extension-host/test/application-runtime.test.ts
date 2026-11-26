@@ -570,7 +570,7 @@ test("recreating a Runtime in the same process cannot satisfy a trusted-native r
   } finally { await recreated.stop(); }
 });
 
-test("persistent routes select different real providers by Thread and isolate provider withdrawal", { timeout: 30_000 }, async () => {
+test("persistent routes select different real providers by Thread and isolate provider withdrawal", { timeout: 30_000 }, async (t) => {
   const dataDir = await temporaryDirectory("varin-routing-runtime-");
   const alpha = await temporaryDirectory("varin-routing-alpha-");
   const beta = await temporaryDirectory("varin-routing-beta-");
@@ -649,15 +649,35 @@ test("persistent routes select different real providers by Thread and isolate pr
     assert.equal(await read(runScope), "alpha");
     assert.equal(await read({ ...runScope, sourceRunId: "run-beta" }), "beta");
     assert.equal(await read({ ...runScope, branchId: "branch-other" }), "alpha");
-    const accepted = await runtime.prepareService({ args: [], method: "read", routing: runScope, serviceId, version: 1 });
+    const selection = await runtime.state();
+    const slots = [{ serviceId, version: 1 }, { serviceId: "dev.example.missing", version: 1 }];
+    const signal = new AbortController().signal;
+    const [selected, missing] = await runtime.prepareDirectoryServices(slots, runScope, selection, signal);
+    assert.equal(missing?.status, "rejected");
+    assert.equal(selected?.status, "fulfilled");
+    const accepted = selected.value;
     const pin = accepted.pin();
     accepted.release();
+    let prepared!: () => void, resume!: () => void;
+    const preparing = new Promise<void>(resolve => { prepared = resolve; });
+    const paused = new Promise<void>(resolve => { resume = resolve; });
+    const prepareExtension = runtime.supervisor.prepareDirectoryExtension;
+    const observer = t.mock.method(runtime.supervisor, "prepareDirectoryExtension", async (...args: Parameters<typeof prepareExtension>) => {
+      const lease = await prepareExtension.apply(runtime.supervisor, args);
+      prepared();
+      await paused;
+      return lease;
+    });
+    const refused = assert.rejects(runtime.prepareDirectoryServices(slots, runScope, selection, signal), /selection changed during directory preparation/);
     try {
-      await runtime.upsertServiceRoutingRule({ expectedRevision: (await runtime.routing.read()).document.revision,
+      await Promise.race([preparing, refused.then(() => { throw new Error("Directory settled before the route changed"); })]);
+      await runtime.upsertServiceRoutingRule({ expectedRevision: selection.routing.document.revision,
         rule: { allowFallback: false, providerKeys: [betaProvider.providerKey], scope: runScope, serviceId, version: 1 } });
+      resume();
+      await refused;
       assert.equal(await read(runScope), "beta");
       assert.equal(await pin.invoke("read", []), "alpha", "accepted work keeps its exact provider when current Run routing changes");
-    } finally { pin.release(); }
+    } finally { resume(); observer.mock.restore(); pin.release(); }
 
     for (const providerKeys of [[], [alphaProvider.providerKey, betaProvider.providerKey]]) {
       await runtime.upsertServiceRoutingRule({ expectedRevision: (await runtime.routing.read()).document.revision,

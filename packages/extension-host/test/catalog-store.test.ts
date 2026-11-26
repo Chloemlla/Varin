@@ -71,10 +71,19 @@ test("distinguishes a missing catalog from a persisted empty catalog", async () 
   assert.equal(persistedRevisionZero.storageState, "ready");
 });
 
-test("preserves the last valid catalog when the file becomes malformed or disappears", async () => {
+test("preserves the last valid catalog when the file changes without a revision, becomes malformed, or disappears", async () => {
   const catalog = new ApplicationExtensionCatalog({ dataDir: await temporaryDirectory() });
   const installed = await catalog.upsert(installation(), 0);
   assert.equal(installed.extensions.length, 1);
+
+  assert.equal((await catalog.snapshot()).authoritative, true);
+  const replaced = JSON.parse(await readFile(catalog.store.catalogPath, "utf8"));
+  replaced.extensions = {};
+  await writeFile(catalog.store.catalogPath, JSON.stringify(replaced), "utf8");
+  const reused = await catalog.snapshot();
+  assert.equal(reused.authoritative, false);
+  assert.equal(reused.diagnostics[0]?.code, "catalog_revision_reused");
+  assert.deepEqual(reused.extensions, installed.extensions);
 
   await writeFile(catalog.store.catalogPath, "{ malformed", "utf8");
   const malformed = await catalog.snapshot();

@@ -226,10 +226,10 @@
 .conversation-composer-attachment { animation: wb-material-arrive var(--motion-dur-settle) var(--motion-ease-settle) both; }
 
 @container composer (max-width: 600px) {
-  .conversation-composer-footer { grid-template-columns: minmax(0, 1fr) auto; }
-  .conversation-composer-models { grid-column: 1 / -1; grid-row: 1; justify-content: flex-start; }
-  .conversation-composer-options { grid-column: 1; grid-row: 2; }
-  .conversation-composer-actions { grid-column: 2; grid-row: 2; }
+  .conversation-composer-footer:where(:not([data-mobile-model-toolbar])) { grid-template-columns: minmax(0, 1fr) auto; }
+  :where(.conversation-composer-footer:not([data-mobile-model-toolbar])) > .conversation-composer-models { grid-column: 1 / -1; grid-row: 1; justify-content: flex-start; }
+  :where(.conversation-composer-footer:not([data-mobile-model-toolbar])) > .conversation-composer-options { grid-column: 1; grid-row: 2; }
+  :where(.conversation-composer-footer:not([data-mobile-model-toolbar])) > .conversation-composer-actions { grid-column: 2; grid-row: 2; }
   .conversation-composer-models button { max-width: 100%; }
 }
 @container composer (max-width: 360px) {

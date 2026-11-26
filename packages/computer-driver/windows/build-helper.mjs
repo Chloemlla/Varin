@@ -6,12 +6,13 @@ import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import artifact from './helper-artifact.cjs';
+import { windowsMsvcEnvironment } from '../../../scripts/windows-msvc.cjs';
 const source = path.dirname(fileURLToPath(import.meta.url));
 const repository = path.resolve(source, '../../..');
 const { PROTOCOL_VERSION, EXECUTABLE, digest, inspectExecutable, readSignature, verifyHelper } = artifact;
 export const windowsHelperInputs = ['kernel/crates/varin-computer-windows', 'kernel/Cargo.toml', 'kernel/Cargo.lock',
   'kernel/rust-toolchain.toml', 'packages/computer-driver/windows', 'packages/electron/resources/icons/icon.ico',
-  'scripts/kernel-binary-identity.cjs', 'package.json'];
+  'scripts/kernel-binary-identity.cjs', 'scripts/windows-msvc.cjs', 'package.json'];
 
 function sourceIdentity(root) {
   const entries = [];
@@ -24,21 +25,6 @@ function sourceIdentity(root) {
   return digest(JSON.stringify(entries));
 }
 
-function windowsEnvironment(architecture, run, environment) {
-  if (environment.INCLUDE && environment.WindowsSdkDir && environment.VSCMD_ARG_TGT_ARCH === architecture) return environment;
-  const installer = path.join(environment['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Microsoft Visual Studio', 'Installer', 'vswhere.exe');
-  const installation = String(run(installer, ['-latest', '-products', '*', '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', '-property', 'installationPath'], { encoding: 'utf8', env: environment })).trim();
-  if (!installation) throw new Error('Visual Studio C++ build tools and the Windows SDK are required to build VarinComputer');
-  const script = path.join(installation, 'Common7', 'Tools', 'VsDevCmd.bat');
-  // cmd.exe parses this command, not the C runtime. Node's default argument
-  // escaping turns the quoted batch path into literal backslash-quotes.
-  const output = String(run('cmd.exe', ['/d', '/s', '/c', `call "%VARIN_VSDEVCMD%" -arch=${architecture} -host_arch=${process.arch} >nul && set`],
-    { encoding: 'utf8', windowsHide: true, windowsVerbatimArguments: true, env: { ...environment, VARIN_VSDEVCMD: script } }));
-  const env = { ...environment };
-  for (const line of output.split(/\r?\n/)) { const split = line.indexOf('='); if (split > 0) env[line.slice(0, split)] = line.slice(split + 1); }
-  return env;
-}
-
 export function windowsHelperBuildIdentity({ architecture = process.env.VARIN_TARGET_ARCH || process.arch,
   root = repository, run = execFileSync, environment = process.env, platform = process.platform } = {}) {
   if (platform !== 'win32') throw new Error('The Windows Computer helper requires a Windows build host and SDK');
@@ -46,7 +32,7 @@ export function windowsHelperBuildIdentity({ architecture = process.env.VARIN_TA
   if (!target) throw new Error(`Unsupported Windows Computer helper architecture: ${architecture}`);
   const pinned = /^channel\s*=\s*"([^"]+)"/m.exec(fs.readFileSync(path.join(root, 'kernel/rust-toolchain.toml'), 'utf8'))?.[1];
   if (!pinned) throw new Error('The Computer helper requires the pinned kernel Rust toolchain');
-  const env = windowsEnvironment(architecture, run, { ...environment, RUSTUP_TOOLCHAIN: environment.RUSTUP_TOOLCHAIN || pinned });
+  const env = windowsMsvcEnvironment(architecture, { ...environment, RUSTUP_TOOLCHAIN: environment.RUSTUP_TOOLCHAIN || pinned }, run);
   const options = { cwd: path.join(root, 'kernel'), encoding: 'utf8', windowsHide: true, env };
   const rustc = String(run('rustc', ['--version', '--verbose'], options)).trim();
   const cargo = String(run('cargo', ['--version'], options)).trim();

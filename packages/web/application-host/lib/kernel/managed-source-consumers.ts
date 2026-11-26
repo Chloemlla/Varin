@@ -19,7 +19,7 @@ export interface ManagedSourceAccess {
 }
 export interface ManagedSourceConsumerOptions {
   coordinatorHostId(): string;
-  registry: Pick<ManagedRemoteTargetRegistry, 'source' | 'sourceTargets'>;
+  registry: Pick<ManagedRemoteTargetRegistry, 'source' | 'sourceTargets'> & Partial<Pick<ManagedRemoteTargetRegistry, 'describeSourceTargets'>>;
   /** The Run's original admitted binding. Never replace it with a fresh grant for an old effect. */
   withRunAuthority<T>(runId: string, source: ThreadSource, consume: (access: ManagedSourceAccess) => Promise<T>, signal?: AbortSignal): Promise<T>;
 }
@@ -56,6 +56,7 @@ export function createManagedSourceConsumers(options: ManagedSourceConsumerOptio
   };
   const threads: ThreadSourceRemoteOwner = {
     list: signal => options.registry.sourceTargets(signal),
+    describe: signal => options.registry.describeSourceTargets?.(signal) ?? Promise.resolve({ targets: [], unavailable: [] }),
     async resolve(request, signal) {
       if (request.resourceOwner.kind !== 'managed_host') throw new Error('Managed source requires its exact target owner');
       const client = await options.registry.source(request.resourceOwner, signal);

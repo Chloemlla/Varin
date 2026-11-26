@@ -38,6 +38,7 @@ import {
   type VarinExtensionRemoveRequest,
   type VarinExtensionServiceInvocationRequest,
   type VarinExtensionServiceProvision,
+  type VarinExtensionServiceRoutingContext,
   type VarinExtensionServiceRoutingRuleRemoveRequest,
   type VarinExtensionServiceRoutingRuleUpdateRequest,
   type VarinExtensionServiceRoutingSnapshot,
@@ -81,6 +82,7 @@ export interface PreparedHostServiceCollection {
   readonly bindings: readonly HostServiceBinding[];
   readonly routingRevision: number;
 }
+export interface HostServiceSlot { serviceId: string; version: number }
 export interface ResolvedHostServiceCompositions {
   readonly services: readonly { providerKey: string; descriptor: Readonly<VarinExtensionServiceProvision>; composition: VarinHostServiceComposition }[];
   readonly routingRevision: number;
@@ -110,6 +112,13 @@ export class ExtensionPackageApplicationError extends Error {
   constructor(readonly result: VarinExtensionPackageResult, cause: unknown) {
     super(cause instanceof Error ? cause.message : "Extension candidate preparation failed", { cause });
   }
+}
+
+function requireServiceRoute(...args: Parameters<typeof resolveDeclaredServiceRouting>) {
+  const route = resolveDeclaredServiceRouting(...args);
+  if (route.status !== 'resolved') throw new HostServiceBindingError(route.status === 'ambiguous' ? 'ambiguous'
+    : route.matchedRule ? 'selected_unavailable' : 'missing', route.diagnostics.map(diagnostic => diagnostic.message).join('; '));
+  return route;
 }
 
 export class ApplicationExtensionRuntime {
@@ -738,6 +747,106 @@ export class ApplicationExtensionRuntime {
     return binding!;
   }
 
+  /** Prepare independently releasable services from one scoped selection. A
+   * failed provider only affects its slots; a moved routing document invalidates
+   * the batch before any binding is handed to the caller. */
+  prepareDirectoryServices(slots: readonly HostServiceSlot[], scope: VarinExtensionServiceRoutingContext,
+    { catalog, routing, services }: Pick<VarinExtensionHostStateSnapshot, 'catalog' | 'routing' | 'services'>,
+    signal: AbortSignal): Promise<PromiseSettledResult<HostServiceBinding>[]> {
+    return this.#read(async () => {
+      signal.throwIfAborted();
+      if (!catalog.authoritative || !routing.authoritative) throw new Error('Cannot prepare a Host directory from stale selection state');
+      const groups = new Map<string, Array<{ slot: HostServiceSlot; index: number }>>();
+      const results: PromiseSettledResult<HostServiceBinding>[] = [];
+      for (const [index, slot] of slots.entries()) {
+        try {
+          const route = requireServiceRoute(catalog, routing, slot.serviceId, slot.version, scope, undefined, undefined, services.providers);
+          if (route.extensionIds.length !== 1) throw new HostServiceBindingError('selected_unavailable', 'Single-service preparation requires exactly one provider');
+          const native = registeredWorkbenchDeclarations(catalog, services.providers, slot.serviceId, slot.version)
+            .find(provider => provider.providerKey === route.providerKeys[0]);
+          if (native) {
+            results[index] = { status: 'fulfilled', value: this.services.bind(slot.serviceId, slot.version, native.providerId) };
+            continue;
+          }
+          const id = route.extensionIds[0]!;
+          const group = groups.get(id) ?? [];
+          group.push({ slot, index });
+          groups.set(id, group);
+        } catch (reason) { results[index] = { status: 'rejected', reason }; }
+      }
+      try {
+        await Promise.all([...groups].map(async ([id, group]) => {
+          let lease: HostCompositionLease;
+          try { lease = await this.supervisor.prepareDirectoryExtension(id, scope, catalog, routing, signal); }
+          catch (reason) {
+            for (const { index } of group) results[index] = { status: 'rejected', reason };
+            return;
+          }
+          let remaining = 0;
+          for (const { slot, index } of group) {
+            try {
+              const binding = lease.bind(slot.serviceId, slot.version);
+              remaining++;
+              let released = false;
+              results[index] = { status: 'fulfilled', value: Object.freeze({ ...binding, release: () => {
+                if (released) return;
+                released = true;
+                try { binding.release(); }
+                finally { if (--remaining === 0) lease.release(); }
+              } }) };
+            } catch (reason) { results[index] = { status: 'rejected', reason }; }
+          }
+          if (remaining === 0) lease.release();
+        }));
+        if (!results.some(result => result.status === 'fulfilled')) {
+          signal.throwIfAborted();
+          return results;
+        }
+        const [currentCatalog, currentRouting] = await Promise.all([this.catalog.snapshot(), this.routing.read()]);
+        signal.throwIfAborted();
+        if (this.#stopped) throw new Error('Application extension runtime is stopped');
+        if (!currentCatalog.authoritative || !currentRouting.authoritative || currentRouting.document.revision !== routing.document.revision)
+          throw new Error('Host service selection changed during directory preparation');
+        if (currentCatalog.revision !== catalog.revision) {
+          // Cold built-in materialization also advances the catalog. Accept the
+          // ready bindings whose selection and owner graph still match.
+          const currentRoots = new Map<string, string>();
+          const registered = this.services.getSnapshot().providers;
+          for (const [index, result] of results.entries()) {
+            if (result.status === 'rejected') continue;
+            const slot = slots[index]!, binding = result.value;
+            try {
+              const route = requireServiceRoute(currentCatalog, currentRouting, slot.serviceId, slot.version, scope, undefined, undefined, registered);
+              if (route.providerKeys.length !== 1 || route.providerKeys[0] !== binding.providerKey)
+                throw new Error('Host service route changed during directory preparation');
+              if (!binding.composition) continue;
+              const id = route.extensionIds[0]!;
+              let root = currentRoots.get(id);
+              if (!root) {
+                root = createHostCompositionPlan(currentCatalog, currentRouting, id, scope).composition.root;
+                currentRoots.set(id, root);
+              }
+              if (root !== binding.composition.root) throw new Error('Host composition changed during directory preparation');
+              for (const node of binding.composition.nodes) {
+                const before = catalog.extensions.find(entry => entry.manifest.id === node.extensionId);
+                const after = currentCatalog.extensions.find(entry => entry.manifest.id === node.extensionId);
+                if (before?.desired.revision !== after?.desired.revision || !isDeepStrictEqual(before?.restartHandoffs, after?.restartHandoffs))
+                  throw new Error('Host owner changed during directory preparation');
+              }
+            } catch (reason) {
+              binding.release();
+              results[index] = { status: 'rejected', reason };
+            }
+          }
+        }
+        return results;
+      } catch (error) {
+        for (const result of results) if (result?.status === 'fulfilled') result.value.release();
+        throw error;
+      }
+    });
+  }
+
   /** An explicitly selected durable source must not follow unrelated global service routing.
    * The original supervisor still owns grants, dependency preparation and generation retirement. */
   async prepareEventSource(extensionId: string, serviceId: string, version: number, signal?: AbortSignal): Promise<HostServiceBinding> {
@@ -785,10 +894,8 @@ export class ApplicationExtensionRuntime {
     if (parsed.providerId) throw new Error('Declaration resolution does not accept a live provider identity');
     if (!catalog.authoritative || !routing.authoritative) throw new Error('Cannot resolve a Host composition from stale selection state');
     if (options?.expectedRoutingRevision !== undefined && options.expectedRoutingRevision !== routing.document.revision) throw new Error('Host service routing changed during resolution');
-    const resolution = resolveDeclaredServiceRouting(catalog, routing, parsed.serviceId, parsed.version, parsed.routing,
+    const resolution = requireServiceRoute(catalog, routing, parsed.serviceId, parsed.version, parsed.routing,
       options?.defaultProviderKey, options?.collection ? 'ordered' : undefined);
-    if (resolution.status !== 'resolved') throw new HostServiceBindingError(resolution.status === 'ambiguous' ? 'ambiguous'
-      : resolution.matchedRule ? 'selected_unavailable' : 'missing', resolution.diagnostics.map(diagnostic => diagnostic.message).join('; '));
     const services = resolution.extensionIds.map(extensionId => {
       const plan = createHostCompositionPlan(catalog, routing, extensionId, parsed.routing);
       const descriptor = plan.root.entry.manifest.provides!.services!.find(service => service.id === parsed.serviceId && service.version === parsed.version)!;
@@ -818,10 +925,8 @@ export class ApplicationExtensionRuntime {
     const root = frozen?.nodes.find(node => node.id === frozen.root);
     const resolution = frozen && root ? { status: 'resolved' as const, extensionIds: [root.extensionId],
       providerKeys: [`${root.extensionId}:host:${parsed.serviceId}@${parsed.version}`] }
-      : resolveDeclaredServiceRouting(catalog, routing, parsed.serviceId, parsed.version,
+      : requireServiceRoute(catalog, routing, parsed.serviceId, parsed.version,
         parsed.routing, options?.defaultProviderKey, collection ? 'ordered' : undefined, this.services.getSnapshot().providers);
-    if (resolution.status !== 'resolved') throw new HostServiceBindingError(resolution.status === 'ambiguous' ? 'ambiguous'
-      : resolution.matchedRule ? 'selected_unavailable' : 'missing', resolution.diagnostics.map(diagnostic => diagnostic.message).join('; '));
     const bindings: HostServiceBinding[] = [];
     const prepared = await Promise.allSettled(resolution.extensionIds.map(async (id, index) => {
       const native = registeredWorkbenchDeclarations(catalog, this.services.getSnapshot().providers, parsed.serviceId, parsed.version)

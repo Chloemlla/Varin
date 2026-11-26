@@ -80,3 +80,14 @@ new segments still decode normally.
 - Silence-only segments (peak < 300) are cleared, never committed, so
   Whisper-style providers do not hallucinate on silence.
 - Model files live under the Varin data directory (`~/.config/varin/speech-models` on Linux).
+
+## Resource lifetime
+
+Metadata/model-list requests do not start the speech worker. A local STT or TTS
+request starts it on demand. An admitted native request or STT stream keeps the
+current generation, even if a caller timed out before its native reply. Closing
+or replacing a WebSocket dictation cancels pending admission; a session that
+still starts is closed on its original generation and is not published. After
+the last request and stream drains, the worker can remain warm for its normal
+idle period. Reacquisition waits for physical close if retirement has begun.
+Host stop closes that generation before the shutdown stage completes.

@@ -6,7 +6,7 @@ import type { BrowserPageSnapshot } from '@varin/application-client';
 import type { BrowserResource, BrowserResourceBinding } from '@varin/protocol';
 import { ConnectedBrowserPage, ConnectedBrowserSurface } from './ConnectedBrowserPane';
 
-const mocks = vi.hoisted(() => ({ list: vi.fn(), pages: vi.fn(), observe: vi.fn(), control: vi.fn(), task: vi.fn(), selectTask: vi.fn(),
+const mocks = vi.hoisted(() => ({ list: vi.fn(), refresh: vi.fn(), acquire: vi.fn(), holdPage: vi.fn(), pages: vi.fn(), observe: vi.fn(), control: vi.fn(), task: vi.fn(), selectTask: vi.fn(),
   thread: null as { runtime: 'agent'; threadId: string; branchId: string } | null, host: 1, listeners: new Set<() => void>() }));
 vi.mock('@varin/application-client', () => ({
   browserResources: mocks, getRuntimeEndpointGeneration: () => mocks.host,
@@ -31,7 +31,7 @@ beforeEach(() => {
   vi.stubGlobal('document', document); vi.stubGlobal('window', window); vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
   vi.stubGlobal('HTMLElement', window.HTMLElement); vi.stubGlobal('Element', window.Element); vi.stubGlobal('Node', window.Node);
   container = document.createElement('div'); document.body.append(container);
-  mocks.list.mockResolvedValue([resource]); mocks.pages.mockResolvedValue([snapshot('Original page').observation.page]); mocks.observe.mockResolvedValue(snapshot('Original page'));
+  mocks.list.mockResolvedValue([resource]); mocks.refresh.mockResolvedValue([resource]); mocks.acquire.mockResolvedValue(resource); mocks.holdPage.mockResolvedValue(undefined); mocks.pages.mockResolvedValue([snapshot('Original page').observation.page]); mocks.observe.mockResolvedValue(snapshot('Original page'));
   mocks.thread = null; mocks.task.mockResolvedValue({ preferredBrowserId: null }); mocks.selectTask.mockResolvedValue({ preferredBrowserId: 'office' });
 });
 afterEach(async () => { await act(async () => root?.unmount()); root = undefined; vi.unstubAllGlobals(); vi.clearAllMocks(); mocks.host = 1; mocks.listeners.clear(); });
@@ -39,6 +39,7 @@ const render = async (node: React.ReactNode) => act(async () => { root ??= creat
 
 it('shows readable activity and real observations; takeover and resume reobserve the same tab', async () => {
   await render(<ConnectedBrowserPage resource={resource} binding={binding} />);
+  expect(mocks.holdPage).not.toHaveBeenCalled();
   expect(container.textContent).not.toContain('session-original');
   expect(container.textContent).toContain('Original page');
   expect(container.textContent).toContain('browser.resource.waitingCount 1');
@@ -64,6 +65,19 @@ it('viewing a browser does not change task placement; the task action selects it
   expect(container.textContent).toContain('browser.resource.taskSelected');
 });
 
+it('keeps catalog mounting passive and acquires a disconnected original owner only on explicit retry', async () => {
+  mocks.list.mockResolvedValue([{ ...resource, state: 'interrupted', activation: 'connect' }]);
+  const change = vi.fn();
+  await render(<ConnectedBrowserSurface binding={binding} onBindingChange={change} preview={null} />);
+  expect(mocks.list).toHaveBeenCalledOnce();
+  expect(mocks.acquire).not.toHaveBeenCalled();
+  expect(mocks.refresh).not.toHaveBeenCalled();
+  const reconnect = Array.from(container.querySelectorAll('button')).find(el => el.textContent === 'browser.resource.refresh')!;
+  await act(async () => reconnect.click());
+  expect(mocks.acquire).toHaveBeenCalledWith('office', expect.any(AbortSignal));
+  expect(change).toHaveBeenCalledWith({ browserId: 'office', instanceId: 'session-original' });
+});
+
 it('does not offer local URL opening when activate is unsupported and retains failed observation honestly', async () => {
   await render(<ConnectedBrowserPage resource={{ ...resource, capabilities: ['read'] }} binding={binding} />);
   expect(button('browser.resource.openOnDevice')).toBeUndefined();
@@ -84,13 +98,17 @@ it('keeps the binding across owner replacement and never displays a different lo
   expect(mocks.pages).not.toHaveBeenCalled();
 });
 
-it('ignores late page and control responses after the selected binding changes; closing the view sends no release', async () => {
+it('ignores late page/control responses and cancels only the departing viewer claim', async () => {
   let resolveRead!: (value: BrowserPageSnapshot) => void;
   mocks.observe.mockImplementationOnce(() => new Promise(resolve => { resolveRead = resolve; }));
   const renderPage = (next: BrowserResourceBinding) => render(<ConnectedBrowserSurface binding={next} onBindingChange={vi.fn()} preview={null} />);
   await renderPage(binding);
+  const originalViewer = mocks.holdPage.mock.calls[0]![1] as AbortSignal;
+  expect(originalViewer.aborted).toBe(false);
   mocks.observe.mockResolvedValue(snapshot('New selection'));
   await renderPage({ ...binding, pageId: 'tab-second' });
+  expect(originalViewer.aborted).toBe(true);
+  const currentViewer = mocks.holdPage.mock.calls[1]![1] as AbortSignal;
   await act(async () => resolveRead(snapshot('Late obsolete selection')));
   expect(container.textContent).not.toContain('Late obsolete selection');
   expect(container.textContent).toContain('New selection');
@@ -99,6 +117,7 @@ it('ignores late page and control responses after the selected binding changes; 
   await act(async () => { button('browser.takeOver').click(); button('browser.takeOver').click(); });
   expect(mocks.control).toHaveBeenCalledOnce();
   await act(async () => root?.unmount()); root = undefined;
+  expect(currentViewer.aborted).toBe(true);
   await act(async () => resolveControl({ usage: snapshot('', 'human').usage }));
   expect(mocks.control).toHaveBeenCalledOnce();
 });

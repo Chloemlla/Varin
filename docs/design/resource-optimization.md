@@ -13,7 +13,7 @@
 The first two rows exercised the real broker and preparation code with isolated data. Tool configuration, available sources and selected plugins affect the result in a deployed Host. For a production memory comparison, repeat the same workload on the same processes and sample after the work settles. On Linux, record Host and kernel memory separately from the container's file cache. [Measurement guide](../performance.md)
 
 1. Ship direct first-party tool dispatch and default context in the **first PR**, including recovery of existing tool bindings. Verify it independently in the full Host.
-2. Retire the TriviumDB 0.8 helper after Varin 0.9.53 in an independent release change. Verify the upgrade guidance and packaged artifacts.
+2. Varin 0.9.53 is the bridge for WAL-only TriviumDB 0.8 stores. Subsequent builds ship the current addon and its matching migrator.
 3. Reuse verified grammars and avoid reading old message bodies for history deltas. Land and measure each on its own. Change content collection separately because it controls physical deletion.
 4. Prioritize the remaining renderer, desktop, distribution and build changes by measured cost on the affected deployment.
 
@@ -121,9 +121,9 @@ Deployment checks should include Light Desktop or mobile connected to a remote H
 
 ### Retire the TriviumDB 0.8 helper
 
-**Varin v0.9.53 is the last proposed bridge release.** The helper shipped from v0.9.36 through v0.9.53. On a writable open it lets the old engine produce the first complete checkpoint for a legacy knowledge database whose acknowledged writes exist only in its write-ahead log (WAL). Each database migrates when opened, so a dormant Bot or an old backup may still need this step. [Existing database opener](../../packages/web/application-host/lib/knowledge/database.ts)
+**Varin v0.9.53 is the last bridge release.** Its 0.8 helper produces a first complete checkpoint for stores whose acknowledged writes exist only in the write-ahead log (WAL). Each database migrates when opened, so a dormant Bot or an old backup may still need this step. [Database opener](../../packages/web/application-host/lib/knowledge/database.ts)
 
-In the following release, open with the current engine first. Translate `TDB_CORRUPTED_FILE` into upgrade guidance only when the reason identifies the missing typed checkpoint and directs recovery with the original version. Preserve the original diagnostic for other failures. Identify the affected knowledge store in the UI and logs. Ask the operator to stop its writers, use a copy of the complete data file group, open that store for writing with v0.9.53, close it normally, and open the converted copy with the current release. [Cold backup and isolated copies](../ops/cold-backup.md)
+The 0.9.3 storage worker opens with the current engine first. When the main file is missing and only a v3 WAL remains, the error identifies the file and directs the operator to open a writable copy under Varin 0.9.53. All checkpointed stores continue through the standard migration path. [Cold backup and isolated copies](../ops/cold-backup.md)
 
 | Sample observed with the current engine | Result to preserve after removing the helper |
 | --- | --- |
@@ -131,7 +131,7 @@ In the following release, open with the current engine first. Translate `TDB_COR
 | 0.8 database with a valid checkpoint and pending v3 WAL | Open normally and recover committed entries and links. |
 | Damaged main file with a v3 WAL | Report the original corruption. The WAL header is identical in all three samples. |
 
-Remove the legacy package and helper script together with their entries in both lockfiles, native binary preparation, loader patching, staging, pruning and release smoke checks. Use small fixed legacy fixtures for the three cases so normal builds and tests can run without installing the retired engine. Verify the built desktop package and container runtime contain only the intended database engine. [Database fixtures and tests](../../packages/web/application-host/lib/knowledge/database.test.ts) · [Desktop native preparation](../../packages/electron/scripts/prepare-trivium-runtime.mjs)
+The old addon and its Windows loader patch have been removed from the runtime. Fixed file groups exercise direct migration, the WAL-only guidance, corruption, and the result of opening the same WAL in Varin 0.9.53. [Database fixtures and tests](../../packages/web/application-host/lib/knowledge/database.native.test.ts) · [Desktop native preparation](../../packages/electron/scripts/prepare-trivium-runtime.mjs)
 
 ## Build footprint and module ownership
 

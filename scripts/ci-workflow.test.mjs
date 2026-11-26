@@ -394,7 +394,9 @@ test('automatic Dependabot PRs run only lock preflight and a separate, supersedi
   const preflight = workflow.jobs['dependabot-preflight'];
   assert.equal(preflight.if, "github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]' && inputs.source_sha == ''");
   assert.equal(workflow.jobs.changes.if, "github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || inputs.source_sha != ''");
-  assert.ok(preflight.steps.some(step => step.run === 'node scripts/build-cloud-runtime.mjs --check-lock'));
+  for (const builder of ['build-cloud-runtime', 'build-resource-node']) {
+    assert.ok(preflight.steps.some(step => step.run?.includes(`node scripts/${builder}.mjs --check-lock`)))
+  };
   assert.ok(preflight.steps.some(step => step.run === 'bun install --lockfile-only --frozen-lockfile --ignore-scripts'));
   const report = parse(fs.readFileSync(new URL('../.github/workflows/dependency-report.yml', import.meta.url), 'utf8'));
   assert.deepEqual(report.on.pull_request_target.types, ['opened', 'reopened', 'synchronize']);

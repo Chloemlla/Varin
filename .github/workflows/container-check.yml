@@ -22,6 +22,10 @@ on:
         description: Exercise cold, warm and clean-builder caches in a disposable localhost registry
         default: true
         type: boolean
+      real_linux_roles:
+        description: Run opt-in Chromium and isolated X11 native acceptance against the exact candidate kernel
+        default: false
+        type: boolean
   workflow_call:
     inputs:
       source_sha:
@@ -117,6 +121,83 @@ jobs:
           CONTAINER_OUTPUT_DIR: ../artifacts/container-build/cold
         run: node scripts/build-container-images.mjs build
 
+      - name: Set up Bun for opt-in native roles
+        if: github.event_name == 'workflow_dispatch' && inputs.real_linux_roles
+        uses: ./tooling/.github/actions/setup-bun
+        with:
+          bun-version: 1.3.14
+
+      - name: Prepare exact native fixtures and extract candidate kernel
+        id: native_role_prerequisites
+        if: github.event_name == 'workflow_dispatch' && inputs.real_linux_roles
+        shell: bash
+        env:
+          BROWSER_IMAGE: ${{ steps.images.outputs.browser_node }}
+          SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+        run: |
+          set -euo pipefail
+          if ! [[ "$BROWSER_IMAGE" =~ ^localhost:5000/varin-browser-node@sha256:[a-f0-9]{64}$ ]]; then
+            echo 'Opt-in native roles require an immutable Browser candidate from this validation run.' >&2
+            exit 1
+          fi
+          [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -f packages/web/application-host/lib/browser/browser-node-chromium.native.test.ts
+          test -f packages/web/application-host/lib/kernel/computer-node-x11.native.test.ts
+
+          image_root="$(mktemp -d "$RUNNER_TEMP/varin-role-kernel.XXXXXX")"
+          cid=''
+          trap 'if [[ -n "$cid" ]]; then docker rm -f "$cid" >/dev/null; fi' EXIT
+          docker pull --platform linux/amd64 "$BROWSER_IMAGE"
+          cid="$(docker create --platform linux/amd64 "$BROWSER_IMAGE")"
+          test "$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$cid")" = "$SOURCE_SHA"
+          mkdir -p "$image_root/packages/web"
+          docker cp "$cid:/home/varin/app/packages/web/package.json" "$image_root/packages/web/package.json"
+          docker cp "$cid:/home/varin/app/packages/web/kernel" "$image_root/packages/web/kernel"
+          kernel="$image_root/packages/web/kernel/varin-kernel"
+          test -x "$kernel" && test ! -L "$kernel"
+          node --input-type=module - "$image_root" <<'NODE'
+          import { verifyKernelBundle } from './scripts/verify-resource-node-install.mjs';
+          await verifyKernelBundle(process.argv[2]);
+          NODE
+          printf 'kernel=%s\n' "$kernel" >> "$GITHUB_OUTPUT"
+
+          bun install --frozen-lockfile
+          bun run build:runtime-dependencies
+
+      - name: Exercise the real Chromium Browser role
+        if: ${{ !cancelled() && steps.native_role_prerequisites.outcome == 'success' }}
+        shell: bash
+        timeout-minutes: 6
+        env:
+          VARIN_TEST_KERNEL_PATH: ${{ steps.native_role_prerequisites.outputs.kernel }}
+        run: |
+          set -euo pipefail
+          VARIN_TEST_BROWSER_CHROMIUM="$(command -v google-chrome || command -v chromium)" || { echo "No installed Chrome or Chromium on this runner." >&2; exit 1; }
+          test -x "$VARIN_TEST_BROWSER_CHROMIUM"
+          export VARIN_TEST_BROWSER_CHROMIUM
+          "$VARIN_TEST_BROWSER_CHROMIUM" --version
+          node scripts/test-kernel-authority.mjs --vitest-file=browser-node-chromium.native.test.ts
+
+      - name: Exercise the real Computer X11 role
+        if: ${{ !cancelled() && steps.native_role_prerequisites.outcome == 'success' }}
+        shell: bash
+        timeout-minutes: 8
+        env:
+          VARIN_TEST_KERNEL_PATH: ${{ steps.native_role_prerequisites.outputs.kernel }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends xvfb xauth x11-xserver-utils \
+            dbus-x11 at-spi2-core python3-gi gir1.2-atspi-2.0 gir1.2-gtk-3.0 gir1.2-gdkpixbuf-2.0
+          # GI belongs to the distro interpreter, not a runner Python toolcache.
+          python_bin="$(mktemp -d "$RUNNER_TEMP/varin-role-python.XXXXXX")"
+          trap 'rm -rf -- "$python_bin"' EXIT
+          ln -s /usr/bin/python3 "$python_bin/python3"
+          export PATH="$python_bin:$PATH"
+          bash scripts/test-computer-role-x11.sh
+
       - name: Repeat the exact graph to measure warm reuse
         id: warm
         if: inputs.benchmark
@@ -180,6 +261,21 @@ jobs:
           IMAGE_REF: ${{ steps.images.outputs.resource_node }}
           EXPECTED_RELEASE_ID: image-${{ inputs.source_sha || github.sha }}
         run: node scripts/smoke-container-resource-node.mjs "$IMAGE_REF" "$EXPECTED_RELEASE_ID"
+
+      - name: Smoke exact Browser and Computer role images
+        if: ${{ !cancelled() && steps.images.outcome == 'success' && (steps.images.outputs.browser_node != '' || steps.images.outputs.computer_node != '') }}
+        working-directory: tooling
+        env:
+          BROWSER_IMAGE: ${{ steps.images.outputs.browser_node }}
+          COMPUTER_IMAGE: ${{ steps.images.outputs.computer_node }}
+          EXPECTED_RELEASE_ID: image-${{ inputs.source_sha || github.sha }}
+          MULTI_PLATFORM: ${{ inputs.multi_platform }}
+        run: |
+          for platform in linux/amd64 linux/arm64; do
+            if [ "$platform" = 'linux/arm64' ] && [ "$MULTI_PLATFORM" != 'true' ]; then continue; fi
+            if [ -n "$BROWSER_IMAGE" ]; then node scripts/smoke-container-service-node.mjs browser "$BROWSER_IMAGE" "$EXPECTED_RELEASE_ID" "$platform"; fi
+            if [ -n "$COMPUTER_IMAGE" ]; then node scripts/smoke-container-service-node.mjs computer "$COMPUTER_IMAGE" "$EXPECTED_RELEASE_ID" "$platform"; fi
+          done
 
       - name: Smoke the exact toolbelt image
         if: ${{ !cancelled() && inputs.toolbelt && steps.images.outcome == 'success' }}

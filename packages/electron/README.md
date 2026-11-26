@@ -193,10 +193,7 @@ node packages/electron/scripts/measure-installer-payload.mjs OLD.exe OLD_UNPACKE
   `~/.cache/varin-components/local-semantic/<platform>-<arch>` (macOS Intel builds ONNX Runtime
   1.30.0 from pinned source). Installed on demand in Settings → Memory and knowledge embeddings;
   never bundled in the base app or downloaded on startup.
-- **Windows ARM64 TriviumDB**: Native recipe builds TriviumDB 0.9.1
-  (`46f767f8c5befeb7da091267f2b19052f3cba8d9`) and the one-time 0.8.10 WAL checkpoint helper
-  (`221a628209838483e20296d29bcf35fc3e2dd156`, with ARM64 loader repair), requiring Rust + ARM64
-  MSVC. Cached in `~/.cache/varin-native` and staged outside ASAR (target arch only).
+- **Windows ARM64 TriviumDB**: Rust and ARM64 MSVC build the current addon from the [same release revision as the bundled migration tool](../../scripts/trivium-release.json). The target addon is cached in `~/.cache/varin-native` and staged outside ASAR.
 
 ### Platform Matrix, Signing, CI & Updater
 

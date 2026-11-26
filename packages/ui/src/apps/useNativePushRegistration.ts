@@ -6,7 +6,7 @@ import { useThreadStore } from '@/stores/useThreadStore';
 import { useUIStore } from '@/stores/useUIStore';
 
 /**
- * Registers the native iOS APNs device token with the connected server so the app can
+ * Registers the native push token with the connected server so the app can
  * receive remote push even when suspended/closed. Delivery goes through the central relay
  * (server posts generic text → relay signs+sends) — see
  * `packages/web/application-host/lib/notifications/APNS.md`.
@@ -18,10 +18,8 @@ import { useUIStore } from '@/stores/useUIStore';
  * additionally gates on the `nativeNotificationsEnabled` setting and re-registers when
  * the connection (and thus the active server endpoint) changes.
  */
-// Native push: iOS uses APNs, Android uses FCM. Both are set up natively (google-services.json +
-// the Google Services Gradle plugin on Android), so @capacitor/push-notifications' register()
-// returns the right token per platform. The token is sent to the server tagged with its platform
-// so the relay routes it to APNs vs FCM.
+// iOS uses APNs and Android builds with Firebase configured use FCM.
+// The relay routes each token based on its platform.
 // APNs environment of this build. Xcode/dev-signed installs get sandbox device tokens,
 // TestFlight/App Store installs get production ones; the native iOS shell reports which via
 // a global injected in SceneDelegate (see packages/mobile/ios/App/App/AppDelegate.swift).
@@ -42,6 +40,17 @@ const isNativePushPlatform = (): boolean => {
   return platform === 'ios' || platform === 'android';
 };
 
+const isNativePushAvailable = async (): Promise<boolean> => {
+  if (getClientPlatform() === 'ios') return true;
+  const { registerPlugin } = await import('@capacitor/core');
+  const support = registerPlugin<{
+    getAvailability(): Promise<{ available: boolean }>;
+  }>('NativePushSupport');
+  // The Android plugin is installed even when no default Firebase app exists.
+  // Calling its register method in that state can terminate the native process.
+  return (await support.getAvailability()).available;
+};
+
 export const useNativePushRegistration = (options: { enabled: boolean }): void => {
   const { enabled } = options;
   const hostKey = useThreadStore(state => state.hostKey);
@@ -59,6 +68,8 @@ export const useNativePushRegistration = (options: { enabled: boolean }): void =
     void import('@capacitor/push-notifications')
       .then(async ({ PushNotifications }) => {
         if (disposed) return;
+        const available = await isNativePushAvailable();
+        if (!available || disposed) return;
 
         let permission = await PushNotifications.checkPermissions().catch(() => null);
         if (permission?.receive !== 'granted') {

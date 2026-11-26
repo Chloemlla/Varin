@@ -2,6 +2,8 @@
 
 Design proposal, 2026-11-25. Source baseline `0581422ca439d75c85b8aaf45b18ed4b63b29720`.
 
+Implemented: [dormant native defaults, scoped child file access and on-demand scripts on the original local directory](../../packages/web/application-host/lib/kernel/THREADS.md#dormant-launch-work-locations), passive Browser/Computer discovery and selected activation, worker/connection retention, independently locked [File, Browser and Computer roles](../ops/cloud-deployment.md), authenticated Host activity and an opt-in [resident local supervisor](../runtime.md#opt-in-local-supervisor-handoff-posix). Existing explicit project/native workspace preparation remains when needed to capture admitted context. The local supervisor accepts declared Catalog event pages, not arbitrary HTTP writes, and does not enable automatic Host parking. Applying these guarantees to managed dormant script directories and native workspace retirement requires the corresponding owners' bindings.
+
 This proposal covers the open-source runtime, resource owners, clients and distribution. It follows the [resource optimization work](resource-optimization.md) and prepares reusable integration points for a separately operated hosted product. The behavior below is proposed unless identified as current implementation. Startup latency, retained memory and idle policy values require measurements on the resulting implementation.
 
 ## Intended behavior
@@ -206,6 +208,8 @@ Wake publication and subsequent changes need recovery after a crash. Use durable
 
 Open-source deployments can keep the Host online when they have no external wake supervisor. An ordinary sleeping Host cannot receive its own network request or run its own timer. Scheduled work and event listeners must retain a running owner until their actual delivery has been handed off.
 
+The default Compose Application Host runs as the foreground application with a restart policy. To park it without an immediate restart, the supervised deployment must keep its ingress/supervisor resident while the Host process exits, or use a deployment policy that distinguishes a park from a crash. The Thread write owner rechecks drain admission after HTTP authentication and retains admitted work until its handler settles, including after disconnect. Parking acceptance must observe an absent Host process before wake and preserve an admitted submission not yet acknowledged by the Catalog.
+
 This step extends [shutdown](../../packages/web/application-host/lib/shutdown-runtime.ts), [admission drain](../../packages/web/application-host/lib/draining-admission.ts), [runtime ownership](../runtime.md), [scheduled tasks](../../packages/web/application-host/lib/scheduled-tasks/DOCUMENTATION.md) and [Bot lifecycle](../../packages/web/application-host/lib/bots/bot-lifecycle-runtime.ts).
 
 ## Independent roles and distribution
@@ -222,7 +226,7 @@ Provide deployable roles with exact dependency closures and compatible versioned
 
 A device may assemble several roles and share one physical browser or filesystem. Each role advertises its actual supported capabilities. Reuse the existing Host and resource-node assembly functions and extract capability-specific wiring as roles become deployable.
 
-First give `varin-node` an exact production dependency closure, lockfile/build verification and role-specific health checks. It currently removes the UI and main entrypoint from the application tree while retaining the shared production dependency set. Reproducible packaging must check the installed dependency graph as well as entrypoint files. Shared image layers can still contain useful common tools.
+Each dedicated role has its own production lockfile and verifies the installed dependency graph and entrypoint. Dedicated role readiness checks control-plane liveness, not whether Chromium, a platform desktop driver or an application is presently available. Shared image layers can still contain useful common tools.
 
 Add browser and computer role assembly from the existing services. A browser-only node carries its profile/transfer dependencies. Computer images or installers include the driver and applications required by that platform. Native file nodes include the selected FUSE/FSKit/macFUSE/WinFsp support and preserve its existing mount behavior. Full and Light Desktop keep their respective local-service and remote-client assembly.
 

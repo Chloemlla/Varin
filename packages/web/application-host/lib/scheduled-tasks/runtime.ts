@@ -162,6 +162,7 @@ export const createScheduledTasksRuntime = ({ projectConfigRuntime, listProjects
       owner = next;
     },
     getStatus: () => status(),
+    getActivity: (signal: AbortSignal) => calendarOwner().activity(loopWatchers.size > 0, signal),
     getProjectStatus: (projectID: string) => status(projectID),
   };
 };

@@ -59,6 +59,10 @@ impl FrozenBuiltin {
                 "call differs from the child's original built-in declaration",
             ));
         }
+        if self.admitted.version != self.implementation_schema.version {
+            // The native v1 compatibility path consumes the original call and schema together.
+            return self.inner.clone().bind_call(call, frozen, cancel);
+        }
         let mut implementation_context = frozen.clone();
         let mut schemas = frozen.tools.as_ref().clone();
         let selected = schemas

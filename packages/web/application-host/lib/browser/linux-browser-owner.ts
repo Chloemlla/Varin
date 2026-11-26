@@ -11,6 +11,7 @@ type Scope = BrowserUseScope & { binding: BrowserResourceBinding };
 type Options = { computers: ComputerService; runtime: Pick<AgentRuntimeClient, 'run'> };
 type Shared = {
   instanceId?: string;
+  state?: BrowserProviderStatus['state'];
   pages: Map<string, BrowserPage>;
   observations: Map<string, { pageId: string; instanceId: string; documentId: string }>;
   listeners: Set<(event: BrowserEvent) => void>;
@@ -88,13 +89,21 @@ export class LinuxBrowserOwner implements BrowserOwner {
   }
 
   async resource(): Promise<BrowserProviderStatus> {
-    const capabilities: BrowserProviderStatus['capabilities'] = ['tabs', 'open', 'read', 'screenshot', 'act'];
+    return { state: this.shared.state ?? 'disconnected',
+      ...(this.shared.instanceId ? { instanceId: this.shared.instanceId } : {}),
+      capabilities: ['tabs', 'open', 'read', 'screenshot', 'act'], operations, activation: 'existing-session' };
+  }
+
+  async prepareResource(): Promise<void> {
+    let state: BrowserProviderStatus['state'];
     try {
       const result = await this.call({ op: 'status' });
-      if (!result.status?.running || !result.status.instanceId) return { state: 'disconnected', capabilities, operations };
-      this.rememberInstance(result.status.instanceId);
-      return { state: 'online', instanceId: result.status.instanceId, capabilities, operations };
-    } catch { return { state: 'interrupted', ...(this.shared.instanceId ? { instanceId: this.shared.instanceId } : {}), capabilities, operations }; }
+      if (result.status?.running && result.status.instanceId) { this.rememberInstance(result.status.instanceId); state = 'online'; }
+      else state = 'disconnected';
+    } catch { state = 'interrupted'; }
+    this.shared.state = state;
+    this.emit({ kind: 'connection', browserId: this.browserId, state,
+      ...(this.shared.instanceId ? { instanceId: this.shared.instanceId } : {}) });
   }
 
   async list(): Promise<BrowserPage[]> {
@@ -201,7 +210,9 @@ export function createLinuxBrowserResources(options: Options) {
       const inventory = await options.computers.list({ localOnly: true });
       return inventory.desktops.flatMap(desktop => {
         const machine = inventory.machines.find(machine => machine.id === desktop.machineId);
-        if (desktop.remote || machine?.platform !== 'linux' || desktop.capabilities?.applicationTools?.browser !== true) return [];
+        if (desktop.remote || machine?.platform !== 'linux'
+          || desktop.capabilities?.applicationTools?.browser === false
+          || !desktop.managed && desktop.id !== 'local-console' && desktop.capabilities?.applicationTools?.browser !== true) return [];
         let owner = owners.get(desktop.id);
         if (!owner) { owner = new LinuxBrowserOwner(options, desktop.id); owners.set(desktop.id, owner); }
         return [{ owner, label: `${desktop.label} · Chromium`, deviceName: machine.name }];

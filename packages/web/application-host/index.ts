@@ -219,6 +219,7 @@ import { createDocumentRootGuard } from './lib/documents/allowed-roots.js';
 import { createWorkspaceConfig } from './lib/workspace/workspace-config.js';
 
 import { openWorkspaceKnowledge, type KnowledgeStore } from './lib/knowledge/store.js';
+import { knowledgeDatabaseExists, LEGACY_CHECKPOINT_REQUIRED } from './lib/knowledge/database-files.js';
 
 import { createKnowledgeContextRuntime } from './lib/knowledge/context-runtime.js';
 import { createContextObservationPublication } from './lib/knowledge/context-publication.js';
@@ -338,6 +339,7 @@ import { createNgrokTunnelProvider } from './lib/tunnels/providers/ngrok.js';
 import { TUNNEL_MODE_MANAGED_LOCAL, TUNNEL_MODE_MANAGED_REMOTE, TUNNEL_MODE_QUICK, TUNNEL_PROVIDER_CLOUDFLARE, TunnelServiceError, isSupportedTunnelMode, normalizeOptionalPath, normalizeTunnelMode, normalizeTunnelProvider, normalizeTunnelStartRequest, type TunnelController } from './lib/tunnels/types.js';
 import { createRequestSecurityRuntime } from './lib/security/request-security.js';
 import { getInvalidBindHostErrorMessage, getUnauthenticatedLanErrorMessage, isLoopbackBindHost, isNetworkExposedBindHost, isUnsafeUnauthenticatedLanAllowed, normalizeBindHost } from './lib/security/bind-host.js';
+import { getLanHostAddresses } from './lib/platform/lan-addresses.js';
 import { registerTtsRoutes } from './lib/tts/routes.js';
 import { detectSayTtsCapability } from './lib/tts/capability-runtime.js';
 import { createTerminalRuntime } from './lib/terminal/runtime.js';
@@ -354,7 +356,7 @@ import { createMobilePairingRuntime } from './lib/mobile/pairing-runtime.js';
 import { createMobilePushRuntime } from './lib/mobile/push-runtime.js';
 import { registerMobileRoutes } from './lib/mobile/routes.js';
 import { createGracefulShutdownRuntime, createShutdownCollector, ShutdownDeadline, resolveShutdownTimeoutMs, reportShutdownOutcome } from './lib/shutdown-runtime.js';
-import { createDrainingAdmission, createHttpObservationDrain } from './lib/draining-admission.js';
+import { createDrainingAdmission, createHttpObservationDrain, createThreadWriteAdmission } from './lib/draining-admission.js';
 import { assertDataRootMayStart } from './lib/data-restore-guard.js';
 import { createProjectConfigRuntime } from './lib/projects/project-config.js';
 import { createProjectTextEncodingService } from './lib/projects/text-encoding.js';
@@ -379,6 +381,9 @@ import { resolveVarinDataDir } from './lib/platform/data-paths.js';
 import { clearAppImageArgv0FromProcessEnv } from './lib/platform/inherited-env.js';
 import { pathLooksUserConfigured, mergePathValues } from './lib/platform/path-utils.js';
 import { createProjectDirectoryRuntime } from './lib/platform/project-directory-runtime.js';
+import { projectHostActivity, registerHostActivityRoute } from './lib/lifecycle/host-activity.js';
+import { startSupervisorInbox } from './lib/lifecycle/supervisor-inbox.js';
+import { SupervisorJournal } from './lib/lifecycle/supervisor-journal.js';
 import { registerVarinRoutes } from './lib/platform/varin-routes.js';
 import { createPlatformRoutesRuntime } from './lib/platform/routes-runtime.js';
 import { runCliEntryIfMain } from './lib/platform/cli-entry-runtime.js';
@@ -782,12 +787,6 @@ const bootstrapRuntime = createServerBootstrapRuntime({
 });
 const platformRoutesRuntime = createPlatformRoutesRuntime({ clientReloadDelayMs: CLIENT_RELOAD_DELAY_MS });
 
-const requestReachedLanAddress = (req: Request): string | null => {
-  const raw = typeof req?.socket?.localAddress === 'string' ? req.socket.localAddress : '';
-  const address = raw.startsWith('::ffff:') ? raw.slice(7) : raw;
-  return /^\d+\.\d+\.\d+\.\d+$/.test(address) && !address.startsWith('127.') ? address : null;
-};
-
 async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerController> {
   await assertDataRootMayStart(VARIN_DATA_DIR);
   if (server?.listening) throw new Error('Varin server is already running');
@@ -862,6 +861,7 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
   console.log(`Starting Varin on port ${port === 0 ? 'auto' : port}`);
   const app = express();
   const httpObservationDrain = createHttpObservationDrain();
+  const threadWriteAdmission = createThreadWriteAdmission(() => isShuttingDown);
   app.use(httpObservationDrain.middleware);
   app.use(createDrainingAdmission(() => isShuttingDown));
   const extensionCatalog = options.extensionCatalog
@@ -977,41 +977,14 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
   let dictationRuntime: ReturnType<typeof createDictationRuntime> | null = null;
 
   const activePort = () => tunnelRuntimeContext?.getActivePort() || port;
+  const resolveDirectLanUrls = (req: Request): string[] => getLanHostAddresses(effectiveBindHost, req.socket.localAddress)
+    .map(address => `http://${address.includes(':') ? `[${address}]` : address}:${activePort()}`);
   // Anywhere pairing needs an operator-configured relay (VARIN_RELAY_URL); there is no built-in one.
-  const resolvePairingTransports = (req: Request) => {
-    const local = `http://127.0.0.1:${activePort()}`;
-    let lanHost = null;
-    if (isNetworkExposedBindHost(effectiveBindHost)) {
-      lanHost = requestReachedLanAddress(req);
-      if (!lanHost) {
-        for (const list of Object.values(os.networkInterfaces())) {
-          const entry = (list || []).find((candidate) => candidate.family === 'IPv4' && !candidate.internal);
-          if (entry) { lanHost = entry.address; break; }
-        }
-      }
-    } else if (!['127.0.0.1', 'localhost', '::1'].includes(effectiveBindHost.toLowerCase())) {
-      lanHost = effectiveBindHost;
-    }
-    const lan = lanHost ? `http://${lanHost.includes(':') ? `[${lanHost}]` : lanHost}:${activePort()}` : null;
-    return { local, lan, relayAvailable: resolveRelayEndpoint().state === 'configured' };
-  };
-  const resolveDirectLanUrls = (req: Request): string[] => {
-    const urls: string[] = [];
-    const add = (address: string | null): void => {
-      if (!address) return;
-      const url = `http://${address.includes(':') ? `[${address}]` : address}:${activePort()}`;
-      if (!urls.includes(url)) urls.push(url);
-    };
-    if (isNetworkExposedBindHost(effectiveBindHost)) {
-      add(requestReachedLanAddress(req));
-      for (const list of Object.values(os.networkInterfaces())) {
-        for (const entry of list || []) if (entry.family === 'IPv4' && !entry.internal) add(entry.address);
-      }
-    } else if (!['127.0.0.1', 'localhost', '::1'].includes(effectiveBindHost.toLowerCase())) {
-      add(effectiveBindHost);
-    }
-    return urls;
-  };
+  const resolvePairingTransports = (req: Request) => ({
+    local: `http://127.0.0.1:${activePort()}`,
+    lan: resolveDirectLanUrls(req)[0] ?? null,
+    relayAvailable: resolveRelayEndpoint().state === 'configured',
+  });
 
   const sayTTSCapability = detectSayTtsCapability(process);
   const bootstrapResult = bootstrapRuntime.setupBaseRoutes(app, {
@@ -1766,8 +1739,6 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
     vmProviders: async () => configuredVmProviders(await readSettingsFromDisk() as unknown as Record<string, unknown>),
   });
   computerServiceRef.current = computerService;
-  void computerService.defaultDesktop().then(id => id ? computerService.prewarm(id) : undefined)
-    .catch(error => console.error('[Computer] Desktop preparation failed:', errorMessage(error)));
   options.onComputerControlsReady?.({
     holderId: desktopControlHolder,
     takeover: async () => { await computerService.takeover({ desktopId: 'local-console', holderId: desktopControlHolder }); },
@@ -1816,8 +1787,7 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
   const memoryOrganizer = createMemoryOrganizer({
     sharedStoreIfPresent: async () => {
       if (userKnowledgeStore) return userKnowledgeStore;
-      try { await fsPromises.access(path.join(VARIN_DATA_DIR, 'knowledge', hostId, 'user.tdb')); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
+      if (!await knowledgeDatabaseExists(path.join(VARIN_DATA_DIR, 'knowledge', hostId, 'user.tdb'))) return null;
       return getUserKnowledgeStore();
     },
     getInference: () => memoryInference,
@@ -1832,7 +1802,7 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
     storeForScopeId: getKnowledgeStoreForScope,
     hasStoreForScope: async (scopeId) => {
       const storePath = path.join(VARIN_DATA_DIR, 'knowledge', hostId, `${knowledgeStoreKeyForScope(scopeId)}.tdb`);
-      return fsPromises.access(storePath).then(() => true, () => false);
+      return knowledgeDatabaseExists(storePath);
     },
     listScopeIds: async () => {
       return (await botService.list()).map((bot) => botScopeId(bot.id)).sort();
@@ -2148,7 +2118,7 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
     if (!officeRuntimeOwner.current) throw new Error('Office tool preparation is unavailable');
     if (!browserRuntimeOwner.current) throw new Error('Browser tool preparation is unavailable');
     let configuration = await computerRuntimeOwner.current.prepareConfiguration(run, required);
-    configuration = await scriptRuntimeOwner.current.prepareConfiguration(configuration, run.source, required);
+    configuration = await scriptRuntimeOwner.current.prepareConfiguration(configuration, run.source, required, run.lazyWorkLocation);
     configuration = await webRuntimeOwner.current.prepareConfiguration(run, required, configuration);
     configuration = await researchDiscoveryOwner.current.prepareConfiguration(run, required, configuration);
     configuration = await imageRuntimeOwner.current.prepareConfiguration(run, required, configuration);
@@ -2476,6 +2446,13 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
     } });
   const modelWorkLocations = createModelWorkLocations({runtime: agentRuntime, kernel: kernelClient, directory: sourceDirectory,
     prepare: prepareThreadSource, executionEnvironment: () => executionEnvironment.snapshot(),
+    async captureLocationContext(run, source, signal, instructionDirectories) {
+      const checkpoint = await agentRuntime.context(run.branch_id, signal);
+      const admitted = checkpoint?.personalization;
+      if (!admitted || admitted.threadId !== run.thread_id) throw new Error('The admitted work-location context is unavailable');
+      return threadResources.prepare({runtime:'agent',threadId:run.thread_id,branchId:run.branch_id},source,
+        {mode:admitted.mode as 'agent' | 'bot',threadRole:admitted.threadRole,projectId:admitted.projectId}, {signal,instructionDirectories});
+    },
     transfer: (input, signal) => transferResourceFiles(input, signal),
     openProcessView: (source, runId, processId, signal) => admitRunSourceAuthority(kernelClient, agentRuntime,
       savedSourceLaunch(runId, source, ['process_inspect', 'process_read']),
@@ -2788,7 +2765,7 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
     onError: error => console.warn('[Calendar] preparation or asset synchronization requires attention:', calendarErrorCode(error)),
   });
   scheduledTasksRuntime.setCalendarOwner(calendarOwner);
-  scriptRuntimeOwner.current = createScriptRuntime({ kernel: kernelClient, runtime: agentRuntime, resolveLiveSource: liveSources.validate, onError: () => console.error('[Script] Original environment requires reconciliation') });
+  scriptRuntimeOwner.current = createScriptRuntime({ kernel: kernelClient, runtime: agentRuntime, resolveLiveSource: liveSources.validate, prepareDormantDefault: modelWorkLocations.prepareScriptDefault, onError: () => console.error('[Script] Original environment requires reconciliation') });
   computerRuntimeOwner.current = createComputerRuntime({ kernel: kernelClient, runtime: agentRuntime, computers: computerService, enabled: async runId => {
     const launch = await kernelClient.agentRuntimeRequest<import('./lib/kernel/protocol.generated.js').LaunchIntent | null, 'runtime.launch.inspect'>('runtime.launch.inspect', { runId });
     const workspace = launch?.selection.source?.resource_owner.kind === 'local' ? await documentsAuthority.admitWorkspaceRegistration(launch.selection.source.workspace_id) : undefined;
@@ -2844,7 +2821,7 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
   kernelClient.setFollowupEventOwner(createFollowupEventOwner(agentRuntime, pluginEventSources));
   const conversationOrganization = new ConversationOrganizationService({ runtime: agentRuntime, threads, external: externalAgents, readSettings: readSettingsFromDisk });
   registerConversationOrganizationRoutes(app, conversationOrganization, uiAuthController.requireAuth, (req, res) => uiAuthController!.resolveAuthContext(req, res));
-  registerThreadRoutes(app, threads, uiAuthController?.requireAuth ?? ((_request, _response, next) => next()), researchRuntime.user, computerRuntimeOwner.current.user, webRuntimeOwner.current.user, userIntegrations, pluginEventSources);
+  registerThreadRoutes(app, threads, uiAuthController?.requireAuth ?? ((_request, _response, next) => next()), researchRuntime.user, computerRuntimeOwner.current.user, webRuntimeOwner.current.user, userIntegrations, pluginEventSources, threadWriteAdmission);
   const agentProfiles = createAgentProfilesAPI({ settings: modelsService.settings,
     capabilities: signal => agentRuntime.childCapabilities(signal),
     contextAgentDefinition: signal => agentRuntime.contextAgentDefinition(signal),
@@ -3032,13 +3009,7 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
 
   const knowledgeStoreExistsForScope = async (scopeId: string): Promise<boolean> => {
     const file = path.join(VARIN_DATA_DIR, 'knowledge', hostId, `${knowledgeStoreKeyForScope(scopeId)}.tdb`);
-    // A durable journal can exist before its first checkpoint. Opening that
-    // original store is recovery, whereas an entirely absent store stays absent.
-    for (const suffix of ['', '.wal', '.publish']) {
-      try { await fsPromises.access(`${file}${suffix}`); return true; }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-    }
-    return false;
+    return knowledgeDatabaseExists(file);
   };
 
   const environmentObservations = createEnvironmentObservationRuntime({
@@ -3049,7 +3020,9 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
     getLegacyStore: async workspaceId => await knowledgeStoreExistsForScope(workspaceId) ? getKnowledgeStoreForScope(workspaceId) : null,
     onError: error => console.error('[ContextObservations] Original legacy import awaits recovery:', errorMessage(error)),
     onUnavailable: (error, owner) => console.error('[ContextObservations] Workspace notifications unavailable; conversation continues:',
-      { workspaceId: error.workspaceId, runId: owner.runId, reason: error.reason }),
+      { workspaceId: error.workspaceId, runId: owner.runId, reason: error.reason,
+        ...(error.cause instanceof Error && 'code' in error.cause && error.cause.code === LEGACY_CHECKPOINT_REQUIRED
+          ? { recovery: error.cause.message } : {}) }),
   });
   const knowledgeContextRuntime = createKnowledgeContextRuntime({
     recallContextForThread: botRecallContext,
@@ -3328,6 +3301,13 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
     console.warn('[Varin Extensions] Host reconciliation failed:', error?.message || error);
   });
   const unregisterWorkbenchLayoutService = await registerBuiltinWorkbenchLayoutService(extensionRuntime);
+  // Explicit trusted OS-local handoff. Never opens a network event-ingress API
+  // or takes over a Catalog source owner.
+  const supervisorInbox = process.env.VARIN_LOCAL_SUPERVISOR === '1'
+    ? startSupervisorInbox(await SupervisorJournal.open(path.join(VARIN_DATA_DIR, 'supervisor-wake'), hostId),
+      (page, signal) => agentRuntime.receivePluginEvents(page, signal),
+      () => console.warn('[Supervisor] Durable inbox unavailable; accepted pages remain on disk'))
+    : undefined;
   pluginEventSources.start();
   pluginEventTransport.start();
   botLifecycleRuntime = createBotLifecycleRuntime({
@@ -3422,6 +3402,23 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
   });
   relayServiceInstance = relayService;
   relayService.registerRoutes(app);
+  const getHostActivity = (signal: AbortSignal) => projectHostActivity({
+    kernelEpoch: () => kernelClient.isReady ? kernelClient.kernelEpoch : null,
+    draining: () => isShuttingDown,
+    observationStreams: httpObservationDrain.count,
+    threadWrites: threadWriteAdmission.count,
+    externalIngressActive: () => Boolean(tunnelService.getPublicUrl() || externalIngress?.enabled || selfHosted.getIngress()?.enabled),
+    admission: async (ownerSignal) => (await agentRuntime.status(ownerSignal)).admission,
+    calendar: scheduledTasksRuntime.getActivity,
+    browser: () => browserResources.activity(),
+    computerOperations: () => computerService.activities().filter(row => row.activity.status === 'running').length,
+    dictation: () => dictationRuntime?.activity() ?? null,
+  }, signal);
+  registerHostActivityRoute(app, uiAuthController.requireAuth, async request => {
+    const auth = await uiAuthController!.resolveRequestAuth(request, { allowUrlToken: false });
+    return typeof auth?.principalId === 'string' && await hostPrincipals().isOwner(auth.principalId);
+  }, getHostActivity);
+
 
   await platformRoutesRuntime.registerRoutes(app, {
     onProjectGitDispatcher: dispatch => { projectGitDispatcher = dispatch; },
@@ -3597,6 +3594,7 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
     },
     setExternalIngressEnabled,
     getTunnelUrl: () => tunnelService.getPublicUrl(),
+    getHostActivity: (signal = AbortSignal.timeout(2000)) => getHostActivity(signal),
     getQuitRiskStatus: async () => ({
       tunnel: { active: Boolean(tunnelService.getPublicUrl() || externalIngress?.enabled || selfHosted.getIngress()?.enabled) },
       scheduledTasks: await scheduledTasksRuntime.getStatus(),
@@ -3618,6 +3616,7 @@ async function main(options: StartWebUiServerOptions = {}): Promise<WebUiServerC
       previewProxyRuntime.beginDraining();
       stopTask = (async () => {
         const shutdown = createShutdownCollector({ deadline, stopOnFailure: true });
+        await shutdown.run('supervisorInbox.close', () => supervisorInbox?.close());
         await shutdown.run('externalIngress.close', async () => {
           unsubscribeExternalIngressRevocation();
           await externalIngress?.close();

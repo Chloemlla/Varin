@@ -1,6 +1,6 @@
 # Knowledge storage
 
-This module owns **plans**, **symbol indexes**, and **Bot/user long-term knowledge** backed by TriviumDB 0.9.1. Ordinary Agent notes and editable system instructions live in the Rust typed-record owner described in [memory/DOCUMENTATION.md](../memory/DOCUMENTATION.md); new environment observations live in the native Catalog/ContentStore via [`environment-observations`](../environment-observations/README.md). See [retrieval.md](../../../../../docs/retrieval.md) for cross-domain retrieval behavior.
+This module owns **plans**, **symbol indexes**, and **Bot/user long-term knowledge** backed by TriviumDB 0.9.3. Ordinary Agent notes and editable system instructions live in the Rust typed-record owner described in [memory/DOCUMENTATION.md](../memory/DOCUMENTATION.md); new environment observations live in the native Catalog/ContentStore via [`environment-observations`](../environment-observations/README.md). See [retrieval.md](../../../../../docs/retrieval.md) for cross-domain retrieval behavior.
 
 ## Entrypoints and process architecture
 
@@ -8,7 +8,7 @@ This module owns **plans**, **symbol indexes**, and **Bot/user long-term knowled
 | --- | --- |
 | [`store.ts`](store.ts), [`store-contract.ts`](store-contract.ts), [`store-protocol.ts`](store-protocol.ts) | Async Host facade, DTOs/errors (no native addon load), and typed IPC protocol |
 | [`store-process.ts`](store-process.ts), [`store-worker.ts`](store-worker.ts), [`store-engine.ts`](store-engine.ts) | Private Node storage child-process launcher, worker entry, and native engine |
-| [`database.ts`](database.ts), [`persistence.ts`](persistence.ts) | Shared native open (incl. 0.8 WAL-only checkpoint upgrade) and WAL/checkpoint scheduler |
+| [`database.ts`](database.ts), [`persistence.ts`](persistence.ts) | Shared native open, format migration, and WAL/checkpoint scheduler |
 | [`plan-store.ts`](plan-store.ts) | Native Thread/branch plan versions, fork captures, and atomic mutation receipts |
 | [`symbols.ts`](symbols.ts), [`association-refresh.ts`](association-refresh.ts), [`file-purge.ts`](file-purge.ts), [`file-purge-engine.ts`](file-purge-engine.ts), [`import-resolve.ts`](import-resolve.ts), [`index-scope.ts`](index-scope.ts) | Workspace symbol graph, cooperative association refresh, and stepped catalog purge |
 | [`context-publication.ts`](context-publication.ts), [`context-runtime.ts`](context-runtime.ts), [`recall-material.ts`](recall-material.ts) | Read-only legacy event-journal importer and recall material helpers |
@@ -19,8 +19,8 @@ This module owns **plans**, **symbol indexes**, and **Bot/user long-term knowled
 
 ## Storage engine, upgrades and checkpoints
 
-- **Format & backup**: TriviumDB 0.9.1 writes v13 checkpoints and v6 WAL (`payloadCacheMb: 0`; unused full-text sidecar is not loaded/rebuilt — reads use property/ngram indexes and payloads). Stop all writers and [back up the full file group](../../../../../docs/ops/cold-backup.md) before upgrading; rollback to 0.9.0 requires restoring the pre-upgrade backup.
-- **Upgrade & publish safety**: `database.ts` opens 0.8/0.9.0 checkpoints natively; for legacy WAL-only stores without a base checkpoint, it CRC-checks complete WAL frames and runs a short-lived `triviumdb-upgrade-0.8` helper to close a checkpoint before reopening with 0.9.1 (never for read-only opens or corruption). Native checkpoints retain prior committed files behind a `.publish` undo journal until `.tdb/.vec/.pld/.flush_ok` commit; writable opens restore interrupted publications before WAL replay.
+- **Format & backup**: TriviumDB 0.9.3 writes format 15 with WAL 7. Stop all writers and [back up the complete data directory](../../../../../docs/ops/cold-backup.md) before upgrading. Later writes to a migrated store live in `<name>.store/current/database.tdb` and its sidecars.
+- **First writable open**: The private storage worker migrates older checkpoints with the bundled, revision-matched upstream tool. It replays the source on a copy, verifies the converted database and publishes a directory beside the flat file group. Interrupted publication resumes against the same source and destination. Subsequent opens use that directory. A TriviumDB 0.8 store containing only a v3 WAL reports its path and the [Varin 0.9.53 recovery steps](../../../../../docs/ops/cold-backup.md#legacy-triviumdb-08-knowledge-stores). Read-only opens never start a conversion.
 - **Durability (`persistence.ts`)**: Authoritative user writes (plans, memories) use `syncMode: "full"` and fsync incremental WAL before acknowledging; derived symbol callbacks temporarily use `normal` WAL mode and restore `full` before another op enters. Full snapshots run on a 30s deadline and at close (closing an unchanged current-format store skips an extra checkpoint). Failed checkpoints retain dirty state, schedule bounded-backoff retry, and must recover before subsequent admitted ops (including reads).
 - **Cooperative graph maintenance**:
   - `association-refresh.ts` steps one file per IPC call (`begin/step/releaseAssociationRefresh`, protocol v4) so plan/memory ops interleave freely; only connection-row or candidate-file changes invalidate a pass.

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { test } from 'vitest';
+import { test, expect } from 'vitest';
+import request from 'supertest';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -73,7 +74,7 @@ test('root desktop requests explain the child-only contract without dispatch or 
     assert.equal(f.requestFacts.length, 0);
   } finally { await f.cleanup(); }
 });
-async function fixture(records = new Map<string, KernelRecordResult>(), remote: Partial<Pick<ComputerServiceOptions, 'hostId' | 'remoteHosts' | 'fetch' | 'platform' | 'vmExec' | 'resolveWork'>> = {}) {
+async function fixture(records = new Map<string, KernelRecordResult>(), remote: Partial<Pick<ComputerServiceOptions, 'hostId' | 'remoteHosts' | 'fetch' | 'platform' | 'vmExec' | 'resolveWork' | 'createDriver'>> = {}) {
   const dataDir = await mkdtemp(join(tmpdir(), 'varin-computer-domain-'));
   let enabled = true, releases = 0, failClear = false, blockInput = false, idle = false, deliveries = 0, terminal = false, releaseSucceeds = true, failList = false;
   const failedRuns = new Set<string>();
@@ -190,6 +191,64 @@ async function fixture(records = new Map<string, KernelRecordResult>(), remote: 
     cleanup: async () => { computer.stop(); input.resolve(response()); await computers.dispose(); await rm(dataDir, { recursive: true, force: true }); } };
 }
 
+test('Computer HTTP catalog and default are cold; viewer release retires only the separate capture helper', async () => {
+  const roles: string[] = [], disposed: string[] = [];
+  const started = deferred<void>(), frame = deferred<DriverResponse>();
+  const f = await fixture(undefined, { createDriver: spec => {
+    const role = spec.env!.VARIN_DRIVER_ROLE!;
+    roles.push(role);
+    let alive = true;
+    return { capabilities: null, alive: () => alive, cancel: () => false,
+      dispose: async () => { disposed.push(role); alive = false; },
+      request: async op => {
+        if (op.tool === 'capabilities') return response({ capabilities: { platform: 'windows', status: 'ready', driver: 'test' } });
+        if (op.tool === 'capture_frame') { started.resolve(); return frame.promise; }
+        return response();
+      } };
+  } });
+  const app = express(); app.use(express.json());
+  registerComputerRoutes(app, { computers: f.computers });
+  const abort = [new AbortController(), new AbortController(), new AbortController()];
+  const server = app.listen(0, '127.0.0.1');
+  try {
+    await EventEmitter.once(server, 'listening');
+    const addr = server.address();
+    assert.ok(addr && typeof addr === 'object');
+    const base = `http://127.0.0.1:${addr.port}/api/computers`;
+    await request(app).get('/api/computers').expect(200);
+    await request(app).post('/api/computers/default-target').send({ desktopId: 'local-console' }).expect(200);
+    assert.deepEqual(roles, []);
+    const probe = await request(app).post('/api/computers/desktops/local-console/probe').expect(200);
+    assert.ok(probe.body.desktop.probedAt);
+    const metadata = await request(app).get('/api/computers').expect(200);
+    assert.equal(metadata.body.desktops[0].probedAt, probe.body.desktop.probedAt);
+    assert.deepEqual(roles, ['input']);
+    const stream = `${base}/desktops/local-console/stream`;
+    for (const [i, owner] of abort.entries()) {
+      const view = await fetch(`${stream}?viewer=view-${i}`, { signal: owner.signal });
+      assert.equal(view.status, 200);
+      const reader = view.body!.getReader();
+      const first = await reader.read();
+      assert.match(new TextDecoder().decode(first.value), /control/);
+      reader.releaseLock();
+      if (i === 1) { abort[0]!.abort(); abort[1]!.abort(); }
+    }
+    await started.promise;
+    assert.deepEqual(roles, ['input', 'capture']);
+    assert.deepEqual(disposed, []);
+    frame.resolve(response({ frame: { base64: 'QQ==', mime: 'image/png', bounds: { x: 0, y: 0, width: 1, height: 1 } } }));
+    abort[2]!.abort();
+    await expect.poll(() => disposed).toEqual(['capture']);
+    assert.deepEqual(roles, ['input', 'capture']);
+  } finally {
+    for (const item of abort) item.abort();
+    frame.resolve(response());
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    await f.cleanup();
+  }
+});
+
 test('obsolete desktop stays visible and fenced without poisoning healthy work restoration or its Storage retry', async () => {
   const f = await fixture();
   try {
@@ -202,7 +261,9 @@ test('obsolete desktop stays visible and fenced without poisoning healthy work r
     ] as const) f.records.set(`computer.desktop:${id}`, { ...structuredClone(original), recordId: `computer.desktop:${id}`,
       payloadJson: JSON.stringify({ ...payload, id, label: id, ...runtime }) });
     const catalog = await f.computers.list();
-    assert.equal(catalog.desktops.find(desktop => desktop.id === 'local-console')?.status, 'available');
+    assert.equal(catalog.desktops.find(desktop => desktop.id === 'local-console')?.status, 'unavailable');
+    assert.equal(f.calls.length, 0, 'metadata reads do not create or probe the driver');
+    assert.equal((await f.computers.probe('local-console')).status, 'available');
     for (const id of ['obsolete', 'malformed']) {
       const desktop = catalog.desktops.find(desktop => desktop.id === id);
       assert.equal(desktop?.status, 'unavailable'); assert.ok(desktop?.statusDetail);

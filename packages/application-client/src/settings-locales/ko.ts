@@ -668,6 +668,8 @@ export const settingsDict = {
   'settings.remoteInstances.clientAuth.qrDialogTitle': '스캔하여 연결',
 'settings.remoteInstances.clientAuth.actions.addDevice': '기기 추가',
   'settings.remoteInstances.clientAuth.actions.copied': '복사됨',
+  'settings.remoteInstances.clientAuth.field.lanAddress': '로컬 네트워크 주소',
+  'settings.remoteInstances.clientAuth.actions.copyAddress': '주소 복사',
   'settings.remoteInstances.clientAuth.addDevice.transportLabel': '이 기기를 어디에서 사용하나요?',
   'settings.remoteInstances.clientAuth.addDevice.subtitle': '다른 기기를 이 서버에 연결하는 일회용 QR 코드를 만듭니다.',
   'settings.remoteInstances.clientAuth.addDevice.transport.local': '이 컴퓨터 전용',

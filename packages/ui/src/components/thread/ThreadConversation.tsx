@@ -164,7 +164,7 @@ export function ThreadConversation({ api, identity, onBranchCreated, initialWork
   const snapshotHost = React.useRef<number | undefined>(undefined);
   const historyWindow = React.useMemo(() => threadHistoryWindow(api, String(host), { runtime: identity.runtime, threadId: identity.threadId, branchId: identity.branchId }), [api, host, identity.runtime, identity.threadId, identity.branchId]);
   const history = React.useSyncExternalStore(historyWindow.subscribe, historyWindow.getSnapshot, historyWindow.getSnapshot);
-  const navigationEnabled = useUIStore(state => state.promptNavigatorEnabled);
+  const navigationEnabled = useUIStore(state => state.promptNavigatorEnabled && !state.isMobile);
   React.useEffect(() => { historyWindow.enableNavigation(navigationEnabled); }, [historyWindow, navigationEnabled]);
   const scrollMode = useTimelineViewStore(state => state.views[draftKey]?.scrollMode ?? 'following-end');
   const identityGeneration = React.useRef(0);
@@ -345,6 +345,7 @@ export function ThreadConversation({ api, identity, onBranchCreated, initialWork
       if (!current()) return;
       if (value instanceof ThreadRequestError && value.status === 409) await projection.current?.refresh();
       if (!current()) return;
+      if (propagate) throw value;
       const resourceError = value instanceof ThreadRequestError ? threadSourceFailureMessage(value.code) ?? resourceErrorMessages.get(value.code) : undefined;
       if (value instanceof ThreadRequestError && value.code === 'resource-stale' && resourceError) {
         resourceFailure.current = { snapshotId: snapshot?.context.checkpoint?.resources?.snapshot.id ?? null, message: resourceError };
@@ -353,7 +354,6 @@ export function ThreadConversation({ api, identity, onBranchCreated, initialWork
         ? 'These images exceed the current transport request size. Remove or resize an image and retry; your attachments are still here.'
         : value instanceof ThreadRequestError && value.code === 'model-images-unsupported' ? 'The selected model does not accept images. Choose an image-capable model or remove the images.'
         : value instanceof Error ? value.message : 'Thread request failed'));
-      if (propagate) throw value;
     }
     finally { if (current()) { pendingAction.current = null; setPending(false); } }
   };

@@ -760,6 +760,7 @@ impl ToolExecutor for CollaborationTools {
                         tool_schema_generation: resolved.tool_schema_generation,
                         tools: schemas,
                         policy: crate::observations::default_policy_identity(),
+                        lazy_work_location: resolved.lazy_work_location.clone(),
                         source: handoff.as_ref().map(|handoff| handoff.source.clone()),
                     };
                     let preparation = self
@@ -1051,7 +1052,11 @@ pub(crate) fn resolve_selection_with_attachments(
     attachments: &[varin_runtime::catalog::attachments::Attachment],
 ) -> Result<(varin_runtime::catalog::dispatch::ResolvedChildSelection, Vec<ToolSchema>), ExecutionError> {
     let resolved = selected.resolve_with_attachments(input, attachments).map_err(error)?;
-    let mut schemas = crate::child_capabilities::select_frozen(selected, &resolved.profile.tools)
+    use crate::child_capabilities::ChildFileRoute;
+    let route = if resolved.lazy_work_location.is_some() { ChildFileRoute::Deferred }
+        else if selected.project(input).map_err(error)?.is_some() { ChildFileRoute::Project }
+        else { ChildFileRoute::Existing };
+    let mut schemas = crate::child_capabilities::select_frozen(selected, &resolved.profile.tools, route)
         .map_err(error)?;
     // The actual composed directory publishes a canonical name order; selection order grants
     // no additional capability and must not make an identical child fail on restore.

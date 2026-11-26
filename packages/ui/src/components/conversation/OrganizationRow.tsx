@@ -1,6 +1,7 @@
 import React from 'react';
 import { VARIN_CONVERSATION_SLOTS } from '@varin/extension-contract';
 import { Icon } from '@/components/icon/Icon';
+import { DropdownMenu, DropdownMenuContent, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { SwapIcon } from '@/components/motion/SwapIcon';
 import { cn } from '@/lib/utils';
 import { useI18n } from '@/lib/i18n';
@@ -14,8 +15,9 @@ function Decoration({ session, current, attention }: { session: SidebarConversat
 }
 
 /** One quiet navigation row, with the existing attention, decoration and motion contracts. */
-export function OrganizationRow({ id, title, icon, origin, active, container, expanded, expandable, selected, selecting, busy, waiting, attention, pinned, recent, path, time, actions, summary, onOpen, onToggle, onSelect, onKeyDown }: {
-  id: string; title: string; icon: React.ReactNode; origin?: React.ReactNode; actions: React.ReactNode;
+export function OrganizationRow({ id, title, icon, origin, active, container, expanded, expandable, selected, selecting, busy, waiting, attention, pinned, recent, path, time, actions, menu, menuBoundary, summary, onOpen, onToggle, onSelect, onKeyDown }: {
+  id: string; title: string; icon: React.ReactNode; origin?: React.ReactNode; actions?: React.ReactNode; menu: React.ReactNode;
+  menuBoundary?: HTMLElement;
   active?: boolean; container?: boolean; expanded: boolean; expandable: boolean; selected: boolean; selecting: boolean;
   busy?: boolean; waiting?: boolean; attention?: ConversationSessionAttentionState; pinned?: boolean;
   recent?: boolean; path?: string; time?: string; summary?: SidebarConversation;
@@ -23,7 +25,6 @@ export function OrganizationRow({ id, title, icon, origin, active, container, ex
 }) {
   const { t } = useI18n();
   const status = waiting ? 'waiting' : busy ? 'busy' : attention?.kind ?? (pinned ? 'pinned' : 'none');
-  const rowActions = <div className="organization-row-actions">{actions}</div>;
   return <div ref={pauseLoopsOffscreen} role="treeitem" tabIndex={0} data-sidebar-row={id} data-current={active || undefined}
     data-container={container || undefined} data-recent={recent || undefined} aria-expanded={expandable ? expanded : undefined}
     aria-selected={selected || !!active} onKeyDown={onKeyDown}
@@ -46,9 +47,21 @@ export function OrganizationRow({ id, title, icon, origin, active, container, ex
             : attention ? <span className="mx-1 size-1.5 rounded-full bg-primary" aria-label={t('sessions.sidebar.session.status.unread')} />
               : pinned ? <Icon name="pushpin" className="size-3 text-muted-foreground/70" /> : null}
     </SwapIcon>
-    {recent ? <div className="organization-row-trailing">
-      {time && <span className="organization-row-time typography-micro text-muted-foreground">{time}</span>}
-      {rowActions}
-    </div> : rowActions}
+    <div className="organization-row-trailing">
+      {recent && time && <span className="organization-row-time typography-micro text-muted-foreground">{time}</span>}
+      <div className="organization-row-actions">
+        {actions && <div className="organization-row-shortcuts">{actions}</div>}
+        <DropdownMenu modal={false}>
+          <DropdownMenuTrigger asChild>
+            <button type="button" aria-label={t('organization.actions', { name: title })} className="organization-row-more">
+              <span><Icon name="more" className="size-4" /></span>
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" sideOffset={2} collisionBoundary={menuBoundary} className="organization-row-menu min-w-40 overflow-y-auto">
+            {menu}
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
+    </div>
   </div>;
 }

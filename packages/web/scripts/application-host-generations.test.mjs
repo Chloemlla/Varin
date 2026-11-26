@@ -44,6 +44,7 @@ test('real dev/build launchers use the correct owner while reclaiming an exited 
     for (const file of ['build-application-host.mjs', 'application-host-generations.mjs', 'run-application-host-dev.mjs']) copy(file);
     write('packages/web/scripts/copy-structure-runtime.mjs', '');
     write('scripts/host-production-boundary.mjs', 'export const pruneLegacyHostArtifacts = () => ({runtimeModules:2, removedArtifacts:0});');
+    write('scripts/prepare-trivium-migrator.mjs', 'export const prepareTriviumMigrator = () => {};');
     write('packages/computer-driver/windows/build-helper.mjs', 'export const buildWindowsComputerHelper = () => {};');
     write('packages/computer-driver/macos/build-helper.mjs', 'export const buildMacComputerHelper = () => {};');
     write('packages/computer-driver/linux/driver', 'stub');

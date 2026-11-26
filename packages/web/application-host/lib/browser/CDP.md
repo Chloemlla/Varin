@@ -5,6 +5,18 @@ WebSocket endpoint. It does not launch a profile, turn on debugging in an existi
 user profile, choose a desktop, or acquire input authority. The browser resource
 registry supplies resource routing, task assignment and takeover admission.
 
+Catalog reads expose the configured resource and last-observed state without
+contacting its endpoint. Explicit acquisition, including selecting it from the
+connected Browser viewer, attaches on the original owner. Peer catalog refresh
+discovers metadata without attaching to all listed browsers. Concurrent callers
+join a single startup; a disconnected caller cannot abort another caller's
+startup or redirect an exact old tab to a new instance.
+
+An explicitly opened live Browser viewer claims its exact page for the lifetime
+of the view stream. It releases only that claim when closed. A one-shot page
+observation and a history snapshot do not retain the page. Existing owner
+retention, input lanes, and download handling still apply.
+
 The HTTP discovery response must retain the configured origin. WebSocket URL
 credentials and optional authentication headers stay in the provider; status and
 events expose neither. A standard CDP browser token identifies the instance. A

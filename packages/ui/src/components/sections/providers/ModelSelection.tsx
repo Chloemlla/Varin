@@ -9,12 +9,13 @@ import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { ModelLogo } from '@/components/ui/ModelLogo';
 import { Icon } from '@/components/icon/Icon';
 import { useI18n } from '@/lib/i18n';
+import { cn } from '@/lib/utils';
 import { modelCandidates } from './model-edits';
 import './model-connections.css';
 
 /** Shared by the new-service flow and the existing service's add-model dialog. */
-export function ModelPicker({ available, initialIds = [], busy, onConfirm, confirmLabel }: {
-  available: DiscoveredModel[]; initialIds?: string[]; busy: boolean;
+export function ModelPicker({ available, initialIds = [], busy, allowEmpty = false, onConfirm, confirmLabel }: {
+  available: DiscoveredModel[]; initialIds?: string[]; busy: boolean; allowEmpty?: boolean;
   onConfirm(entries: DiscoveredModel[]): void; confirmLabel?: string;
 }) {
   const { t } = useI18n();
@@ -28,12 +29,12 @@ export function ModelPicker({ available, initialIds = [], busy, onConfirm, confi
   const addManual = () => {
     const ids = [...new Set(manual.split(/[,\n]/).map(id => id.trim()).filter(Boolean))];
     setManualModels(previous => [...previous, ...ids.filter(id => !previous.some(model => model.id === id)).map(id => ({ id, name: id }))]);
-    setPicked(previous => new Set([...previous, ...ids])); setManual('');
+    setPicked(previous => new Set([...previous, ...ids])); setManual(''); setQuery('');
   };
   const selected = entries.filter(model => picked.has(model.id));
   return <div className="space-y-4">
-    <Input aria-label={t('settings.models.filterModels')} placeholder={t('settings.models.filterModels')} value={query} onChange={event => setQuery(event.target.value)} />
     {entries.length ? <>
+      <Input aria-label={t('settings.models.filterModels')} placeholder={t('settings.models.filterModels')} value={query} onChange={event => setQuery(event.target.value)} />
       <div className="flex items-center justify-between gap-3"><label className="flex items-center gap-2 typography-meta"><Checkbox ariaLabel={t('settings.models.selectAll')} checked={filtered.length > 0 && filtered.every(model => picked.has(model.id))} disabled={busy || !filtered.length} onChange={checked => setPicked(previous => { const next = new Set(previous); filtered.forEach(model => checked ? next.add(model.id) : next.delete(model.id)); return next; })} />{t('settings.models.selectAll')}</label><span className="typography-micro text-muted-foreground">{filtered.length}</span></div>
       <div className="max-h-[40dvh] overflow-y-auto divide-y divide-border/40">
         {filtered.map(model => <label key={model.id} className="flex cursor-pointer items-center gap-3 rounded-md px-2 py-3 hover:bg-interactive-hover"><Checkbox ariaLabel={model.name || model.id} checked={picked.has(model.id)} disabled={busy} onChange={checked => toggle(model.id, checked)} /><ModelLogo modelId={model.id} requestModelId={model.requestModelId} displayName={model.name} /><span className="min-w-0"><span className="block truncate typography-meta">{model.name || model.id}</span>{model.name !== model.id ? <span className="block truncate typography-micro text-muted-foreground">{model.id}</span> : null}</span></label>)}
@@ -41,27 +42,43 @@ export function ModelPicker({ available, initialIds = [], busy, onConfirm, confi
       </div>
     </> : <p className="typography-meta text-muted-foreground">{t('settings.models.manualHint')}</p>}
     <div className="flex gap-2 border-t border-border/50 pt-4"><Input aria-label={t('settings.models.modelId')} placeholder={t('settings.models.modelIdsPlaceholder')} value={manual} disabled={busy} onChange={event => setManual(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.nativeEvent.isComposing && manual.trim()) { event.preventDefault(); addManual(); } }} /><Button variant="outline" disabled={busy || !manual.trim()} onClick={addManual}>{t('settings.models.addModel')}</Button></div>
-    <div className="flex justify-end"><Button disabled={busy} onClick={() => onConfirm(selected)}>{confirmLabel ?? t('settings.models.addSelected')} · {selected.length}</Button></div>
+    {entries.length || allowEmpty ? <div className="flex justify-end">
+      <Button disabled={busy || (!allowEmpty && !selected.length)} onClick={() => onConfirm(selected)}>{confirmLabel ?? t('settings.models.addSelected')}{selected.length ? ` · ${selected.length}` : ''}</Button>
+    </div> : null}
   </div>;
 }
 
-export function ModelSelection({ models, type, candidates, busy, usages, onToggle, onAdd, onConfigure, onDiscover }: {
-  models: ChannelModel[]; type: ChannelTypeInfo; candidates: DiscoveredModel[]; busy: boolean;
+export type ModelDiscoveryResult = { models: DiscoveredModel[] } | { error: string };
+
+export function ModelSelection({ models, type, candidates, busy, discovering, discovery, usages, onToggle, onAdd, onConfigure, onDiscover }: {
+  models: ChannelModel[]; type: ChannelTypeInfo; candidates: DiscoveredModel[]; busy: boolean; discovering: boolean; discovery: ModelDiscoveryResult | null;
   usages: Record<string, {label: string; page: string; item: string}[]>;
   onToggle(id: string, enabled: boolean): void; onAdd(entries: DiscoveredModel[]): Promise<boolean>;
-  onConfigure(id: string): void; onDiscover(): Promise<boolean>;
+  onConfigure(id: string): void; onDiscover(): Promise<void>;
 }) {
   const navigate = React.useContext(SettingsItemNavigationContext);
   const { t } = useI18n();
-  const [picking, setPicking] = React.useState(false);
-  const available = modelCandidates(type, candidates).filter(candidate => !models.some(model => model.id === candidate.id));
+  const [picker, setPicker] = React.useState<'manual' | DiscoveredModel[] | null>(null);
+  const discovered = discovery && 'models' in discovery ? discovery.models : null;
+  const configuredIds = new Set(models.map(model => model.id));
+  const requestIds = new Set(models.map(model => model.requestModelId ?? model.id));
+  const newModels = discovered?.filter(model => !configuredIds.has(model.id) && !requestIds.has(model.requestModelId ?? model.id)) ?? [];
+  const openDiscoveredModels = React.useEffectEvent(() => {
+    if (newModels.length) setPicker(newModels);
+  });
+  React.useEffect(() => { if (discovered) openDiscoveredModels(); }, [discovered]);
+  const status = discovered && !newModels.length
+    ? t(discovered.length ? 'settings.models.discoveryUpToDate' : 'settings.models.discoveryEmpty').replace('{count}', String(discovered.length))
+    : null;
   const missing = models.filter(model => model.enabled && model.operations.includes('chat') && !model.description?.trim()).length;
   return <section className="mt-8 border-t border-border/60 pt-6">
     <div className="mb-3 flex flex-wrap items-center justify-between gap-3"><h2 className="typography-ui-label">{t('settings.models.models')} <span className="ml-1 text-muted-foreground">{models.length}</span></h2>
-      <div className="flex gap-2">{type.discovery ? <Button variant="outline" size="sm" disabled={busy} onClick={() => { void onDiscover().then(ok => { if (ok) setPicking(true); }); }}><Icon name="refresh" className="size-3.5" />{t('settings.models.discover')}</Button> : null}
-        <Button variant="outline" size="sm" disabled={busy} onClick={() => setPicking(true)}><Icon name="add" className="size-3.5" />{t('settings.models.addModel')}</Button>
+      <div className="flex gap-2">{type.discovery ? <Button variant="outline" size="sm" disabled={busy} aria-busy={discovering} onClick={() => { void onDiscover(); }}><Icon name={discovering ? 'loader-4' : 'refresh'} className={cn('size-3.5', discovering && 'animate-spin')} />{t('settings.models.discover')}</Button> : null}
+        <Button variant="outline" size="sm" disabled={busy} onClick={() => setPicker('manual')}><Icon name="add" className="size-3.5" />{t('settings.models.addModel')}</Button>
       </div>
     </div>
+    {status ? <p role="status" className="mb-3 typography-meta text-muted-foreground">{status}</p> : null}
+    {discovery && 'error' in discovery ? <p role="alert" className="mb-3 typography-meta text-destructive">{discovery.error}</p> : null}
     <p className="mb-3 typography-micro text-muted-foreground">{t('settings.models.instantSave')}{missing ? ` · ${t('settings.models.missingDescriptions').replace('{count}', String(missing))}` : ''}</p>
     <div className="model-service-list divide-y divide-border/50">
       {models.map(model => {
@@ -94,9 +111,10 @@ export function ModelSelection({ models, type, candidates, busy, usages, onToggl
       })}
       {!models.length ? <p className="py-5 typography-meta text-muted-foreground">{t('settings.models.noModels')}</p> : null}
     </div>
-    <Dialog open={picking} onOpenChange={setPicking}>
+    <Dialog open={picker !== null} onOpenChange={open => { if (!open) setPicker(null); }}>
       <DialogContent className="max-w-xl"><DialogTitle>{t('settings.models.addModel')}</DialogTitle>
-        <ModelPicker available={available} busy={busy} onConfirm={entries => { void onAdd(entries).then(ok => { if (ok) setPicking(false); }); }} />
+        {picker && <ModelPicker available={picker === 'manual' ? modelCandidates(type, candidates).filter(model => !configuredIds.has(model.id)) : picker}
+          busy={busy} onConfirm={entries => { void onAdd(entries).then(ok => { if (ok) setPicker(null); }); }} />}
       </DialogContent>
     </Dialog>
   </section>;

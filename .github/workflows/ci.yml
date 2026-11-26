@@ -49,7 +49,11 @@ jobs:
         with:
           node-version: 24
       - name: Verify production lockfile
-        run: node scripts/build-cloud-runtime.mjs --check-lock
+        run: |
+          node scripts/build-cloud-runtime.mjs --check-lock
+          node scripts/build-resource-node.mjs --check-lock
+          node scripts/build-resource-node.mjs --check-lock --role browser
+          node scripts/build-resource-node.mjs --check-lock --role computer
       - name: Check for Bun workspace changes
         id: bun-changes
         run: |
@@ -120,7 +124,11 @@ jobs:
           node-version: 24
       # No install/build: block consumers of an invalid production graph while
       # unrelated source and native-owner checks still report their results.
-      - run: node scripts/build-cloud-runtime.mjs --check-lock
+      - run: |
+          node scripts/build-cloud-runtime.mjs --check-lock
+          node scripts/build-resource-node.mjs --check-lock
+          node scripts/build-resource-node.mjs --check-lock --role browser
+          node scripts/build-resource-node.mjs --check-lock --role computer
 
   portable-source:
     name: Portable source checks

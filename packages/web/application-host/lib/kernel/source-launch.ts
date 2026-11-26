@@ -138,7 +138,9 @@ export async function admitRunSourceAuthority(
   if (processView && (processView.run_id !== run.id || processView.managed_process?.purpose.kind !== 'process_job')) {
     throw new Error('Process view belongs to another Run or operation');
   }
-  const sourceSelection = processView?.resource_source ?? saved?.selection.source;
+  const scriptOwner = options.purpose === 'script_environment' && options.operationId
+    ? await runtime.operation(options.operationId, signal) : undefined;
+  const sourceSelection = processView?.resource_source ?? scriptOwner?.resource_source ?? saved?.selection.source;
   if (!sourceSelection || !isDeepStrictEqual(sourceSelection.resource_owner, selection.resourceOwner) || sourceSelection.workspace_id !== selection.workspaceId
     || sourceSelection.execution_workspace_id !== selection.executionWorkspaceId
     || sourceSelection.mode !== selection.mode
@@ -175,12 +177,12 @@ export async function admitRunSourceAuthority(
   }
   if (options.purpose === 'script_environment') {
     if (!options.operationId || options.retention !== 'caller') throw new Error('Script source requires its original environment operation');
-    const operation = await runtime.operation(options.operationId, signal);
-    if (operation.managed_process?.purpose.kind !== 'script_environment') throw new Error('Source is not the original script environment');
+    if (!scriptOwner || scriptOwner.id !== options.operationId || scriptOwner.run_id !== run.id
+      || scriptOwner.managed_process?.purpose.kind !== 'script_environment') throw new Error('Source is not the original script environment');
   }
   if (options.retention === 'caller') {
     if (!options.operationId) throw new Error('Independent source lifetime requires its actual Operation');
-    const operation = await runtime.operation(options.operationId, signal);
+    const operation = scriptOwner ?? await runtime.operation(options.operationId, signal);
     const liveCall = operation.lifetime === 'run' && operation.phase === 'running' && !operation.cancel_requested && !run.cancel_requested;
     if (operation.run_id !== run.id || (!liveCall && operation.lifetime !== 'thread' && !(operation.lifetime === 'environment' && operation.managed_process?.purpose.kind === 'script_environment')) || (operation.execution_owner?.kind !== 'external' && !processView)) throw new Error('Caller-retained source Operation differs from its original Thread/Run owner');
   }
@@ -222,7 +224,7 @@ export async function admitRunSourceAuthority(
     threadId: run.thread_id,
     runId: run.id,
     ...(options.retention === 'caller' ? { operationId: options.operationId } : {}),
-    capabilities: ['storage.read', 'storage.write', ...(selection.mode === 'live_root' && runtime.deviceFileAccess !== false && !processView ? ['filesystem.device'] : []), ...(integration ? ['recovery'] : []), ...(processView || saved.selection.tools.some(tool => tool.requirements?.process) ? ['process'] : [])],
+    capabilities: ['storage.read', 'storage.write', ...(selection.mode === 'live_root' && runtime.deviceFileAccess !== false && !processView ? ['filesystem.device'] : []), ...(integration ? ['recovery'] : []), ...(processView || scriptOwner || saved.selection.tools.some(tool => tool.requirements?.process) ? ['process'] : [])],
     pathScopes: [''],
   }, signal);
 

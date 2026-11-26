@@ -967,3 +967,31 @@ it.each([false, true])('existing-session requests settle without adopting or cle
   expect((await f.service.read('external:test')).conversation.parent).toBeUndefined();
   expect((await f.service.read('external:test')).connected).toBe(true);
 });
+
+it('holds a resumed connection across explicit capability refresh and restarts warm grace on settlement', async () => {
+  let now = 1_000;
+  vi.spyOn(Date, 'now').mockImplementation(() => now);
+  const f = await fixture();
+  const owner = f.service as unknown as { connections: Map<string, { connection: HarnessConnection }> };
+  const connection = owner.connections.get('external:test')!.connection;
+  Object.assign(connection.capabilities, { modelsError: 'metadata stale', modelsRefresh: true });
+  let finish!: () => void;
+  const refresh = vi.fn(() => new Promise<void>(resolve => { finish = resolve; }));
+  Object.assign(connection, { refreshCapabilities: refresh });
+  const use = f.service.connect('external:test');
+  await vi.waitFor(() => expect(refresh).toHaveBeenCalled());
+  now += 20 * 60_000;
+  await f.sweep();
+  expect(f.children[0]!.terminating).toBe(false);
+  await expect(f.service.disconnect('external:test')).rejects.toMatchObject({ code: 'conversation_busy' });
+  finish();
+  await use;
+  now += 5 * 60_000 - 1;
+  await f.sweep();
+  expect(f.children[0]!.terminating).toBe(false);
+  now++;
+  const sweep = f.sweep();
+  await vi.waitFor(() => expect(f.children[0]!.terminating).toBe(true));
+  f.children[0]!.end();
+  await sweep;
+});

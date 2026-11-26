@@ -320,3 +320,44 @@ An automatic activation whose previous launch uses a different source waits
 until a foreground submission prepares a matching launch or the user restores
 the previous default. The branch preference applies between Runs. Each
 admitted request and Operation retains its original execution source.
+
+### Dormant launch work locations
+
+An ordinary owner-controlled launch can record `lazy_work_location` without
+an execution Source. A fresh Bot's home/default directory or a saved folder
+can be selected this way. Explicit fixed/native views, explicit branch
+workspace selection and project context capture still use their existing
+admission paths. A previous source-less launch without this selection stays
+source-less; it does not gain Host file or process access.
+
+The native location router resolves a saved default only for an admitted
+file, recovery, process or code retrieval operation and records its actual target.
+A terminal write or resize uses the process's original device and root.
+A retrieval investigation delegates the resolved source to its child and keeps
+the chosen path scope when reading files. The
+renderer addresses completed file actions through the recorded target.
+Ordinary location discovery and background labels use saved/cached facts;
+explicit refresh probes devices. If preparation discovers default-location
+instructions, the operation does not dispatch and returns the precise
+instructions plus their revision. Reissue with that revision after applying
+the instructions; changed instructions, including captured rules for the
+requested relative directories, invalidate a previous revision. Concurrent
+preparations may share the same resolution, but each Operation owns its
+individual grant and release.
+`work_location_switch` remains an explicit next-Run live workspace change.
+
+An ordinary native child dispatch with explicitly selected file tools and a
+shared or read-only work mode can borrow the original recorded dormant
+default. It uses a child-specific tool schema, has no location selector, and
+cannot discover devices, switch location, transfer files, or acquire command
+execution from that descriptor. Both the Catalog and Host check the original
+dispatch and recorded launch before binding. Child continuations and explicit
+project/fixed/native selections keep their existing behavior.
+
+The bundled script evaluator can also open an environment on an admitted
+ordinary Run's dormant local default. It first resolves the original saved
+directory and applies the same context-reissue check. The Catalog retains the
+physical Source on the `script_open` Operation before process dispatch; later
+cells, close and restart reconciliation address that original environment.
+The Run's default does not become a physical binding, and a managed dormant
+directory or delegated child cannot activate this local route.

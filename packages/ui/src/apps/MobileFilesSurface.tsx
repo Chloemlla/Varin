@@ -1,4 +1,8 @@
 import React from 'react';
+import { EditorView } from '@codemirror/view';
+import type { ThreadIdentity } from '@varin/application-client';
+import type { MobileDocumentLink } from '@/contexts/mobile-pages';
+import { addContentReference } from '@/lib/agent-editor/attachments';
 import {
   RiArrowLeftLine,
   RiArrowRightSLine,
@@ -38,7 +42,10 @@ type MobileFilesRoute =
   | { type: 'browser'; directory: string }
   | { type: 'file'; path: string; returnDirectory: string };
 
-const normalizePath = (value?: string | null): string => (value || '').replace(/\\/g, '/').replace(/\/+$/g, '');
+const normalizePath = (value?: string | null): string => {
+  const path = (value ?? '').replace(/\\/g, '/');
+  return path === '/' || /^[a-z]:\/$/i.test(path) ? path : path.replace(/\/+$/, '');
+};
 
 const getNameFromPath = (path: string): string => {
   const normalized = normalizePath(path);
@@ -75,15 +82,21 @@ const formatFileSize = (size?: number): string => {
 };
 
 type MobileFilesSurfaceProps = {
+  initialFile?: MobileDocumentLink;
+  quoteTarget?: ThreadIdentity | null;
+  onQuoted?(): void;
   /** When provided, header gets a close X that calls this; used when the surface is hosted in MobileSurfaceShell. */
   onClose?: () => void;
 };
 
-export const MobileFilesSurface: React.FC<MobileFilesSurfaceProps> = ({ onClose }) => {
+export const MobileFilesSurface: React.FC<MobileFilesSurfaceProps> = ({ onClose, initialFile, quoteTarget, onQuoted }) => {
   const { t } = useI18n();
   const { files, documents } = useRuntimeAPIs();
-  const root = normalizePath(useEffectiveDirectory() ?? null);
-  const [route, setRoute] = React.useState<MobileFilesRoute>(() => ({ type: 'browser', directory: root }));
+  const currentRoot = useEffectiveDirectory();
+  const root = normalizePath(initialFile?.directory ?? currentRoot);
+  const [route, setRoute] = React.useState<MobileFilesRoute>(() => initialFile
+    ? { type: 'file', path: initialFile.path, returnDirectory: getParentDirectory(initialFile.path) || root }
+    : { type: 'browser', directory: root });
   const [entries, setEntries] = React.useState<FileListEntry[]>([]);
   const [isLoadingDirectory, setIsLoadingDirectory] = React.useState(false);
   const [directoryError, setDirectoryError] = React.useState<string | null>(null);
@@ -98,12 +111,12 @@ export const MobileFilesSurface: React.FC<MobileFilesSurfaceProps> = ({ onClose 
   const directoryLoadRequestIdRef = React.useRef(0);
 
   React.useEffect(() => {
-    if (!root) return;
-    setRoute((current) => {
-      if (current.type === 'browser' && current.directory) return current;
-      return { type: 'browser', directory: root };
+    setRoute(current => {
+      if (initialFile) return current.type === 'file' && current.path === initialFile.path ? current :
+        { type: 'file', path: initialFile.path, returnDirectory: getParentDirectory(initialFile.path) || root };
+      return current.type === 'browser' && current.directory === root ? current : { type: 'browser', directory: root };
     });
-  }, [root]);
+  }, [initialFile, root]);
 
   const currentDirectory = route.type === 'browser' ? route.directory : route.returnDirectory;
   const fileIdentity = route.type === 'file' && resolvedFile?.path === route.path
@@ -219,12 +232,15 @@ export const MobileFilesSurface: React.FC<MobileFilesSurfaceProps> = ({ onClose 
     }
 
     let cancelled = false;
+    let opened: DocumentIdentity | undefined;
+    const registry = getDocumentRegistry();
     setIsLoadingFile(true);
     void resolveTextDocumentIdentity(documents, root, route.path)
       .then((identity) => {
         if (cancelled) return;
         setResolvedFile({ path: route.path, identity });
-        return getDocumentRegistry().open(identity);
+        opened = identity;
+        return registry.open(identity, { revalidate: true });
       })
       .catch((error) => {
         if (!cancelled) setFileError(error instanceof Error ? error.message : t('filesView.error.readFileFailed'));
@@ -235,6 +251,7 @@ export const MobileFilesSurface: React.FC<MobileFilesSurfaceProps> = ({ onClose 
 
     return () => {
       cancelled = true;
+      if (opened) registry.releaseClosedDocument(opened);
     };
   }, [documents, root, route, t]);
 
@@ -267,6 +284,12 @@ export const MobileFilesSurface: React.FC<MobileFilesSurfaceProps> = ({ onClose 
     return (
       <MobileFileDetail
         path={route.path}
+        line={initialFile?.path === route.path ? initialFile.line : undefined} column={initialFile?.column}
+        onQuote={quoteTarget && onQuoted ? text => {
+          addContentReference(quoteTarget, { ref: 'file-selection:' + crypto.randomUUID(), title: getNameFromPath(route.path), text,
+            source: { kind: 'file', thread: quoteTarget, path: route.path, capturedAt: new Date().toISOString() } });
+          onQuoted();
+        } : undefined}
         imageSrc={imageSrc}
         error={fileError}
         isLoading={isLoadingFile}
@@ -428,7 +451,13 @@ const MobileFileDetail: React.FC<{
   onBack: () => void;
   onCopyPath: () => void;
   onCopyContent: () => void;
-}> = ({ path, imageSrc, error, isLoading, binaryBlocked, identity, record, onBack, onCopyPath, onCopyContent }) => {
+  line?: number; column?: number; onQuote?(text: string): void;
+}> = ({ path, imageSrc, error, isLoading, binaryBlocked, identity, record, onBack, onCopyPath, onCopyContent, line, column, onQuote }) => {
+  const editor = React.useRef<EditorView | null>(null);
+  const [hasSelection, setHasSelection] = React.useState(false);
+  const extensions = React.useMemo(() => [EditorView.updateListener.of(update => {
+    if (update.selectionSet) setHasSelection(!update.state.selection.main.empty);
+  })], []);
   const { t } = useI18n();
   const isImage = isImageFile(path);
   const registryBlocked = record?.status === 'binary' || record?.status === 'unsupported-encoding';
@@ -477,6 +506,9 @@ const MobileFileDetail: React.FC<{
             <RiFileCopyLine className="size-4" />
           </Button>
         ) : null}
+        {onQuote && hasSelection && <Button type="button" variant="ghost" size="icon" aria-label={t('chat.context.quoteSelection')}
+          onMouseDown={e => e.preventDefault()} onClick={() => { const state = editor.current?.state; if (state && !state.selection.main.empty)
+            onQuote(state.sliceDoc(state.selection.main.from, state.selection.main.to)); }}><Icon name="chat-quote" className="size-4" /></Button>}
         <Button type="button" variant="ghost" size="icon" onClick={onCopyPath} aria-label={t('mobile.files.copyPathAria')}>
           <RiClipboardLine className="size-4" />
         </Button>
@@ -505,7 +537,11 @@ const MobileFileDetail: React.FC<{
             <DocumentConflictBanner identity={identity} />
             <DocumentEncodingNotice identity={identity} />
             <div className="min-h-0 flex-1 overflow-hidden">
-              <DocumentCodeMirror identity={identity} className="h-full" />
+              <DocumentCodeMirror identity={identity} className="h-full" extensions={extensions}
+                onViewReady={view => { editor.current = view;
+                  if (line) { const row = view.state.doc.line(Math.max(1, Math.min(line, view.state.doc.lines)));
+                    view.dispatch({ selection: { anchor: Math.min(row.to, row.from + Math.max(0, (column ?? 1) - 1)) }, scrollIntoView: true }); }
+                }} onViewDestroy={() => { editor.current = null; setHasSelection(false); }} />
             </div>
           </div>
         ) : (

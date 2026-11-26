@@ -71,14 +71,19 @@ it('rejects an implicit snapshot identity before any native read', async () => {
 it('lets an authenticated draft discover source Hosts without creating or granting a Thread', async () => {
   const f = fixture();
   const result = { targets: [{ resourceOwner: { kind: 'local' as const }, label: 'This Host', capabilities: [] }], unavailable: [] };
-  const list = vi.fn(async () => result); const resolve = vi.fn();
-  f.adapter.bindSourceDirectory({ list, resolve });
+  const list = vi.fn(async () => result);
+  const describe = vi.fn(async () => result);
+  const resolve = vi.fn();
+  f.adapter.bindSourceDirectory({ list, describe, resolve });
   await expect(f.api.sources.list(null)).resolves.toEqual(result);
-  expect(list).toHaveBeenCalledOnce(); expect(resolve).not.toHaveBeenCalled(); expect(f.requests).not.toHaveBeenCalled();
+  await expect(f.api.sources.list(null, undefined, { refresh: false })).resolves.toEqual(result);
   expect((await f.request('/api/threads/source/list', {}, false)).status).toBe(401);
   expect((await f.request('/api/threads/source/list', { runtime: 'agent' })).status).toBe(400);
   expect((await f.request('/api/threads/source/resolve', { resourceOwner: { kind: 'local' }, path: '/repo' })).status).toBe(400);
-  expect(resolve).not.toHaveBeenCalled(); expect(list).toHaveBeenCalledOnce();
+  expect(list).toHaveBeenCalledOnce();
+  expect(describe).toHaveBeenCalledOnce();
+  expect(resolve).not.toHaveBeenCalled();
+  expect(f.requests).not.toHaveBeenCalled();
 });
 
 it('uses the native product query and forwards original metadata/read command identities unchanged', async () => {

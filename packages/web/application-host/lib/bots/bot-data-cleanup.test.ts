@@ -20,6 +20,9 @@ async function fixture() {
     activity: { state: 'asleep', operationId: 'sleep', planned: true, error: null, machines: [],
       work: [{ runtime: 'agent' as const, threadId: 'child', branchId: 'main', runId: 'old-run', resume: false, stopped: true, resumed: false }] } };
   await mkdir(join(dataDir, 'knowledge', 'host'), { recursive: true });
+  const migrated = join(dataDir, 'knowledge', 'host', key + '.store', 'current');
+  await mkdir(migrated, { recursive: true });
+  await writeFile(join(migrated, 'database.tdb'), 'migrated data');
   await mkdir(bot.homeDir, { recursive: true });
   for (const name of [`${key}.tdb`, `${key}.tdb.wal`, `${key}.vec`, `${key}.pld.4`, 'other.tdb', 'user.tdb']) {
     await writeFile(join(dataDir, 'knowledge', 'host', name), 'fixture');

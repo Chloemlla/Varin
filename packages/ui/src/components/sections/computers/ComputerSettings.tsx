@@ -5,7 +5,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { useI18n } from '@/lib/i18n';
 import { useEffectiveDirectory } from '@/hooks/useEffectiveDirectory';
 import { useUIStore } from '@/stores/useUIStore';
-import { changeComputerDesktop, listComputers, probeComputerDesktop, setDefaultComputerTarget, type ComputerCatalog } from '@/lib/computers';
+import { changeComputerDesktop, listComputers, refreshComputers, probeComputerDesktop, setDefaultComputerTarget, type ComputerCatalog } from '@/lib/computers';
 import { ComputerDesktopView } from '@/components/sections/computers/ComputerDesktopView';
 import { ComputerVmSection } from '@/components/sections/computers/ComputerVmSection';
 import type { ComputerDesktop } from '@varin/protocol';
@@ -28,6 +28,7 @@ function ComputerSettingsContent() {
   const [error, setError] = React.useState<string | null>(null);
   const [probing, setProbing] = React.useState<string | null>(null);
   const [saving, setSaving] = React.useState(false);
+  const [discovering, setDiscovering] = React.useState(false);
   const [viewing, setViewing] = React.useState<ComputerDesktop | null>(null);
   const directory = useEffectiveDirectory();
   const openContextPanelTab = useUIStore((state) => state.openContextPanelTab);
@@ -52,6 +53,12 @@ function ComputerSettingsContent() {
   }, []);
 
   React.useEffect(() => { void refresh(); }, [refresh]);
+  const discover = async () => {
+    setDiscovering(true);
+    try { setCatalog(await refreshComputers()); setError(null); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
+    finally { setDiscovering(false); }
+  };
 
   const probe = async (desktopId: string) => {
     setProbing(desktopId);
@@ -118,6 +125,7 @@ function ComputerSettingsContent() {
         </SettingsFieldRow>
       </SettingsSection>
       <SettingsSection title={t('settings.computers.section.desktops')} contentClassName="space-y-4">
+        <Button variant="outline" size="sm" disabled={discovering} onClick={() => { void discover(); }}>{t('browser.resource.refresh')}</Button>
         {catalog.desktops.length === 0 ? <p className="typography-meta text-muted-foreground">{t('settings.computers.empty')}</p> : null}
         {catalog.desktops.map((desktop) => {
           const machine = catalog.machines.find((m) => m.id === desktop.machineId);
@@ -127,6 +135,7 @@ function ComputerSettingsContent() {
                 <p className="typography-ui-label text-foreground truncate">{desktop.label}</p>
                 <p className="typography-meta text-muted-foreground">
                   {machine ? `${machine.name} · ${machine.platform}` : desktop.machineId} · {desktop.kind}
+                  {desktop.probedAt ? ` · ${t('browser.resource.observedAt', { time: new Date(desktop.probedAt).toLocaleString() })}` : ''}
                   {machine ? ` · ${t('settings.computers.coordinator')}: ${machine.coordinatorHostId}` : ''}
                 </p>
               </div>

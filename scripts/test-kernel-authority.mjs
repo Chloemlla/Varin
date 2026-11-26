@@ -63,6 +63,11 @@ if (vitestFiles.length === 0) {
 // native resources, so serialize files on every runner; concurrency within
 // each test remains exercised without coupling teardown to another fixture.
 const config = args.includes('--platform') ? 'packages/web/vitest.kernel.platform.config.ts' : 'packages/web/vitest.kernel.config.ts';
+const migrationSuite = path.join(root, 'packages/web/application-host/lib/knowledge/database.native.test.ts');
+if (!env.VARIN_TDB_MIGRATOR_PATH && (!vitestFiles.length || vitestFiles.some(file => migrationSuite.includes(path.normalize(file))))) {
+  const { prepareTriviumMigrator } = await import('./prepare-trivium-migrator.mjs');
+  env.VARIN_TDB_MIGRATOR_PATH = prepareTriviumMigrator();
+}
 run(process.execPath, ['node_modules/vitest/vitest.mjs', 'run', '--config', config,
   ...vitestFiles,
   ...vitestTestNames.flatMap(name => ['--testNamePattern', name]),

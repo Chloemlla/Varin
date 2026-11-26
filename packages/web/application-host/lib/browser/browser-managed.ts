@@ -24,7 +24,7 @@ const text = (value: unknown): value is string => typeof value === 'string' && v
 const oneOf = (value: unknown, choices: readonly string[]): value is string => typeof value === 'string' && choices.includes(value);
 const invalid = (message: string) => new BrowserExecutionError(message, 'none');
 const capabilities: BrowserResourceCapability[] = ['tabs', 'open', 'read', 'screenshot', 'act', 'upload', 'download', 'activate'];
-const methods = ['list', 'open', 'read', 'act', 'activate', 'controlPage', 'usage', 'downloads', 'readDownload', 'releaseDownload', 'upload', 'releaseThread'] as const;
+const methods = ['list', 'open', 'read', 'act', 'activate', 'controlPage', 'usage', 'downloads', 'readDownload', 'releaseDownload', 'upload', 'retainPage', 'releaseThread'] as const;
 type Method = typeof methods[number];
 interface Call {
   coordinatorHostId: string;
@@ -57,6 +57,7 @@ function parseCall(value: unknown): Call {
     case 'readDownload': case 'releaseDownload': valid = args.length === 2 && text(first) && text(second); break;
     case 'upload': valid = args.length === 3 && text(first) && text(second) && Array.isArray(third) && third.length > 0
       && third.every(file => object(file) && exact(file, ['name', 'bytesBase64']) && text(file.name) && bytes(file.bytesBase64)); break;
+    case 'retainPage': valid = args.length === 1 && text(first) && text(value.threadId); break;
     case 'releaseThread': valid = args.length === 0 && text(value.threadId); break;
   }
   if (!valid) throw invalid('Invalid managed browser method arguments');
@@ -74,7 +75,7 @@ function writes(call: Pick<Call, 'method' | 'args'>) {
 function supported(resource: BrowserResource, method: Method, args: unknown[]) {
   const capability = method === 'list' ? 'tabs' : ['downloads', 'readDownload', 'releaseDownload'].includes(method) ? 'download'
     : method === 'read' && (args[0] as BrowserReadRequest).view === 'screenshot' ? 'screenshot' : method;
-  if (method === 'usage' || method === 'controlPage' || method === 'releaseThread') return true;
+  if (method === 'usage' || method === 'controlPage' || method === 'retainPage' || method === 'releaseThread') return true;
   if (!resource.capabilities.includes(capability as BrowserResourceCapability)) return false;
   if (!resource.operations || ['downloads', 'readDownload', 'releaseDownload', 'upload'].includes(method)) return true;
   if (method === 'act') {
@@ -123,6 +124,8 @@ export function managedBrowserThread(clientId: string, coordinatorHostId: string
 export function registerManagedBrowserRoutes(app: Express, options: {
   hostId: string; resources: BrowserResources; requireAuth: RequestHandler;
   settings?: BrowserSettingsOwner;
+  allowProbe?: boolean;
+  parseRequestBody?: RequestHandler;
   clientId(request: Request): Promise<string | undefined>;
 }) {
   const principals = new WeakMap<Request, string>();
@@ -147,9 +150,17 @@ export function registerManagedBrowserRoutes(app: Express, options: {
       principals.set(req, clientId); next();
     }).catch(next);
   });
+  if (options.parseRequestBody) app.use(base, options.parseRequestBody);
   app.get(`${base}/resources`, route(async (_req, res) => {
     // Never publish imported peers: discovery and dispatch are strictly one hop.
     res.json({ resources: await options.resources.list({ localOnly: true }) });
+  }));
+  app.post(`${base}/resources/:browserId/acquire`, route(async (req, res) => {
+    const controller = new AbortController();
+    const close = () => { if (!res.writableEnded) controller.abort(); };
+    res.once('close', close);
+    try { res.json({ resources: [await options.resources.acquire(String(req.params.browserId), controller.signal, true)] }); }
+    finally { res.off('close', close); }
   }));
   app.get(`${base}/configuration`, route(async (_req, res) => {
     if (!options.settings) throw invalid('Browser connection management is unavailable');
@@ -160,7 +171,7 @@ export function registerManagedBrowserRoutes(app: Express, options: {
     const settings = await options.settings.save(req.body.revision, req.body);
     res.json({ settings, resources: await options.resources.list({ localOnly: true }) });
   }));
-  app.post(`${base}/probe`, route(async (req, res) => { res.json(await probeBrowserConnection(req.body)); }));
+  if (options.allowProbe !== false) app.post(`${base}/probe`, route(async (req, res) => { res.json(await probeBrowserConnection(req.body)); }));
   app.post(`${base}/call`, route(async (req, res) => {
     const call = parseCall(req.body);
     const resource = (await options.resources.list({ localOnly: true })).find(item => item.browserId === call.browserId);
@@ -185,6 +196,7 @@ export function registerManagedBrowserRoutes(app: Express, options: {
         dispatched = true;
         switch (call.method) {
           case 'list': return owner.list();
+          case 'retainPage': return null;
           case 'open': return owner.open(call.args[0] as Parameters<BrowserOwner['open']>[0], { ...(threadId ? { threadId } : {}) });
           case 'read': return owner.read(call.args[0] as BrowserReadRequest, signal);
           case 'act': return owner.act(pageId!, call.args[1] as BrowserAction, signal);
@@ -229,7 +241,8 @@ function catalog(value: unknown): BrowserResource[] {
       || item.instanceId !== undefined && !text(item.instanceId)
       || item.state === 'online' && !text(item.instanceId)
       || !Array.isArray(item.capabilities) || item.capabilities.some(capability => !capabilities.includes(capability))
-      || item.operations !== undefined && (!Array.isArray(item.operations) || !item.operations.every(text))) throw invalid('Invalid managed browser catalog');
+      || item.operations !== undefined && (!Array.isArray(item.operations) || !item.operations.every(text))
+      || item.activation !== undefined && !oneOf(item.activation, ['connect', 'existing-session', 'start-owned', 'restore-profile'])) throw invalid('Invalid managed browser catalog');
     seen.add(item.browserId);
   }
   return value.resources as BrowserResource[];
@@ -257,8 +270,25 @@ export class ManagedBrowserOwner implements BrowserOwner {
     for (const listener of this.listeners) listener({ kind: 'connection', browserId: this.browserId, state: this.status.state,
       ...(this.status.instanceId ? { instanceId: this.status.instanceId } : {}) });
   }
-  async resource() { const { state, instanceId, capabilities, operations } = this.status; return { state,
-    ...(instanceId ? { instanceId } : {}), capabilities: [...capabilities], ...(operations ? { operations: [...operations] } : {}) }; }
+  async resource() { const { state, instanceId, capabilities, operations, activation } = this.status; return { state,
+    ...(instanceId ? { instanceId } : {}), capabilities: [...capabilities], ...(operations ? { operations: [...operations] } : {}),
+    ...(activation ? { activation } : {}) }; }
+  async prepareResource() {
+    if (this.disposed) throw invalid('The original managed browser owner has ended');
+    const target = await this.targets.forwardTarget(this.peer);
+    const client = new ManagedTargetClient(target, this.fetchImpl);
+    if (!this.status.activation) {
+      // Older peers and push connectors do not advertise an acquire operation.
+      const resources = catalog(await client.request(`${relative}/resources`));
+      const current = resources.find(item => item.browserId === this.status.browserId);
+      if (current) this.update(current);
+      else this.interrupt();
+      return;
+    }
+    const resources = catalog(await client.json(`${relative}/resources/${encodeURIComponent(this.status.browserId)}/acquire`, {}, 'POST'));
+    if (resources.length !== 1 || resources[0]!.browserId !== this.status.browserId) throw invalid('Managed browser acquisition returned a different resource');
+    this.update(resources[0]!);
+  }
   private async request<T>(instanceId: string, method: Method, args: unknown[], scope: BrowserUseScope = {}): Promise<T> {
     if (this.disposed || this.status.state !== 'online') throw invalid('The original managed browser is offline');
     if (instanceId !== this.status.instanceId) throw invalid('The original managed browser instance ended');
@@ -308,6 +338,19 @@ export class ManagedBrowserOwner implements BrowserOwner {
       resource: () => this.resource(),
       list: async () => (await request<BrowserPage[]>('list', [])).map(page),
       open: async (input, openScope) => page(await request<BrowserPage>('open', [input], openScope.signal, openScope.threadId)),
+      holdPage: async (pageId, viewer, signal) => {
+        try {
+          // Do not link the retain receipt to the requesting viewer cancellation:
+          // if it reached the owner, the release must follow that receipt.
+          await this.request(instanceId, 'retainPage', [pageId], { threadId: viewer });
+        } catch (error) {
+          await this.request(instanceId, 'releaseThread', [], { threadId: viewer }).catch(() => undefined);
+          throw error;
+        }
+        const release = async () => { await this.request(instanceId, 'releaseThread', [], { threadId: viewer }); };
+        if (signal?.aborted) { await release(); signal.throwIfAborted(); }
+        return release;
+      },
       read: async (input, signal) => { const result = await request<BrowserObservation>('read', [input], signal); return { ...result, page: page(result.page) }; },
       act: async (pageId, action, signal) => { const result = await request<BrowserActionResult>('act', [pageId, action], signal); return { ...result, page: page(result.page) }; },
       activate: async pageId => { await request('activate', [pageId]); },

@@ -287,6 +287,7 @@ export function createManagedRemoteTargetRegistry(options: ManagedRemoteTargetRe
         if (result.status === "fulfilled") {
           const target = result.value;
           probedByConnection.set(connection.id, target);
+          if (target.identity.role === 'browser' || target.identity.role === 'computer') continue;
           if (!next.has(target.machineId)) next.set(target.machineId, target);
         } else {
           failedByConnection.set(connection.id, result.reason instanceof Error ? result.reason.message : "target probe failed");
@@ -362,6 +363,23 @@ export function createManagedRemoteTargetRegistry(options: ManagedRemoteTargetRe
       unavailable: results.flatMap((result, index) => result.status === 'rejected'
         ? [{ connectionId: connections[index]!.id, label: connections[index]!.label, message: 'The configured Host source is unavailable' }] : []),
     };
+  };
+
+  const describeSourceTargets = async (signal?: AbortSignal) => {
+    signal?.throwIfAborted();
+    const connections = configuredHosts(await options.readSettings());
+    signal?.throwIfAborted();
+    const targets = [], unavailable = [];
+    for (const connection of connections) {
+      const observed = peers.get(connection.id);
+      if (!observed || connectionKey(observed.connection) !== connectionKey(connection) || !observed.identity.capabilities.includes('sources')) {
+        unavailable.push({ connectionId: connection.id, label: connection.label, message: 'Configured Host source has not been observed as available' });
+        continue;
+      }
+      targets.push({ resourceOwner: { kind: 'managed_host' as const, hostId: observed.hostId, connectionId: connection.id,
+        endpointIdentity: managedEndpointIdentity(connection) }, label: connection.label, capabilities: [...observed.identity.capabilities] });
+    }
+    return { targets, unavailable };
   };
 
   /** Browser discovery uses the same configured peer authority, without
@@ -960,7 +978,7 @@ export function createManagedRemoteTargetRegistry(options: ManagedRemoteTargetRe
     };
   };
 
-  return { refresh, resolveBackend, externalAuthority, targetFor, sourceTargets, browserTargets, sourceTarget, forwardTarget, selectForwardTarget, storageTargets, storage, source, shellExec, shellRead, shellWrite, shellKill, setScopeSleeping, releaseScope, ownersForMachine };
+  return { refresh, resolveBackend, externalAuthority, targetFor, sourceTargets, describeSourceTargets, browserTargets, sourceTarget, forwardTarget, selectForwardTarget, storageTargets, storage, source, shellExec, shellRead, shellWrite, shellKill, setScopeSleeping, releaseScope, ownersForMachine };
 }
 
 export type ManagedRemoteTargetRegistry = ReturnType<typeof createManagedRemoteTargetRegistry>;

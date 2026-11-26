@@ -104,6 +104,8 @@ vi.mock('@/components/ui/dropdown-menu', () => ({
   DropdownMenuTrigger: ({ children }: { children: React.ReactNode }) => <>{children}</>,
   DropdownMenuContent: ({ children }: { children: React.ReactNode }) => <div data-menu="">{children}</div>,
   DropdownMenuItem: ({ children, onSelect, onClick, disabled }: { children: React.ReactNode; onSelect?: () => void; onClick?: () => void; disabled?: boolean }) => <button type="button" data-menu-item="" disabled={disabled} onClick={() => { onClick?.(); onSelect?.(); }}>{children}</button>,
+  DropdownMenuRadioGroup: ({ children }: React.PropsWithChildren) => <>{children}</>,
+  DropdownMenuRadioItem: ({ children }: React.PropsWithChildren) => <button role="menuitemradio">{children}</button>,
   DropdownMenuSeparator: () => null,
 }));
 vi.mock('@/components/sections/harness/useHarnessSettings', () => ({ useHarnessSettings: () => ({ harness: null, update: vi.fn(), error: null }) }));
@@ -140,7 +142,7 @@ vi.mock('@/components/layout/MainLayout', () => ({
     navigationTitle?: string; navigationSubtitle?: string; headerPanelControl?: React.ReactNode;
   }) => <>
     <header data-title={navigationTitle} data-subtitle={navigationSubtitle ?? ''}>{headerPanelControl}</header>
-    {renderNavigator(true)}{renderConversation(true)}<div data-secondary="">{renderSecondaryPanel?.('docked', true)}</div>
+    {renderNavigator(true)}{renderConversation(true)}<div data-secondary="">{renderSecondaryPanel?.(state.mobile ? 'drawer' : 'docked', true)}</div>
   </>,
 }));
 
@@ -310,13 +312,13 @@ describe('Bot workbench', () => {
     expect(useUIStore.getState().contextPanelByDirectory['']).toBe(ordinaryPanel);
   });
 
-  it('opens the exact read-only Bot context in a mobile dialog without a workspace', async () => {
+  it('opens the exact read-only Bot context on the mobile detail page without a workspace', async () => {
     state.mobile = true;
     state.sessions.mockImplementation(async (id: string) => [sessionOf(id, `entry-${id}`, `branch-${id}`, { archived: true }, true)]);
     await render();
     await click('Open context');
     await settle();
-    const inspector = container.querySelector('[role="dialog"] [data-context-thread]');
+    const inspector = container.querySelector('[data-secondary] [data-context-thread]');
     expect(inspector?.getAttribute('data-context-thread')).toBe('entry-a');
     expect(inspector?.getAttribute('data-context-branch')).toBe('branch-a');
     expect(inspector?.getAttribute('data-context-readonly')).toBe('true');
@@ -348,7 +350,7 @@ describe('Bot workbench', () => {
     state.mobile = true;
     useUIStore.getState().openContextPanelTab(BOT_CONVERSATION_PANEL_SCOPE, { mode: 'context' });
     await render();
-    expect(container.querySelector('[role="dialog"]')?.textContent).toContain('contextSidebar.empty.openSession');
+    expect(container.querySelector('[data-secondary]')?.textContent).toContain('contextSidebar.empty.openSession');
     expect(container.querySelector('[data-context-thread]')).toBeNull();
   });
 

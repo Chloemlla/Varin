@@ -34,10 +34,10 @@ export function classifyChanges(files, { full = false, called = false, qualifica
     if (/^(?:Dockerfile(?:\.base)?$|\.dockerignore$|docker-compose(?:\.(?:toolbelt|resource-node))?\.yml$|\.github\/workflows\/(?:docker(?:-commit)?|container-(?:check|images))\.yml$|scripts\/(?:docker-|build-container-images))/u.test(file)) {
       enable('container', 'toolbelt'); continue;
     }
-    if (['scripts/smoke-container-budget.mjs', 'scripts/smoke-container-stop.mjs', 'scripts/smoke-container-resource-node.mjs'].includes(file)) {
+    if (['scripts/smoke-container-budget.mjs', 'scripts/smoke-container-stop.mjs', 'scripts/smoke-container-resource-node.mjs', 'scripts/smoke-container-service-node.mjs'].includes(file)) {
       enable('container', 'toolbelt'); continue;
     }
-    if (file === 'packages/web/application-host/resource-node.ts') {
+    if (/^packages\/web\/application-host\/(?:(?:resource|browser|computer)-node\.ts|lib\/(?:node-role-auth\.ts|browser\/(?!.*\.test\.ts$)|computer\/computer-node-role\.ts))/u.test(file)) {
       enable('native', 'windows', 'macos', 'production', 'container'); continue;
     }
     if (/^packages\/(?:ui\/|web\/(?:src\/|public\/|(?:index|mobile|mini-chat|companion)\.html$|vite\.config\.ts$|postcss\.config\.js$))/u.test(file)) {
@@ -51,6 +51,7 @@ export function classifyChanges(files, { full = false, called = false, qualifica
     }
     if (file.startsWith('packages/computer-driver/')) {
       enable('production');
+      if (file.startsWith('packages/computer-driver/linux/')) enable('container');
       if (file.startsWith('packages/computer-driver/windows/')) enable('windows');
       else if (file.startsWith('packages/computer-driver/macos/')) enable('macos');
       else if (!file.startsWith('packages/computer-driver/linux/')) enable('windows', 'macos');

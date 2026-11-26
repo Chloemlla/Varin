@@ -9,38 +9,16 @@ import {
 } from '@/lib/settings/builtin-page-metadata';
 import type { SettingsPageImplementation } from '@/lib/settings/page-types';
 
-// Register metadata synchronously. Page modules load only when their content mounts.
-const GeneralPage = React.lazy(() => import('@/components/sections/preferences/GeneralPage').then(m => ({ default: m.GeneralPage })));
-const AppearancePage = React.lazy(() => import('@/components/sections/preferences/AppearancePage').then(m => ({ default: m.AppearancePage })));
-const ChatPage = React.lazy(() => import('@/components/sections/preferences/ChatPage').then(m => ({ default: m.ChatPage })));
-const EditorPage = React.lazy(() => import('@/components/sections/preferences/EditorTerminalPages').then(m => ({ default: m.EditorPage })));
-const TerminalPage = React.lazy(() => import('@/components/sections/preferences/EditorTerminalPages').then(m => ({ default: m.TerminalPage })));
-const NotificationsPage = React.lazy(() => import('@/components/sections/preferences/PreferenceWrappers').then(m => ({ default: m.NotificationsPage })));
-const ShortcutsPage = React.lazy(() => import('@/components/sections/preferences/PreferenceWrappers').then(m => ({ default: m.ShortcutsPage })));
-const VoicePage = React.lazy(() => import('@/components/sections/preferences/PreferenceWrappers').then(m => ({ default: m.VoicePage })));
-const DevicesPage = React.lazy(() => import('@/components/sections/devices/DevicesPage').then(m => ({ default: m.DevicesPage })));
-const RemoteAccessPage = React.lazy(() => import('@/components/sections/devices/RemoteAccessPage').then(m => ({ default: m.RemoteAccessPage })));
-const ProxyPage = React.lazy(() => import('@/components/sections/devices/ProxyPage').then(m => ({ default: m.ProxyPage })));
-const WorkspacesPage = React.lazy(() => import('@/components/sections/devices/WorkspacesPage').then(m => ({ default: m.WorkspacesPage })));
-const CodeIntelPage = React.lazy(() => import('@/components/sections/language-support/CodeIntelPage').then(m => ({ default: m.CodeIntelPage })));
-const BrowserSettingsPage = React.lazy(() => import('@/components/sections/browsers/BrowserSettingsPage').then(m => ({ default: m.BrowserSettingsPage })));
-const ExternalAgentsPage = React.lazy(() => import('@/components/sections/external-agents/ExternalAgentsPage').then(m => ({ default: m.ExternalAgentsPage })));
-const HistorySettingsPage = React.lazy(() => import('@/components/sections/connections/SettingsUtilityPages').then(m => ({ default: m.HistorySettingsPage })));
-const StorageSettingsPage = React.lazy(() => import('@/components/sections/storage/StorageSettingsPage').then(m => ({ default: m.StorageSettingsPage })));
-const UsageSettingsPage = React.lazy(() => import('@/components/sections/usage/UsageSettingsPage').then(m => ({ default: m.UsageSettingsPage })));
-const AgentMemoryPage = React.lazy(() => import('@/components/sections/assistant/AgentMemoryPage').then(m => ({ default: m.AgentMemoryPage })));
-const AgentPromptPage = React.lazy(() => import('@/components/sections/assistant/AgentPromptPage').then(m => ({ default: m.AgentPromptPage })));
-const ExtensionsPage = React.lazy(() => import('@/components/sections/extensions/ExtensionsPage').then(m => ({ default: m.ExtensionsPage })));
-const GitPage = React.lazy(() => import('@/components/sections/git-identities/GitPage').then(m => ({ default: m.GitPage })));
-const VarinSettingsPage = React.lazy(() => import('@/components/sections/varin/VarinSettingsPage').then(m => ({ default: m.VarinSettingsPage })));
-const CompanionSettings = React.lazy(() => import('@/components/sections/varin/CompanionSettings').then(m => ({ default: m.CompanionSettings })));
-const ProjectsPage = React.lazy(() => import('@/components/sections/projects/ProjectsPage').then(m => ({ default: m.ProjectsPage })));
-const ProjectsSidebar = React.lazy(() => import('@/components/sections/projects/ProjectsSidebar').then(m => ({ default: m.ProjectsSidebar })));
-const ModelRolesPage = React.lazy(() => import('@/components/sections/harness/ModelRolesPage').then(m => ({ default: m.ModelRolesPage })));
-const ModelConnectionsPage = React.lazy(() => import('@/components/sections/providers/ModelConnectionsPage').then(m => ({ default: m.ModelConnectionsPage })));
-const McpConnectionsPage = React.lazy(() => import('@/components/sections/mcp/McpConnectionsPage').then(m => ({ default: m.McpConnectionsPage })));
-const SkillsPage = React.lazy(() => import('@/components/sections/skills/SkillsPage').then(m => ({ default: m.SkillsPage })));
-const BuiltinAboutSettingsPage = React.lazy(() => import('./BuiltinAboutSettingsPage').then(m => ({ default: m.BuiltinAboutSettingsPage })));
+import {
+  GeneralPage, AppearancePage, ChatPage, EditorPage,
+  TerminalPage, NotificationsPage, ShortcutsPage, VoicePage,
+  DevicesPage, RemoteAccessPage, ProxyPage, WorkspacesPage,
+  CodeIntelPage, BrowserSettingsPage, ExternalAgentsPage, HistorySettingsPage,
+  StorageSettingsPage, UsageSettingsPage, AgentMemoryPage, AgentPromptPage,
+  ExtensionsPage, GitPage, VarinSettingsPage, CompanionSettings,
+  ProjectsPage, ProjectsSidebar, ModelRolesPage, ModelConnectionsPage,
+  McpConnectionsPage, SkillsPage, BuiltinAboutSettingsPage,
+} from './builtin-settings-pages';
 
 const PREFERENCE_PAGES: Partial<Record<VarinSettingsSection, () => React.ReactNode>> = {
   general: () => <GeneralPage />,

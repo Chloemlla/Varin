@@ -42,7 +42,7 @@ it('pairs offline, serves an actual original live file and process, and reopens 
       expect(res.status, JSON.stringify(body)).toBe(200);
       return body as T;
     };
-    expect(await accepted(fetch(origin() + '/health'))).toEqual({ status: 'ok', role: 'resources', releaseId: 'test-artifact' });
+    expect(await accepted(fetch(origin() + '/health'))).toEqual({ status: 'ok', role: 'resources', control: 'ready', releaseId: 'test-artifact' });
     expect([401, 403]).toContain((await api('/identity')).status);
     const identity = await accepted<ManagedRemoteIdentity>(api('/identity', reader.token));
     expect(identity.capabilities).toContain('sources');

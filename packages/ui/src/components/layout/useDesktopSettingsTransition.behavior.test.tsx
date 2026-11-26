@@ -4,7 +4,7 @@ import { parseHTML } from 'linkedom';
 import { expect, it, vi } from 'vitest';
 import { activationPoint } from '@/lib/motion/pointer';
 import { useUIStore } from '@/stores/useUIStore';
-import { useDesktopSettingsTransition } from './useDesktopSettingsTransition';
+import { useSettingsTransition } from './useSettingsTransition';
 
 const stage = vi.hoisted(() => ({ cover: vi.fn(), close: vi.fn(), reveal: vi.fn(), dispose: vi.fn() }));
 vi.mock('@/components/ui/workbench-lattice-stage', () => ({ LatticeStage: class {
@@ -17,7 +17,7 @@ vi.mock('@/lib/extensions/workbench-registry', () => ({
 }));
 
 function Shell() {
-  const settings = useDesktopSettingsTransition(true);
+  const settings = useSettingsTransition(true);
   return <div data-shell="">
     <header data-startup-part="header">
       {settings.open && <button type="button" onClick={event => useUIStore.getState().setSettingsDialogOpen(false, activationPoint(event))}>Return</button>}

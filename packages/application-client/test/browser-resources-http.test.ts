@@ -33,3 +33,36 @@ it('routes reads and controls to the original resource, instance and tab without
     assert.equal(screenshot.observation.image?.base64, Buffer.from(bytes).toString('base64'));
   } finally { globalThis.fetch = original; }
 });
+
+it('separates passive catalog, peer discovery, selected acquisition and viewer lifetime', async () => {
+  const original = globalThis.fetch;
+  const paths: Array<[string, string | undefined]> = [];
+  const target = { browserId: 'remote/browser', instanceId: 'actual-session', pageId: 'tab#1' };
+  const owner = { browserId: target.browserId, activation: 'connect', state: 'disconnected' };
+  const lifetime = new AbortController();
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    paths.push([url, init?.method]);
+    if (url.endsWith('/viewer')) return new Response(new ReadableStream({
+      start(stream) {
+        stream.enqueue(new TextEncoder().encode('event: retained\ndata: {}\n\n'));
+        init?.signal?.addEventListener('abort', () => stream.close(), { once: true });
+      },
+    }));
+    if (url.endsWith('/acquire')) return Response.json({ resource: { ...owner, state: 'online', instanceId: target.instanceId } });
+    return Response.json({ resources: [owner] });
+  };
+  try {
+    assert.equal((await browserResources.list())[0]!.state, 'disconnected');
+    await browserResources.refresh();
+    assert.equal((await browserResources.acquire(target.browserId)).instanceId, target.instanceId);
+    const view = browserResources.holdPage(target, lifetime.signal);
+    setImmediate(() => lifetime.abort());
+    await view;
+    assert.deepEqual(paths, [
+      ['/api/browser-resources', 'GET'], ['/api/browser-resources/refresh', 'POST'],
+      ['/api/browser-resources/remote%2Fbrowser/acquire', 'POST'],
+      ['/api/browser-resources/remote%2Fbrowser/actual-session/pages/tab%231/viewer', 'POST'],
+    ]);
+  } finally { lifetime.abort(); globalThis.fetch = original; }
+});

@@ -3,9 +3,9 @@ const path = require('node:path');
 const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const { createRequire } = require('node:module');
+const { windowsMsvcEnvironment } = require('../../../scripts/windows-msvc.cjs');
 const exec = promisify(execFile);
 const root = path.resolve(__dirname, '..');
-const quote = value => `"${value.replaceAll('"', '""')}"`;
 
 async function prepareInstallerUI(destination) {
   await fs.mkdir(destination, { recursive: true });
@@ -45,20 +45,10 @@ async function prepareInstallerUI(destination) {
   const source = path.join(root, 'installer/VarinSetup.cpp');
   const definitions = path.join(root, 'installer/VarinSetup.def');
   const output = path.join(destination, 'VarinSetup.dll');
-  const vswhere = path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Microsoft Visual Studio/Installer/vswhere.exe');
-  const { stdout } = await exec(vswhere, ['-latest', '-products', '*', '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', '-property', 'installationPath'], { windowsHide: true });
-  const candidates = [stdout.trim(), ...[process.env['ProgramFiles(x86)'], process.env.ProgramFiles].filter(Boolean)
-    .flatMap(base => ['BuildTools', 'Community', 'Professional', 'Enterprise'].map(edition => path.join(base, 'Microsoft Visual Studio/2022', edition)))].filter(Boolean);
-  let installation;
-  for (const candidate of candidates) {
-    if (await fs.access(path.join(candidate, 'Common7/Tools/VsDevCmd.bat')).then(() => true, () => false)) { installation = candidate; break; }
-  }
-  if (!installation) throw new Error('MSVC x86 build tools are required for the Unicode NSIS UI plugin.');
-  const developer = path.join(installation, 'Common7/Tools/VsDevCmd.bat');
-  const host = process.arch === 'arm64' ? 'arm64' : 'x64';
-  const command = `call ${quote(developer)} -arch=x86 -host_arch=${host} && cl /nologo /LD /std:c++17 /W4 /O2 /MT /utf-8 /DUNICODE /D_UNICODE /I${quote(destination)} ${quote(source)} /Fo${quote(path.join(destination, 'VarinSetup.obj'))} /link /OUT:${quote(output)} /DEF:${quote(definitions)} user32.lib gdi32.lib comctl32.lib uxtheme.lib dwmapi.lib gdiplus.lib shell32.lib propsys.lib ole32.lib uuid.lib`;
-  const built = await exec(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', command], {
-    windowsHide: true, windowsVerbatimArguments: true, cwd: destination, env: { ...process.env, VSLANG: '1033' },
+  const built = await exec('cl.exe', ['/nologo', '/LD', '/std:c++17', '/W4', '/O2', '/MT', '/utf-8', '/DUNICODE', '/D_UNICODE',
+    `/I${destination}`, source, `/Fo${path.join(destination, 'VarinSetup.obj')}`, '/link', `/OUT:${output}`, `/DEF:${definitions}`,
+    'user32.lib', 'gdi32.lib', 'comctl32.lib', 'uxtheme.lib', 'dwmapi.lib', 'gdiplus.lib', 'shell32.lib', 'propsys.lib', 'ole32.lib', 'uuid.lib'], {
+    windowsHide: true, cwd: destination, env: { ...windowsMsvcEnvironment('x86'), VSLANG: '1033' },
   });
   if (built.stderr.trim()) process.stderr.write(built.stderr);
   const binary = await fs.readFile(output);

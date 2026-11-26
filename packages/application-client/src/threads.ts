@@ -177,7 +177,7 @@ export interface ThreadSourcesAPI {
   /** Explicit pending source discovery before Thread creation. */
   draftFiles(options: import('./thread-source-files.js').ThreadDraftFileOptions, signal?: AbortSignal): Promise<import('./thread-source-files.js').ThreadSourceFilePage>;
   /** A draft may discover configured Hosts before a Thread exists; discovery grants no source access. */
-  list(identity: ThreadIdentity | null, signal?: AbortSignal): Promise<ThreadSourceTargets>;
+  list(identity: ThreadIdentity | null, signal?: AbortSignal, options?: { refresh?: boolean }): Promise<ThreadSourceTargets>;
   resolve(identity: ThreadIdentity, request: { resourceOwner: SourceResourceOwner; path: string }, signal?: AbortSignal): Promise<ThreadResolvedSource>;
 }
 export interface ThreadPreparedSource {

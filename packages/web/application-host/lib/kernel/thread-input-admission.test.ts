@@ -248,55 +248,66 @@ it('checks the branch revision and Host authority before consulting a live works
   expect(fallback).not.toHaveBeenCalled();
 });
 
-it('uses the saved original Host on first native admission, retains inherited/chat-only choices and never prepares a replacement registration', async () => {
+it('records a saved original Host lazily and preserves concrete, lazy and chat-only inheritance', async () => {
   const f = fixture();
   const a = { kind: 'local' as const }, b = { kind: 'managed_host' as const, hostId: 'b', connectionId: 'paired-b', endpointIdentity: 'endpoint-b' };
   const rows = [a, b].map((resourceOwner, index) => ({ kind: 'folder' as const, resourceOwner, path: '/project', workspaceId: 'same',
     id: String(index), name: index ? 'Remote project' : 'Local project' }));
-  let preferred = '1', workspaceId = 'same', principalAllowed = true, botId: string | null = null;
+  let preferred = '1', principalAllowed = true, botId: string | null = null, latest: {id:string} | null = null;
+  let prior: {selection:{source:null;lazy_work_location?:{resource_owner:typeof b;path:string;workspace_id:string}}} | null = null;
   let checkpoint: {resources: {source: ReturnType<typeof resourceSource>}} | null = null;
   const readWorkspaceSettings = vi.fn(async () => ({ projects: [], workspaceLocations: rows, defaultWorkspaceLocationId: preferred }));
-  f.runtime.thread.mockImplementation(async () => ({ thread_id: identity.threadId, branches: [{ branch_id: identity.branchId, latest_run: null }],
+  f.runtime.thread.mockImplementation(async () => ({ thread_id: identity.threadId, branches: [{ branch_id: identity.branchId, latest_run: latest }],
     principal_id: 'owner', bot_id: botId }) as never);
   const runtime = { context: async () => checkpoint,
-    launch: async () => null, sourceTools: async () => ['file_read'], principalCanUseHostResources: async () => principalAllowed,
+    launch: async () => prior, sourceTools: async () => ['file_read'], principalCanUseHostResources: async () => principalAllowed,
     organizationCreationDefaults: async () => null } as unknown as Parameters<typeof createConversationWorkLocation>[0]['agentRuntime'];
-  const resolve = vi.fn<Parameters<typeof createConversationWorkLocation>[0]['sourceDirectory']['resolve']>(async input => ({ ...input, workspaceId }));
+  const resolve = vi.fn<Parameters<typeof createConversationWorkLocation>[0]['sourceDirectory']['resolve']>(async input => ({ ...input, workspaceId:'same' }));
   const prepare = vi.fn<Parameters<typeof createConversationWorkLocation>[0]['prepare']>(async input => ({
     path: '/project', source: { resourceOwner: input.resourceOwner, workspaceId: input.workspaceId, executionWorkspaceId: input.workspaceId,
       mode: 'live_root', liveRoot: { hostId: input.resourceOwner.kind === 'local' ? 'a' : input.resourceOwner.hostId,
         rootId: 'original-root', canonicalRoot: '/project' }, tools: ['file_read'] },
   }));
+  const liveTools = ['file_read', 'process_spawn', 'process_write', 'process_resize', 'recovery_points', 'file_restore', 'code_retrieval'];
+  f.runtime.sourceTools.mockResolvedValue(liveTools);
   f.adapter.bindDefaultDeviceSource(createConversationWorkLocation({ agentRuntime: runtime, readWorkspaceSettings,
     prepare, sourceDirectory: { resolve }, botWorkingDirectory: async () => '/bots/home', servicePath: '/service' }));
   await f.adapter.submit(input);
   expect(f.runtime.submit).toHaveBeenLastCalledWith(expect.objectContaining({ launch: expect.objectContaining({
-    inheritSource: true, source: expect.objectContaining({ resourceOwner: b, workspaceId: 'same' }), enabledTools: ['file_read'],
+    inheritSource: true, source:null, lazyWorkLocation:{resourceOwner:b,path:'/project',workspaceId:'same'}, enabledTools: liveTools,
   }) }));
-  const selected = (await prepare.mock.results[0]!.value).source;
-  checkpoint = { resources: { source: resourceSource(selected) } }; preferred = '0';
+  expect(resolve).not.toHaveBeenCalled(); expect(prepare).not.toHaveBeenCalled();
+  checkpoint = {resources:{source:null}}; preferred = '0'; latest={id:'prior'};
+  prior={selection:{source:null,lazy_work_location:{resource_owner:b,path:'/project',workspace_id:'same'}}};
+  await f.adapter.submit({ ...input, key: 'lazy-successor' });
+  expect(f.runtime.submit).toHaveBeenLastCalledWith(expect.objectContaining({launch:expect.objectContaining({source:null,
+    lazyWorkLocation:{resourceOwner:b,path:'/project',workspaceId:'same'}})}));
+  const selected = {resourceOwner:b,workspaceId:'same',executionWorkspaceId:'same',mode:'live_root' as const,
+    liveRoot:{hostId:b.hostId,rootId:'original-root',canonicalRoot:'/project'},tools:['file_read']};
+  checkpoint = { resources: { source: resourceSource(selected) } };
   await f.adapter.submit({ ...input, key: 'successor' });
   expect(f.runtime.submit).toHaveBeenLastCalledWith(expect.objectContaining({ launch: expect.objectContaining({
     source: expect.objectContaining({ resourceOwner: b }),
   }) }));
-  checkpoint = { resources: { source: null } };
+  checkpoint = { resources: { source: null } }; prior={selection:{source:null}};
   await f.adapter.submit({ ...input, key: 'source-less-successor' });
   expect(f.runtime.submit).toHaveBeenLastCalledWith(expect.objectContaining({ launch: expect.objectContaining({ source: null }) }));
-  checkpoint = null;
+  checkpoint = null; latest=null; prior=null;
   await f.adapter.submit({ ...input, key: 'explicit-none', source: null });
   expect(readWorkspaceSettings).toHaveBeenCalledTimes(1);
-  expect(prepare).toHaveBeenCalledTimes(1);
+  expect(prepare).not.toHaveBeenCalled();
   principalAllowed = false;
   await f.adapter.submit({ ...input, key: 'guest' });
   expect(readWorkspaceSettings).toHaveBeenCalledTimes(1);
   principalAllowed = true; botId = 'bot';
   await f.adapter.submit({ ...input, key: 'bot-default' });
-  expect(resolve).toHaveBeenLastCalledWith({ resourceOwner: a, path: '/bots/home' }, undefined);
+  expect(f.runtime.submit).toHaveBeenLastCalledWith(expect.objectContaining({launch:expect.objectContaining({
+    source:null,lazyWorkLocation:{resourceOwner:a,path:'/bots/home'}})}));
   expect(readWorkspaceSettings).toHaveBeenCalledTimes(1);
-  botId = null; preferred = '1'; workspaceId = 'replacement';
+  botId = null; preferred = 'missing';
   const admitted = f.runtime.submit.mock.calls.length;
-  await expect(f.adapter.submit({ ...input, key: 'replaced' })).rejects.toThrow();
-  expect(resolve).toHaveBeenLastCalledWith({ resourceOwner: b, path: '/project' }, undefined);
-  expect(prepare).toHaveBeenCalledTimes(2);
+  await expect(f.adapter.submit({ ...input, key: 'removed' })).rejects.toThrow();
+  expect(resolve).not.toHaveBeenCalled();
+  expect(prepare).not.toHaveBeenCalled();
   expect(f.runtime.submit).toHaveBeenCalledTimes(admitted);
 });

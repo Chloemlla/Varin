@@ -41,6 +41,7 @@ interface LastValidCatalog {
   document: VarinExtensionCatalogDocument;
   fingerprint: string;
   storageState: "missing" | "ready";
+  text?: string;
 }
 
 interface ParsedBuiltinDefinition {
@@ -814,7 +815,11 @@ export class ExtensionCatalogStore {
 
   async #readPreservingAuthority(): Promise<CatalogReadState> {
     try {
-      const document = parseVarinExtensionCatalogDocument(JSON.parse(await readFile(this.catalogPath, "utf8")) as unknown);
+      const text = await readFile(this.catalogPath, "utf8");
+      // Byte-identical reads already passed validation. A different file still
+      // goes through the revision and fingerprint checks below.
+      if (text === this.#lastValid?.text) return this.#stateFromLastValid();
+      const document = parseVarinExtensionCatalogDocument(JSON.parse(text) as unknown);
       const nextFingerprint = fingerprint(document);
       if (this.#lastValid && document.revision < this.#lastValid.document.revision) {
         return this.#stale("catalog_revision_regressed", `Catalog revision regressed from ${this.#lastValid.document.revision} to ${document.revision}`);
@@ -826,7 +831,7 @@ export class ExtensionCatalogStore {
       ) {
         return this.#stale("catalog_revision_reused", `Catalog content changed without advancing revision ${document.revision}`);
       }
-      this.#lastValid = { document: cloneDocument(document), fingerprint: nextFingerprint, storageState: "ready" };
+      this.#lastValid = { document, fingerprint: nextFingerprint, storageState: "ready", text };
       return this.#stateFromLastValid();
     } catch (error) {
       if (errorCode(error) === "ENOENT") {

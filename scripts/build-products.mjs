@@ -78,7 +78,7 @@ export async function prepareHost(platform = process.env.VARIN_TARGET_PLATFORM |
   const result = await cache.task(`host-${platform}-${arch}`, {
     inputs: [...sharedInputs, 'packages/web/application-host', 'packages/web/scripts', 'packages/web/tsconfig.application-host.json',
       'packages/computer-driver', 'packages/browser-connector/extension', 'scripts/host-production-boundary.mjs', 'scripts/refresh-grammar-manifest.mjs',
-      ...(windowsBuild?.windowsHelperInputs ?? [])],
+      'scripts/prepare-trivium-migrator.mjs', 'scripts/trivium-release.json', ...(windowsBuild?.windowsHelperInputs ?? [])],
     values: { ...environment, platform, arch, runtime: runtime.digest, computerBuild: computerBuild?.buildId ?? null }, outputs: [directory],
     build() { runBuild('packages/web/scripts/build-application-host.mjs', ['--output', directory], { VARIN_TARGET_PLATFORM: platform, VARIN_TARGET_ARCH: arch }); },
   });
@@ -93,7 +93,8 @@ export async function prepareKernel(platform = process.env.VARIN_TARGET_PLATFORM
   const prebuilt = process.env.VARIN_KERNEL_PREBUILT;
   if (prebuilt && process.env.VARIN_RELEASE_SOURCE_SHA) throw new Error('Release builds import a verified VARIN_KERNEL_ARTIFACT rather than an unproven prebuilt binary');
   const spec = {
-    inputs: ['kernel', 'scripts/build-kernel.mjs', 'scripts/kernel-binary-identity.cjs', 'scripts/build-products.mjs', 'scripts/build-cache.mjs', 'packages/workspace-driver/macos'],
+    inputs: ['kernel', 'scripts/build-kernel.mjs', 'scripts/kernel-binary-identity.cjs', 'scripts/build-products.mjs', 'scripts/build-cache.mjs', 'packages/workspace-driver/macos',
+      ...(platform === 'win32' ? ['scripts/windows-msvc.cjs'] : [])],
     values: { platform, arch, toolchain: await fs.readFile(path.join(repository, 'kernel/rust-toolchain.toml'), 'utf8'),
       overrideToolchain: process.env.RUSTUP_TOOLCHAIN ?? '', targetTriple: process.env.VARIN_TARGET_TRIPLE ?? '',
       buildIdentity: process.env.VARIN_KERNEL_BUILD_IDENTITY || JSON.parse(await fs.readFile(path.join(repository, 'package.json'), 'utf8')).version,

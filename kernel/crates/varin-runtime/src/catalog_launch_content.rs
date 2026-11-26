@@ -31,6 +31,8 @@ pub struct LaunchSelectionMetadata {
     pub tool_schema_generation: u64,
     pub policy: PolicyIdentity,
     pub source: Option<SourceSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lazy_work_location: Option<launches::LazyWorkLocation>,
     pub tools_ref: Value,
     pub base_tools_ref: Value,
     pub mcp_binding_ref: Option<Value>,
@@ -154,6 +156,7 @@ impl LaunchSelectionMetadata {
             tool_schema_generation: selection.tool_schema_generation,
             policy: selection.policy,
             source: selection.source,
+            lazy_work_location: selection.lazy_work_location,
             tools_ref,
             base_tools_ref,
             mcp_binding_ref,
@@ -206,6 +209,7 @@ impl LaunchSelectionMetadata {
             tool_schema_generation: self.tool_schema_generation,
             policy: self.policy,
             source: self.source,
+            lazy_work_location: self.lazy_work_location,
         };
         Ok(selection)
     }
@@ -346,6 +350,10 @@ impl ChildLaunchPreparation {
         names.sort();
         if names != self.selected.profile.tools
             || self.child.agent != self.selected.agent
+            || self.child.lazy_work_location != self.selected.lazy_work_location
+            || self.child.lazy_work_location.as_ref().is_some_and(|location| {
+                self.child.source.is_some() || self.read.metadata.selection.lazy_work_location.as_ref() != Some(location)
+            })
             || self.child.connection_identity != self.selected.model.connection_identity()?
             || self.child.credential_scope != self.selected.model.credential_scope
             || self.child.model != self.selected.model.configuration.model

@@ -50,7 +50,7 @@ export async function prepareDesktopProduct({ platform, architecture, role = 'fu
   await cache.task(`desktop-runtime-${target}`, {
     inputs: ['package.json', 'bun.lock', 'bun-patches', 'packages/electron/package.json', 'packages/electron/bootstrap.mjs',
       'packages/electron/scripts/stage-runtime.mjs', 'packages/electron/scripts/node-module-file-policy.cjs',
-      'packages/electron/scripts/prepare-trivium-runtime.mjs', 'packages/electron/scripts/patch-trivium-arm64-loader.mjs'],
+      'packages/electron/scripts/prepare-trivium-runtime.mjs'],
     values: { role, platform, architecture, host: host?.digest, bundle: bundle.digest, runtime: runtime.digest }, outputs: [directory],
     build() { return stageRuntime({ repository, destination: directory, bundleDirectory, hostDirectory: host?.directory, platform, architecture, role }); },
   });

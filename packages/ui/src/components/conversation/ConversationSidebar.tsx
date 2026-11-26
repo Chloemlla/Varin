@@ -715,10 +715,8 @@ export const ConversationSidebar: React.FC<ConversationSessionSidebarProps> = ({
   }, [mobileVariant, onRequestClose, setArchivePageOpen, setSessionSwitcherOpen]);
 
   const handleOpenSettings = React.useCallback((event: React.MouseEvent<HTMLButtonElement>) => {
-    if (mobileVariant) setSessionSwitcherOpen(false);
-    onRequestClose?.();
     setSettingsDialogOpen(true, activationPoint(event));
-  }, [mobileVariant, onRequestClose, setSessionSwitcherOpen, setSettingsDialogOpen]);
+  }, [setSettingsDialogOpen]);
 
   const handleOpenShortcuts = React.useCallback((event: React.MouseEvent<HTMLButtonElement>) => {
     if (mobileVariant) setSessionSwitcherOpen(false);
@@ -1193,20 +1191,23 @@ export const ConversationSidebar: React.FC<ConversationSessionSidebarProps> = ({
           !isVisible && 'pointer-events-none',
         )}
         aria-hidden={!isVisible}
+        data-touch-directory={mobileVariant || undefined}
         onContextMenuCapture={(event) => { if (isSidebarEditor(event.target)) event.stopPropagation(); }}
         onTouchStartCapture={(event) => { if (isSidebarEditor(event.target)) event.stopPropagation(); }}
       >
-        {mobileVariant ? <div className="px-3 pt-3"><WorkbenchProfileSwitcher /></div> : null}
-        <div className="flex shrink-0 items-center gap-1 px-2.5 py-2">
+        <div className={mobileVariant ? 'mobile-directory-toolbar' : 'flex shrink-0 items-center gap-1 px-2.5 py-2'}>
+          {mobileVariant && <><WorkbenchProfileSwitcher /><span className="flex-1" /><button type="button" className="mobile-page-action" data-varin-settings-origin="open"
+            aria-label={t('sessions.sidebar.footer.actions.settings')} onClick={handleOpenSettings}><Icon name="settings-3" className="size-5" /></button></>}
           <button
             type="button"
             onClick={() => void handleCreate(null)}
-            className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md px-1.5 text-left typography-ui-label font-medium text-foreground hover:bg-interactive-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
+            aria-label={t('sessions.sidebar.header.actions.newSession')}
+            className={mobileVariant ? 'mobile-page-action' : 'flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md px-1.5 text-left typography-ui-label font-medium text-foreground hover:bg-interactive-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50'}
           >
             <Icon name="chat-new" className="size-4 shrink-0" />
-            <span className="truncate">{organizationFocus ? t('organization.newIn', { name: organizationFocus }) : t('sessions.sidebar.header.actions.newSession')}</span>
+            <span className={mobileVariant ? 'sr-only' : 'truncate'}>{organizationFocus ? t('organization.newIn', { name: organizationFocus }) : t('sessions.sidebar.header.actions.newSession')}</span>
           </button>
-          <Tooltip>
+          {!mobileVariant && <Tooltip>
             <TooltipTrigger asChild>
               <button
                 type="button"
@@ -1225,7 +1226,7 @@ export const ConversationSidebar: React.FC<ConversationSessionSidebarProps> = ({
               </button>
             </TooltipTrigger>
             <TooltipContent side="bottom">{t('sessions.sidebar.header.actions.searchSessions')}</TooltipContent>
-          </Tooltip>
+          </Tooltip>}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <button
@@ -1316,9 +1317,9 @@ export const ConversationSidebar: React.FC<ConversationSessionSidebarProps> = ({
           </button>
         </div>}
 
-        {searchOpen ? (
+        {mobileVariant || searchOpen ? (
           <div className="shrink-0 px-2.5 pb-2 pt-0.5">
-            <div className="mb-1 flex items-center justify-between px-0.5 typography-micro text-muted-foreground/80">
+            <div hidden={mobileVariant} className="mb-1 flex items-center justify-between px-0.5 typography-micro text-muted-foreground/80">
               {query && !apis.conversationOrganization ? (
               <span>{visibleCount === 1
                   ? t('sessions.sidebar.header.search.matchCountSingle', { count: visibleCount })
@@ -1330,6 +1331,7 @@ export const ConversationSidebar: React.FC<ConversationSessionSidebarProps> = ({
               <Icon name="search" className="pointer-events-none absolute left-2 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
               <Input
                 ref={searchInputRef}
+                type="search"
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
                 onKeyDown={(event) => {
@@ -1346,6 +1348,7 @@ export const ConversationSidebar: React.FC<ConversationSessionSidebarProps> = ({
               <button
                 type="button"
                 onClick={query ? () => setQuery('') : closeSearch}
+                hidden={mobileVariant && !query}
                 className="absolute right-1 top-1/2 flex size-6 -translate-y-1/2 items-center justify-center rounded-md text-muted-foreground hover:bg-interactive-hover/60 hover:text-foreground"
                 aria-label={query
                   ? t('sessions.sidebar.header.search.clear')

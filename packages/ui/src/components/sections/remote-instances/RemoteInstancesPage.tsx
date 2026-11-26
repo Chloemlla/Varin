@@ -284,6 +284,43 @@ const isLoopbackUrl = (value: string): boolean => {
   }
 };
 
+type PairingTransportOptions = {
+  localUrl: string | null;
+  lanUrl: string | null;
+  relayAvailable: boolean;
+  // The legacy pairing fallback may use the current origin, including a tunnel.
+  lanReportedByHost?: boolean;
+};
+
+function PairingCopyRow({ value, copyLabel, label }: { value: string; copyLabel: string; label?: string }) {
+  const { t } = useI18n();
+  const labelId = React.useId();
+  const [copied, setCopied] = React.useState(false);
+  const resetTimer = React.useRef<number | undefined>(undefined);
+  React.useEffect(() => () => window.clearTimeout(resetTimer.current), []);
+
+  const copy = async () => {
+    const result = await copyTextToClipboard(value);
+    if (!result.ok) return;
+    setCopied(true);
+    window.clearTimeout(resetTimer.current);
+    resetTimer.current = window.setTimeout(() => setCopied(false), 2000);
+  };
+
+  return (
+    <div className="flex items-center gap-2 rounded-md border border-[var(--interactive-border)] p-2">
+      <div className="flex min-w-0 flex-1 flex-col sm:flex-row sm:items-baseline sm:gap-2">
+        {label ? <span id={labelId} className="typography-meta shrink-0 text-foreground">{label}</span> : null}
+        <code className="min-w-0 truncate typography-code text-muted-foreground" title={label ? value : undefined}>{value}</code>
+      </div>
+      <Button type="button" variant="outline" size="xs" className="!font-normal shrink-0" aria-describedby={label ? labelId : undefined} onClick={() => void copy()}>
+        <Icon name={copied ? 'check' : 'file-copy'} className={cn('h-3.5 w-3.5', copied && 'text-[var(--status-success)]')} />
+        {copied ? t('settings.remoteInstances.clientAuth.actions.copied') : copyLabel}
+      </Button>
+    </div>
+  );
+}
+
 const resolvePairingServerUrl = async (): Promise<string> => {
   const fallback = normalizeHostUrl(getRuntimeApiBaseUrl()) || window.location.origin;
   if (!isDesktopShell() || !isDesktopLocalOriginActive()) {
@@ -479,7 +516,6 @@ const RemoteInstancesContent: React.FC<RemoteInstancesPageProps> = ({ view = 'ho
   // once the device redeems it (the pairing leaves the pending list).
   const [createdPairingId, setCreatedPairingId] = React.useState<string | null>(null);
   const [pairingQrDataUrl, setPairingQrDataUrl] = React.useState<string | null>(null);
-  const [pairingCopied, setPairingCopied] = React.useState(false);
   // "Add a device" dialog: a configure phase (name + transport + fallback) then a
   // result phase (QR + link). The QR only ever shows inside this dialog.
   const [addDeviceOpen, setAddDeviceOpen] = React.useState(false);
@@ -487,7 +523,7 @@ const RemoteInstancesContent: React.FC<RemoteInstancesPageProps> = ({ view = 'ho
   const [addDeviceCreating, setAddDeviceCreating] = React.useState(false);
   const [addDeviceTransport, setAddDeviceTransport] = React.useState<'local' | 'lan' | 'relay'>('relay');
   const [addDeviceFallback, setAddDeviceFallback] = React.useState(true);
-  const [transportOptions, setTransportOptions] = React.useState<{ localUrl: string | null; lanUrl: string | null; relayAvailable: boolean } | null>(null);
+  const [transportOptions, setTransportOptions] = React.useState<PairingTransportOptions | null>(null);
   const revokedClientCount = React.useMemo(() => remoteClients.filter((client) => Boolean(client.revokedAt)).length, [remoteClients]);
   const [sshAddDialogOpen, setSshAddDialogOpen] = React.useState(false);
   const [sshCommandDraft, setSshCommandDraft] = React.useState('ssh user@example.com');
@@ -766,11 +802,11 @@ const RemoteInstancesContent: React.FC<RemoteInstancesPageProps> = ({ view = 'ho
   // for LAN reachability (derived from its bind, not the UI origin), so "Local
   // network" works even when the UI is opened on localhost. Falls back to the
   // client-side guess if the endpoint is unavailable.
-  const resolveTransportOptions = React.useCallback(async (): Promise<{ localUrl: string | null; lanUrl: string | null; relayAvailable: boolean }> => {
+  const resolveTransportOptions = React.useCallback(async (): Promise<PairingTransportOptions> => {
     if (clientAuth?.getPairingTransports) {
       try {
         const transports = await clientAuth.getPairingTransports();
-        return { localUrl: transports.local, lanUrl: transports.lan, relayAvailable: transports.relayAvailable };
+        return { localUrl: transports.local, lanUrl: transports.lan, relayAvailable: transports.relayAvailable, lanReportedByHost: true };
       } catch {
         // fall through to the client-side guess
       }
@@ -792,8 +828,8 @@ const RemoteInstancesContent: React.FC<RemoteInstancesPageProps> = ({ view = 'ho
     setRemoteClientError(null);
     setPairingUrl(null);
     setPairingQrDataUrl(null);
-    setPairingCopied(false);
     setCreatedPairingId(null);
+    setTransportOptions(null);
     setAddDevicePhase('configure');
     setAddDeviceFallback(true);
     setAddDeviceOpen(true);
@@ -853,7 +889,6 @@ const RemoteInstancesContent: React.FC<RemoteInstancesPageProps> = ({ view = 'ho
       // Pairing payloads are dense (multiple transport candidates + the relay
       // E2EE key), so render at high resolution with low error-correction.
       setPairingQrDataUrl(await QRCode.toDataURL(encoded, { width: 1024, margin: 2, errorCorrectionLevel: 'L' }));
-      setPairingCopied(false);
       pairingSeenPendingRef.current = false;
       setCreatedPairingId(pairing.id);
       setAddDevicePhase('result');
@@ -866,15 +901,6 @@ const RemoteInstancesContent: React.FC<RemoteInstancesPageProps> = ({ view = 'ho
       setAddDeviceCreating(false);
     }
   }, [clientAuth, transportOptions, addDeviceTransport, addDeviceFallback, remoteClientLabel, loadRemoteClients]);
-
-  const handleCopyPairing = React.useCallback(() => {
-    if (!pairingUrl) return;
-    void copyTextToClipboard(pairingUrl).then((result) => {
-      if (!result.ok) return;
-      setPairingCopied(true);
-      window.setTimeout(() => setPairingCopied(false), 2000);
-    });
-  }, [pairingUrl]);
 
   const revokeRemoteClient = React.useCallback(async (client: RemoteClientRecord) => {
     if (!clientAuth) return;
@@ -1675,13 +1701,14 @@ const RemoteInstancesContent: React.FC<RemoteInstancesPageProps> = ({ view = 'ho
                   </div>
                 ) : null}
                 {pairingUrl ? (
-                  <div className="flex items-center gap-2 rounded-md border border-[var(--interactive-border)] p-2">
-                    <code className="min-w-0 flex-1 truncate typography-code text-muted-foreground">{pairingUrl}</code>
-                    <Button type="button" variant="outline" size="xs" className="!font-normal shrink-0" onClick={handleCopyPairing}>
-                      <Icon name={pairingCopied ? 'check' : 'file-copy'} className={cn('h-3.5 w-3.5', pairingCopied && 'text-[var(--status-success)]')} />
-                      {pairingCopied ? t('settings.remoteInstances.clientAuth.actions.copied') : t('settings.common.actions.copyAll')}
-                    </Button>
-                  </div>
+                  <PairingCopyRow value={pairingUrl} copyLabel={t('settings.common.actions.copyAll')} />
+                ) : null}
+                {transportOptions?.lanReportedByHost && transportOptions.lanUrl ? (
+                  <PairingCopyRow
+                    value={transportOptions.lanUrl}
+                    label={t('settings.remoteInstances.clientAuth.field.lanAddress')}
+                    copyLabel={t('settings.remoteInstances.clientAuth.actions.copyAddress')}
+                  />
                 ) : null}
                 <div className="flex justify-end">
                   <Button type="button" size="xs" className="!font-normal" onClick={() => setAddDeviceOpen(false)}>{t('settings.remoteInstances.clientAuth.addDevice.done')}</Button>
