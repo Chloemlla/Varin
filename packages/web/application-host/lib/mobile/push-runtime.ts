@@ -1,6 +1,7 @@
 const EXPO_PUSH_ENDPOINT = 'https://exp.host/--/api/v2/push/send';
 
 import type { MobileDeviceStore } from './device-store.js';
+import { hostEnvironment } from '../security/host-environment.js';
 
 const normalizeString = (value: unknown): string => (typeof value === 'string' ? value.trim() : '');
 
@@ -38,7 +39,7 @@ export const createMobilePushRuntime = (deps: MobilePushDependencies) => {
     fetchImpl = fetch,
     deviceStore,
     expoPushEndpoint = EXPO_PUSH_ENDPOINT,
-    expoAccessToken = process.env.EXPO_ACCESS_TOKEN || process.env.VARIN_EXPO_ACCESS_TOKEN || '',
+    expoAccessToken = hostEnvironment.read('EXPO_ACCESS_TOKEN') || hostEnvironment.read('VARIN_EXPO_ACCESS_TOKEN') || '',
   } = deps;
 
   const sendExpoMessages = async (messages: ExpoMessage[]): Promise<{ failed: number; sent: number }> => {

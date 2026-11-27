@@ -39,6 +39,29 @@ test('offline catalogs populate mixed protocol services while initial settings r
   expect(command.models.find(model => model.id === 'claude-sonnet-5-5')?.protocol).toBe('anthropic-messages');
 });
 
+test('operator directory snapshots replace public metadata without refreshing or rewriting personal caches', async () => {
+  const personal = await fixture();
+  const cachePath = join(personal.directory, 'model-directory.json');
+  const snapshot = (id: string) => ({ version: 1, sources: { [CHANNEL_DIRECTORY_URL]: {
+    checkedAt: 1, body: { version: 1, channels: [
+      { id, name: 'Fixture Vendor', kind: 'model-vendor', protocol: 'openai-completions', baseUrl: 'https://fixture.test/v1' },
+    ] },
+  } } });
+  const original = JSON.stringify(snapshot('personal-vendor'));
+  await writeFile(cachePath, original);
+  const models = new ModelsService(personal.directory, { projectTrusted: () => false, directorySnapshot: snapshot('operator-vendor') });
+  let requests = 0;
+  const stop = models.startDirectory(async () => { requests += 1; throw new Error('Unexpected refresh'); });
+  try {
+    const configuration = await models.read();
+    expect(configuration.types.map(type => type.id)).toContain('operator-vendor');
+    expect(configuration.types.map(type => type.id)).not.toContain('personal-vendor');
+    await models.modelDirectory.refresh(true);
+    expect(requests).toBe(0);
+    expect(await readFile(cachePath, 'utf8')).toBe(original);
+  } finally { stop(); }
+});
+
 test('Magpie can discover and save models with a cached directory that predates it', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'varin-directory-')); directories.push(directory);
   const dependencies = { projectTrusted: () => false, fetch: unexpected };

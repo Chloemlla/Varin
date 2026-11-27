@@ -33,7 +33,8 @@ export function createOfficeRenderer(options: { spawn: ManagedSpawn; temporaryRo
         formats: { docx: { read: true, create: true, editText: true, preserveOtherParts: true },
           xlsx: { read: true, create: true, editCells: true, preserveOtherParts: true, recalculate: !!command },
           pptx: { read: true, create: true, editTextAndGeometry: true, preserveOtherParts: true } },
-        javascript: { modules: Object.fromEntries(['docx', 'exceljs', 'pptxgenjs', 'adm-zip'].map(name => [name, require.resolve(name)])),
+        javascript: { modules: { docx: require.resolve('docx'), exceljs: require.resolve('exceljs'),
+          pptxgenjs: require.resolve('pptxgenjs'), 'adm-zip': require.resolve('adm-zip') },
           usage: 'These are reusable module entry paths on this Host. In a JavaScript environment on this Host, load them with createRequire from node:module. File source and process permissions still belong to the selected task.' },
         rendering: command ? { available: true, engine: 'LibreOffice', command }
           : { available: false, engine: 'LibreOffice', reason: 'LibreOffice was not found on this Host. Configure its executable or use a connected desktop with computer_office. Structure reading, creation and local edits are available.' },

@@ -70,6 +70,8 @@ export interface ThreadResourceScopeOwners {
     withLiveSourceRead<T>(source: Extract<ThreadSource, { mode: 'live_root'|'native_workspace' }>, consume: (store: WorkingStateRootStore) => Promise<T>, signal?: AbortSignal): Promise<T>;
   };
   dataDirectory: string;
+  /** Standalone resource nodes serve the admitted project, without machine-local Agent resources. */
+  projectOnly?: boolean;
   homeDir?: string;
   documents: Pick<DocumentAuthority, 'inspectWorkspace' | 'readSnapshot' | 'admitWorkspaceRegistration'> & Partial<Pick<DocumentAuthority, 'readSnapshots' | 'resolveWorkspace' | 'resolveTextEncodingPolicy'>>;
   workingStates: WorkspaceWorkingStateRootAccess;
@@ -361,6 +363,7 @@ export function createThreadResourceScope(owners: ThreadResourceScopeOwners): Th
         // All roles in this view share the recorder, including validation of configured resources.
         return { target: { kind: 'source', directory: relative }, reader: observed.reader, directory: relative, root };
       }
+      if (owners.projectOnly) throw new ResourceScopeError(resourceFailure(source, '', 'denied', 'Resource path is outside the admitted project'));
       let captured = captures.get(domainRoot);
       if (!captured) {
         captured = recordReader(await resourceAssetReader(domainRoot, domainId('source-dependency', domainRoot), `source-capsule:${randomUUID()}`,
@@ -386,6 +389,7 @@ export function createThreadResourceScope(owners: ThreadResourceScopeOwners): Th
         const actual = await canonicalizePathIdentity(path.join(root, prefix), { allowMissing: true });
         if (!isPathWithinRoot(actual, mapped?.[1].root ?? root)) { alias = prefix; break; }
       }
+      if (owners.projectOnly) throw new ResourceScopeError(resourceFailure(source, relative, 'denied', 'Resource link is outside the admitted project'));
       const admitted = await captureDomain(await canonicalizePathIdentity(path.join(root, alias), { allowMissing: true }));
       sourceLinks.set(alias, admitted);
       return { ...admitted, path: normalize(path.posix.join(admitted.directory, relative.slice(alias.length).replace(/^\//, ''))) };
@@ -446,10 +450,10 @@ export function createThreadResourceScope(owners: ThreadResourceScopeOwners): Th
     for (let current = root; ; current = path.dirname(current)) {
       try { await lstat(path.join(current, '.git')); nearestGit = current; break; }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-      if (path.dirname(current) === current) break;
+      if (owners.projectOnly || path.dirname(current) === current) break;
     }
     const ancestorRoots: string[] = [];
-    for (let current = path.dirname(root); current !== root; current = path.dirname(current)) {
+    for (let current = path.dirname(root); !owners.projectOnly && current !== root; current = path.dirname(current)) {
       ancestorRoots.unshift(current); if (path.dirname(current) === current) break;
     }
     for (const ancestor of ancestorRoots) {
@@ -507,7 +511,7 @@ export function createThreadResourceScope(owners: ThreadResourceScopeOwners): Th
       }
     }
     if (metadataOnly) {
-      await addUser(scope, { ...(signal ? { signal } : {}) });
+      if (!owners.projectOnly) await addUser(scope, { ...(signal ? { signal } : {}) });
       const result = await authority.inspect(scope, signal);
       if (result.status !== 'ready') throw new ResourceScopeError(result);
       if (trusted && !await owners.projectTrusted(root)) throw new ResourceScopeError(resourceFailure(source, '', 'denied', 'Project resource trust changed during discovery'));
@@ -675,7 +679,8 @@ export function createThreadResourceScope(owners: ThreadResourceScopeOwners): Th
       ...(options.instructionDirectories ? { instructionDirectories: options.instructionDirectories } : {}),
       ...(options.supportingFiles ? { supportingFiles: options.supportingFiles } : {}) };
     const finish = async () => {
-      await addUser(scope, options); signal?.throwIfAborted();
+      if (!owners.projectOnly) await addUser(scope, options);
+      signal?.throwIfAborted();
       const result = await consume({ admittedScope: scope, readers: domainReaders(scope) });
       signal?.throwIfAborted();
       if (source?.mode === 'live_root') await owners.validateLiveSource(source, signal);

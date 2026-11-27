@@ -83,6 +83,7 @@ export const MainLayout: React.FC<MainLayoutProps> = ({ renderConversation, rend
     const setMultiRunLauncherOpen = useUIStore((state) => state.setMultiRunLauncherOpen);
     const multiRunLauncherPrefillPrompt = useUIStore((state) => state.multiRunLauncherPrefillPrompt);
     const isScheduledTasksPageOpen = useUIStore((state) => state.isScheduledTasksDialogOpen);
+    const isBotSchedulePageOpen = useUIStore((state) => state.isScheduledTasksDialogOpen && Boolean(state.scheduledTasksConversation?.botPage));
     const isArchivePageOpen = useUIStore((state) => state.isArchivePageOpen);
     const worktreesPageProjectId = useUIStore((state) => state.worktreesPageProjectId);
     // Any full-page surface replacing the chat area. While open, the chat and
@@ -155,9 +156,8 @@ export const MainLayout: React.FC<MainLayoutProps> = ({ renderConversation, rend
     }, [activeMainTab, isMobile]);
 
     const isChatActive = activeMainTab === 'chat';
-    // Desktop settings is an overlay: keep the conversation and editor alive
-    // underneath it. Mobile settings replaces the page and can suspend it.
-    const conversationActive = shellActive && isChatActive && !isSurfacePageOpen;
+    // Bot schedules temporarily cover the active conversation without replacing its timeline or draft.
+    const conversationActive = shellActive && isChatActive && (!isSurfacePageOpen || isBotSchedulePageOpen);
     const conversation = renderConversation
         ? renderConversation(conversationActive)
         : <RegularChatView active={conversationActive} />;

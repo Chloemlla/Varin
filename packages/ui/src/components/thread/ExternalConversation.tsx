@@ -1,3 +1,4 @@
+import { retainParkingObservations } from '@varin/application-client';
 import { prepareQuotedFiles } from '@/lib/agent-runtime/quoteAttachments';
 import { ChatUserReferences } from '@/components/conversation/ChatUserReferences';
 import { freezeDraftContentReferences, acknowledgeDraftMarkers, insertDraftMarker, draftAttachmentImageReferences } from '@/lib/agent-editor/contentReferences';
@@ -691,6 +692,8 @@ function ExternalConversationSession({ id, host, readOnly, turnId }: { id: strin
   const recentItems = snapshot?.items;
   const messages = React.useMemo(() => [...new Map([...earlier, ...(recentItems ?? [])].map(item => [item.id, item])).values()]
     .filter(item => !turnId || item.turnId === turnId || item.turnId === consumedTurnId), [earlier, recentItems, turnId, consumedTurnId]);
+  const keepLive = !turnId && Boolean(snapshot?.conversation.activeTurn);
+  React.useEffect(() => keepLive ? retainParkingObservations(host) : undefined, [host, keepLive]);
   if (!snapshot)
     return (
       <p role="status" className="p-6 text-muted-foreground">

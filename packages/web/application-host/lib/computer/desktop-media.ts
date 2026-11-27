@@ -17,6 +17,7 @@ export function attachDesktopMedia(options: {
   const server = new WebSocketServer({ noServer: true, maxPayload: 0, perMessageDeflate: false });
   const streams = new Set<Duplex>();
   let stopped = false;
+  let opening = 0;
   const refuseDraining = (socket: Duplex): boolean => {
     if (!stopped && !options.isDraining?.()) return false;
     socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
@@ -27,28 +28,47 @@ export function attachDesktopMedia(options: {
     const match = /^\/api\/computers\/desktops\/([^/]+)\/vnc$/u.exec(pathname);
     if (!match) return;
     if (refuseDraining(socket)) return;
+    opening++;
+    const connection = new AbortController();
+    const disconnected = () => connection.abort();
+    socket.once('close', disconnected);
+    let release: (() => void) | undefined;
+    let connected = false;
     void (async () => {
       const expected = request.headers['x-varin-computer-host'];
       if ((expected && expected !== options.hostId) || !await options.authenticate(request) || !await options.originAllowed(request)) {
         socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n'); return;
       }
       if (refuseDraining(socket)) return;
-      const target = await options.computers.mediaTarget(decodeURIComponent(match[1]!));
+      const target = await options.computers.mediaTarget(decodeURIComponent(match[1]!), connection.signal);
+      if ('url' in target) release = target.release;
       if (socket.destroyed || refuseDraining(socket)) return;
       server.handleUpgrade(request, socket, head, (viewer) => {
         const downstream = createWebSocketStream(viewer);
         const upstream = 'socketPath' in target ? connect(target.socketPath)
           : createWebSocketStream(new WebSocket(target.url, { headers: target.headers, maxPayload: 0, perMessageDeflate: false }));
         streams.add(downstream); streams.add(upstream);
-        const close = () => { downstream.destroy(); upstream.destroy(); streams.delete(downstream); streams.delete(upstream); };
+        connected = true;
+        const close = () => {
+          downstream.destroy(); upstream.destroy();
+          streams.delete(downstream); streams.delete(upstream);
+          release?.(); release = undefined;
+        };
         downstream.on('error', close); upstream.on('error', close);
         downstream.on('close', close); upstream.on('close', close);
         downstream.pipe(upstream).pipe(downstream);
       });
     })().catch(() => {
       if (!socket.destroyed) socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
+    }).finally(() => {
+      opening--;
+      socket.off('close', disconnected);
+      if (!connected) release?.();
     });
   };
   options.server.on('upgrade', upgrade);
-  return { stop() { stopped = true; options.server.off('upgrade', upgrade); for (const stream of streams) stream.destroy(); streams.clear(); server.close(); } };
+  return {
+    busy: () => opening > 0 || streams.size > 0,
+    stop() { stopped = true; options.server.off('upgrade', upgrade); for (const stream of streams) stream.destroy(); streams.clear(); server.close(); },
+  };
 }

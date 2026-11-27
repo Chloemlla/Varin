@@ -5,6 +5,7 @@ import { SemanticInferenceError, type SemanticInference } from '../semantic/runt
 import { HarnessInferenceSettingsValidationError, parseHarnessEmbeddingSettings } from '@varin/protocol';
 import type { SemanticEmbedder } from '../semantic/embedder.js';
 import { captureKnowledgeLocalLease } from './local-lease.js';
+import { DeploymentPolicyDeniedError } from '../../deployment/policy.js';
 
 /** Knowledge embeddings have no workspace inventory, code index or language-service owner. */
 export function createKnowledgeEmbeddingOwner(kernel: Pick<KernelClient, 'agentRuntimeRequest'>, inference: SemanticInference, local?: { resolve(): SemanticEmbedder; close(): Promise<void> }) {
@@ -34,6 +35,7 @@ export function createKnowledgeEmbeddingOwner(kernel: Pick<KernelClient, 'agentR
         try { return { status: 'ready', embedder: await owned.resolve(scopeId, lease) }; }
         finally { lease.release(); }
       } catch (error) {
+        if (error instanceof DeploymentPolicyDeniedError) return { status: 'unavailable', message: error.message };
         if (error instanceof HarnessInferenceSettingsValidationError) return { status: 'invalid', message: error.message };
         if (error instanceof SemanticInferenceError) {
           return error.status === 'unconfigured' ? { status: 'unconfigured' }

@@ -10,7 +10,8 @@ function fixture() {
     children: vi.fn(async () => children), childPrincipal: vi.fn(async (child: typeof children[number]) => child.parent_run_id === 'mine-run' ? 'alice' : 'bob'),
     childPresentation: vi.fn(async () => ({ name: 'Own pending delegate' })), read: vi.fn(async (id: string) => ({ id })),
     update: vi.fn(async () => ({ deleted: true })), send: vi.fn(), connect: vi.fn(), uploadAttachment: vi.fn(), readAttachment: vi.fn(),
-    subscribe: vi.fn(() => () => {}), settings: vi.fn(async () => ({ agents: [] })), create: vi.fn(async () => ({ id: 'created' })) };
+    subscribe: vi.fn(() => () => {}), settings: vi.fn(async () => ({ agents: [] })), defaultResourceOwner: vi.fn(async () => undefined),
+    create: vi.fn(async () => ({ id: 'created' })) };
   const router = Router();
   registerExternalAgentRoutes(router as unknown as Express, service as unknown as ExternalAgentsService, (_req, _res, next) => next(), async req => ({ principalId: req.headers['x-user'] ?? null }));
   const call = (action: string, body: unknown = {}, user: string | null = 'alice', method = 'POST') => new Promise<{ status: number; body: unknown }>((resolve, reject) => {

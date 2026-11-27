@@ -47,8 +47,10 @@ export interface BotReturnPoint {
   session: BotReadyEntry;
   sessionTitle: string;
   workThreadId: string;
+  workBranchId?: string;
+  draftKey?: string;
   /** The panel row the user left from, lit again on return. */
-  focus?: { tab: 'overview' | 'activity' | 'memory' | 'schedule'; id: string };
+  focus?: { tab: 'overview' | 'activity' | 'memory' | 'schedule'; id: string; occurrenceId?: string };
 }
 /** `returned` is the point the user just came back through, until the Bot shell has shown it. */
 export const useBotReturn = create<{ point: BotReturnPoint | null; returned: BotReturnPoint | null }>(() => ({ point: null, returned: null }));

@@ -80,13 +80,15 @@ jobs:
           bun run update:resource-node-lock
           node scripts/build-resource-node.mjs --update-lock-only --role browser
           node scripts/build-resource-node.mjs --update-lock-only --role computer
+          node scripts/build-resource-node.mjs --update-lock-only --role extensions
 
       - name: Commit the refreshed lockfile
         env:
           PR: ${{ inputs.pull-request }}
         run: |
           set -euo pipefail
-          if git diff --quiet -- scripts/cloud-runtime.bun.lock scripts/resource-node.bun.lock scripts/browser-node.bun.lock scripts/computer-node.bun.lock; then
+          locks=(scripts/cloud-runtime.bun.lock scripts/{resource,browser,computer,extension}-node.bun.lock)
+          if git diff --quiet -- "${locks[@]}"; then
             echo "No cloud runtime lockfile change; nothing to push."
             exit 0
           fi
@@ -97,22 +99,21 @@ jobs:
           # declared `bin` entries, which shows up as a change with no added or removed lines and is
           # never a reason to stop a lockfile refresh. `--numstat` reports `-` for binary files, so
           # those still count as changed.
-          unexpected=$(
-            git diff --numstat -- . ':!scripts/cloud-runtime.bun.lock' ':!scripts/resource-node.bun.lock' ':!scripts/browser-node.bun.lock' ':!scripts/computer-node.bun.lock' \
-              | awk '$1 != "0" || $2 != "0" { print $3 }'
-          )
+          excluded=()
+          for lock in "${locks[@]}"; do excluded+=(":!$lock"); done
+          unexpected=$(git diff --numstat -- . "${excluded[@]}" | awk '$1 != "0" || $2 != "0" { print $3 }')
           if [ -n "$unexpected" ]; then
             echo "::error::Unexpected changes outside the cloud runtime lockfile:"
             echo "$unexpected"
             echo "--- diff ---"
-            git diff --stat -- . ':!scripts/cloud-runtime.bun.lock' ':!scripts/resource-node.bun.lock' ':!scripts/browser-node.bun.lock' ':!scripts/computer-node.bun.lock'
-            git diff -- . ':!scripts/cloud-runtime.bun.lock' ':!scripts/resource-node.bun.lock' ':!scripts/browser-node.bun.lock' ':!scripts/computer-node.bun.lock' | head -80
+            git diff --stat -- . "${excluded[@]}"
+            git diff -- . "${excluded[@]}" | head -80
             exit 1
           fi
 
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add scripts/cloud-runtime.bun.lock scripts/resource-node.bun.lock scripts/browser-node.bun.lock scripts/computer-node.bun.lock
+          git add -- "${locks[@]}"
           git commit \
             -m 'build(deps): refresh cloud runtime lockfile' \
             -m 'The cloud runtime workspace keeps its own lockfile and CI verifies it frozen, so it has to move with the dependency bump in this pull request.'

@@ -7,10 +7,11 @@ import type { ComputerCatalog } from '@/lib/computers';
 
 const fixture = vi.hoisted(() => ({ generation: 1, listeners: new Set<() => void>(), sources: vi.fn(), computers: vi.fn(),
   selected: {} as { identity: ThreadIdentity | null; snapshot?: ThreadSnapshot; error?: string },
-  browsers: vi.fn(),
+  browsers: vi.fn(), policy: null as unknown,
   translate: (key: string) => key,
 }));
 vi.mock('@varin/application-client', () => ({ browserResources: { configuration: fixture.browsers }, getRuntimeEndpointGeneration: () => fixture.generation, getRuntimeApiBaseUrl: () => 'https://host.example',
+  runtimeFetch: async () => Response.json(fixture.policy),
   subscribeRuntimeEndpointChanged: (listener: () => void) => { fixture.listeners.add(listener); return () => fixture.listeners.delete(listener); } }));
 vi.mock('@/hooks/useRuntimeAPIs', () => { const threads = { sources: { list: fixture.sources } }; return { useRuntimeAPIs: () => ({ threads }) }; });
 vi.mock('@/hooks/useSelectedThreadSnapshot', () => ({ useSelectedThreadSnapshot: () => fixture.selected }));
@@ -36,7 +37,7 @@ const source = (mode: 'live_root' | 'materialized' | 'fixed_branch' = 'materiali
 const snapshot = (mode?: 'live_root' | 'materialized' | 'fixed_branch') => ({ launch: { selection: { source: source(mode) } } }) as ThreadSnapshot;
 const render = () => act(async () => root.render(<WorkConnectionsPage />));
 beforeEach(() => {
-  vi.clearAllMocks(); fixture.generation += 1;
+  vi.clearAllMocks(); fixture.generation += 1; fixture.policy = null;
   fixture.selected = { identity: { runtime: 'agent', threadId: 'thread', branchId: 'branch' } };
   fixture.sources.mockResolvedValue({ targets: [], unavailable: [] } satisfies ThreadSourceTargets);
   fixture.computers.mockResolvedValue({ machines: [], desktops: [], defaultDesktopId: null } satisfies ComputerCatalog);
@@ -85,4 +86,12 @@ it('fences late resource discovery when the endpoint generation changes even wit
   await act(async () => finishOld({ machines: [], desktops: [], defaultDesktopId: 'old-default' }));
   expect(card('settings.connections.computerDefault').textContent).toContain('settings.connections.automaticDesktop');
   expect(card('settings.connections.computerDefault').textContent).not.toContain('settings.connections.resourceUnavailable');
+});
+
+it('keeps provider resource inventory visible when adding static devices is disabled', async () => {
+  fixture.policy = { ingress: { mode: 'gateway' }, connections: { staticHosts: false, ssh: false } };
+  fixture.sources.mockResolvedValue({ targets: [{ label: 'Provider workspace', resourceOwner: source().resource_owner, capabilities: ['work-location'] }], unavailable: [] });
+  await render();
+  expect(container.textContent).toContain('Provider workspace');
+  expect(container.textContent).not.toContain('bot.workspace.addDevice');
 });

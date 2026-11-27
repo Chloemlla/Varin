@@ -62,7 +62,9 @@ export function createManagedMcpInteractions(options: {
   const cleanupKey = (origin: McpInteractionOrigin, endpoint: SourceMcpHolderBinding['endpoint']) => stable([origin.operationId, origin.executionOwner, endpoint]);
   const report = (error: unknown) => options.onError?.(error instanceof Error ? error : failure('mcp_interaction_receipt_unavailable'));
   const wake = (owner: Owner) => { owner.revision++; for (const listener of [...owner.watchers]) listener(); };
-  const ownerFor = (scope: Scope): Owner => {
+  const ownerFor = ({ principal, coordinatorHostId, authorityId, resourceEpoch }: Scope): Owner => {
+    // Retain the interaction address. A live Source can also carry an opaque Kernel grant.
+    const scope: Scope = { principal, coordinatorHostId, authorityId, resourceEpoch };
     const found = owners.get(key(scope));
     if (found) return found;
     const created: Owner = { scope: structuredClone(scope), incarnation: randomUUID(), revision: 1, closed: false,

@@ -29,6 +29,21 @@ export class PluginCredentialCapability {
     this.#receivers.set(scope, { connectionId, accountId });
     return () => { this.#receivers.delete(scope); };
   }
+  /** Park grants one already-bound connection. Refresh authority stays with the Host. */
+  async captureEventReceiver(context: HostCapabilityCallContext) {
+    const selected = context.invocation && this.#receivers.get(context.invocation);
+    if (!selected) throw invalid();
+    const { connectionId, accountId } = selected;
+    const reference = `plugin:${createHash('sha256').update(context.owner.extensionId).digest('hex')}:${this.#scope(context, connectionId)}`;
+    const record = await this.credentials.read(reference);
+    context.signal.throwIfAborted();
+    if (record.account !== accountId) throw invalid();
+    const metadata = { connected: true, account: record.account, generation: record.generation, kind: record.value.kind,
+      ...(record.value.kind === 'oauth' && record.value.accountId ? { accountId: record.value.accountId } : {}) };
+    const value = { ...record.value };
+    if (value.kind === 'oauth') delete value.refreshToken;
+    return { metadata, value };
+  }
   readonly #stop = new AbortController();
   readonly #attempts = new Map<string, { scope: string; extensionId: string; cancel(): void }>();
   #unregister: (() => void) | undefined;

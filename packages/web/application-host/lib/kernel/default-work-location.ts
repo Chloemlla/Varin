@@ -46,31 +46,36 @@ async function resolveWorkLocation(location: WorkLocation, directory: Pick<Sourc
 }
 
 export function listWorkLocations(settings: { workspaceLocations?: unknown; defaultWorkspaceLocationId?: unknown },
-  projects: ProjectEntry[], servicePath: string): ThreadLocationDirectory & { projects: ThreadLocationDirectory['locations'] } {
+  projects: ProjectEntry[], servicePath: string, providerDefault?: LazyDefaultWorkLocation, managedOnly = false): ThreadLocationDirectory & { projects: ThreadLocationDirectory['locations'] } {
   const favorites = parseWorkspaceLocations(settings.workspaceLocations ?? []);
-  return { servicePath, defaultId: parseDefaultWorkspaceLocationId(settings.defaultWorkspaceLocationId ?? null),
-    projects: projects.filter(project => !favorites.some(row => row.kind === 'project' && row.projectId === project.id)).map(project => {
-      const id = `project:${project.id}`;
-      return { id, ...workspaceLocationSource({ kind: 'project', id, projectId: project.id }, projects) };
-    }),
-    locations: favorites.map(row => {
+  const defaultId = parseDefaultWorkspaceLocationId(settings.defaultWorkspaceLocationId ?? null);
+  const providerLocation = providerDefault && { id: 'deployment:workspace', name: 'Managed workspace', ...providerDefault };
+  const locations = [...(providerLocation ? [providerLocation] : []), ...favorites.map(row => {
       if (row.kind === 'project' && !projects.some(project => project.id === row.projectId)) {
         return { id: row.id, name: row.projectId, unavailable: 'Project no longer registered' };
       }
       const { name, resourceOwner, path, workspaceId, selection } = workspaceLocationSource(row, projects);
       return { id: row.id, name, resourceOwner, path, ...(workspaceId ? { workspaceId } : {}), ...(selection ? { selection } : {}) };
-    }) };
+    })].filter(location => !managedOnly || 'resourceOwner' in location && location.resourceOwner.kind === 'managed_host');
+  return { servicePath, defaultId: (managedOnly && !locations.some(location => location.id === defaultId) ? null : defaultId) ?? providerLocation?.id ?? null,
+    projects: projects.filter(project => (!managedOnly || project.source?.resourceOwner.kind === 'managed_host') && !favorites.some(row => row.kind === 'project' && row.projectId === project.id)).map(project => {
+      const id = `project:${project.id}`;
+      return { id, ...workspaceLocationSource({ kind: 'project', id, projectId: project.id }, projects) };
+    }),
+    locations };
 }
 
 /** The ordinary native input and cold work paths share this resolver. A completed
  * branch, even with no source, is not eligible for creation preferences. */
-export function createConversationWorkLocation({ agentRuntime, sourceDirectory, readWorkspaceSettings, prepare, botWorkingDirectory, servicePath }: {
+export function createConversationWorkLocation({ agentRuntime, sourceDirectory, readWorkspaceSettings, prepare, botWorkingDirectory, servicePath, providerDefault, denyLocal }: {
   agentRuntime: Pick<AgentRuntimeClient, 'context' | 'launch' | 'sourceTools' | 'principalCanUseHostResources' | 'organizationCreationDefaults'>;
   sourceDirectory: Pick<SourceDirectory, 'resolve'>;
   readWorkspaceSettings(): Promise<{ projects: ProjectEntry[]; workspaceLocations?: unknown; defaultWorkspaceLocationId?: unknown }>;
   prepare(input: ThreadPrepareSource, signal?: AbortSignal): Promise<ThreadPreparedSource>;
   botWorkingDirectory(id: string): Promise<string>;
   servicePath: string;
+  providerDefault?: LazyDefaultWorkLocation;
+  denyLocal?(): never;
 }) {
   async function creationLocation(thread: ThreadSummary, signal?: AbortSignal): Promise<WorkLocation> {
     const defaults = await agentRuntime.organizationCreationDefaults(thread.thread_id, signal);
@@ -82,11 +87,12 @@ export function createConversationWorkLocation({ agentRuntime, sourceDirectory, 
         ...(project.source ? { workspaceId: project.source.workspaceId } : {}), selection: freezeProjectSourceSelection(project) };
     }
     if (thread.bot_id) {
-      return { resourceOwner: { kind: 'local' }, path: await botWorkingDirectory(thread.bot_id) };
+      return providerDefault ?? { resourceOwner: { kind: 'local' }, path: await botWorkingDirectory(thread.bot_id) };
     }
     const saved = await readWorkspaceSettings();
     const preferred = preferredWorkLocation(saved, saved.projects);
-    return preferred ?? { resourceOwner: { kind: 'local' }, path: servicePath };
+    return (denyLocal && preferred?.resourceOwner.kind === 'local' ? null : preferred)
+      ?? providerDefault ?? { resourceOwner: { kind: 'local' }, path: servicePath };
   }
 
   return async (identity: ThreadIdentity, thread: ThreadSummary, signal?: AbortSignal): Promise<DefaultWorkLocationSelection> => {
@@ -97,15 +103,18 @@ export function createConversationWorkLocation({ agentRuntime, sourceDirectory, 
     if (inherited) {
       const source = resourceThreadSource(inherited);
       if (!source) throw new Error('The inherited execution source is unavailable');
+      if (source.resourceOwner.kind === 'local' && source.mode !== 'fixed_branch') denyLocal?.();
       return { ...source, tools: await agentRuntime.sourceTools(source.mode, signal) };
     }
     if (thread.parent_thread_id || !await agentRuntime.principalCanUseHostResources?.(thread.principal_id)) return null;
     if (prior?.lazy_work_location && !inherited) {
       const { resource_owner: resourceOwner, path, workspace_id: workspaceId } = prior.lazy_work_location;
+      if (resourceOwner.kind === 'local') denyLocal?.();
       return { lazyWorkLocation: { resourceOwner, path, ...(workspaceId ? { workspaceId } : {}) } };
     }
     if (latest || checkpoint?.resources) return null;
     const saved = await creationLocation(thread, signal);
+    if (saved.resourceOwner.kind === 'local') denyLocal?.();
     if (!saved.selection && !saved.requiresProjectContext) {
       return { lazyWorkLocation: { resourceOwner: saved.resourceOwner, path: saved.path, ...(saved.workspaceId ? { workspaceId: saved.workspaceId } : {}) } };
     }

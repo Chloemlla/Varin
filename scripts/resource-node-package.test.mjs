@@ -66,17 +66,19 @@ test('Node and the Bun build interpreter trace the same compiled Node role impor
 });
 
 test('committed resolution locks match their own role manifests', () => {
-  for (const role of ['resources', 'browser', 'computer']) checkResourceNodeLock({ role });
+  for (const role of ['resources', 'browser', 'computer', 'extensions']) checkResourceNodeLock({ role });
 });
 
-test('browser and computer closure traces never include an unreferenced role entry', t => {
+test('dedicated role closure traces never include an unreferenced role entry', t => {
   const { root, write } = fixture(t);
   write('browser-node.js', "import 'ws';");
   write('computer-node.js', "import './active.js';");
+  write('extension-node.js', "import 'tar';");
   write('active.js', "import 'express';");
   write('index.js', "import 'lost-host-only-dependency';");
   assert.deepEqual(collectResourceClosure(root, ts, 'browser-node').files, ['browser-node.js']);
   assert.deepEqual(collectResourceClosure(root, ts, 'computer-node').files, ['active.js', 'computer-node.js']);
+  assert.deepEqual(collectResourceClosure(root, ts, 'extension-node').files, ['extension-node.js']);
 });
 
 test('installed resource dependency validation rejects missing and unreferenced locked packages', t => {

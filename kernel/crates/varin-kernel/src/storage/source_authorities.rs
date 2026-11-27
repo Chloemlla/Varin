@@ -846,6 +846,27 @@ impl Storage {
         }
         Ok(serde_json::to_value(found)?)
     }
+    pub(crate) fn source_retention(&mut self, epoch: &str) -> Result<Value, KernelError> {
+        let current_authorities: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM domain_records
+             WHERE record_type='source.authority' AND state IN ('preparing','ready','retaining','draining')
+             AND json_extract(payload_json,'$.result.resourceEpoch')=?1",
+            [epoch],
+            |row| row.get(0),
+        )?;
+        let active_process = self.active_process_writer(Path::new(""))?.is_some();
+        let active_file_operations =
+            !self.file_leases.is_empty() || self.file_observation_reads_active();
+        let active_computation = self.computations.jobs.values().any(|job| !job.done());
+        Ok(json!({
+            "kernelEpoch": epoch,
+            "authorities": current_authorities,
+            "activeProcess": active_process,
+            "activeFileOperations": active_file_operations,
+            "activeComputation": active_computation,
+            "retireReady": current_authorities == 0 && !active_process && !active_file_operations && !active_computation
+        }))
+    }
     pub(crate) fn release_source_scope(
         &mut self,
         p: SourceAuthorityScopeReleaseParams,

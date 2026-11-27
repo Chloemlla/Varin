@@ -62,7 +62,8 @@ function HarnessSelectorContent({
   const style = 'flex min-w-0 items-center gap-1.5 rounded-md px-2 py-1 typography-meta text-muted-foreground';
   if (!onChange) return <span className={style} title={label}>{content}</span>;
 
-  const selectable = settings?.agents.filter(candidate => candidate.enabled &&
+  const unavailable = new Set(settings?.detections?.filter(detection => detection.code === 'deployment-policy-denied').map(detection => detection.id));
+  const selectable = settings?.agents.filter(candidate => candidate.enabled && !unavailable.has(candidate.id) &&
     candidate.availability !== 'disabled' &&
     (candidate.availability !== 'auto' ||
       (discoveredAgentIds?.includes(candidate.id) ??

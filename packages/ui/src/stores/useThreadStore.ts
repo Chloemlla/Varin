@@ -32,6 +32,7 @@ interface ThreadNavigationState {
   resolveThread(target: { threadId: string; branchId?: string }): Promise<{ identity: ThreadIdentity; botId: string | null; parentThreadId: string | null }>;
   selectThread(identity: { threadId: string; branchId?: string }): Promise<ThreadIdentity>;
   openDraft(options?: Pick<ThreadDraft, 'workspacePath' | 'sourceSelection' | 'organization' | 'projectId' | 'botId'>): string;
+  selectDraft(key: string): boolean;
   materializeDraft(draftKey: string, options?: { waitForCatalog?: boolean; model?: ThreadModel }): Promise<ThreadIdentity>;
   updateThread(threadId: string, patch: Partial<ThreadMetadata>): Promise<void>;
   deleteThread(threadId: string): Promise<void>;
@@ -196,12 +197,19 @@ export const useThreadStore = create<ThreadNavigationState>((set, get) => ({
   },
   openDraft(options) {
     const host = get().hostKey;
-    navigation += 1;
     const key = JSON.stringify([host, 'draft', crypto.randomUUID()]);
     useThreadDraftStore.getState().patch(key, options ? structuredClone(options) : {});
+    get().selectDraft(key);
+    return key;
+  },
+  selectDraft(key) {
+    const host = get().hostKey;
+    const draft = useThreadDraftStore.getState().drafts[key];
+    if (!draft || draft.identity || JSON.parse(key)[0] !== host) return false;
+    navigation += 1;
     selections.delete(host); draftSelections.set(host, key);
     set({ selectedIdentity: null, selectedDraftKey: key });
-    return key;
+    return true;
   },
   async materializeDraft(draftKey, options) {
     const api = requireAPI(); const owner = binding; const host = get().hostKey; const selectedNavigation = navigation;

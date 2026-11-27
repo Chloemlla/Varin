@@ -4,6 +4,8 @@ import { afterEach, beforeEach, it } from 'node:test';
 import { isAllowedObservationRequest, type ObservationClientMessage, type ObservationServerMessage } from '../src/transport/observation-protocol.js';
 import { clearRuntimeAuthCredentialProvider, setLocalRuntimeAuthCredentialProvider, setLocalRuntimeUrlAuthToken, setRuntimeBearerToken, setRuntimeExtraHeaders, setRuntimeUrlAuthToken } from '../src/transport/runtime-auth.js';
 import { configureRuntimeUrlResolver } from '../src/transport/runtime-url.js';
+import { retainParkingObservations } from '../src/transport/observation-transport.js';
+import { getRuntimeEndpointGeneration, switchRuntimeEndpoint } from '../src/transport/runtime-switch.js';
 import { fetchWithoutRuntimeRouting, runtimeFetch } from '../src/transport/runtime-fetch.js';
 import { registerRelayTunnelProvider } from '../src/transport/relay-provider.js';
 
@@ -128,6 +130,69 @@ it('never connects an already aborted observation and never replays or HTTP-fall
   headers(freshSocket, opens(freshSocket)[0]!.id); await (await fresh).body!.cancel();
 });
 
+it('keeps observation open for active views, then releases it after idle time and wakes on interaction', async context => {
+  context.mock.timers.enable({ apis: ['setTimeout'] });
+  const originalDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
+  const page = Object.assign(new EventTarget(), { visibilityState: 'visible' });
+  Object.defineProperty(globalThis, 'document', { configurable: true, value: page });
+  const windowEvents = new EventTarget();
+  Object.assign(window, { addEventListener: windowEvents.addEventListener.bind(windowEvents),
+    removeEventListener: windowEvents.removeEventListener.bind(windowEvents), dispatchEvent: windowEvents.dispatchEvent.bind(windowEvents) });
+  let ready!: () => void;
+  const waking = new Promise<void>(resolve => { ready = resolve; });
+  globalThis.fetch = async input => {
+    network.push(String(input));
+    if (String(input).endsWith('/api/version')) await waking;
+    return new Response(null, { headers: { 'x-varin-host-parking': 'enabled' } });
+  };
+  const abort = new AbortController();
+  const firstView = retainParkingObservations(getRuntimeEndpointGeneration());
+  const secondView = retainParkingObservations(getRuntimeEndpointGeneration());
+  try {
+    await runtimeFetch('/api/system/info');
+    const first = runtimeFetch('/api/threads/observe');
+    await flush();
+    const socket = Socket.instances[0]!;
+    socket.open(); await flush();
+    headers(socket, opens(socket)[0]!.id);
+    const stream = (await first).body!.getReader();
+    context.mock.timers.tick(60_000);
+    assert.equal(socket.readyState, 1);
+    firstView();
+    context.mock.timers.tick(60_000);
+    assert.equal(socket.readyState, 1);
+    secondView();
+    const suspended = assert.rejects(stream.read(), /observation suspended/);
+    context.mock.timers.tick(59_000);
+    assert.equal(socket.readyState, 1);
+    context.mock.timers.tick(1_000);
+    await suspended;
+    assert.equal(socket.readyState, 3);
+    const reconnect = runtimeFetch('/api/threads/observe', { signal: abort.signal });
+    void reconnect.catch(() => undefined);
+    await flush();
+    assert.equal(Socket.instances.length, 1);
+    assert.deepEqual(network, ['https://remote.test/mount/api/system/info']);
+    page.dispatchEvent(new Event('pointerdown'));
+    await flush();
+    assert.equal(network.at(-1), 'https://remote.test/mount/api/version');
+    assert.equal(Socket.instances.length, 1);
+    ready(); await flush();
+    assert.equal(Socket.instances.length, 2);
+    const resumed = Socket.instances[1]!;
+    resumed.open(); await flush();
+    headers(resumed, opens(resumed)[0]!.id);
+    await (await reconnect).body!.cancel();
+  } finally {
+    firstView(); secondView();
+    abort.abort(); ready();
+    globalThis.fetch = async () => Response.json({ token: 'personal', expiresAt: Date.now() + 60_000 });
+    switchRuntimeEndpoint({ apiBaseUrl: '' });
+    if (originalDocument) Object.defineProperty(globalThis, 'document', originalDocument);
+    else Reflect.deleteProperty(globalThis, 'document');
+  }
+});
+
 it('keeps Host-local extension waits separate from selected remote mount, credentials and proxy', async () => {
   Object.assign(window, { __VARIN_LOCAL_ORIGIN__: 'https://local.test' });
   setRuntimeExtraHeaders({ 'X-Remote-Gateway': 'remote-secret' });
@@ -158,7 +223,7 @@ it('waits for local handshake authentication before observing the application Ho
   setLocalRuntimeAuthCredentialProvider('https://local.test', async () => ({ type: 'bearer', token: 'local-bearer' }));
   let release!: (response: Response) => void;
   globalThis.fetch = async (input, init) => {
-    assert.equal(String(input), 'https://local.test/auth/url-token');
+    assert.equal(String(input), 'https://local.test/auth/url-token?observation=1');
     assert.equal(new Headers(init?.headers).get('Authorization'), 'Bearer local-bearer');
     return new Promise<Response>(resolve => { release = resolve; });
   };

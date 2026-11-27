@@ -9,6 +9,8 @@ import { knowledgeDatabasePath, knowledgeMigrationRoot, knowledgeMigrationTarget
 
 const require = createRequire(import.meta.url);
 const { TriviumDB } = require('triviumdb') as typeof import('triviumdb');
+const migratorExecutable = () => process.env.VARIN_TDB_MIGRATOR_PATH || fileURLToPath(new URL(
+  './native/triviumdb-migrate' + (process.platform === 'win32' ? '.exe' : ''), import.meta.url));
 // A read-only open reports a missing main file before inspecting the WAL.
 // A leftover checkpoint sidecar can also mean damage; preserve that diagnostic.
 function isLoneLegacyWal(file: string): boolean {
@@ -27,14 +29,12 @@ function isLoneLegacyWal(file: string): boolean {
 function migrate(file: string, options: TriviumDBOptions) {
   const target = knowledgeMigrationTarget(file);
   mkdirSync(knowledgeMigrationRoot(file), { recursive: true });
-  const executable = process.env.VARIN_TDB_MIGRATOR_PATH || fileURLToPath(new URL(
-    './native/triviumdb-migrate' + (process.platform === 'win32' ? '.exe' : ''), import.meta.url));
   // The native tool computes required scratch space and checks actual free disk.
   // Use the source volume's capacity for its CLI budgets instead of imposing a
   // fixed 1 GiB limit on existing Varin data.
   const volume = statfsSync(dirname(file), { bigint: true });
   const capacityMiB = ((volume.blocks * volume.bsize) / 1048576n + 1n).toString();
-  const result = spawnSync(executable, ['--execute', '--source', file, '--destination', target,
+  const result = spawnSync(migratorExecutable(), ['--execute', '--source', file, '--destination', target,
     '--source-dtype', options.dtype ?? 'f32', '--storage', options.storageMode ?? 'mmap',
     '--max-source-mib', capacityMiB, '--max-work-mib', capacityMiB], { encoding: 'utf8', windowsHide: true });
   if (result.error) throw result.error;
@@ -45,6 +45,43 @@ function migrate(file: string, options: TriviumDBOptions) {
       failure && { code: failure.code, phase: failure.phase, outcome: failure.outcome, details: failure.details });
   }
   return new TriviumDB(join(target, 'database.tdb'), options);
+}
+
+type KnowledgeFormatProbe =
+  | { status: 'current' }
+  | { status: 'upgrade'; component: string; current: number; target: number }
+  | { status: 'blocked'; reason: string; code?: string };
+
+export function probeKnowledgeFormat(file: string): KnowledgeFormatProbe {
+  try {
+    const current = knowledgeDatabasePath(file);
+    // A published generation with a migration marker needs its normal migration
+    // owner to verify and finish the publish, even if it opens read-only.
+    if (current !== file && existsSync(current + '.migration')) {
+      return { status: 'blocked', reason: 'An interrupted knowledge migration needs to be resumed by the current Host.' };
+    }
+    const open = (dim?: number) => openKnowledgeDatabase(file, { ...(dim === undefined ? {} : { dim }), accessMode: 'readOnly',
+      autoBuildQuiver: false, loadTextIndex: false, payloadCacheMb: 0 });
+    let reader;
+    try { reader = open(); }
+    catch (error) {
+      const diagnostic = error as { code?: string; details?: { expected?: number } };
+      const dimension = diagnostic.details?.expected;
+      if (diagnostic.code !== 'TDB_DIMENSION_MISMATCH' || !Number.isSafeInteger(dimension)) throw error;
+      reader = open(dimension);
+    }
+    reader.close();
+    return { status: 'current' };
+  } catch (error) {
+    const diagnostic = error as { code?: string; details?: { component?: string; found?: number; current?: number } };
+    const details = diagnostic.details;
+    if (diagnostic.code === 'TDB_MIGRATION_REQUIRED' && details?.component && typeof details.found === 'number'
+      && typeof details.current === 'number' && existsSync(file)) {
+      if (!existsSync(migratorExecutable())) return { status: 'blocked', reason: 'The bundled TriviumDB migrator is unavailable.', code: diagnostic.code };
+      return { status: 'upgrade', component: details.component, current: details.found, target: details.current };
+    }
+    return { status: 'blocked', reason: error instanceof Error ? error.message : String(error), ...(diagnostic.code && { code: diagnostic.code }) };
+  }
 }
 
 export function openKnowledgeDatabase(file: string, options: TriviumDBOptions) {

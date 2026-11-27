@@ -160,7 +160,7 @@ const sendGitError = (res: GitRouteResponse, error: unknown, fallback: string): 
   return res.status(statusCode).json({ error: errorMessage(error, fallback) });
 };
 
-export function registerGitRoutes(app: Express, {
+export function registerGitRoutes(app: Express | undefined, {
   documents,
   onStatus,
   readDefaultGitIdentity,

@@ -9,6 +9,8 @@ import { pairComputerNode, revokeComputerNodeClient, startComputerNode } from '.
 import { computerDriverFixture } from '../computer/driver-fixture.test-helper.js';
 import { createComputerService } from '../computer/computer-service.js';
 import { createNodeRoleKernel, nodeRoleDataDirectory } from '../node-role-auth.js';
+import { createManagedRemoteTargetRegistry } from '../harness/managed-remote-client.js';
+import type { ResourceProvider } from '../deployment/resource-provider.js';
 
 const kernelPath = process.env.VARIN_TEST_KERNEL_PATH ?? fileURLToPath(new URL(
   '../../../../../kernel/target/release/' + (process.platform === 'win32' ? 'varin-kernel.exe' : 'varin-kernel'), import.meta.url));
@@ -60,7 +62,10 @@ it('runs a dedicated Computer node, scopes peer work/leases, and recovers the sa
     expect(await expectOk(request('/health'))).toMatchObject({ role: 'computer', control: 'ready' });
     expect((await request(api)).status).toBe(401);
     const identity = '/api/harness/managed-execution/v1/identity';
+    const retention = '/api/harness/managed-execution/v1/retention';
     expect(await expectOk(request(identity, observer.token))).toMatchObject({ hostId: node.hostId, role: 'computer', capabilities: ['computer'] });
+    expect((await request(retention)).status).toBe(401);
+    expect(await expectOk(request(retention, observer.token))).toEqual({ retireReady: true });
     expect((await request(identity, observer.token, undefined, { 'X-Varin-Managed-Target': 'other-host' })).status).toBe(409);
     expect((await request('/api/threads', other.token)).status).toBe(404);
     expect((await request('/api/harness/managed-execution/v1/shell/exec', other.token, {})).status).toBe(404);
@@ -79,6 +84,7 @@ it('runs a dedicated Computer node, scopes peer work/leases, and recovers the sa
     const actor: ComputerActor = { execution, rootWork: work, rootExecution: execution, label: 'coordinator' };
     const assignment = { origin: 'coordinator-host:fixture', assignmentId: 'same-visible-assignment', access: 'observe', actor };
     const firstLease = (await expectOk<{ token: string }>(request(desktop + '/assignment', observer.token, { ...assignment, op: 'claim' }))).token;
+    expect(await expectOk(request(retention, observer.token))).toEqual({ retireReady: false });
     const forged = await request(desktop + '/observe', other.token, { app: 'fixture-editor' }, { 'X-Varin-Computer-Lease': firstLease });
     expect(forged.status).toBe(409);
     expect(await forged.json()).toMatchObject({ computerExecution: { inputWriterStopped: true, receipt: { effect: 'none' } } });
@@ -86,6 +92,7 @@ it('runs a dedicated Computer node, scopes peer work/leases, and recovers the sa
     const observation = await expectOk(request(desktop + '/observe', observer.token, { app: 'fixture-editor' }, { 'X-Varin-Computer-Lease': firstLease }));
     expect(JSON.stringify(observation)).toContain('Original node desktop');
     await expectOk(request(desktop + '/assignment', observer.token, { ...assignment, op: 'drop' }));
+    expect(await expectOk(request(retention, observer.token))).toEqual({ retireReady: true });
 
     // Separate Computer owner/storage in the coordinating Host, using the
     // production remote catalog, assignment guard and public operation route.
@@ -100,6 +107,47 @@ it('runs a dedicated Computer node, scopes peer work/leases, and recovers the sa
       coordinator!.observe({ desktopId: mirror.id, app: 'fixture-editor' }), execution);
     expect(remote.desktopId).toBe(mirror.id);
     expect(remote.app.windowTitle).toBe('Original node desktop');
+    await coordinator.finishExecution(execution);
+    await coordinator.dispose(); coordinator = undefined;
+    await coordinatorKernel.kernel.close(); coordinatorKernel = undefined;
+
+    const managedDir = await nodeRoleDataDirectory(path.join(dir, 'managed-coordinator'));
+    coordinatorKernel = await createNodeRoleKernel(managedDir, kernelPath);
+    await coordinatorKernel.kernel.start();
+    let allocations = 0;
+    const leases = new Set<string>();
+    const provider: ResourceProvider = {
+      id: 'fixture-provider',
+      describe: async () => [{ id: 'desktop', hostId: node!.hostId, label: 'On-demand desktop', role: 'computer',
+        capabilities: ['computer'], desktopId: 'local-console', platform: 'windows' }],
+      status: async resourceId => ({ resourceId, state: leases.size ? 'ready' : 'cold' }),
+      acquire: async input => {
+        allocations++; leases.add(input.leaseId);
+        return { ...input, generation: String(node!.port), endpoint: url(), bearer: observer.token, expiresAt: Date.now() + 60_000 };
+      },
+      renew: async input => ({ ...input, endpoint: url(), bearer: observer.token, expiresAt: Date.now() + 60_000 }),
+      release: async input => { leases.delete(input.leaseId); },
+      retire: async () => { throw new Error('The Computer owner only releases its own leases'); },
+    };
+    const placement = createManagedRemoteTargetRegistry({ coordinatorHostId: coordinatorKernel.hostId,
+      kernel: coordinatorKernel.kernel, resources: {} as never, readSettings: async () => ({}), provider });
+    coordinator = createComputerService({ client: coordinatorKernel.kernel, hostId: coordinatorKernel.hostId, dataDir: managedDir,
+      resolveActor: async () => actor, providerHosts: placement.providerComputers });
+    const coldDesktop = (await coordinator.list()).desktops.find(item => item.remote)!;
+    expect(coldDesktop).toMatchObject({ label: 'On-demand desktop', status: 'stopped', remote: { hostId: node.hostId } });
+    expect(allocations).toBe(0);
+    const managed = await coordinator.automation.authorize(work, 'observe', coldDesktop.id, async () => {
+      expect(leases.size).toBe(1);
+      expect(await expectOk(request(retention, observer.token))).toEqual({ retireReady: false });
+      return coordinator!.observe({ desktopId: coldDesktop.id, app: 'fixture-editor' });
+    }, execution);
+    expect(managed.app.windowTitle).toBe('Original node desktop');
+    expect(managed.desktopId).toBe(coldDesktop.id);
+    expect(leases.size).toBe(1);
+    await coordinator.finishExecution(execution);
+    await expect.poll(() => leases.size).toBe(0);
+    expect(allocations).toBe(1);
+    expect(await expectOk(request(retention, observer.token))).toEqual({ retireReady: true });
     await coordinator.dispose(); coordinator = undefined;
     await coordinatorKernel.kernel.close(); coordinatorKernel = undefined;
 

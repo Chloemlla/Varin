@@ -693,7 +693,7 @@ export class KernelClient {
   private readonly credentialBridge: CredentialBridge;
   private readonly modelProtocolBridge: ModelProtocolBridge;
   private readonly toolBridge: ToolBridge;
-  private readonly mcpReleaseListeners = new Set<(runId: string) => void>();
+  private readonly mcpReleaseListeners = new Set<(runId: string, terminal: boolean) => void>();
   private readonly languageBridge: LanguageBridge;
   private readonly managedSourceBridge: ManagedSourceBridge;
   private readonly memoryBridge: MemoryBridge;
@@ -761,7 +761,7 @@ export class KernelClient {
       () => this.failAll(new KernelClientError({ code: "language-channel-failed", message: "Private language channel failed", retryable: false }), true));
     this.toolBridge = new ToolBridge(() => this.epoch, response => this.write(response),
       () => this.failAll(new KernelClientError({ code: "mcp-channel-failed", message: "Private MCP channel failed", retryable: false }), true),
-      (runId, terminal) => { if (terminal) { this.credentialBridge.unregister(runId); this.driverBridge.release(runId); } void this.languageBridge.releaseSource({ runId }).catch(() => undefined); for (const listener of this.mcpReleaseListeners) { try { listener(runId); } catch { this.mcpReleaseListeners.delete(listener); } } }, undefined,
+      (runId, terminal) => { if (terminal) { this.credentialBridge.unregister(runId); this.driverBridge.release(runId); } void this.languageBridge.releaseSource({ runId }).catch(() => undefined); for (const listener of this.mcpReleaseListeners) { try { listener(runId, terminal); } catch { this.mcpReleaseListeners.delete(listener); } } }, undefined,
       { retain: (binding, model, selection) => this.credentialBridge.retainChildModel(binding, model, selection),
         release: (runId, operationId) => this.credentialBridge.releaseChildModel(runId, operationId),
         reconcile: children => this.credentialBridge.reconcileChildModels(children) });
@@ -857,7 +857,7 @@ export class KernelClient {
   retainedExtensionBinding(runId: string, binding: import('./protocol.generated.js').ExtensionToolBinding): import('./protocol.generated.js').LiveExtensionToolBinding | undefined {
     return this.toolBridge.retainedExtensionBinding(runId, binding);
   }
-  onToolReleased(listener: (runId: string) => void): () => void {
+  onToolReleased(listener: (runId: string, terminal: boolean) => void): () => void {
     this.mcpReleaseListeners.add(listener); return () => { this.mcpReleaseListeners.delete(listener); };
   }
   /** Resolve only an actual Host-issued native Run grant, never caller-created scope metadata. */

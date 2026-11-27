@@ -1,4 +1,5 @@
 import { createServer } from 'node:http';
+import { connect as connectTcp, type Socket } from 'node:net';
 import express from 'express';
 import request from 'supertest';
 import { BrowserResources } from './browser-resources.js';
@@ -11,6 +12,7 @@ import WebSocket, { WebSocketServer } from 'ws';
 import { BrowserExecutionError, type BrowserEvent } from '@varin/protocol';
 import type { CdpResult } from './cdp-transport.js';
 import { createCdpBrowserOwner, type CdpBrowserOwner } from './cdp-owner.js';
+import { createEgressRuntime } from '../harness/egress.js';
 
 type Command = { id: number; method: string; params: CdpResult; sessionId?: string };
 const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6c98AAAAASUVORK5CYII=';
@@ -88,6 +90,57 @@ beforeEach(async () => { peer = new BrowserPeer(); await peer.start(); scratch =
 afterEach(async () => { await owner.dispose(); await peer.stop(); await rm(scratch, { recursive: true, force: true }); });
 
 describe('independent CDP browser owner', () => {
+  it('routes discovery and WebSocket upgrades through deployment egress', async () => {
+    const denied = createEgressRuntime({ deployment: { userDestinations: 'public' },
+      resolveAll: async () => [{ address: '127.0.0.1', family: 4 }] });
+    const websocket = peer.endpoint.replace('http:', 'ws:') + '/devtools/browser/process-1';
+    try {
+      for (const endpoint of [peer.endpoint, websocket, websocket.replace('127.0.0.1', 'browser-fixture.test')]) {
+        const candidate = createCdpBrowserOwner({ browserId: 'denied', endpoint, egress: denied });
+        try { await expect(candidate.connect()).rejects.toMatchObject({ kind: 'deployment-policy-denied' }); }
+        finally { await candidate.dispose(); }
+      }
+      expect(peer.requests).toEqual([]);
+    } finally { await denied.close(); }
+  });
+
+  it('uses the operator proxy for a CDP WebSocket despite local proxy bypass settings', async () => {
+    const addresses: string[] = [];
+    const sockets = new Set<Socket>();
+    const proxy = createServer();
+    const target = new URL(peer.endpoint);
+    proxy.on('connect', (request, socket, head) => {
+      addresses.push(request.url!);
+      const outgoing = connectTcp(Number(target.port), target.hostname, () => {
+        socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        if (head.length) outgoing.write(head);
+        socket.pipe(outgoing).pipe(socket);
+      });
+      sockets.add(outgoing);
+      socket.on('error', () => outgoing.destroy());
+      socket.on('close', () => outgoing.destroy());
+      outgoing.on('error', () => socket.destroy());
+      outgoing.on('close', () => { sockets.delete(outgoing); socket.destroy(); });
+    });
+    await new Promise<void>(resolve => proxy.listen(0, '127.0.0.1', resolve));
+    const address = proxy.address();
+    if (!address || typeof address !== 'object') throw new Error('Test proxy did not bind a TCP port');
+    const egress = createEgressRuntime({ env: { NO_PROXY: '*' }, deployment: {
+      userDestinations: 'public', requiredProxy: `http://127.0.0.1:${address.port}`,
+    } });
+    const browser = createCdpBrowserOwner({ browserId: 'proxied', endpoint: peer.endpoint.replace('http:', 'ws:') + '/devtools/browser/process-1', egress });
+    try {
+      await browser.connect();
+      expect(addresses).toEqual([target.host]);
+      expect(await browser.list()).toHaveLength(2);
+    } finally {
+      await browser.dispose();
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>(resolve => proxy.close(() => resolve()));
+      await egress.close();
+    }
+  });
+
   it('keeps HTTP discovery cold and opens only the explicitly acquired owner', async () => {
     const resources = new BrowserResources();
     resources.register(owner, 'Office browser', 'This Host', { source: 'cdp' });

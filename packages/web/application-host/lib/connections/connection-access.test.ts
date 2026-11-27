@@ -11,6 +11,7 @@ import { FULL_CONTROL_CAPABILITIES } from '../client-auth/remote-clients.js';
 import type { VarinAuthenticatedClient, VarinRequestAuthContext } from '../client-auth/request-context.js';
 import { HostSshManager } from './ssh-manager.js';
 import { writeHostConnections } from './hosts.js';
+import { createEgressRuntime } from '../harness/egress.js';
 import { registerConnectionRoutes } from './connection-routes.js';
 import { attachConnectionProxy } from './host-proxy.js';
 
@@ -21,7 +22,7 @@ const listen = async (server: Server) => {
   cleanup.push(() => new Promise<void>(resolve => { server.closeAllConnections(); server.close(() => resolve()); }));
   return `http://127.0.0.1:${(server.address() as import('node:net').AddressInfo).port}`;
 };
-const fixture = async (requireClientAuth = true) => {
+const fixture = async (requireClientAuth = true, policy?: { staticHosts: boolean; ssh: boolean }) => {
   const directory = await mkdtemp(join(tmpdir(), 'varin-connection-access-'));
   cleanup.push(() => rm(directory, { recursive: true, force: true }));
   const spawn = vi.fn(() => { throw new Error('Unexpected SSH process'); });
@@ -46,7 +47,9 @@ const fixture = async (requireClientAuth = true) => {
   };
   app.use(resolve);
   app.post('/auth/url-token', auth.handleUrlAuthToken);
-  registerConnectionRoutes(app, ssh, auth.requireAuth);
+  const egress = policy && createEgressRuntime({ deployment: { userDestinations: 'public' } });
+  if (egress) cleanup.push(egress.close);
+  registerConnectionRoutes(app, ssh, auth.requireAuth, { ...(policy ?? { staticHosts: true, ssh: true }), fetch: egress?.fetch ?? fetch });
   const server = createServer(app), url = await listen(server);
   const gateway = attachConnectionProxy({ app, server, settings: ssh.settingsStore, requireAuth: auth.requireAuth,
     authenticateUpgrade: request => auth.resolveAuthContext(request, null), originAllowed: () => true });
@@ -145,4 +148,25 @@ test('local UI-session grants preserve trusted session authority without treatin
   const [data] = await once(socket, 'message'); expect(String(data)).toBe('session accepted');
   f.auth.dispose();
   expect(await wsDenied(`${f.url.replace('http:', 'ws:')}/api/connections/hosts/peer/proxy/api/terminal/ws?varin_url_token=${grant}`)).toBe(401);
+});
+
+test('managed connection controls preserve saved settings, and probes use the Host egress owner', async () => {
+  const restricted = await fixture(true, { staticHosts: false, ssh: false });
+  await writeHostConnections(restricted.ssh.settingsStore, { hosts: [{ id: 'peer', label: 'Peer', url: 'https://peer.invalid' }], defaultHostId: 'peer' });
+  const before = restricted.ssh.settingsStore.readSync();
+  expect(await (await restricted.request('/api/connections/hosts', 'full')).json()).toMatchObject({ hosts: [] });
+  for (const [url, method, body] of [
+    ['/hosts', 'PUT', { hosts: [], defaultHostId: null }], ['/ssh/peer/connect', 'POST', {}],
+  ] as const) {
+    const result = await restricted.request('/api/connections' + url, 'full', method, body);
+    expect(result.status).toBe(403);
+    expect(await result.json()).toMatchObject({ code: 'deployment-policy-denied', section: 'connections' });
+  }
+  expect(restricted.spawn).not.toHaveBeenCalled();
+  expect(restricted.ssh.settingsStore.readSync()).toEqual(before);
+
+  const probe = await fixture(true, { staticHosts: true, ssh: false });
+  const denied = await probe.request('/api/connections/hosts/probe', 'full', 'POST', { url: probe.url });
+  expect(denied.status).toBe(403);
+  expect(await denied.json()).toMatchObject({ code: 'deployment-policy-denied', section: 'egress' });
 });

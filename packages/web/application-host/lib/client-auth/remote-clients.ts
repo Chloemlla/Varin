@@ -223,6 +223,30 @@ const safeJsonParse = (raw: string): unknown => {
   }
 };
 
+/** The sleeping gateway can verify an issued credential without initializing a
+ * Host, migrating its stores, caching revocation state or writing usage. */
+export async function authenticateOfflineGateway(
+  authorization: string | undefined,
+  options: Pick<RemoteClientRuntimeOptions, 'fsPromises' | 'crypto' | 'path' | 'storePath'>,
+): Promise<{ principalId: string; clientId: string } | null> {
+  const token = /^Bearer (varin_client_[A-Za-z0-9_-]+)$/i.exec(authorization ?? '')?.[1];
+  if (!token?.startsWith(TOKEN_PREFIX)) return null;
+  const read = (filename: string) => options.fsPromises.readFile(filename, 'utf8').then(safeJsonParse).catch(error => {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  });
+  const [clients, principals] = await Promise.all([read(options.storePath), read(options.path.join(options.path.dirname(options.storePath), 'ui-principals.json'))]);
+  const store = asRecord(clients), subjects = asRecord(principals);
+  if (store?.version !== STORE_VERSION || !Array.isArray(store.clients) || subjects?.version !== 1 || !Array.isArray(subjects.principals)) return null;
+  const tokenHash = options.crypto.createHash('sha256').update(token).digest('hex');
+  const client = store.clients.map(asRecord).find(row => row?.tokenHash === tokenHash);
+  if (!client || client.authMethod !== 'offline' || client.profile !== REMOTE_CLIENT_PROFILE.FULL_CONTROL || client.revokedAt !== null
+    || typeof client.id !== 'string' || typeof client.principalId !== 'string' || client.principalId !== subjects.ownerId
+    || client.expiresAt !== null && !(typeof client.expiresAt === 'string' && Date.parse(client.expiresAt) > Date.now())
+    || !subjects.principals.some(row => row?.id === client.principalId && row.disabled === false)) return null;
+  return { principalId: client.principalId, clientId: client.id };
+}
+
 const createRuntime = ({
   fsPromises,
   path,

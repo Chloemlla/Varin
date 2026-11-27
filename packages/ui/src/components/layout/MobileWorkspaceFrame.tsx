@@ -17,6 +17,7 @@ import { useNativeAndroidBackButton } from '@/apps/useNativeAndroidBackButton';
 import { lazyWithChunkRecovery } from '@/lib/chunkLoadRecovery';
 import { ErrorBoundary } from '@/components/ui/ErrorBoundary';
 import { requestSettingsNavigation } from '@/lib/settings/drafts';
+import { BotReturnChip } from '@/workbenches/bot/BotReturnChip';
 
 const SettingsView = lazyWithChunkRecovery(() => import('@/components/views/SettingsView').then(m => ({ default: m.SettingsView })));
 const Files = lazyWithChunkRecovery(() => import('@/apps/MobileFilesSurface').then(m => ({ default: m.MobileFilesSurface })));
@@ -36,6 +37,7 @@ export function MobileWorkspaceFrame({ scope, conversationKey, identity, directo
   const [rail, setRail] = React.useState(true);
   const split = wide && rail;
   const settings = useSettingsTransition(active, 'page');
+  const schedulePageOpen = useUIStore(state => state.isScheduledTasksDialogOpen && Boolean(state.scheduledTasksConversation?.botPage));
   const settingsBack = React.useRef<(() => void) | null>(null);
   const host = useThreadStore(s => s.hostKey);
   const { page, navigate } = useMobilePageNavigation(JSON.stringify([host, scope]), active && !settings.open, conversationKey);
@@ -65,7 +67,7 @@ export function MobileWorkspaceFrame({ scope, conversationKey, identity, directo
   const navigation = React.useMemo(() => ({ showDetails: setPanel, openDocument: (link: MobileDocumentLink) => navigate({ kind: 'document', link }) }), [setPanel, navigate]);
   return <MobilePageContext.Provider value={navigation}><div className="mobile-workspace-frame varin-mobile-app-shell main-content-safe-area" data-mobile-layout-tier={layout.tier} data-mobile-layout-kind={layout.kind} data-page-scroll-lock="true">
     <div className="mobile-workspace-content" hidden={settings.open} inert={settings.open}>
-      <MobileConversationPages listOpen={list} split={split} sideBySide={wide && layout.isLandscape && layout.viewportWidth >= (split ? 1100 : 900)} directory={directory(split || list)}
+      <div className="contents" inert={schedulePageOpen}><MobileConversationPages listOpen={list} split={split} sideBySide={wide && layout.isLandscape && layout.viewportWidth >= (split ? 1100 : 900)} directory={directory(split || list)}
         detail={details ? { title: documentLink ? t('mobile.menu.files') : detailLabel, close: () => setPanel(false),
           content: documentLink ? <ErrorBoundary><React.Suspense fallback={null}><Files initialFile={documentLink} quoteTarget={identity}
             onQuoted={() => setPanel(false)} /></React.Suspense></ErrorBoundary> : detail(true, () => setPanel(false)) } : undefined}>
@@ -76,8 +78,9 @@ export function MobileWorkspaceFrame({ scope, conversationKey, identity, directo
           {title({ open: details, toggle: () => setPanel(!details) })}
           <div>{actions}</div>
         </header>
+        {scope === 'workbench' && <div className="bot-schedule-return"><BotReturnChip scheduleOnly /></div>}
         {children}
-      </MobileConversationPages>
+      </MobileConversationPages></div>
       <ErrorBoundary><MobileTaskSurfaces group={scheduledGroup} /></ErrorBoundary>
     </div>
     {settings.open && <div className="mobile-workspace-settings">

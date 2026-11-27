@@ -13,6 +13,7 @@ type PipelineOptions = Omit<TerminalOptions, 'TERMINAL_INPUT_WS_HEARTBEAT_INTERV
   & ServerStartupDependencies
   & {
     apiOnly: boolean;
+    upgradeServer?: TerminalOptions['server'];
     attachSignals: boolean;
     dictationModelsDir: string;
     host?: string;
@@ -77,7 +78,7 @@ export const createStartupPipelineRuntime = (dependencies: {
 
     const terminalRuntime = createTerminalRuntime({
       app,
-      server,
+      server: options.upgradeServer ?? server,
       fs,
       path,
       ...(uiAuthController ? { uiAuthController } : {}),
@@ -95,13 +96,14 @@ export const createStartupPipelineRuntime = (dependencies: {
     const dictationRuntime = createDictationRuntime({
       ...(options.isDraining ? { isDraining: options.isDraining } : {}),
       app,
-      server,
+      server: options.upgradeServer ?? server,
       express,
       ...(uiAuthController ? { uiAuthController } : {}),
       isRequestOriginAllowed,
       rejectWebSocketUpgrade,
       modelsDir: dictationModelsDir,
       ...(options.fetchModel ? { fetchModel: options.fetchModel } : {}),
+      ...(options.localInference && { localInference: options.localInference }),
     });
 
     if (apiOnly) {

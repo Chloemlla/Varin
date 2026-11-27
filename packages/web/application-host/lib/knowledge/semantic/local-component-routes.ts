@@ -10,13 +10,14 @@ import { ComponentInstallConflict, type LocalSemanticComponentManager } from "./
 export interface LocalSemanticComponentRoutesOptions {
   manager: LocalSemanticComponentManager;
   requireAuth?: RequestHandler;
+  allowDownload?: boolean;
 }
 
 const noAuth: RequestHandler = (_request, _response, next) => next();
 
 export const registerLocalSemanticComponentRoutes = (
   app: Express,
-  { manager, requireAuth = noAuth }: LocalSemanticComponentRoutesOptions,
+  { manager, requireAuth = noAuth, allowDownload = true }: LocalSemanticComponentRoutesOptions,
 ): void => {
   const uploadRoot = join(tmpdir(), "varin-local-semantic-imports");
   mkdirSync(uploadRoot, { recursive: true });
@@ -32,6 +33,7 @@ export const registerLocalSemanticComponentRoutes = (
   });
 
   app.post("/api/harness/local-semantic/install", requireAuth, async (_request, response, next) => {
+    if (!allowDownload) return response.status(403).json({ code: "deployment-policy-denied", section: "localInference" });
     try {
       void manager.install().catch(next);
       response.status(202).json(manager.status());

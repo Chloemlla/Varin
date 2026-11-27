@@ -27,7 +27,8 @@ Varin reads files, calls models, executes shell commands, and controls desktops.
 
 ## Network, Recovery & Cancellation
 
-- **Egress**: Host egress enforces destination policy, private/reserved IP restrictions, redirects, and proxy/DNS/TLS rules. Browser cookie access is opt-in.
+- **Egress**: Personal Hosts can reach loopback, LAN and container services by default. A [deployment policy](ops/cloud-deployment.md#operator-policy-and-gateway-credentials) can require public destinations in participating Host and kernel transports or delegate destination enforcement to a required proxy. Provider-managed endpoints come from the operator's provider. Extension, command and browser processes follow their execution environment's network policy. Browser cookie access is opt-in.
+- **Supervisor replay**: The local supervisor passes replay authority over its private process channel. Replay is scoped to original authorized inputs and their Catalog receipts. Child processes receive no replay credential.
 - **Recovery / Integration**: Requires original Source/root, current maintenance authority, conditional file versions, and real dirty-buffer observation. User confirmation cannot override an unavailable Surface dirty-state barrier.
 - **Cancellation**: Cancel intent, observer detach, effect outcome, and confirmed executor stop are separate facts. HTTP abort or IPC loss never proves a process tree, file reader, or input lane has drained.
 

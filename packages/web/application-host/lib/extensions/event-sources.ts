@@ -2,7 +2,7 @@
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { compileToolJsonSchema } from '../models/schema.js';
-import { VARIN_EVENTS_CAPABILITY, parseVarinEventBatch, parseVarinEventConnections,
+import { VARIN_EVENTS_CAPABILITY, parseVarinEventConnections,
   type JsonObject, type JsonValue, type VarinEventSourceDescriptor, type VarinEventSourceIdentity,
   type VarinCredentialMetadata } from '@varin/extension-contract';
 import { declaredEventSources, type ApplicationExtensionRuntime, type DeclaredEventSource,
@@ -12,12 +12,16 @@ import type { AgentRuntimeClient } from '../kernel/agent-runtime-client.js';
 import type { FollowupEventSourceIdentity, FollowupEventSourceStatus } from '../kernel/protocol.generated.js';
 import { bindPluginInvocationPrincipal } from './invocation-principal.js';
 import type { PluginCredentialCapability } from './credentials.js';
+import { receiverEventPage } from './event-page.js';
+import { RECEIVER_LEASE_MS, type SandboxReceiverLease } from '../lifecycle/sandbox-receiver-lease.js';
+import type { SandboxRelayClient } from '../lifecycle/sandbox-relay-client.js';
 
 type Catalog = Pick<AgentRuntimeClient, 'eventSourceSubscriptions' | 'eventSourceCheckpoint' | 'updateEventSourceStatus'
   | 'receivePluginEvents' | 'eventTransportSources' | 'onEvent' | 'onExit' | 'onReady'>;
 interface Held { pin: HostServicePin; owner: HostServiceOwnerIdentity; scope: HostInvocationScope;
   context: HostCapabilityCallContext; allowReceive(): void; release(): void }
-interface Flight { identity: FollowupEventSourceIdentity; controller: AbortController; fingerprint: string;
+interface Receiver { held: Held; identity: FollowupEventSourceIdentity; declaration: DeclaredEventSource; status: FollowupEventSourceStatus | null }
+interface Flight { identity: FollowupEventSourceIdentity; controller: AbortController; fingerprint: string; receiver?: Receiver;
   providerId?: string; work: Promise<void> }
 const keyFor = ({ principalId, source }: FollowupEventSourceIdentity) => JSON.stringify([
   principalId, source.extensionId, source.sourceId, source.connectionId, source.accountId]);
@@ -27,17 +31,19 @@ export class PluginEventSources {
   readonly #stop = new AbortController();
   readonly #flights = new Map<string, Flight>();
   readonly #retries = new Map<string, ReturnType<typeof setTimeout>>();
-  readonly #receivers = new WeakMap<HostInvocationScope, { held: Held; identity: FollowupEventSourceIdentity;
-    declaration: DeclaredEventSource; status: FollowupEventSourceStatus | null }>();
+  readonly #receivers = new WeakMap<HostInvocationScope, Receiver>();
   readonly #removers: Array<() => void> = [];
   #remote?: Pick<import('./event-transport.js').PluginEventTransport, 'discover' | 'validateArrangement'>;
   setRemote(remote: Pick<import('./event-transport.js').PluginEventTransport, 'discover' | 'validateArrangement'>): void { this.#remote = remote; }
+  #inboxBlocks?: (identity: FollowupEventSourceIdentity) => boolean;
+  setInboxBarrier(blocked: (identity: FollowupEventSourceIdentity) => boolean): void { this.#inboxBlocks = blocked; }
   #pumping: Promise<void> | undefined;
   #dirty = false;
   #suspended = false;
   #started = false;
   constructor(readonly extensions: ApplicationExtensionRuntime, readonly catalog: Catalog,
-    readonly credentials: PluginCredentialCapability, readonly retryDelayMs = 5_000, readonly hostId = '') {}
+    readonly credentials: PluginCredentialCapability, readonly retryDelayMs = 5_000, readonly hostId = '',
+    readonly relay?: SandboxRelayClient) {}
 
   start(): void {
     if (this.#started) return;
@@ -144,27 +150,18 @@ export class PluginEventSources {
     context.signal.throwIfAborted(); receiver.held.context.signal.throwIfAborted(); receiver.held.pin.assertAvailable();
     if (method === 'assertReceiver' && raw && typeof raw === 'object' && !Array.isArray(raw) && !Object.keys(raw).length) return null;
     if (method !== 'submit') throw unavailable('event_receiver_method_invalid');
-    const batch = parseVarinEventBatch(raw);
-    const validate = compileToolJsonSchema(receiver.declaration.contract.schema);
-    if (batch.events.some(event => !validate(event.attributes))) throw unavailable('event_attributes_invalid');
+    const page = receiverEventPage({ identity: receiver.identity, hostId: this.hostId, schema: receiver.declaration.contract.schema,
+      recovery: receiver.declaration.declaration.recovery, status: receiver.status }, raw);
     // Credential replacement is checked at commit admission, even if no network refresh occurred.
     if (receiver.declaration.declaration.credentials === 'required') await this.credentials.call('inspect', {
       connectionId: receiver.identity.source.connectionId, expectedAccount: receiver.identity.source.accountId }, receiver.held.context);
-    const coverage = receiver.declaration.declaration.recovery === 'realtime'
-      ? { kind: 'from', fromMs: Math.max(receiver.status?.coverage?.fromMs ?? Date.now(), batch.coverage?.fromMs ?? 0) }
-      : batch.coverage ? { kind: batch.coverage.kind, fromMs: batch.coverage.fromMs ?? null } : receiver.status?.coverage ?? null;
-    const status: FollowupEventSourceStatus = { code: null, message: null, coverage,
-      lastConnectedAtMs: receiver.status?.lastConnectedAtMs ?? Date.now() };
-    const receipt = await this.catalog.receivePluginEvents({ identity: receiver.identity,
-      expectedCursor: batch.expectedCursor, nextCursor: batch.nextCursor, status,
-      events: batch.events.map(event => ({ ...event, objectId: event.objectId ?? null, senderId: event.senderId ?? null, revision: event.revision ?? null, files: event.files ?? [],
-        echoOf: event.echoOf ? { ...event.echoOf, ownerHostId: event.echoOf.ownerHostId === this.hostId ? null : event.echoOf.ownerHostId ?? null } : null })) }, receiver.held.context.signal);
+    const receipt = await this.catalog.receivePluginEvents(page, receiver.held.context.signal);
     receiver.status = receipt.checkpoint.status;
     return { cursor: receipt.checkpoint.cursor, accepted: receipt.accepted, duplicates: receipt.duplicates };
   }
 
   reconcile(): Promise<void> {
-    if (this.#stop.signal.aborted || this.#suspended) return Promise.resolve();
+    if (!this.#started || this.#stop.signal.aborted || this.#suspended) return Promise.resolve();
     this.#dirty = true;
     if (this.#pumping) return this.#pumping;
     this.#pumping = this.#reconcile().catch(() => { this.#retry('catalog'); }).finally(() => { this.#pumping = undefined; });
@@ -178,7 +175,7 @@ export class PluginEventSources {
       const desired = new Map<string, { identity: FollowupEventSourceIdentity; declaration: DeclaredEventSource | undefined; fingerprint: string }>();
       for (const identity of [...subscriptions.filter(item => item.state === 'active').map(item => item.identity), ...transportSources]) {
         const source = identity.source;
-        if (source.host) continue;
+        if (source.host || this.#inboxBlocks?.(identity)) continue;
         const declaration = declarations.find(item => item.extensionId === source.extensionId && item.declaration.sourceId === source.sourceId);
         const entry = snapshot.extensions.find(item => item.manifest.id === source.extensionId);
         desired.set(keyFor(identity), { identity, declaration,
@@ -196,7 +193,7 @@ export class PluginEventSources {
         const flight: Flight = { identity: selected.identity, controller, fingerprint: selected.fingerprint, work: Promise.resolve() };
         this.#flights.set(key, flight);
         flight.work = this.#run(flight, selected.declaration).catch(async error => {
-          if (!controller.signal.aborted && !this.#stop.signal.aborted) {
+          if (!controller.signal.aborted && !this.#stop.signal.aborted && !this.#suspended) {
             const code = ['account_changed', 'connection_unavailable', 'plugin_disabled', 'authentication_required', 'source_capability_unavailable'].includes(error?.code) ? error.code : 'source_unavailable';
             const checkpoint = await this.catalog.eventSourceCheckpoint(flight.identity).catch(() => null);
             await this.catalog.updateEventSourceStatus({ identity: flight.identity,
@@ -231,13 +228,51 @@ export class PluginEventSources {
         coverage: declaration.declaration.recovery === 'realtime' ? { kind: 'from', fromMs: Date.now() } : checkpoint.status?.coverage ?? null,
         lastConnectedAtMs: checkpoint.status?.lastConnectedAtMs ?? null };
       await this.catalog.updateEventSourceStatus({ identity: flight.identity, status }, held.context.signal);
-      this.#receivers.set(held.scope, { held, identity: flight.identity, declaration, status });
+      flight.receiver = { held, identity: flight.identity, declaration, status };
+      this.#receivers.set(held.scope, flight.receiver);
       await held.pin.invoke(declaration.declaration.receiveMethod, [{ sourceId: declaration.declaration.sourceId,
         connectionId: flight.identity.source.connectionId, accountId: flight.identity.source.accountId, cursor: checkpoint.cursor }], held.context.signal, held.scope);
       held.context.signal.throwIfAborted();
       throw unavailable('event_receiver_stopped');
     } finally { this.#receivers.delete(held.scope); unrestricted?.(); held.release(); }
   }
+  activity() {
+    const pending = [...this.#flights.values()].filter(flight => !this.relay || !flight.receiver || !flight.identity.principalId);
+    return { receivers: this.#flights.size, untransferred: pending.length, reconciling: Boolean(this.#pumping), retries: this.#retries.size };
+  }
+
+  async prepareParking() {
+    if (!this.#flights.size) return undefined;
+    if (!this.relay || this.activity().untransferred) throw unavailable('event_receiver_not_transferable');
+    const receivers = [...this.#flights.values()].map(flight => flight.receiver!);
+    // The supervisor pauses the authenticated stream between capability calls.
+    // The next cursor read therefore follows the last live Catalog acceptance.
+    this.#suspended = true;
+    const resume = async (reservation?: Awaited<ReturnType<SandboxRelayClient['freeze']>>) => {
+      try { await reservation?.rollback(); }
+      finally { this.#suspended = false; void this.reconcile(); }
+    };
+    let reservation: Awaited<ReturnType<SandboxRelayClient['freeze']>> | undefined;
+    try {
+      const heldTransfer = reservation = await this.relay.freeze(receivers.map(receiver => receiver.held.scope.id));
+      const leases = await Promise.all(receivers.map(async (receiver): Promise<SandboxReceiverLease> => {
+        const { identity, held, declaration } = receiver;
+        const [checkpoint, credentials] = await Promise.all([
+          this.catalog.eventSourceCheckpoint(identity, held.context.signal),
+          declaration.declaration.credentials === 'required' ? this.credentials.captureEventReceiver(held.context) : undefined,
+        ]);
+        const expiresAt = credentials ? Math.min(Date.now() + RECEIVER_LEASE_MS,
+          credentials.value.kind === 'oauth' ? credentials.value.expiresAt ?? Infinity : Infinity) : null;
+        if (expiresAt !== null && expiresAt <= Date.now()) throw unavailable('event_receiver_token_expired');
+        return { scope: held.scope.id, cursor: checkpoint.cursor, expiresAt, identity, hostId: this.hostId,
+          schema: declaration.contract.schema, status: checkpoint.status, recovery: declaration.declaration.recovery, ...(credentials && { credentials }) };
+      }));
+      const deadlines = leases.flatMap(item => item.expiresAt === null ? [] : [item.expiresAt]);
+      return { nextWakeAtMs: deadlines.length ? Math.min(...deadlines) : null,
+        commit: () => heldTransfer.commit(leases), rollback: () => resume(heldTransfer) };
+    } catch (error) { await resume(reservation); throw error; }
+  }
+
   async close(): Promise<void> {
     this.#stop.abort(); for (const remove of this.#removers.splice(0)) remove();
     for (const timer of this.#retries.values()) clearTimeout(timer); this.#retries.clear();

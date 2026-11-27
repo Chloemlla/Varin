@@ -37,6 +37,7 @@ import { ExtensionCatalogStaleStateError, ExtensionStorageError } from "./errors
 import type { HostCapabilityRegistry } from "./capability-registry.js";
 import { ExtensionPackageManager } from "./package-manager.js";
 import { NativeHostTransport } from "./native-host-transport.js";
+import type { BrokeredArtifactTransfer } from './artifact-store.js';
 import {
   HostServiceRegistry,
   type HostServiceOwnerIdentity,
@@ -83,22 +84,26 @@ interface BrokerCancelMessage { kind: "cancel"; id: string; }
 
 type BrokerMessage = BrokerRequestMessage | BrokerResponseMessage | BrokerEventMessage | BrokerCancelMessage;
 
-export interface BrokeredHostStopResult { processExited: true; cleanup: "confirmed" | "unconfirmed" }
+export type BrokeredHostStopResult = { processExited: true; cleanup: "confirmed" | "unconfirmed" }
+  | { processExited: false; cleanup: "transferred" };
 
 export class BrokeredHostUnavailableError extends Error {
   readonly code = 'extension-host-unavailable';
 }
 
 export interface BrokeredHostTransport {
+  readonly transfersInvocationScopes?: boolean;
   forceTerminate(): void;
   request(method: string, params?: unknown, signal?: AbortSignal): Promise<unknown>;
   terminate(): Promise<BrokeredHostStopResult | void>;
 }
 
 export interface BrokeredHostTransportOptions {
+  artifact: BrokeredArtifactTransfer;
   grants: VarinExtensionCapabilityGrant[];
   onCrash(error: Error): void;
   owner: HostServiceOwnerIdentity;
+  requestFromExtension(method: string, params: unknown, signal: AbortSignal): Promise<JsonValue>;
 }
 
 export type BrokeredHostTransportFactory = (
@@ -155,6 +160,7 @@ export interface BrokeredHostSupervisorOptions {
   services: HostServiceRegistry;
   storage: ExtensionStorageStore;
   transportFactory?: BrokeredHostTransportFactory;
+  sandboxTransportFactory?: BrokeredHostTransportFactory;
   routing: ServiceRoutingStore;
   prepareBuiltin?(extensionId: string): Promise<void>;
 }
@@ -197,8 +203,21 @@ const diagnosticState = (
   updatedAt: new Date().toISOString(),
 });
 
-export class ChildBrokeredHostTransport implements BrokeredHostTransport {
-  readonly #child: ChildProcess;
+export interface BrokeredHostChannel {
+  connected(): boolean;
+  send(message: unknown, callback?: (error: Error | null) => void): void;
+  stop(force: boolean): void;
+  observe(events: {
+    received(message: unknown): void;
+    failed(error: Error): void;
+    stopped(error: Error, processExited: boolean): void;
+    transferred(): void;
+  }): void;
+}
+
+export class BrokeredHostRpcTransport implements BrokeredHostTransport {
+  readonly transfersInvocationScopes: boolean;
+  readonly #channel: BrokeredHostChannel;
   readonly #childRequests = new Map<string, AbortController>();
   readonly #onCrash: (error: Error) => void;
   readonly #pending = new Map<string, { reject(error: Error): void; resolve(value: unknown): void }>();
@@ -207,6 +226,7 @@ export class ChildBrokeredHostTransport implements BrokeredHostTransport {
   readonly #shutdownGraceMs: number;
   #termination: Promise<BrokeredHostStopResult> | undefined;
   #cleanupConfirmed = false;
+  #transferred = false;
   readonly #requestFromChild: (method: string, params: unknown, signal: AbortSignal) => Promise<JsonValue>;
   #intentional = false;
   #crashed = false;
@@ -214,9 +234,9 @@ export class ChildBrokeredHostTransport implements BrokeredHostTransport {
   #requestId = 0;
 
   constructor(options: {
-    brokerScript: string;
+    channel: BrokeredHostChannel;
     shutdownGraceMs?: number;
-    forkProcess?: typeof fork;
+    transfersInvocationScopes?: boolean;
     onCrash(error: Error): void;
     requestFromChild(method: string, params: unknown, signal: AbortSignal): Promise<JsonValue>;
   }) {
@@ -224,52 +244,44 @@ export class ChildBrokeredHostTransport implements BrokeredHostTransport {
     if (!Number.isSafeInteger(this.#shutdownGraceMs) || this.#shutdownGraceMs <= 0) throw new Error("Broker shutdown grace must be a positive integer");
     this.#onCrash = options.onCrash;
     this.#requestFromChild = options.requestFromChild;
-    this.#child = (options.forkProcess ?? fork)(options.brokerScript, [], {
-      env: process.env,
-      serialization: "json",
-      stdio: ["ignore", "ignore", "ignore", "ipc"],
-    });
+    this.transfersInvocationScopes = options.transfersInvocationScopes === true;
+    this.#channel = options.channel;
     let resolveExited!: () => void;
-    this.#exited = new Promise<void>(resolve => { resolveExited = resolve; });
-    let rejectReadyRequest: (error: Error) => void = () => undefined;
-    this.#ready = new Promise((resolveReady, rejectReady) => {
-      rejectReadyRequest = rejectReady;
-      const onMessage = (value: unknown) => {
-        const message = value as BrokerMessage;
-        if (message?.kind === "event" && message.event === "ready") {
-          this.#child.off("error", rejectReady);
-          resolveReady();
-        }
-      };
-      this.#child.on("message", onMessage);
-      this.#child.once("error", rejectReady);
-    });
+    let rejectExited!: (error: Error) => void;
+    this.#exited = new Promise<void>((resolve, reject) => { resolveExited = resolve; rejectExited = reject; });
+    let resolveReady!: () => void;
+    let rejectReady!: (error: Error) => void;
+    this.#ready = new Promise<void>((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
     // The process may exit while its owner is preparing storage, before the first
     // request observes readiness. Own that rejection for the transport lifetime,
     // while retaining the original rejected promise for every later request.
     void this.#ready.catch(() => undefined);
-    this.#child.on("message", (value) => { void this.#onMessage(value as BrokerMessage); });
-    this.#child.once("exit", (code, signal) => {
-      resolveExited();
-      const error = new BrokeredHostUnavailableError(`Brokered Host process exited (${code ?? signal ?? "unknown"})`);
-      rejectReadyRequest(error);
+    void this.#exited.catch(() => undefined);
+    const settleChannel = (error: Error, ownershipEnded: boolean) => {
+      if (ownershipEnded) resolveExited();
+      else rejectExited(error);
+      rejectReady(error);
       for (const pending of this.#pending.values()) pending.reject(error);
       this.#pending.clear();
       for (const controller of this.#childRequests.values()) controller.abort(error);
       this.#childRequests.clear();
-      if (!this.#intentional && !this.#crashed) { this.#crashed = true; this.#onCrash(error); }
-    });
-    this.#child.on("error", (error) => {
-      if (!this.#child.pid) {
-        // Spawn failed: there was no execution process to retain.
-        resolveExited();
-        rejectReadyRequest(error);
-        for (const pending of this.#pending.values()) pending.reject(error);
-        this.#pending.clear();
-      } else this.#failChannel(error);
-    });
-    this.#child.on("disconnect", () => {
-      if (!this.#intentional) this.#failChannel(new BrokeredHostUnavailableError("Brokered Host IPC disconnected"));
+    };
+    this.#channel.observe({
+      received: value => {
+        const message = value as BrokerMessage;
+        if (message?.kind === 'event' && message.event === 'ready') resolveReady();
+        else void this.#onMessage(message);
+      },
+      failed: error => { if (!this.#intentional) this.#failChannel(error); },
+      stopped: (error, processExited) => {
+        settleChannel(error, processExited);
+        if (!this.#intentional && !this.#crashed) { this.#crashed = true; this.#onCrash(error); }
+      },
+      transferred: () => {
+        this.#transferred = true;
+        this.#intentional = true;
+        settleChannel(new Error("Extension broker transferred to the supervisor"), true);
+      },
     });
   }
 
@@ -284,7 +296,7 @@ export class ChildBrokeredHostTransport implements BrokeredHostTransport {
     } else await this.#ready;
     signal?.throwIfAborted();
     if (this.#channelFailure) throw this.#channelFailure;
-    if (!this.#child.connected) throw new Error("Brokered Host process is disconnected");
+    if (!this.#channel.connected()) throw new Error("Brokered Host process is disconnected");
     const id = `parent-${process.pid}-${++this.#requestId}`;
     return new Promise((resolveRequest, reject) => {
       const cleanup = () => signal?.removeEventListener("abort", abort);
@@ -300,11 +312,11 @@ export class ChildBrokeredHostTransport implements BrokeredHostTransport {
         };
         // A failed cancel delivery says nothing about whether the original handler stopped.
         // Preserve its pending ownership until the original response or actual process exit.
-        try { this.#child.send(message, failed); }
+        try { this.#channel.send(message, failed); }
         catch (error) { failed(error instanceof Error ? error : new Error(String(error))); }
       };
       const abort = () => {
-        if (this.#child.connected) send({ kind: "cancel", id });
+        if (this.#channel.connected()) send({ kind: "cancel", id });
       };
       this.#pending.set(id, { reject: rejectRequest, resolve: (value) => { cleanup(); resolveRequest(value); } });
       signal?.addEventListener("abort", abort, { once: true });
@@ -314,6 +326,7 @@ export class ChildBrokeredHostTransport implements BrokeredHostTransport {
 
   terminate(): Promise<BrokeredHostStopResult> {
     if (this.#termination) return this.#termination;
+    if (this.#transferred) return Promise.resolve({ processExited: false, cleanup: "transferred" });
     if (this.#intentional) return this.#exited.then(() => ({ processExited: true, cleanup: this.#cleanupConfirmed ? "confirmed" : "unconfirmed" }));
     this.#intentional = true;
     this.#termination = (async () => {
@@ -322,8 +335,8 @@ export class ChildBrokeredHostTransport implements BrokeredHostTransport {
       // process-cleanup phase, after normal replacement has respected every live exchange pin.
       const timer = setTimeout(() => { forced = true; this.forceTerminate(); }, this.#shutdownGraceMs);
       try {
-        if (this.#child.connected) { await this.request("deactivate"); this.#cleanupConfirmed = true; }
-        if (this.#child.connected) this.#child.disconnect();
+        if (this.#channel.connected()) { await this.request("deactivate"); this.#cleanupConfirmed = true; }
+        this.#channel.stop(false);
         await this.#exited;
       } catch (error) {
         this.forceTerminate();
@@ -339,7 +352,7 @@ export class ChildBrokeredHostTransport implements BrokeredHostTransport {
     this.#intentional = true;
     for (const controller of this.#childRequests.values()) controller.abort("Brokered Host process force-terminated");
     this.#childRequests.clear();
-    this.#child.kill("SIGKILL");
+    this.#channel.stop(true);
   }
 
   #failChannel(error: Error): void {
@@ -372,18 +385,19 @@ export class ChildBrokeredHostTransport implements BrokeredHostTransport {
       this.#childRequests.get(message.id)?.abort(new Error("Brokered Host call cancelled"));
       return;
     }
+    if (message.kind !== 'request' || typeof message.id !== 'string' || typeof message.method !== 'string' || this.#childRequests.has(message.id)) return;
     const controller = new AbortController();
     this.#childRequests.set(message.id, controller);
     try {
       const result = await this.#requestFromChild(message.method, message.params, controller.signal);
       try {
-        if (this.#child.connected) this.#child.send({ kind: "response", id: message.id, success: true, result } satisfies BrokerResponseMessage);
+        if (this.#channel.connected()) this.#channel.send({ kind: "response", id: message.id, success: true, result } satisfies BrokerResponseMessage);
       } catch {
         // The child can exit after the connection check; its request is already cancelled by exit handling.
       }
     } catch (error) {
       try {
-        if (this.#child.connected) this.#child.send({
+        if (this.#channel.connected()) this.#channel.send({
           kind: "response",
           id: message.id,
           success: false,
@@ -395,6 +409,37 @@ export class ChildBrokeredHostTransport implements BrokeredHostTransport {
     } finally {
       this.#childRequests.delete(message.id);
     }
+  }
+}
+
+function childBrokerChannel(child: ChildProcess): BrokeredHostChannel {
+  return {
+    connected: () => child.connected,
+    send: (message, callback) => { child.send(message as object, callback); },
+    stop: force => { if (force) child.kill('SIGKILL'); else if (child.connected) child.disconnect(); },
+    observe(events) {
+      child.on('message', events.received);
+      const exited = (code: number | null, signal: NodeJS.Signals | null) => events.stopped(
+        new BrokeredHostUnavailableError(`Brokered Host process exited (${code ?? signal ?? 'unknown'})`), true);
+      child.once('exit', exited);
+      child.on('error', error => {
+        if (child.pid) events.failed(error);
+        else events.stopped(error, true);
+      });
+      child.on('disconnect', () => events.failed(new BrokeredHostUnavailableError('Brokered Host IPC disconnected')));
+    },
+  };
+}
+
+export class ChildBrokeredHostTransport extends BrokeredHostRpcTransport {
+  constructor(options: Omit<ConstructorParameters<typeof BrokeredHostRpcTransport>[0], 'channel'> & {
+    brokerScript: string;
+    forkProcess?: typeof fork;
+  }) {
+    const child = (options.forkProcess ?? fork)(options.brokerScript, [], {
+      env: process.env, serialization: 'json', stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+    });
+    super({ ...options, channel: childBrokerChannel(child) });
   }
 }
 
@@ -451,6 +496,7 @@ export class BrokeredHostSupervisor {
   readonly #ownerDependencies = new Map<string, { bindings: VarinHostServiceDependencyBinding[]; pins: HostServicePin[] }>();
   readonly #storageSessions = new Map<string, Map<string, BrokerStorageSession>>();
   readonly #transportFactory: BrokeredHostTransportFactory;
+  readonly #sandboxTransportFactory: BrokeredHostTransportFactory | undefined;
   readonly #operations = new Map<string, Promise<void>>();
   readonly #retirements = new Map<string, { instance: BrokeredHostInstance; promise: Promise<void> }>();
   readonly #pending = new Map<string, { node: HostCompositionNode; promise: Promise<BrokeredHostInstance>; controller: AbortController; waiters: number; settled: boolean }>();
@@ -481,11 +527,12 @@ export class BrokeredHostSupervisor {
     this.#storage = options.storage;
     this.#routing = options.routing;
     this.#prepareBuiltin = options.prepareBuiltin ?? (async () => {});
+    this.#sandboxTransportFactory = options.sandboxTransportFactory;
     this.#transportFactory = options.transportFactory ?? (transportOptions => new ChildBrokeredHostTransport({
       brokerScript: this.#brokerScript,
       ...(options.brokerShutdownGraceMs === undefined ? {} : { shutdownGraceMs: options.brokerShutdownGraceMs }),
       onCrash: transportOptions.onCrash,
-      requestFromChild: (method, params, signal) => this.#handleChildRequest(transportOptions.owner, transportOptions.grants, method, params, signal),
+      requestFromChild: transportOptions.requestFromExtension,
     }));
   }
   async requestRestartHandoff(request: VarinExtensionRestartHandoffRequest): Promise<VarinExtensionCatalogSnapshot> {
@@ -1366,11 +1413,14 @@ export class BrokeredHostSupervisor {
         ? { modulePath: join(residentRoot, builtin!.manifest.entrypoints!.host!.file), packageRoot: residentRoot }
         : await this.#packages.resolveBrokeredHostEntrypoint(entry.manifest.id, selection.slot, selection.integrity);
       controller.signal.throwIfAborted();
+      const sandbox = builtin ? undefined : this.#sandboxTransportFactory;
       const broker = direct ? declarationLifecycle : residentRoot || selection.manifest.entrypoints?.host?.mode === "native"
         ? new NativeHostTransport({ requestFromExtension })
-        : this.#transportFactory({
+        : (sandbox ?? this.#transportFactory)({
+          artifact: { integrity: selection.integrity, open: signal => this.#packages.artifacts.openBrokeredArtifact(selection.integrity, signal) },
           grants,
           owner,
+          requestFromExtension,
           onCrash: (error) => {
             crashed = error;
             // A crash belongs to this actual process, including an unpublished candidate.
@@ -1507,6 +1557,7 @@ export class BrokeredHostSupervisor {
               serviceId: descriptor.id,
               version: descriptor.version,
               ...(invocationId ? { invocationId } : {}),
+              ...(broker.transfersInvocationScopes && context.invocation && { hostScopeId: context.invocation.id }),
             }, context.signal));
           } finally {
             lifetime?.abort(new Error("Host capability invocation has expired"));

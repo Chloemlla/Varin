@@ -13,13 +13,14 @@ import { resourceSource } from './thread-context.js';
 import type { SourceDirectory } from './thread-sources.js';
 import { sourceToolSchemas } from './source-launch.js';
 import { workLocationCapabilities } from './work-location-capabilities.js';
-import { normalizePathIdentity, normalizeWorkspaceRelativePath } from '../workspace/path-safety.js';
+import { normalizeWorkspaceRelativePath } from '../workspace/path-safety.js';
 import { resourceSections } from '../agent-resources/render.js';
 import type { PreparedAgentResources } from '../agent-resources/authority.js';
 import { waitWithSignal } from '../cancellation.js';
 import type { createResourceFileTransfer } from '../workspace/resource-file-routes.js';
 
 import { DORMANT_SCRIPT_IDENTITY, VARIN_BUILTIN_SCRIPT_EXTENSION_ID } from './dormant-script-contract.js';
+import { isModelToolOrigin } from './model-tool-origin.js';
 import type { ToolInvocationAuthority } from './tool-invocation.js';
 
 const denied = () => new SourceAdmissionError('source_authority_denied');
@@ -65,6 +66,7 @@ function device(target: ThreadSourceTarget) {
 export function createModelWorkLocations(options: {
   runtime: Runtime; kernel: Pick<KernelClient, 'isReady' | 'kernelEpoch' | 'issueGrant' | 'scoped' | 'retireGrant' | 'textEncodingPolicy'>;
   directory: Pick<SourceDirectory, 'list' | 'describe' | 'resolve'>;
+  withSourceUse?: import('../harness/managed-remote-client.js').ManagedRemoteTargetRegistry['withSourceUse'];
   prepare(input: ThreadPrepareSource, signal?: AbortSignal): Promise<ThreadPreparedSource>;
   captureLocationContext?(run: Run, source: ThreadPreparedSource['source'], signal: AbortSignal, instructionDirectories: string[]): Promise<PreparedAgentResources>;
   executionEnvironment?(): Promise<NonNullable<SourceToolBinding['executionEnvironment']>>;
@@ -78,12 +80,7 @@ export function createModelWorkLocations(options: {
   const keyFor = (runId: string, operationId: string) => JSON.stringify([runId, operationId]);
   async function admit(query: Record<string, unknown>, signal: AbortSignal) {
     if (!nonempty(query.runId) || !nonempty(query.threadId) || !nonempty(query.callId) ||
-      !validToolOrigin(query.origin) || !['model_step','nested_call'].includes(query.origin.kind)) throw denied();
-    if (query.origin.kind === 'nested_call') {
-      const parent = await runtime.operation(query.origin.parent_operation_id, signal);
-      if (parent.run_id !== query.runId || parent.phase !== 'running' || parent.cancel_requested || parent.executor !== 'tool_invoke' ||
-        !object(parent.intent) || !object(parent.intent.origin) || parent.intent.origin.kind !== 'model_step') throw denied();
-    }
+      !validToolOrigin(query.origin) || !await isModelToolOrigin(runtime, query.runId, query.origin, signal)) throw denied();
     const run = await runtime.run(query.runId, signal);
     if (run.id !== query.runId || run.thread_id !== query.threadId || run.cancel_requested ||
       !['executing','generating','runnable','waiting'].includes(run.state) ||
@@ -327,7 +324,7 @@ export function createModelWorkLocations(options: {
           from: device(from.target), to: device(to.target), path, destinationPath };
       }
       if (!object(q.key) && q.default !== true && !processInput) throw denied();
-      const target = await (async () => {
+      const locateTarget = async () => {
         if (processInput) {
           const original = await runtime.operation(q.processId as string, signal);
           const source = original.resource_source;
@@ -345,39 +342,46 @@ export function createModelWorkLocations(options: {
         // cannot substitute a different owner, working directory or grant.
         const description = {resourceOwner:row.resourceOwner,label:row.name,capabilities:[]};
         return {row,target:description,...await locate(row,description)};
-      })();
-      const {key:actual,row,canonicalPath} = target;
-      if (q.kind === 'work_location_switch') {
-        const source = await prepareLocation(run, q.operationId, row, actual, canonicalPath, signal);
-        await admit(q, signal);
-        return { source: resourceSource(source), name: row.name, device: device(target.target), path: canonicalPath };
-      }
-      const tool = q.tool;
-      if (typeof tool !== 'string' || (q.default === true || processInput
-        ? !tools.some(schema => schema.name === tool) : !workLocationCapabilities(tool))) throw denied();
-      if (q.default !== true && !processInput && target.target.resourceOwner.kind === 'managed_host'
-        && !target.target.capabilities.includes(tool === 'file_read' ? 'work-location-read' : 'work-location')) throw unavailable();
-      const key = keyFor(run.id,q.operationId);
-      if (leases.has(key) || preparing.has(key)) throw changed();
-      const lifecycle = new AbortController();
-      preparing.set(key,lifecycle);
-      const active = AbortSignal.any([signal,lifecycle.signal]);
-      try {
-        const source = await shareLocationPreparation(run,row,actual,canonicalPath,active);
-        if (q.default === true && options.captureLocationContext) {
-          const snapshot = await options.captureLocationContext(run, source, active, instructionDirectories);
-          const context = workLocationContext(snapshot, resourceSource(source)!);
-          await admit(q, active);
-          if (context && context.revision !== q.resourceContext) return context;
+      };
+      const operationId = q.operationId;
+      const prepareLocationOperation = async () => {
+        const target = await locateTarget();
+        const {key:actual,row,canonicalPath} = target;
+        if (q.kind === 'work_location_switch') {
+          const source = await prepareLocation(run, operationId, row, actual, canonicalPath, signal);
+          await admit(q, signal);
+          return { source: resourceSource(source), name: row.name, device: device(target.target), path: canonicalPath };
         }
-        const entry = await lease(run,q.operationId,tool,source,actual,active,q.default === true && deviceFileAccess);
+        const tool = q.tool;
+        if (typeof tool !== 'string' || (q.default === true || processInput
+          ? !tools.some(schema => schema.name === tool) : !workLocationCapabilities(tool))) throw denied();
+        if (q.default !== true && !processInput && target.target.resourceOwner.kind === 'managed_host'
+          && !target.target.capabilities.includes(tool === 'file_read' ? 'work-location-read' : 'work-location')) throw unavailable();
+        const key = keyFor(run.id,operationId);
+        if (leases.has(key) || preparing.has(key)) throw changed();
+        const lifecycle = new AbortController();
+        preparing.set(key,lifecycle);
+        const active = AbortSignal.any([signal,lifecycle.signal]);
         try {
-          const current = await admit(q, active);
-          if (current.run.epoch !== run.epoch || !isDeepStrictEqual(current.lazy,lazy)) throw changed();
-          leases.set(key,entry);
-          return entry.binding;
-        } catch(error) { await entry.release(); throw error; }
-      } finally { preparing.delete(key); }
+          const source = await shareLocationPreparation(run,row,actual,canonicalPath,active);
+          if (q.default === true && options.captureLocationContext) {
+            const snapshot = await options.captureLocationContext(run, source, active, instructionDirectories);
+            const context = workLocationContext(snapshot, resourceSource(source)!);
+            await admit(q, active);
+            if (context && context.revision !== q.resourceContext) return context;
+          }
+          const entry = await lease(run,operationId,tool,source,actual,active,q.default === true && deviceFileAccess);
+          try {
+            const current = await admit(q, active);
+            if (current.run.epoch !== run.epoch || !isDeepStrictEqual(current.lazy,lazy)) throw changed();
+            leases.set(key,entry);
+            return entry.binding;
+          } catch(error) { await entry.release(); throw error; }
+        } finally { preparing.delete(key); }
+      };
+      return await (q.default === true && lazy && options.withSourceUse
+        ? options.withSourceUse(lazy.resource_owner, prepareLocationOperation, signal)
+        : prepareLocationOperation());
     } catch(error) {
       // Neither model nor execution transcripts should receive transport URLs,
       // credentials or raw target diagnostics, even on a malformed response.
@@ -387,14 +391,14 @@ export function createModelWorkLocations(options: {
   };
   async function prepareScriptDefault(authority: ToolInvocationAuthority, contextRevision: string | undefined, signal: AbortSignal) {
     const { runId, threadId, operationId, callId, origin, executorOwner } = authority;
-    if (origin.kind !== 'model_step' || authority.source !== null || authority.toolName !== 'script_open'
-      || authority.configurationIdentity !== DORMANT_SCRIPT_IDENTITY || operationId !== `${origin.request_id}:tool:${callId}`
+    if (authority.source !== null || authority.toolName !== 'script_open'
+      || authority.configurationIdentity !== DORMANT_SCRIPT_IDENTITY || operationId !== toolOperationId(origin, callId)
       || !options.captureLocationContext) throw denied();
     const request = {kind:'script_open',runId,threadId,callId,origin};
     const original = async () => {
       const admitted = await admit(request, signal);
       const [operation, launch] = await Promise.all([runtime.operation(operationId,signal),runtime.launch(runId,signal)]);
-      if (admitted.lazy?.resource_owner.kind !== 'local' || operation.id !== operationId || operation.run_id !== runId
+      if (!admitted.lazy || operation.id !== operationId || operation.run_id !== runId
         || operation.phase !== 'running' || operation.cancel_requested || operation.executor !== 'script_open'
         || !isDeepStrictEqual(operation.execution_owner, executorOwner) || operation.managed_process
         || !launch?.selection.extension_bindings.some(binding => binding.extensionId === VARIN_BUILTIN_SCRIPT_EXTENSION_ID
@@ -405,8 +409,7 @@ export function createModelWorkLocations(options: {
     const {run,lazy} = await original();
     const location = await directory.resolve({resourceOwner:lazy.resource_owner,path:lazy.path},signal);
     // V1 intentionally does not turn a saved alias into a different durable root.
-    if (location.resourceOwner.kind !== 'local' || location.path !== lazy.path
-      || normalizePathIdentity(location.path) !== normalizePathIdentity(lazy.path)
+    if (!isDeepStrictEqual(location.resourceOwner, lazy.resource_owner) || location.path !== lazy.path
       || (lazy.workspace_id && lazy.workspace_id !== location.workspaceId)) throw changed();
     const row = {name:'Default script work location',path:lazy.path,resourceOwner:lazy.resource_owner,workspaceId:location.workspaceId};
     const prepared = await shareLocationPreparation(run,row,row,location.path,signal);

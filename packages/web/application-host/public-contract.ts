@@ -45,6 +45,13 @@ export interface StartWebUiServerOptions {
   onTunnelReady?: ((publicUrl: string, connectUrl: string | null) => void) | undefined;
   openFilesystemPath?: ((targetPath: string) => void | Promise<void>) | undefined;
   port?: number | undefined;
+  /** Trusted, in-process integration for a gateway-mode Host. The platform supplies
+   * a private ingress proof and owns process retirement after a successful park. */
+  managedLifecycle?: {
+    replayProof: string;
+    eventInbox: import('./lib/lifecycle/event-inbox.js').DurableEventInbox;
+    wakePublisher: import('./lib/lifecycle/wake-publisher.js').WakePublisher;
+  };
   /** The embedding process owns a real stop and clean-process relaunch. */
   restartApplicationHost?: (() => Promise<void>) | undefined;
   /** Real embedded pages shared by the local user and tool invocations. */
@@ -74,6 +81,8 @@ export interface WebUiServerController {
   setExternalIngressEnabled(enabled: boolean): Promise<void>;
   httpServer: Server;
   isReady(): boolean;
+  /** Returns the durable wake revision after Host-owned resources close, or null while busy. */
+  park?(): Promise<number | null>;
   /** Synchronously fences new admissions. Rejects on incomplete drain; callers
    * must not treat a rejected/expired stop as permission to reuse the data root. */
   stop(options?: { exitProcess?: boolean | undefined }): Promise<void>;

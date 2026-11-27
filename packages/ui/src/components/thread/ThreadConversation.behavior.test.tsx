@@ -4989,3 +4989,20 @@ it('opens calendar from an unsubmitted native draft with its displayed model and
     expect(create).not.toHaveBeenCalled();
   } finally { unbind?.(); }
 });
+
+it('clears a stored inbox observation when the gateway no longer has that receipt', async () => {
+  const f = fixture();
+  const key = threadComposerKey(threadHostKey(), identity);
+  let rejectReceipt!: (error: Error) => void;
+  const receipt = new Promise<never>((_resolve, reject) => { rejectReceipt = reject; });
+  const readSnapshot = vi.spyOn(f.api, 'snapshot');
+  f.api.observeInbox = vi.fn(() => receipt);
+  useThreadDraftStore.getState().patch(key, { inboxObservations: ['old-receipt'], text: 'new draft' });
+  await act(async () => root.render(<ThreadConversation api={f.api} identity={identity} />));
+  const reads = readSnapshot.mock.calls.length;
+  expect(f.api.observeInbox).toHaveBeenCalledWith('old-receipt', expect.any(AbortSignal));
+  await act(async () => rejectReceipt(new ThreadRequestError(404, 'inbox-input-not-found')));
+  expect(useThreadDraftStore.getState().drafts[key]).toMatchObject({ inboxObservations: [], text: 'new draft' });
+  expect(readSnapshot.mock.calls.length).toBeGreaterThan(reads);
+  expect(container.textContent).not.toContain('chat.send.waitingForHost');
+});

@@ -1763,6 +1763,10 @@ export const createLanguageSupervisor = ({
 
   return {
     retainSourceView, releaseSourceViews, checkSourceView,
+    activity() {
+      return { sourceViews: sourceViews.size, workspaceHolders: retainedWorkspaces.size,
+        starting: inflight.size + activations.size, stopping: pendingExits.size };
+    },
     registerProvider(descriptor: LanguageProviderDescriptor, owner?: LanguageOwner) {
       const languageIds = Array.isArray(descriptor?.languageIds)
         ? descriptor.languageIds.filter((id) => typeof id === 'string' && id)

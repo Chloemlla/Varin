@@ -72,6 +72,7 @@ import type {
 import { KernelClientError, type KernelClient, type KernelScopedClient } from "../kernel/kernel-client.js";
 import type { KernelRecordResult } from "../kernel/protocol.generated.js";
 import { HarnessServiceError } from "../harness/service-error.js";
+import { retainProviderResponse, type ProviderStatus } from '../deployment/resource-provider.js';
 import {
   computerDriverDir,
   localDriverSpawnSpec,
@@ -447,6 +448,31 @@ export interface ComputerRemoteHost {
   expectedHostId?: string;
 }
 
+interface ComputerPlacement {
+  connection: ComputerRemoteHost;
+  generation: string;
+  endpoint: string;
+  release(): void;
+}
+export interface ComputerProviderHost {
+  id: string;
+  label: string;
+  expectedHostId: string;
+  desktopId: string;
+  platform: ComputerPlatform;
+  state?: ProviderStatus['state'];
+  acquire(signal?: AbortSignal): Promise<ComputerPlacement>;
+}
+type ComputerHost = ComputerRemoteHost | ComputerProviderHost;
+interface RemoteDesktopTarget { connection: ComputerHost; remoteId: string; desktop: ComputerDesktop }
+interface RemoteDesktopClaim {
+  lease: ComputerLease;
+  target: RemoteDesktopTarget;
+  token: string | undefined;
+  ready: Promise<void>;
+  placement?: ComputerPlacement;
+}
+
 export interface ComputerServiceOptions {
   localControlHolder?: string | undefined;
   /** Provider-cost tuning for short semantic reads, never a polling sleep inside the input lane. */
@@ -470,6 +496,7 @@ export interface ComputerServiceOptions {
    * Host-to-Host computer calls; local SSH credentials are never copied.
    */
   remoteHosts?: () => Promise<ComputerRemoteHost[]>;
+  providerHosts?: (withStatus?: boolean) => Promise<ComputerProviderHost[]>;
   /** Test seam: override fetch for remote Host calls. */
   fetch?: typeof fetch;
   /**
@@ -553,10 +580,11 @@ export interface ComputerService {
   claimDesktop(origin: string, assignmentId: string, actor: ComputerActor, desktopId: string, access: ComputerAccess): Promise<string>;
   dropDesktopClaim(origin: string, assignmentId: string, actor: ComputerActor, desktopId: string, access: ComputerAccess): Promise<void>;
   activities(work?: ComputerWorkRef): ComputerActivityEntry[];
+  canRetire(): Promise<boolean>;
   preparationTarget(connectionId?: string): Promise<ComputerDesktop>;
   prepareDesktop(params: ComputerDesktopPrepareParams, dispatch?: ComputerDesktopDispatch): Promise<ComputerDesktopChangeResult>;
   desktopLifecycle(desktopId: string, action: "start" | "stop", dispatch?: ComputerDesktopDispatch): Promise<ComputerDesktopChangeResult>;
-  mediaTarget(desktopId: string): Promise<{ socketPath: string } | { url: string; headers: Record<string, string> }>;
+  mediaTarget(desktopId: string, signal?: AbortSignal): Promise<{ socketPath: string } | { url: string; headers: Record<string, string>; release?(): void }>;
   list(options?: { localOnly?: boolean; refresh?: boolean }): Promise<ComputerListResult>;
   /** Read known driver support without launching or warming desktop helpers. */
   applicationToolAvailability(): Promise<{ browser: boolean; office: boolean }>;
@@ -728,7 +756,7 @@ export function createComputerService(options: ComputerServiceOptions): Computer
   const coordinateObservations = new Map<string, string>();
   const coordinateKey = (observation: ComputerObservation) => JSON.stringify([observation.desktopId, observation.app.pid, observation.windowHandle]);
   const observationOwners = new Map<string, { key: string; actor: ComputerActor }>();
-  const remoteClaims = new Map<string, { lease: ComputerLease; target: NonNullable<Awaited<ReturnType<typeof remoteTargetFor>>>; token: string | undefined; ready: Promise<void> }>();
+  const remoteClaims = new Map<string, RemoteDesktopClaim>();
   const assignmentStreams = new Map<string, () => void>();
   const claimKey = (lease: ComputerLease) => lease.id;
   const linuxDesktop = createLinuxDesktop({ dataDir: options.dataDir ?? process.cwd(),
@@ -1172,9 +1200,10 @@ export function createComputerService(options: ComputerServiceOptions): Computer
 
   const fetchImpl = options.fetch ?? fetch;
 
-  const remoteConnections = async (): Promise<ComputerRemoteHost[]> => (
-    options.remoteHosts ? await options.remoteHosts() : []
-  );
+  const remoteConnections = async (withStatus = false): Promise<ComputerHost[]> => {
+    const [configured, provided] = await Promise.all([options.remoteHosts?.(), options.providerHosts?.(withStatus).catch(() => [])]);
+    return [...(provided ?? []), ...(configured ?? [])];
+  };
 
   const remoteHeaders = (connection: ComputerRemoteHost, extra?: Record<string, string>): Headers => {
     const headers = new Headers(connection.requestHeaders ?? {});
@@ -1185,47 +1214,55 @@ export function createComputerService(options: ComputerServiceOptions): Computer
   };
 
   const remoteFetch = async (
-    connection: ComputerRemoteHost,
+    host: ComputerHost,
     method: string,
     path: string,
     body?: unknown,
     signal?: AbortSignal,
+    pinned?: ComputerPlacement,
   ): Promise<Response> => {
     const admission = automation.context.getStore();
     admission?.assert();
     if (admission) signal = signal ? AbortSignal.any([signal, admission.signal]) : admission.signal;
-    const url = `${connection.apiUrl.replace(/\/$/, "")}${path}`;
     let leaseToken: string | undefined;
     if (admission) {
       const remoteId = /^\/api\/computers\/desktops\/([^/]+)/u.exec(path)?.[1];
-      const claims = [...remoteClaims.values()].filter(claim => sameComputerExecution(claim.lease.actor.execution, admission.actor.execution) && claim.target.connection.id === connection.id
+      const claims = [...remoteClaims.values()].filter(claim => sameComputerExecution(claim.lease.actor.execution, admission.actor.execution) && claim.target.connection.id === host.id
         && encodeURIComponent(claim.target.remoteId) === remoteId);
       const claim = claims.find(item => item.lease.access === 'control') ?? claims[0];
-      if (claim) { await claim.ready; admission.assert(); leaseToken = claim.token; }
+      if (claim) { await claim.ready; admission.assert(); leaseToken = claim.token; pinned ??= claim.placement; }
     }
-    let response: Response;
+    const placement = 'acquire' in host ? await host.acquire(signal) : undefined;
+    if (pinned && (!placement || placement.generation !== pinned.generation || placement.endpoint !== pinned.endpoint)) {
+      placement?.release();
+      throw new HarnessServiceError('unavailable', 'The original desktop instance is unavailable');
+    }
+    const connection = 'acquire' in host ? placement!.connection : host;
+    const url = `${connection.apiUrl.replace(/\/$/, "")}${path}`;
     try {
-      response = await fetchImpl(url, {
+      const response = await fetchImpl(url, {
         method,
         headers: remoteHeaders(connection, { Accept: 'application/json', ...(body === undefined ? {} : { 'Content-Type': 'application/json' }), ...(leaseToken ? { 'X-Varin-Computer-Lease': leaseToken } : {}) }),
         ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
         ...(signal ? { signal } : {}),
         redirect: "error",
       });
+      if (connection.expectedHostId && response.headers.get("x-varin-computer-host") !== connection.expectedHostId) {
+        await response.body?.cancel();
+        throw new RemoteTransportError("Remote computer Host identity changed; rediscover the actual target before operating it");
+      }
+      return placement ? retainProviderResponse(response, placement.release) : response;
     } catch (error) {
+      placement?.release();
+      if (error instanceof RemoteTransportError) throw error;
       throw new RemoteTransportError(
         `Remote Host "${connection.label}" is unreachable: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
-    if (connection.expectedHostId && response.headers.get("x-varin-computer-host") !== connection.expectedHostId) {
-      await response.body?.cancel();
-      throw new RemoteTransportError("Remote computer Host identity changed; rediscover the actual target before operating it");
-    }
-    return response;
   };
 
-  const remoteJson = async <T>(connection: ComputerRemoteHost, method: string, path: string, body?: unknown, signal?: AbortSignal, readOnly = false): Promise<T> => {
-    const response = await remoteFetch(connection, method, path, body, signal);
+  const remoteJson = async <T>(connection: ComputerHost, method: string, path: string, body?: unknown, signal?: AbortSignal, readOnly = false, pinned?: ComputerPlacement): Promise<T> => {
+    const response = await remoteFetch(connection, method, path, body, signal, pinned);
     if (readOnly && response.status === 404) {
       await response.body?.cancel();
       throw new HarnessServiceError('unavailable', 'The target Host does not support semantic query or waiting; its existing computer operations remain available');
@@ -1252,7 +1289,13 @@ export function createComputerService(options: ComputerServiceOptions): Computer
   };
 
   /** The connection + remote id behind a catalog desktop, or null for local. */
-  const remoteTargetFor = async (desktopId: string): Promise<{ connection: ComputerRemoteHost; remoteId: string; desktop: ComputerDesktop } | null> => {
+  const remoteTargetFor = async (desktopId: string): Promise<RemoteDesktopTarget | null> => {
+    const execution = automation.context.getStore()?.actor.execution;
+    if (execution) {
+      const original = [...remoteClaims.values()].find(claim => claim.lease.desktopId === desktopId
+        && 'acquire' in claim.target.connection && sameComputerExecution(claim.lease.actor.execution, execution));
+      if (original) return original.target;
+    }
     await ensureLocal(); // catalog records may not exist until first init
     const { desktop } = await desktopRecord(desktopId);
     if (!desktop.remote) return null;
@@ -1260,6 +1303,8 @@ export function createComputerService(options: ComputerServiceOptions): Computer
     if (!connection) {
       throw new HarnessServiceError("unavailable", `Remote Host "${desktop.remote.connectionId}" is no longer configured`);
     }
+    if ('acquire' in connection && (connection.expectedHostId !== desktop.remote.hostId || connection.desktopId !== desktop.remote.desktopId))
+      throw new HarnessServiceError('unavailable', 'The original provider desktop has changed');
     return { connection: { ...connection, expectedHostId: desktop.remote.hostId }, remoteId: desktop.remote.desktopId, desktop };
   };
 
@@ -1277,11 +1322,16 @@ export function createComputerService(options: ComputerServiceOptions): Computer
       return;
     }
     const key = claimKey(lease);
-    const entry = { lease, target, token: undefined as string | undefined, ready: Promise.resolve() };
+    const entry: RemoteDesktopClaim = { lease, target, token: undefined, ready: Promise.resolve() };
     remoteClaims.set(key, entry);
     entry.ready = automation.context.exit(async () => {
+      if ('acquire' in target.connection) entry.placement = await target.connection.acquire(signal);
       const result = await remoteJson<{ token: string }>(target.connection, 'POST', `/api/computers/desktops/${encodeURIComponent(target.remoteId)}/assignment`,
-        { op: 'claim', origin, assignmentId: lease.id, actor: lease.actor, access: lease.access }, signal);
+        { op: 'claim', origin, assignmentId: lease.id, actor: lease.actor, access: lease.access }, signal, false, entry.placement)
+        .catch(error => {
+          if (error instanceof ComputerBeforeDispatchError) { entry.placement?.release(); delete entry.placement; }
+          throw error;
+        });
       if (!asString(result.token)) throw new RemoteTransportError('Remote Host returned no desktop assignment');
       entry.token = result.token;
     });
@@ -1334,8 +1384,13 @@ export function createComputerService(options: ComputerServiceOptions): Computer
     }
     // Release by origin and execution identity too: a lost claim receipt must not orphan a remote lock.
     await claim?.ready.catch(() => undefined);
+    if ('acquire' in target.connection && claim && !claim.placement) {
+      remoteClaims.delete(claimKey(lease));
+      return { released: true };
+    }
     await remoteJson(target.connection, 'POST', `/api/computers/desktops/${encodeURIComponent(target.remoteId)}/assignment`,
-      { op: 'drop', origin, assignmentId: lease.id, actor: lease.actor, access: lease.access });
+      { op: 'drop', origin, assignmentId: lease.id, actor: lease.actor, access: lease.access }, undefined, false, claim?.placement);
+    claim?.placement?.release();
     remoteClaims.delete(claimKey(lease));
     return { released: true };
   };
@@ -1355,7 +1410,7 @@ export function createComputerService(options: ComputerServiceOptions): Computer
   let remoteSyncAt = 0;
   let remoteSync: Promise<void> | null = null;
   const syncRemote = async (force = false): Promise<void> => {
-    if (!options.remoteHosts) return;
+    if (!options.remoteHosts && !options.providerHosts) return;
     if (remoteSync) {
       await remoteSync;
       if (!force) return;
@@ -1367,7 +1422,7 @@ export function createComputerService(options: ComputerServiceOptions): Computer
   };
   const syncRemoteCatalog = async (): Promise<void> => {
     remoteSyncAt = Date.now();
-    const hosts = await remoteConnections();
+    const hosts = await remoteConnections(true);
     const liveIds = new Set(hosts.map((host) => `remote:${host.id}`));
     // Hosts removed from settings keep their mirrors but report unconfigured.
     const known = (await listRecords("computer.machine"))
@@ -1375,15 +1430,12 @@ export function createComputerService(options: ComputerServiceOptions): Computer
       .filter((m): m is ComputerMachine => m !== null && m.provider === "remote");
     // Mirror rewrites must not erase local work associations (BC8) — the
     // remote Host owns driver state, not which local session used the mirror.
-    const usageByDesktop = new Map(
+    const previousDesktops = new Map(
       (await listRecords("computer.desktop"))
         .map(parseDesktop)
-        .filter((d): d is ComputerDesktop => d !== null && d.usage !== undefined)
-        .map((d) => [d.id, d.usage!]),
+        .filter((d): d is ComputerDesktop => d !== null)
+        .map((d) => [d.id, d]),
     );
-    const workByDesktop = new Map((await listRecords("computer.desktop"))
-      .map(parseDesktop).filter((d): d is ComputerDesktop => d !== null && d.work !== undefined)
-      .map((d) => [d.id, d.work!]));
     const now = new Date().toISOString();
     await Promise.allSettled([
       ...hosts.map(async (host) => {
@@ -1391,7 +1443,16 @@ export function createComputerService(options: ComputerServiceOptions): Computer
         try {
           // Ask only for resources owned there. Federating already mirrored
           // entries recursively creates an expanding A→B→A catalog.
-          const catalog = await remoteJson<ComputerListResult>(host, "GET", "/api/computers?local=1");
+          const catalog: {
+            machines: Pick<ComputerMachine, 'id' | 'platform' | 'provider' | 'coordinatorHostId'>[];
+            desktops: Pick<ComputerDesktop, 'id' | 'machineId' | 'label' | 'remote' | 'status' | 'statusDetail' | 'managed' | 'capabilities' | 'probedAt' | 'media' | 'software'>[];
+          } = 'acquire' in host ? {
+            machines: [{ id: 'provider', platform: host.platform, provider: 'local', coordinatorHostId: host.expectedHostId }],
+            desktops: [{ id: host.desktopId, machineId: 'provider', label: host.desktopId,
+              status: host.state === 'ready' ? 'available' : host.state === 'cold' ? 'stopped' : 'unavailable',
+              ...(host.state === 'preparing' ? { statusDetail: 'Preparing the provider desktop' } : {}),
+              ...(host.desktopId === 'managed-linux' ? { managed: 'linux-xvnc' } : {}) }],
+          } : await remoteJson<ComputerListResult>(host, "GET", "/api/computers?local=1");
           if (!Array.isArray(catalog.machines) || !Array.isArray(catalog.desktops)) throw new Error("Remote Host returned a malformed computer catalog");
           const remoteMachines = catalog.machines.filter((machine) => machine.provider !== "remote");
           const remoteDesktops = catalog.desktops.filter((desktop) => !desktop.remote && remoteMachines.some((machine) => machine.id === desktop.machineId));
@@ -1420,21 +1481,29 @@ export function createComputerService(options: ComputerServiceOptions): Computer
               });
             }
             const mirrorDesktopId = `remote:${host.id}:${primary.coordinatorHostId}:${remoteDesktop.id}`;
-            const mirroredUsage = usageByDesktop.get(mirrorDesktopId);
-            const mirroredWork = workByDesktop.get(mirrorDesktopId);
-            await putRecord(`computer.desktop:${mirrorDesktopId}`, "computer.desktop", remoteDesktop.status, {
+            const previous = previousDesktops.get(mirrorDesktopId);
+            // Provider inventory describes the instance. Keep probed desktop
+            // facts until another real desktop observation can replace them.
+            const inventory = 'acquire' in host;
+            const capabilities = remoteDesktop.capabilities ?? (inventory ? previous?.capabilities : undefined);
+            const probedAt = remoteDesktop.probedAt ?? (inventory ? previous?.probedAt : undefined);
+            const media = remoteDesktop.media ?? (inventory && host.state === 'ready' ? previous?.media : undefined);
+            const priorProbe = inventory && host.state === 'ready' && previous?.probedAt && previous.status !== 'stopped' ? previous : undefined;
+            const status = priorProbe?.status ?? remoteDesktop.status;
+            const detail = priorProbe?.statusDetail ?? remoteDesktop.statusDetail;
+            await putRecord(`computer.desktop:${mirrorDesktopId}`, "computer.desktop", status, {
               id: mirrorDesktopId,
               machineId,
-              label: `${host.label} · ${remoteDesktop.label}`,
+              label: inventory ? host.label : `${host.label} · ${remoteDesktop.label}`,
               kind: "remote-session",
-              ...(remoteDesktop.statusDetail ? { statusDetail: remoteDesktop.statusDetail } : {}),
-              ...(remoteDesktop.capabilities ? { capabilities: remoteDesktop.capabilities as unknown as Record<string, unknown> } : {}),
-              ...(remoteDesktop.probedAt ? { probedAt: remoteDesktop.probedAt } : {}),
+              ...(detail ? { statusDetail: detail } : {}),
+              ...(capabilities ? { capabilities } : {}),
+              ...(probedAt ? { probedAt } : {}),
               remote: { connectionId: host.id, desktopId: remoteDesktop.id, hostId: primary.coordinatorHostId },
-              ...(mirroredUsage ? { usage: mirroredUsage } : {}),
-              ...(mirroredWork ? { work: mirroredWork } : {}),
+              ...(previous?.usage ? { usage: previous.usage } : {}),
+              ...(previous?.work ? { work: previous.work } : {}),
               ...(remoteDesktop.managed ? { managed: remoteDesktop.managed } : {}),
-              ...(remoteDesktop.media ? { media: remoteDesktop.media } : {}),
+              ...(media ? { media } : {}),
               ...(remoteDesktop.software ? { software: remoteDesktop.software } : {}),
             });
           }
@@ -1639,8 +1708,8 @@ export function createComputerService(options: ComputerServiceOptions): Computer
     // peer catalogs and managed status without driving any desktop helper.
     if (listOptions?.refresh) {
       await refreshManagedDesktop();
-      if (!listOptions.localOnly) await syncRemote();
     }
+    if (!listOptions?.localOnly && (listOptions?.refresh || options.providerHosts)) await syncRemote();
     const [machines, desktops] = await Promise.all([
       listRecords("computer.machine"),
       listRecords("computer.desktop"),
@@ -3315,6 +3384,8 @@ export function createComputerService(options: ComputerServiceOptions): Computer
           if (!controller.signal.aborted) {
             try { listener({ type: "error", error: error instanceof Error ? error.message : String(error), terminal: true }); } catch { /* */ }
           }
+        } finally {
+          controller.abort();
         }
       })();
       return () => { controller.abort(); };
@@ -3532,14 +3603,19 @@ export function createComputerService(options: ComputerServiceOptions): Computer
     return journaledOp({ desktopId: id }, { lane: 'action', tool: 'control', op: action },
       () => changeDesktop(id, action, {}, dispatch), id).catch(applicationFailure);
   };
-  const mediaTarget: ComputerService["mediaTarget"] = async (id) => {
+  const mediaTarget: ComputerService["mediaTarget"] = async (id, signal) => {
     const remote = await remoteTargetFor(id);
     if (remote) {
-      const url = new URL(`${remote.connection.apiUrl.replace(/\/$/u, "")}/api/computers/desktops/${encodeURIComponent(remote.remoteId)}/vnc`);
-      url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-      return { url: url.href, headers: { ...remote.connection.requestHeaders,
-        ...(remote.connection.clientToken ? { Authorization: `Bearer ${remote.connection.clientToken}` } : {}),
-        "X-Varin-Computer-Host": remote.desktop.remote!.hostId } };
+      const host = remote.connection;
+      const use = 'acquire' in host ? await host.acquire(signal) : undefined;
+      try {
+        const connection = 'acquire' in host ? use!.connection : host;
+        const url = new URL(`${connection.apiUrl.replace(/\/$/u, "")}/api/computers/desktops/${encodeURIComponent(remote.remoteId)}/vnc`);
+        url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+        return { url: url.href, headers: { ...connection.requestHeaders,
+          ...(connection.clientToken ? { Authorization: `Bearer ${connection.clientToken}` } : {}),
+          "X-Varin-Computer-Host": remote.desktop.remote!.hostId }, ...(use ? { release: use.release } : {}) };
+      } catch (error) { use?.release(); throw error; }
     }
     const { desktop } = await desktopRecord(id);
     if (desktop.managed !== "linux-xvnc") throw new HarnessServiceError("unavailable", "Desktop does not provide VNC media");
@@ -3750,7 +3826,7 @@ export function createComputerService(options: ComputerServiceOptions): Computer
         } else if (state === "running") {
           if (guest.state === "ready" && guest.apiUrl && guest.hostId) {
             const liveHostId = await probeVmGuest(guest.apiUrl, options.appVersion!, options.vmGuestFetch).catch(() => null);
-            const connection = (await remoteConnections()).find((entry) => entry.id === `vm:${binding.domainUuid}`);
+            const connection = (await options.remoteHosts?.())?.find((entry) => entry.id === `vm:${binding.domainUuid}`);
             if (liveHostId === guest.hostId && connection?.apiUrl === guest.apiUrl && connection.clientToken) return;
             if (liveHostId === guest.hostId) {
               guest.state = "preparing";
@@ -4225,6 +4301,12 @@ export function createComputerService(options: ComputerServiceOptions): Computer
       if (access === 'control' && laneFor(desktopId).inputReleaseUnconfirmed) throw new HarnessServiceError('unavailable', 'Assignment is revoked, but native input release is still unconfirmed');
     },
     activities: (work) => [...lanes.entries()].flatMap(([desktopId, lane]) => lane.activity && (!work || lane.activity.execution && sameComputerWork(lane.activity.execution.work, work)) ? [{ desktopId, activity: { ...lane.activity } }] : []),
+    async canRetire() {
+      await restoreRuntimeRecords();
+      return !automation.hasActiveWork() && !controlDeliveries.size &&
+        ![...lanes.values()].some(lane => lane.running || lane.queue.length || lane.transitioning || lane.inputStop ||
+          lane.physicalControl || lane.inputReleaseUnconfirmed || lane.runtimeError);
+    },
     preparationTarget, prepareDesktop, desktopLifecycle, mediaTarget,
     inspectArtifact, registerArtifact, listArtifacts, openDesktopArtifact, openArtifact,
     list, applicationToolAvailability, workDesktops, reconcileControlEvents,
@@ -4267,6 +4349,10 @@ export function createComputerService(options: ComputerServiceOptions): Computer
         entry.viewers.clear();
       }
       viewers.clear();
+      const providerRuns = new Map([...remoteClaims.values()]
+        .filter(claim => 'acquire' in claim.target.connection)
+        .map(claim => [JSON.stringify(claim.lease.actor.execution), claim.lease.actor.execution]));
+      const providerStops = Promise.allSettled([...providerRuns.values()].map(execution => automation.finishRun(execution)));
       for (const lane of lanes.values()) {
         lane.externalAbort?.abort();
         lane.generation += 1;
@@ -4280,6 +4366,8 @@ export function createComputerService(options: ComputerServiceOptions): Computer
       await Promise.allSettled([...vmGuestReconciling.values()]);
       lanes.clear();
       observations.clear();
+      const failed = (await providerStops).find(result => result.status === 'rejected');
+      if (failed?.status === 'rejected') throw failed.reason;
     },
   };
 }

@@ -33,6 +33,9 @@ export type LanguageToolOwner = ((query: LanguageQuery, signal: AbortSignal) => 
 };
 const record = (value: unknown): Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const failure = (status: LanguageResult['status'], message?: string): LanguageResult => ({ status, items: [], omissions: { outOfScope: 0, unmappable: 0, stale: 0, unavailable: 0 }, ...(message ? { message } : {}) });
+const methods: ReadonlySet<LanguageQuery['method']> = new Set([
+  'definition', 'references', 'diagnostics', 'hover', 'workspace_symbols', 'document_symbols', 'call_hierarchy', 'structure',
+]);
 
 /** Adapter onto the selected language owner, not a server/configuration or source-view owner.
  * Rust admits the input before dispatch and every returned location before committing the receipt.
@@ -51,6 +54,7 @@ export function createLanguageOwner({ documents, supervisor, sources, remote, ta
   const owner: LanguageToolOwner = async (query, signal) => {
     try {
     signal.throwIfAborted();
+      if (!methods.has(query.method)) return failure('unsupported', 'Unknown language query');
     if (query.source.resource_owner.kind === 'managed_host' && !targetAuthority) {
       if (!remote) return failure('unavailable', 'The original managed language service is unavailable');
       const { runId: _runId, threadId: _threadId, grantId: _grantId, source: _source, physicalRoot: _physicalRoot, ...request } = query;

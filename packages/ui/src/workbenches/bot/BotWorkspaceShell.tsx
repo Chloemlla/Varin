@@ -2,7 +2,7 @@ import { ThreadDraftConversation } from '@/components/thread/ThreadDraftConversa
 import { MessageHandoff } from '@/components/conversation/messageHandoff';
 import React from 'react';
 import { VARIN_WORKBENCH_BOT_PROFILE_ID } from '@varin/extension-contract';
-import type { BotMatter } from '@varin/protocol';
+import type { BotMatter, CalendarOccurrence } from '@varin/protocol';
 import { getRuntimeEndpointGeneration, type BotAppearance, type BotSession, type ThreadIdentity } from '@varin/application-client';
 import { MainLayout } from '@/components/layout/MainLayout';
 import { BOT_CONVERSATION_PANEL_SCOPE, openConversationTree } from '@/lib/openConversationTree';
@@ -27,6 +27,7 @@ import { MemoryNavigationContext, type MemoryNavigation } from '@/components/con
 import { useRuntimeAPIs } from '@/hooks/useRuntimeAPIs';
 import { threadComposerKey, threadHostKey, useThreadStore } from '@/stores/useThreadStore';
 import { useThreadDraftStore } from '@/stores/useThreadDraftStore';
+import { useConversationTreeStore } from '@/stores/useConversationTreeStore';
 import { useUIStore } from '@/stores/useUIStore';
 import { useDeviceInfo } from '@/lib/device';
 import { varinSurfaceRuntime } from '@/lib/extensions/surface-runtime';
@@ -50,6 +51,7 @@ import { useBotOrganization } from './useBotOrganization';
 import { useBotStage } from './useBotStage';
 import { BotFigure } from './BotFigure';
 import { BotMobileTitle } from './BotMobileTitle';
+import { BotReturnChip } from './BotReturnChip';
 import { BotNavigator } from './BotNavigator';
 import { BotGroupChat, GroupChatCreate } from './BotGroupChat';
 import { groupLabel, groupMemberCount, useBotGroupChats } from './botGroupChatModel';
@@ -353,7 +355,7 @@ const BotWorkspace: React.FC<{ committed: boolean }> = ({ committed }) => {
       : known);
     return items ? sessionViews(items, catalog, []) : null;
   }, [selected, sessionItems, sessionsError, catalog]);
-  const facts = useBotFacts({ botId: selected?.id ?? null, identity: selectedEntry ?? undefined, followups: threads?.followups, revision: revision + workRevision, enabled: committed && Boolean(selected) && !settingsOpen });
+  const facts = useBotFacts({ botId: selected?.id ?? null, revision: revision + workRevision, enabled: committed && Boolean(selected) && !settingsOpen });
   const activity = facts.activity.value;
   const work = React.useMemo(() => workViews(workItems ?? [], catalog, activity), [workItems, catalog, activity]);
   // The Host's presence for every live Bot drives their figures; the selected Bot falls back to the
@@ -452,19 +454,14 @@ const BotWorkspace: React.FC<{ committed: boolean }> = ({ committed }) => {
   // Coming back from the workbench lights the row the user left from.
   const returned = useBotReturn(state => state.returned);
   const focusToken = React.useRef(0);
-  const focusTab = React.useCallback((tab: BotPanelTab, id?: string) => {
+  const focusTab = React.useCallback((tab: BotPanelTab, id?: string, occurrenceId?: string) => {
     setTab(tab);
-    if (id) setFocus({ tab, id, token: ++focusToken.current });
+    if (id) setFocus({ tab, id, occurrenceId, token: ++focusToken.current });
     if (floating) setNarrowPanelOpen(true); else if (!isMobile) setPanelOpen(true);
   }, [setTab, floating, isMobile, setPanelOpen]);
-  React.useEffect(() => {
-    if (!committed || !returned || returned.botId !== selectedId) return;
-    useBotReturn.setState({ returned: null });
-    if (returned.focus) focusTab(returned.focus.tab, returned.focus.id);
-  }, [committed, returned, selectedId, focusTab]);
-
   const openSession = React.useCallback((identity: ThreadIdentity, botId = selected?.id) => {
     if (!botId) return;
+    if (useBotReturn.getState().point?.focus?.occurrenceId) useBotReturn.setState({ point: null });
     dismissDraft();
     opening.current?.abort();
     setBusy(false);
@@ -482,6 +479,37 @@ const BotWorkspace: React.FC<{ committed: boolean }> = ({ committed }) => {
     const point: BotReturnPoint = { botId: selected.id, botName: selected.name, session, sessionTitle: sessionTitle(session.threadId), workThreadId: identity.threadId, ...(origin ? { focus: origin } : {}) };
     void openBotWorkInWorkbench(point, identity).catch((cause: unknown) => setError(message(cause)));
   }, [selected, selectedEntry, sessionTitle]);
+
+  const openScheduleTurn = React.useCallback((taskId: string, record: CalendarOccurrence, beforeNavigate: () => void) => {
+    if (!selected || !record.history_item_id || !record.run_id) return;
+    const identity: ThreadIdentity = { runtime: 'agent', threadId: record.thread_id, branchId: record.branch_id };
+    const session = selectedEntry ?? selected.entry;
+    const point: BotReturnPoint = {
+      botId: selected.id, botName: selected.name, session, sessionTitle: sessionTitle(session.threadId),
+      workThreadId: identity.threadId, workBranchId: identity.branchId, draftKey: activeDraftKey ?? undefined,
+      focus: { tab: 'schedule', id: taskId, occurrenceId: record.id },
+    };
+    const reveal = { kind: 'reveal' as const, entryId: record.history_item_id, runId: record.run_id };
+    const host = getRuntimeEndpointGeneration();
+    const own = sessionsWithWork?.some(item => item.identity.threadId === identity.threadId) ?? false;
+    const go = async () => {
+      if (own) {
+        beforeNavigate();
+        openSession(identity);
+        useBotReturn.setState({ point });
+      } else {
+        await openBotWorkInWorkbench(point, identity);
+      }
+      if (host === getRuntimeEndpointGeneration() && useBotReturn.getState().point === point) {
+        useConversationTreeStore.getState().request(threadComposerKey(threadHostKey(), identity), reveal);
+      }
+    };
+    void go().catch((cause: unknown) => {
+      if (host !== getRuntimeEndpointGeneration() || useBotReturn.getState().point !== point) return;
+      useBotReturn.setState({ point: null });
+      setError(message(cause));
+    });
+  }, [selected, selectedEntry, sessionTitle, activeDraftKey, sessionsWithWork, openSession]);
 
   const openCreateDialog = () => {
     setError(null);
@@ -696,19 +724,31 @@ const BotWorkspace: React.FC<{ committed: boolean }> = ({ committed }) => {
     bot: selected, figure: pose, stage: stageFeed, line,
     sessions: sessionsWithWork, session: currentSession, work, workItems: workItems ?? [], needs, timeline, facts, matters: mattersForBot, threads,
     readOnly: readOnly || offline, busy: actionBusy !== null, focus,
-    sessionTitle, focusTab,
+    sessionTitle, focusTab, scheduleIdentity: selectedEntry ?? undefined,
     openWork,
     openSession,
+    openScheduleTurn,
     openNeed: need => need.session ? openSession(need.identity) : openWork(need.identity, { tab: 'overview', id: need.key }),
     changeState: action => { void mutateBot(selected, action); },
     archiveMatter,
     newSession: () => { void newSession(); },
     openProfile: origin => openBotProfile(selected.id, origin),
   } : null, [selected, pose, stageFeed, line, needs, sessionsWithWork, currentSession, work, timeline, facts, mattersForBot, threads, readOnly, offline, actionBusy, focus,
-    sessionTitle, focusTab, openWork, openSession, mutateBot, archiveMatter, newSession, workItems]);
+    sessionTitle, focusTab, selectedEntry, openWork, openSession, openScheduleTurn, mutateBot, archiveMatter, newSession, workItems]);
 
   const spaces = useBotWorkspaces(panelModel, committed && !settingsOpen, () => { closeConversationPanel(); if (floating) setNarrowPanelOpen(true); else setPanelOpen(true); });
   const openSpace = spaces.open;
+  const selectSpace = spaces.select;
+  React.useEffect(() => {
+    if (!committed || !returned || returned.botId !== selectedId) return;
+    useBotReturn.setState({ returned: null });
+    if (returned.draftKey && useThreadStore.getState().selectDraft(returned.draftKey)) setDismissedDraftKey(null);
+    if (returned.focus?.occurrenceId) {
+      useUIStore.getState().closeContextPanel(BOT_CONVERSATION_PANEL_SCOPE);
+      selectSpace(null);
+    }
+    if (returned.focus) focusTab(returned.focus.tab, returned.focus.id, returned.focus.occurrenceId);
+  }, [committed, returned, selectedId, focusTab, selectSpace]);
   const shownPanel = React.useMemo<BotPanelModel | null>(() => panelModel && ({ ...panelModel,
     openNeed: need => openSpace({ kind: 'work', key: workKey(need.identity), identity: need.identity, title: need.name, operationId: need.operationId }),
   }), [panelModel, openSpace]);
@@ -771,6 +811,7 @@ const BotWorkspace: React.FC<{ committed: boolean }> = ({ committed }) => {
       onWake={bot => { void mutateBot(bot, 'wake'); }} />
     : <div className="flex h-full min-h-0 flex-col"
     onPointerDown={() => { if (floating && narrowPanelOpen) setNarrowPanelOpen(false); }}>
+    <div className="bot-schedule-return"><BotReturnChip inBot scheduleOnly /></div>
     {selected ? <BotActivityBanner bot={selected} busy={actionBusy !== null} onAction={(action) => { void mutateBot(selected, action); }} /> : null}
     {error ? <div role="alert" className="flex items-center gap-3 border-b border-border px-4 py-3 typography-meta">
       <span className="flex-1 text-destructive">{error}</span>
@@ -847,7 +888,8 @@ const BotWorkspace: React.FC<{ committed: boolean }> = ({ committed }) => {
 
   return <ConversationToolsContext.Provider value={{ identity: !currentGroup && ownsConversation && !activeDraftKey ? selectedEntry : null, target: conversationTarget, mode: selectedConversationTab?.mode, bots: bots ?? [], bot: selected ?? undefined }}><BotWorkspaceNavigationContext.Provider value={spaces}><MainLayout renderNavigator={navigator} renderConversation={conversation} renderSecondaryPanel={secondaryPanel}
     scheduledTasksGroup={currentGroup} mobileConversationKey={currentGroup?.id ?? activeDraftKey ?? (selectedEntry && workKey(selectedEntry))} mobileIdentity={!currentGroup && !activeDraftKey && ownsConversation ? selectedEntry : null}
-    secondaryPanelFocus={!currentGroup && conversationTab ? conversationTab.id : !currentGroup && spaces.activeKey ? `${spaces.activeKey}:${spaces.focusRevision}` : null}
+    secondaryPanelFocus={currentGroup ? null : conversationTab ? conversationTab.id : spaces.activeKey ? `${spaces.activeKey}:${spaces.focusRevision}`
+      : focus?.occurrenceId ? `schedule:${focus.token}` : null}
     onMobileDetailClose={conversationTab ? closeConversationPanel : undefined}
     secondaryPanelLabel={currentGroup?.name ?? t(conversationTab ? 'conversationTools.title' : 'bot.panel.aria')}
     navigationTitle={currentGroup?.name ?? navigationTitle} navigationSubtitle={currentGroup ? currentGroup.members.map(member => member.name).join('、') : navigationSubtitle}

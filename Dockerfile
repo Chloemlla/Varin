@@ -187,6 +187,24 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=5 \
 ENTRYPOINT ["node", "packages/web/server/computer-node.js"]
 CMD []
 
+FROM builder AS extension-node-files
+RUN node scripts/build-resource-node.mjs --role extensions /app/artifacts/cloud-runtime /app/artifacts/extension-node
+
+FROM ${RUNTIME_BASE_IMAGE} AS extension-node
+USER root
+WORKDIR /home/varin/app
+LABEL io.varin.image.role="extensions"
+ENV NODE_ENV=production VARIN_HOST=0.0.0.0 VARIN_PORT=3000
+COPY --from=extension-node-files /app/artifacts/extension-node/ ./
+RUN install -d -o root -g root -m 0700 /run/varin-extension-private \
+  && chmod 0755 /home/varin \
+  && chown root:root /home/varin /home/varin/app \
+  && bun install --production --frozen-lockfile \
+  && node verify-resource-node-install.mjs
+EXPOSE 3000
+ENTRYPOINT ["node", "packages/web/server/extension-node.js"]
+CMD []
+
 # This stage runs on TARGETPLATFORM. Installing the canonical runtime tree here
 # ensures native production dependencies match the image architecture instead
 # of the builder architecture.

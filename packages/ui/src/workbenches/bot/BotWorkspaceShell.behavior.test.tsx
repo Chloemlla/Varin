@@ -3,12 +3,13 @@ import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { parseHTML } from 'linkedom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Run, ThreadSummary } from '@varin/protocol';
+import type { CalendarOccurrence, Run, ThreadSummary } from '@varin/protocol';
 import { defaultBotAppearance, type BotEntryResult } from '@varin/application-client';
 import { BotWorkspaceShell } from './BotWorkspaceShell';
-import { useThreadStore } from '@/stores/useThreadStore';
+import { threadComposerKey, threadHostKey, useThreadStore } from '@/stores/useThreadStore';
+import { useConversationTreeStore } from '@/stores/useConversationTreeStore';
 import { useUIStore } from '@/stores/useUIStore';
-import { useBotNavigation, useBotReturn, type BotSession, type BotSummary, type BotWorkItem } from '@/lib/bots';
+import { openBotConversation, useBotNavigation, useBotReturn, type BotSession, type BotSummary, type BotWorkItem } from '@/lib/bots';
 import { threadSummary } from '@/test/threadFixtures';
 import { useBotLayout } from './botLayout';
 import { BOT_CONVERSATION_PANEL_SCOPE } from '@/lib/openConversationTree';
@@ -194,6 +195,7 @@ describe('Bot workbench', () => {
     document.body.append(container);
     root = createRoot(container);
     useBotNavigation.setState({ botId: null, entry: null, archived: undefined });
+    useBotReturn.setState({ point: null, returned: null });
     useBotLayout.setState({ panelOpen: true, panelWidth: 360, tab: 'overview', seen: {}, activityScope: 'all', memoryScope: 'current', ordinarySidebar: null, sidebarOpen: false });
     state.profileId = 'varin.bot'; state.mobile = false;
     state.list.mockReset().mockResolvedValue([bot('a'), bot('b')]);
@@ -377,7 +379,7 @@ describe('Bot workbench', () => {
     expect(state.create).not.toHaveBeenCalled();
   });
 
-  it('waits for a resolved session before reading arrangements after the original entry was deleted', async () => {
+  it('opens arrangements on demand through the resolved session after the original entry was deleted', async () => {
     const original = bot('a');
     const replacement = { runtime: 'agent' as const, threadId: 'replacement-session', branchId: 'replacement-branch' };
     let resolve!: (value: BotEntryResult) => void;
@@ -392,9 +394,47 @@ describe('Bot workbench', () => {
     await settle();
     expect(useBotNavigation.getState().entry).toEqual(replacement);
     expect(centre()?.getAttribute('data-agent')).toBe(replacement.threadId);
-    expect(state.arrangements).toHaveBeenCalledWith(replacement, original.id, expect.any(AbortSignal));
-    expect(state.eventSources).toHaveBeenCalledWith(replacement, expect.any(AbortSignal));
-    expect(state.arrangements.mock.calls.every(([identity]) => identity.threadId === replacement.threadId)).toBe(true);
+    expect(state.arrangements).not.toHaveBeenCalled();
+    await act(async () => useBotLayout.getState().setTab('schedule'));
+    await click('arrangements.title');
+    expect(useUIStore.getState().scheduledTasksConversation).toEqual({ identity: replacement, botPage: { kind: 'arrangements' } });
+  });
+
+  it('reveals a scheduled continuation by its original history item and returns to the draft and record', async () => {
+    const origin = bot('a').entry;
+    const target = sessionOf('a', 'project-session', 'project-branch');
+    state.sessions.mockResolvedValue([sessionOf('a', origin.threadId, origin.branchId, {}, true), target]);
+    const occurrence: CalendarOccurrence = {
+      id: 'delivery', definition_id: 'schedule', generation: 1, revision: 1, reason: { kind: 'manual', key: 'once' },
+      observed_at_ms: 10, target_kind: 'existing_work', thread_id: target.identity.threadId, branch_id: target.identity.branchId,
+      input_id: 'queue-id', history_item_id: 'history-id', run_id: 'scheduled-run', goal_id: null, execution_id: null,
+      state: 'completed', failure_code: null, hold_reason: null,
+    };
+    state.schedules.mockResolvedValue([{ id: 'schedule', name: 'Deployment check', enabled: true, schedule: { kind: 'daily' },
+      target: { kind: 'existing_work', ...target.identity }, calendar: { definition: { next_at_ms: 20 }, occurrences: [occurrence] } }]);
+    await render();
+    let draftKey = '';
+    await act(async () => {
+      draftKey = useThreadStore.getState().openDraft({ botId: 'a' });
+      useThreadDraftStore.getState().patch(draftKey, { text: 'Keep my draft' });
+      useBotLayout.getState().setTab('schedule');
+    });
+    await act(async () => { container.querySelector<HTMLButtonElement>('.bot-schedule-trigger')!.click(); });
+    await act(async () => { container.querySelector<HTMLButtonElement>('.bot-schedule-record')!.click(); });
+    expect(centre()?.getAttribute('data-agent')).toBe(target.identity.threadId);
+    const key = threadComposerKey(threadHostKey(), target.identity);
+    const command = useConversationTreeStore.getState().navigation[key]!;
+    expect(command).toMatchObject({ kind: 'reveal', entryId: 'history-id', runId: 'scheduled-run' });
+    expect(find('bot.schedule.back')).toBeTruthy();
+    const point = useBotReturn.getState().point!;
+    await act(async () => {
+      useConversationTreeStore.getState().consume(key, command.token);
+      await openBotConversation(point.botId, point.session);
+      useBotReturn.setState({ point: null, returned: point });
+    });
+    expect(container.querySelector('[data-bot-draft]')?.getAttribute('data-bot-draft')).toBe(draftKey);
+    expect(useThreadDraftStore.getState().drafts[draftKey]?.text).toBe('Keep my draft');
+    expect(container.querySelector('.bot-schedule-trigger')?.getAttribute('aria-expanded')).toBe('true');
   });
 
   it('asks the Host for the primary Bot when none is active and creates others only on request', async () => {

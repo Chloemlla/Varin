@@ -1,5 +1,5 @@
 import { createProcessRestart } from './process-restart.js';
-import { SUPERVISOR_LAUNCH, validSupervisorLaunch } from '../lifecycle/supervisor-runner.js';
+import { SUPERVISOR_LAUNCH, validSupervisorLaunch } from '../lifecycle/host-parking.js';
 import type {
   ParsedServeCliArgs,
   ParseServeCliOptionsInput,

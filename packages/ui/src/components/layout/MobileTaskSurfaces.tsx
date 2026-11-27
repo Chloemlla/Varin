@@ -10,14 +10,19 @@ const MultiRun = lazyWithChunkRecovery(() => import('@/components/multirun').the
 
 export function MobileTaskSurfaces({ group }: { group?: BotGroupSummary }) {
   const schedule = useUIStore(s => s.isScheduledTasksDialogOpen);
+  const directSchedule = useUIStore(s => Boolean(s.scheduledTasksConversation?.botPage));
   const archive = useUIStore(s => s.isArchivePageOpen);
   const worktrees = useUIStore(s => s.worktreesPageProjectId);
   const multi = useUIStore(s => s.isMultiRunLauncherOpen);
   const prompt = useUIStore(s => s.multiRunLauncherPrefillPrompt);
-  if (!schedule && !archive && !worktrees && !multi) return null;
+  const [visitedSchedule, setVisitedSchedule] = React.useState(false);
+  React.useEffect(() => { if (schedule) setVisitedSchedule(true); }, [schedule]);
   const close = () => useUIStore.getState().setMultiRunLauncherOpen(false);
-  return <div className="absolute inset-0 z-10 flex flex-col bg-background"><React.Suspense fallback={null}>
-    {schedule && <Schedule activeGroup={group} />}{archive && <Archive />}{worktrees && <Worktrees />}
-    {multi && <MultiRun initialPrompt={prompt} onCreated={close} onCancel={close} />}
-  </React.Suspense></div>;
+  return <React.Suspense fallback={null}>
+    {(schedule || visitedSchedule) && <Schedule activeGroup={group} />}
+    {(schedule && !directSchedule || archive || worktrees || multi) && <div className="absolute inset-0 z-10 flex flex-col bg-background">
+      {archive && <Archive />}{worktrees && <Worktrees />}
+      {multi && <MultiRun initialPrompt={prompt} onCreated={close} onCancel={close} />}
+    </div>}
+  </React.Suspense>;
 }

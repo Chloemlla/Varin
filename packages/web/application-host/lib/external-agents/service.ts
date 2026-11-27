@@ -2,17 +2,15 @@ import { closeManagedExternalTransport, openManagedExternalTransport, type Manag
 import { prepareQuoteSelections } from '../kernel/thread-quotes.js';
 import { parseAttachmentImageReferences } from '../kernel/thread-images.js';
 import { randomUUID, createHash } from 'node:crypto';
-import { mkdir, readFile, stat } from 'node:fs/promises';
+import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
-import { finished } from 'node:stream/promises';
 import {
   ExternalAgentError,
   isExternalInteractionValueValid,
   type ExternalAgentConfiguration,
   type ExternalAgentSettings,
-  type ExternalAgentProfile,
   type ExternalConversation,
   type ExternalConversationSnapshot,
   type ExternalContextUsage,
@@ -32,12 +30,11 @@ import { createPlatformEnvironmentRuntime } from '../platform/environment-runtim
 import { HarnessTransport, record, text } from './transport.js';
 import type { HarnessConnection } from './adapter.js';
 import { HarnessSteeringRejected } from './adapter.js';
-import { ACP_DEFAULTS, EXTERNAL_AGENT_PROFILES, getExternalAgentProfile } from './profiles.js';
+import { EXTERNAL_AGENT_PROFILES, getExternalAgentProfile } from './profiles.js';
 import { ExternalAgentInstaller } from './installations.js';
 import { createAcpFileAccess } from './acp-files.js';
-import { connectHermesGateway } from './hermes-gateway.js';
-import { assertProfilePlatform, profileVersionArguments } from './profile-launch.js';
-import { findInstalledExternalExecutable } from './installed-executable.js';
+import { createExternalPrograms, externalProgramConfigurations, validateExternalProgramSettings } from './programs.js';
+import { removePrivateExternalWorkspace } from './private-workspace.js';
 import { cacheableCapabilities, capabilityConfiguration } from './capability-cache.js';
 import { connectCodex } from './codex.js';
 import { connectPi } from './pi.js';
@@ -46,13 +43,9 @@ import { connectClaude } from './claude.js';
 import type { ExternalChild } from '../kernel/protocol.generated.js';
 import { parseExternalAttachmentSelections, prepareHarnessInput, type AcceptedExternalInput, type ExternalAttachmentOwner } from './attachments.js';
 import type { createExternalSourceOwner } from './source.js';
+import type { ExternalAgentDeploymentPolicy } from '../deployment/policy.js';
+import type { SourceResourceOwner } from '@varin/protocol';
 
-const defaults: ExternalAgentConfiguration[] = [
-  { id: 'codex', name: 'Codex', harness: 'codex', command: 'codex', args: [], enabled: false },
-  { id: 'claude', name: 'Claude Code', harness: 'claude', command: 'claude', args: [], enabled: false },
-  { id: 'pi', name: 'Pi', harness: 'pi', command: 'pi', args: [], enabled: false },
-  ...ACP_DEFAULTS,
-];
 type Spawn = ReturnType<typeof createKernelProcessService>['spawn'];
 interface Live {
   capture?: (key:string,path:string,signal?:AbortSignal)=>Promise<import('./attachments.js').ExternalCapturedFile>;
@@ -85,14 +78,18 @@ const launchKey = (launch: (Pick<ExternalAgentConfiguration, 'command' | 'args'>
 
 export class ExternalAgentsService {
   private readonly installer: ExternalAgentInstaller;
-  private readonly gatewayConnections = new Set<() => Promise<void>>();
+  private readonly programs: ReturnType<typeof createExternalPrograms>;
+  activity() {
+    return {
+      sessions: this.connections.size,
+      opening: this.connecting.size + this.authenticating.size,
+      running: this.running.size + this.childTasks.size,
+      stopping: this.disconnecting.size + this.reclaiming.size,
+      installations: this.installer.activeOperations(),
+    };
+  }
   async connectProgramGateway(configuration: ExternalAgentConfiguration, launch: { command: string; args: string[]; env: NodeJS.ProcessEnv }, signal?: AbortSignal) {
-    if ((configuration.profileId ?? configuration.id) !== 'hermes' || launch.env.HERMES_TUI_GATEWAY_URL) return { env: launch.env, release: async () => {} };
-    const bridge = await connectHermesGateway({ ...launch, spawn: this.deps.spawn, cwd: path.join(this.deps.directory, 'probe'), ...(signal ? { signal } : {}) });
-    let closing: Promise<void> | undefined;
-    const release = () => closing ??= bridge.close().finally(() => this.gatewayConnections.delete(release));
-    this.gatewayConnections.add(release);
-    return { env: bridge.env, release };
+    return this.programs.connectProgramGateway(configuration, launch, signal);
   }
   private readonly connections = new Map<string, Live>();
   private readonly connecting = new Map<string, Promise<Live>>();
@@ -106,7 +103,6 @@ export class ExternalAgentsService {
   private readonly structuralRevisions = new Map<string, number>();
   private readonly projectedItems = new Map<string, Map<string, ExternalItem>>();
   private readonly revisions = new Map<string, number>();
-  private readonly environment: ReturnType<typeof createPlatformEnvironmentRuntime>;
   private readonly detectionGenerations = new Map<string, number>();
   private readonly detections = new Map<string, { configuration: string; result: import('@varin/application-client').ExternalAgentDetection }>();
   private stopping = false;
@@ -166,11 +162,13 @@ export class ExternalAgentsService {
   constructor(
     private readonly deps: {
       managed?: () => ManagedExternalOwner;
+      defaultWorkspace?(principal: string | null): Promise<{ resourceOwner: Extract<SourceResourceOwner, { kind: 'managed_host' }>; path: string } | undefined>;
       kernel: KernelClient;
       spawn: Spawn;
       spawnAdmitted?: ReturnType<typeof createKernelProcessService>['spawnAdmitted'];
       directory: string;
       environment?: ReturnType<typeof createPlatformEnvironmentRuntime>;
+      deployment?: ExternalAgentDeploymentPolicy;
       fetch?: import('./installations.js').ExternalAgentDownload;
       removeProgram?: (directory: string) => Promise<void>;
       fileContext?: ReturnType<typeof createKernelProcessService>['fileContext'];
@@ -180,11 +178,12 @@ export class ExternalAgentsService {
       idle?: { preparedMs?: number; conversationMs?: number; sweepMs?: number };
     },
   ) {
-    this.environment = deps.environment ?? createPlatformEnvironmentRuntime();
+    this.programs = createExternalPrograms({ directory: deps.directory, spawn: deps.spawn,
+      environment: deps.environment ?? createPlatformEnvironmentRuntime() });
     this.installer = new ExternalAgentInstaller({
       directory: deps.directory, spawn: deps.spawn, fetch: deps.fetch ?? fetch,
       settings: () => this.settings(), configure: (value, revision, key) => this.configure(value, revision, key),
-      executable: config => this.executable(config),
+      executable: this.programs.executable,
       removeProgram: async directory => {
         if (!deps.removeProgram) throw new ExternalAgentError('process_owner_unavailable', 'Program process ownership is unavailable');
         await deps.removeProgram(directory);
@@ -326,6 +325,7 @@ export class ExternalAgentsService {
         source = (child.handoff || child.project_source)
           ? await this.sources!.prepare(child, signal)
           : await (async () => {
+              this.requirePlacement();
               const cwd = path.join(
                 this.deps.directory,
                 'workspaces',
@@ -357,12 +357,17 @@ export class ExternalAgentsService {
           if (!this.deps.managed) throw new Error('Managed external Source transport is unavailable');
           const owner = this.deps.managed();
           const client = await owner.source(targetOwner as unknown as Extract<import('@varin/protocol').SourceResourceOwner,{kind:'managed_host'}>, signal);
+          if (this.deps.deployment?.profiles) {
+            const settings = await client.externalSettings({ coordinatorHostId: owner.coordinatorHostId }, signal);
+            this.requireProfile(settings.agents.find(agent => agent.id === child.binding.configuration_id));
+          }
           const launch = await client.externalBinding({coordinatorHostId: owner.coordinatorHostId,
             source: executionSource as unknown as import('../kernel/protocol.generated.js').LaunchSource,
             configurationId: child.binding.configuration_id, harness: child.binding.harness as ExternalAgentConfiguration['harness']}, signal);
           if (launch.configuration.id !== child.binding.configuration_id || launch.configuration.harness !== child.binding.harness || !launch.configuration.enabled)
             throw new Error('Original target external Harness configuration changed');
           preparedConfiguration = launch.configuration;
+          this.requireProfile(preparedConfiguration);
           source = {...source, executionBinding: {resourceOwner:targetOwner,configurationId:child.binding.configuration_id,
             harness:child.binding.harness,configurationIdentity:launch.configurationIdentity,profileId:launch.configuration.profileId ?? launch.configuration.id,
             launch:{command:launch.configuration.command,args:[...launch.configuration.args]}}};
@@ -576,23 +581,24 @@ export class ExternalAgentsService {
     if(resourceOwner?.kind==='managed_host'){
       if(!this.deps.managed)throw new Error('Managed external Source transport is unavailable');
       const owner = this.deps.managed();
-      return (await owner.source(resourceOwner, signal)).externalSettings({
+      const settings = await (await owner.source(resourceOwner, signal)).externalSettings({
         coordinatorHostId: owner.coordinatorHostId, ...(discover ? { discover } : {}),
       }, signal);
+      return this.projectSettings(settings, resourceOwner);
     }
     const value = await this.command<ExternalAgentSettings>({ action: 'settings' }, signal);
-    const agents = [...value.agents, ...defaults.filter((d) => !value.agents.some((a) => a.id === d.id)).map(d => ({ ...d, availability: 'auto' as const, enabled: true }))];
+    const agents = externalProgramConfigurations(value.agents);
     const detections = agents.flatMap(agent => {
       const cached = this.detections.get(agent.id);
       return cached?.configuration === JSON.stringify(capabilityConfiguration(agent)) ? [cached.result] : [];
     });
-    return {
+    return this.projectSettings({
       ...value,
       profiles: [...EXTERNAL_AGENT_PROFILES],
       host: { platform: process.platform, architecture: process.arch },
       agents, ...(detections.length ? { detections } : {}),
-      ...(discover ? { discoveredAgentIds: await this.discoverPrograms(agents, signal) } : {}),
-    };
+      ...(discover ? { discoveredAgentIds: await this.programs.discoverPrograms(agents.filter(agent => !this.executionDenial(agent)), signal) } : {}),
+    }, resourceOwner);
   }
   async configure(value: Pick<ExternalAgentSettings, 'agents' | 'defaultAgent'>, expectedRevision: number, key: string, resourceOwner?: import('@varin/protocol').SourceResourceOwner) {
     if (resourceOwner?.kind === 'managed_host') {
@@ -600,34 +606,7 @@ export class ExternalAgentsService {
       const owner = this.deps.managed();
       return (await owner.source(resourceOwner)).externalConfigure({ coordinatorHostId: owner.coordinatorHostId, value, expectedRevision, key });
     }
-    if (
-      !value ||
-      !Array.isArray(value.agents) ||
-      new Set(value.agents.map((v) => v.id)).size !== value.agents.length
-    )
-      throw new ExternalAgentError('invalid_settings', 'External Agent identities must be unique');
-    for (const a of value.agents) {
-      if (
-        !a ||
-        Object.keys(a).some(
-          (key) => !['id', 'profileId', 'name', 'harness', 'enabled', 'availability', 'command', 'args', 'defaults'].includes(key),
-        ) ||
-        !text(a.id).trim() ||
-        !text(a.name).trim() ||
-        !text(a.command).trim() ||
-        !['codex', 'claude', 'pi', 'acp'].includes(a.harness) ||
-        (a.profileId !== undefined && (!getExternalAgentProfile(a.profileId) || getExternalAgentProfile(a.profileId)!.harness !== a.harness)) ||
-        typeof a.enabled !== 'boolean' ||
-        (a.availability !== undefined && !['auto', 'enabled', 'disabled'].includes(a.availability)) ||
-        !Array.isArray(a.args) ||
-        !a.args.every((v) => typeof v === 'string') ||
-        (a.defaults !== undefined && (!a.defaults || typeof a.defaults !== 'object' || Array.isArray(a.defaults) ||
-          Object.entries(a.defaults).some(([key, value]) => !['model', 'thinking', 'mode'].includes(key) || typeof value !== 'string' || !value.trim())))
-      )
-        throw new ExternalAgentError('invalid_settings', 'Invalid external Agent configuration');
-    }
-    if (value.defaultAgent !== null && !value.agents.some((v) => v.id === value.defaultAgent))
-      throw new ExternalAgentError('invalid_default', 'The default Agent configuration is unavailable');
+    validateExternalProgramSettings(value);
     const result = await this.command<ExternalAgentSettings>({
       action: 'configure',
       value,
@@ -638,6 +617,10 @@ export class ExternalAgentsService {
     return result;
   }
   async installations(input: import('@varin/application-client').ExternalAgentInstallationRequest, signal?: AbortSignal, resourceOwner?: import('@varin/protocol').SourceResourceOwner) {
+    if (input.action === 'install' || input.action === 'check') {
+      if (this.deps.deployment?.managedInstalls === false) this.deny('disables managed program installation and update checks');
+      if (this.deps.deployment) await this.configuration(input.id, resourceOwner);
+    }
     if (resourceOwner?.kind === 'managed_host') {
       if (!this.deps.managed) throw new Error('Managed external Source transport is unavailable');
       const owner = this.deps.managed();
@@ -654,100 +637,48 @@ export class ExternalAgentsService {
     return this.installer.log(id);
   }
   private async configuration(id: string,resourceOwner?:import('@varin/protocol').SourceResourceOwner) {
+    this.requirePlacement(resourceOwner);
     const config = (await this.settings(undefined,resourceOwner)).agents.find((a) => a.id === id);
     if (!config) throw new ExternalAgentError('agent_missing', 'External Agent configuration is unavailable');
+    return this.requireProfile(config);
+  }
+  private deny(reason: string): never {
+    throw new ExternalAgentError('deployment-policy-denied', `Deployment policy externalAgents ${reason}`, 403);
+  }
+  private placementDenied(owner?: SourceResourceOwner) {
+    return this.deps.deployment?.placement === 'managed' && owner?.kind !== 'managed_host';
+  }
+  private requirePlacement(owner?: SourceResourceOwner) {
+    if (this.placementDenied(owner)) this.deny('requires a managed execution resource');
+  }
+  private profileDenied(config: ExternalAgentConfiguration) {
+    return this.deps.deployment?.profiles?.includes(config.profileId ?? config.id) === false;
+  }
+  private requireProfile(config: ExternalAgentConfiguration | undefined) {
+    if (!config) throw new ExternalAgentError('agent_missing', 'External Agent configuration is unavailable');
+    if (this.profileDenied(config)) this.deny('disallows this profile');
     return config;
   }
-  private async resolveExecutable(config: ExternalAgentConfiguration, env: NodeJS.ProcessEnv) {
-    const profile = getExternalAgentProfile(config.profileId ?? config.id);
-    assertProfilePlatform(profile, process.platform, process.arch);
-    const executable = path.isAbsolute(config.command)
-      ? config.command
-      : this.environment.searchPathFor(config.command, env.PATH ?? env.Path) ?? await findInstalledExternalExecutable(config);
-    if (!executable || !(await stat(executable).catch(() => null))?.isFile())
-      throw new ExternalAgentError('program_missing', `Cannot find ${config.command} on this Host`);
-    return executable;
+  private executionDenial(config: ExternalAgentConfiguration, owner?: SourceResourceOwner) {
+    if (this.placementDenied(owner)) return 'requires a managed execution resource';
+    if (this.profileDenied(config)) return 'disallows this profile';
   }
-  private async discoverPrograms(agents: ExternalAgentConfiguration[], signal?: AbortSignal) {
-    const candidates = agents.filter(agent => agent.enabled && agent.availability === 'auto');
-    if (candidates.length === 0) return [];
-    signal?.throwIfAborted();
-    const env = this.environment.getLaunchEnvironment();
-    const found = await Promise.all(candidates.map(async agent => {
-      try {
-        await this.resolveExecutable(agent, env);
-        return agent.id;
-      } catch (error) {
-        if (error instanceof ExternalAgentError && ['program_missing', 'platform_unsupported'].includes(error.code)) return null;
-        throw error;
-      }
-    }));
-    signal?.throwIfAborted();
-    return found.filter(id => id !== null);
-  }
-  private async executable(
-    config: ExternalAgentConfiguration,
-  ): Promise<{ executable: string; command: string; args: string[]; env: NodeJS.ProcessEnv }> {
-    const env = this.environment.getLaunchEnvironment();
-    const executable = await this.resolveExecutable(config, env);
-    if (process.platform === 'win32' && /\.cmd$/i.test(executable)) {
-      // npm shims invoke a JS entry point; run that entry directly without a shell quoting layer.
-      const shim = await readFile(executable, 'utf8');
-      const entry = /"(?:%dp0%[\\/]|%~dp0)([^"\r\n]+\.(?:c?js|mjs))"/i.exec(shim)?.[1];
-      if (!entry) return { executable, command: executable, args: config.args, env };
-      const bundledNode = path.join(path.dirname(executable), 'node.exe');
-      const node = (await stat(bundledNode).catch(() => null))?.isFile() ? bundledNode
-        : this.environment.searchPathFor('node', env.PATH ?? env.Path) ?? process.execPath;
-      return {
-        executable,
-        command: node,
-        args: [path.resolve(path.dirname(executable), entry), ...config.args],
-        env: { ...env, ...(node === process.execPath ? { ELECTRON_RUN_AS_NODE: '1' } : {}) },
-      };
-    }
-    return { executable, command: executable, args: config.args, env };
-  }
-  private async probeVersion(launch: Awaited<ReturnType<ExternalAgentsService['executable']>>, signal?: AbortSignal, profile?: ExternalAgentProfile) {
-    if (profile?.versionProbe === 'handshake') return undefined;
-    const cwd = path.join(this.deps.directory, 'probe');
-    await mkdir(cwd, { recursive: true });
-    // This deadline bounds only a version query, never a model turn or native effect.
-    const timeout = AbortSignal.timeout(15_000);
-    const probeSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
-    const args = profileVersionArguments(launch.args, profile);
-    const child = await this.deps.spawn(launch.command, args, {
-      cwd, env: launch.env, stdio: ['ignore', 'pipe', 'pipe'],
-      signal: probeSignal, windowsHide: true,
+  private projectSettings(settings: ExternalAgentSettings, owner?: SourceResourceOwner): ExternalAgentSettings {
+    if (!this.deps.deployment) return settings;
+    const denied = settings.agents.flatMap(agent => {
+      const reason = this.executionDenial(agent, owner);
+      return reason ? [{ id: agent.id, code: 'deployment-policy-denied', status: 'failed' as const,
+        message: `Deployment policy externalAgents ${reason}` }] : [];
     });
-    const stdout: Buffer[] = [];
-    // Native completion confirms capture and exit, not delivery of already
-    // buffered Readable bytes to this consumer. Observe errors immediately, but
-    // keep native completion first so output cannot mask unconfirmed ownership.
-    const stdoutDrained = finished(child.stdout, { cleanup: true, writable: false, signal: probeSignal });
-    void stdoutDrained.catch(() => {});
-    child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk));
-    child.stderr.resume();
-    try {
-      await child.completion;
-      if (!child.exitConfirmed) throw new Error('Program version query exit is unconfirmed');
-      await stdoutDrained;
-      signal?.throwIfAborted();
-      if (timeout.aborted) throw new ExternalAgentError('probe_timeout', 'Program version query did not finish');
-      if (child.exitCode !== 0) throw new Error(`Program version check exited with ${child.exitCode}`);
-      const version = Buffer.concat(stdout).toString('utf8').trim();
-      if (!version) throw new Error('Program version query returned no version');
-      return version;
-    } catch (error) {
-      if (!child.exitConfirmed) throw new AggregateError([error], 'Program version query failed and process exit is unconfirmed');
-      signal?.throwIfAborted();
-      if (timeout.aborted) throw new ExternalAgentError('probe_timeout', 'Program version query did not finish');
-      throw error;
-    } finally {
-      if (child.exitConfirmed) await child.release();
-    }
+    if (!denied.length) return settings;
+    const unavailable = new Set(denied.map(entry => entry.id));
+    return { ...settings, defaultAgent: settings.defaultAgent && unavailable.has(settings.defaultAgent) ? null : settings.defaultAgent,
+      detections: [...(settings.detections ?? []).filter(entry => !unavailable.has(entry.id)), ...denied],
+      ...(settings.discoveredAgentIds && { discoveredAgentIds: settings.discoveredAgentIds.filter(id => !unavailable.has(id)) }) };
   }
   async detect(id: string, signal?: AbortSignal, resourceOwner?:import('@varin/protocol').SourceResourceOwner): Promise<import('@varin/application-client').ExternalAgentDetection> {
     if (resourceOwner?.kind === 'managed_host') {
+      if (this.deps.deployment?.profiles) await this.configuration(id, resourceOwner);
       if (!this.deps.managed) throw new Error('Managed external Source transport is unavailable');
       const owner = this.deps.managed();
       return (await owner.source(resourceOwner, signal)).externalDetect({coordinatorHostId:owner.coordinatorHostId,configurationId:id}, signal);
@@ -765,8 +696,8 @@ export class ExternalAgentsService {
       action: 'inspect_capabilities', configurationId: id, configuration: capabilityConfiguration(config),
     }, signal);
     try {
-      const launch = await this.executable(config);
-      const version = await this.probeVersion(launch, signal, getExternalAgentProfile(config.profileId ?? config.id));
+      const launch = await this.programs.executable(config);
+      const version = await this.programs.probeVersion(launch, signal, getExternalAgentProfile(config.profileId ?? config.id));
       if (observed?.agentVersion && observed.agentVersion !== version)
         await this.invalidateCapabilities(config, observed.generation);
       const managed = await this.installer.inspect(config);
@@ -792,6 +723,7 @@ export class ExternalAgentsService {
   /** Reads configuration/install observations, never initializes a harness or claims authentication. */
   async inspectExecutor(id: string, refresh = false, signal?: AbortSignal, resourceOwner?:import('@varin/protocol').SourceResourceOwner): Promise<import('@varin/application-client').ExternalExecutorInspection> {
     if (resourceOwner?.kind === 'managed_host') {
+      if (this.deps.deployment?.profiles) await this.configuration(id, resourceOwner);
       if (!this.deps.managed) throw new Error('Managed external Source transport is unavailable');
       const owner = this.deps.managed();
       return (await owner.source(resourceOwner, signal)).externalInspect({coordinatorHostId:owner.coordinatorHostId,configurationId:id,refresh}, signal);
@@ -811,6 +743,9 @@ export class ExternalAgentsService {
   list(signal?: AbortSignal) {
     return this.command<ExternalConversation[]>({ action: 'list' }, signal);
   }
+  async defaultResourceOwner(principal: string | null): Promise<SourceResourceOwner | undefined> {
+    return (await this.deps.defaultWorkspace?.(principal))?.resourceOwner;
+  }
   async create(input: { key: string; configurationId: string; source?: {resourceOwner:import("@varin/protocol").SourceResourceOwner;path:string;expectedWorkspaceId?:string}; cwd?: string; title?: string; organization?: import('@varin/application-client').ConversationOrganizationPlacement }, principalId?: string | null) {
     const accepted=await this.command<ExternalConversation|null>({action:'create_receipt',key:input.key,configurationId:input.configurationId,
       ...(input.cwd===undefined?{}:{cwd:input.cwd}),...(input.title===undefined?{}:{title:input.title}),
@@ -818,19 +753,33 @@ export class ExternalAgentsService {
       ...(principalId===undefined?{}:{principalId})});
     if(accepted)return accepted;
     const id = `external:${createHash('sha256').update(principalId == null ? input.key : `${principalId}\0${input.key}`).digest('hex')}`;
-    if (input.source?.resourceOwner.kind === 'managed_host') {
+    const privateWorkspace = !input.source && input.cwd === undefined
+      ? await this.deps.defaultWorkspace?.(principalId ?? null) : undefined;
+    const requested = input.source ?? privateWorkspace;
+    if (requested?.resourceOwner.kind === 'managed_host') {
       if (!this.deps.managed) throw new Error('Managed external Source transport is unavailable');
-      const owner=this.deps.managed(),client=await owner.source(input.source.resourceOwner);
-      const source=await client.externalPrepare({coordinatorHostId:owner.coordinatorHostId,conversationId:id,path:input.source.path,resourceOwner:input.source.resourceOwner,...(input.source.expectedWorkspaceId?{expectedWorkspaceId:input.source.expectedWorkspaceId}:{})});
-      // Catalog remains the only product writer; no target conversation is created.
-      const settings=await client.externalSettings({coordinatorHostId:owner.coordinatorHostId});
-      const selected=settings.agents.find(c=>c.id===input.configurationId);
-      if (!selected) throw new ExternalAgentError('agent_missing','Choose an external Harness configuration');
-      const target=await client.externalBinding({coordinatorHostId:owner.coordinatorHostId,source,configurationId:input.configurationId,harness:selected.harness});
-      const result=await this.command<ExternalConversation>({action:'create',key:input.key,id,configurationId:input.configurationId,harness:target.configuration.harness,profileId:target.configuration.profileId ?? target.configuration.id,
-        cwd:input.source.path,workspaceId:source.workspace_id,executionSource:source,title:input.title||target.configuration.name,
-        ...(input.organization?{organization:input.organization}:{}),...(principalId===undefined?{}:{principalId})});
-      this.notify(id,true);return result;
+      const owner = this.deps.managed(), resourceOwner = requested.resourceOwner;
+      const create = async () => {
+        const client = await owner.source(resourceOwner);
+        const settings = await client.externalSettings({ coordinatorHostId: owner.coordinatorHostId });
+        const selected = this.requireProfile(settings.agents.find(agent => agent.id === input.configurationId));
+        if (!selected.enabled) throw new ExternalAgentError('agent_disabled', 'Enable this external Agent before starting a conversation');
+        const source = await client.externalPrepare({ coordinatorHostId: owner.coordinatorHostId, conversationId: id,
+          path: requested.path, resourceOwner, ...(input.source?.expectedWorkspaceId ? { expectedWorkspaceId: input.source.expectedWorkspaceId } : {}),
+          ...(privateWorkspace ? { privateDirectory: true } : {}) });
+        const target = await client.externalBinding({ coordinatorHostId: owner.coordinatorHostId, source, configurationId: input.configurationId, harness: selected.harness });
+        this.requireProfile(target.configuration);
+        const cwd = privateWorkspace ? source.live_root?.canonicalRoot : requested.path;
+        if (!cwd) throw new Error('The original external private directory is unavailable');
+        const result = await this.command<ExternalConversation>({ action: 'create', key: input.key, id, configurationId: input.configurationId,
+          harness: target.configuration.harness, profileId: target.configuration.profileId ?? target.configuration.id,
+          cwd, workspaceId: source.workspace_id, executionSource: source, title: input.title || target.configuration.name,
+          ...(privateWorkspace ? { privateWorkspace: true } : {}), ...(input.organization ? { organization: input.organization } : {}),
+          ...(principalId === undefined ? {} : { principalId }) });
+        this.notify(id, true);
+        return result;
+      };
+      return owner.withSourceUse ? owner.withSourceUse(resourceOwner, create) : create();
     }
     const config = await this.configuration(input.configurationId);
     if (!config.enabled) throw new ExternalAgentError('agent_disabled','Enable this external Agent before starting a conversation');
@@ -1013,23 +962,13 @@ export class ExternalAgentsService {
   /** Called only by this Host's authenticated Source owner. No credentials cross the wire. */
   async managedLaunch(configurationId: string, harness: ExternalAgentConfiguration['harness'], sessionId?: string, signal?: AbortSignal) {
     const config = await this.configuration(configurationId);
-    if (!config.enabled || config.harness !== harness) throw new ExternalAgentError('agent_disabled', 'The target Host configuration is disabled or changed');
-    const launch = await this.executable(config);
-    const version = await this.probeVersion(launch, signal, getExternalAgentProfile(config.profileId ?? config.id)).catch(error => {
-      if (signal?.aborted || config.harness === 'pi' || error instanceof AggregateError) throw error;
-      return undefined;
-    });
-    const command = harness === 'claude' ? process.execPath : launch.command;
-    const args = harness === 'claude' ? [fileURLToPath(new URL('./claude-worker.js', import.meta.url))]
-      : [...launch.args, ...(harness === 'codex' ? ['app-server'] : harness === 'pi' ? ['--mode','rpc',...(sessionId ? ['--session',sessionId] : [])] : [])];
-    const env = {...launch.env,...(harness === 'claude' ? {ELECTRON_RUN_AS_NODE:'1'} : {})};
-    const configurationIdentity = createHash('sha256').update(JSON.stringify([config,command,args,env,version])).digest('hex');
-    const binding = {configurationIdentity,configuration:config,command:launch.command,args:launch.args,...(version ? {version} : {})};
+    const launch = await this.programs.managedLaunch(config, harness, sessionId, signal);
     const managed = await this.installer.inspect(config);
-    return {binding, command, args, env, ...(managed ? { programDirectory: managed.directory } : {})};
+    return { ...launch, ...(managed ? { programDirectory: managed.directory } : {}) };
   }
   private async executionSource(c: ExternalConversation, signal: AbortSignal) {
     if (c.executionSource?.resource_owner.kind === 'managed_host') throw new ExternalAgentError('remote_source_required','This attachment requires the target Host source owner');
+    this.requirePlacement();
     let admittedSource:
       { workspaceId: string; executionWorkspaceId: string; canonicalRoot: string } | undefined;
     let executionCwd=c.cwd;
@@ -1066,7 +1005,9 @@ export class ExternalAgentsService {
     const prepared = await (async () => {
       if (c.executionSource?.resource_owner.kind === 'managed_host') {
         if (!this.deps.managed) throw new Error('Managed external Source transport is unavailable');
-        const remote = await openManagedExternalTransport(this.deps.managed(),c,input=>this.command(input),error=>this.deps.onError?.(id,error),signal);
+        if (this.deps.deployment?.profiles) await this.configuration(c.configurationId, c.executionSource.resource_owner);
+        const remote = await openManagedExternalTransport(this.deps.managed(),c,input=>this.command(input),error=>this.deps.onError?.(id,error),signal, undefined,
+          this.deps.deployment?.profiles ? configuration => { this.requireProfile(configuration); } : undefined);
         return {config:remote.launch.configuration, capabilityGeneration:null, launch:remote.launch,
           version:remote.launch.version,child:remote.child,executionCwd:remote.executionCwd,start:remote.start,close:remote.close,capture:remote.capture,files:remote.files,attachments:this.attachments ? remote.attachmentOwner(this.attachments) : undefined};
       }
@@ -1077,8 +1018,8 @@ export class ExternalAgentsService {
       throw new ExternalAgentError('backend_changed', 'This configuration now points to another harness');
     const { admittedSource, executionCwd } = await this.executionSource(c, signal);
     const capabilityGeneration = await this.claimCapabilities(config);
-    const launch = await this.executable(config);
-    const version = await this.probeVersion(launch, signal, getExternalAgentProfile(config.profileId ?? config.id)).catch(error => {
+    const launch = await this.programs.executable(config);
+    const version = await this.programs.probeVersion(launch, signal, getExternalAgentProfile(config.profileId ?? config.id)).catch(error => {
       if (signal.aborted || config.harness === 'pi' || error instanceof AggregateError) throw error;
       return undefined;
     });
@@ -1798,36 +1739,17 @@ export class ExternalAgentsService {
           if (child && record(child.source).kind === 'isolated') {
             if (!this.sources) throw new Error('External source owner is unavailable');
             await this.sources.remove(child);
+          } else if (c.privateWorkspace && c.executionSource?.resource_owner.kind === 'managed_host') {
+            const managed = this.deps.managed?.();
+            if (!managed) throw new Error('Managed external Source transport is unavailable');
+            const client = await managed.source(c.executionSource.resource_owner);
+            await client.externalRemovePrivateSource({ coordinatorHostId: managed.coordinatorHostId, conversationId: c.id, source: c.executionSource });
           } else if (c.privateWorkspace && c.workspaceId) {
             const directory = path.resolve(c.cwd),
               container = path.resolve(this.deps.directory, 'workspaces');
             if (path.dirname(directory) !== container)
               throw new Error('Private conversation directory has changed');
-            const grant = await this.deps.kernel.issueGrant({
-              grantId: `external-cleanup:${randomUUID()}`,
-              owningWorkspace: c.workspaceId,
-              executionWorkspace: c.workspaceId,
-              capabilities: ['storage.read', 'storage.write'],
-              pathScopes: [''],
-            });
-            try {
-              const actor = this.deps.kernel.scoped(grant),
-                root = await actor.fileRootRegister({
-                  workspaceId: c.workspaceId,
-                  executionWorkspaceId: c.workspaceId,
-                  canonicalRoot: container,
-                });
-              await actor.fileRemove({
-                operationId: `external-directory-delete:${c.id}`,
-                workspaceId: c.workspaceId,
-                rootId: String(root.rootId),
-                path: path.basename(directory),
-                recursive: true,
-                force: true,
-              });
-            } finally {
-              await this.deps.kernel.revokeGrant(grant.grantId);
-            }
+            await removePrivateExternalWorkspace(this.deps.kernel, c.workspaceId, directory, c.id);
           }
           if (this.attachments) {
             await this.attachments.releaseExternal(c);
@@ -1845,7 +1767,7 @@ export class ExternalAgentsService {
   }
   async close() {
     await this.installer.close();
-    await Promise.all([...this.gatewayConnections].map(close => close()));
+    await this.programs.close();
     this.stopping = true;
     clearInterval(this.idleTimer);
     await Promise.all([...this.inputAdmissions.keys()].map(id => this.drainInputAdmissions(id)));

@@ -500,8 +500,8 @@ it('keeps recent tasks under their dispatch parent, loads children on expansion 
 
 it('uses the owner’s recent page order without leaking expanded category pages, and retains display choices on remount', async () => {
   const folder = group('Work', 0);
-  const first = { ...task('Recent first', 1, 'Work'), updatedAtMs: 20 };
-  const second = { ...task('Recent second', 0, 'Work'), updatedAtMs: 10 };
+  const first = { ...task('Recent first', 1, 'Work'), path: ['Work'], updatedAtMs: 20 };
+  const second = { ...task('Recent second', 0, 'Work'), path: ['Work'], updatedAtMs: 10 };
   const categoryOnly = task('Outside recent page', 2, 'Work');
   transport.read.mockImplementation(async (query: import('@varin/application-client').ConversationOrganizationQuery = {}) => {
     const entries = query.sort === 'recent' ? [first, second] : query.containerId ? [categoryOnly] : [];
@@ -511,11 +511,14 @@ it('uses the owner’s recent page order without leaking expanded category pages
   await click('最近');
   expect(transport.read.mock.calls.some(([query]) => query.kind === 'conversations' && query.sort === 'recent' && query.recursive)).toBe(true);
   expect([...container.querySelectorAll<HTMLButtonElement>('[role="treeitem"] button[title]')].map(button => button.title)).toEqual(['Recent first', 'Recent second']);
+  expect(row('Recent first').querySelector('.organization-row-path')?.textContent).toBe('Work');
+  expect(container.querySelector('.organization-drag')).toBeNull();
   expect(row('Outside recent page')).toBeUndefined();
   await act(async () => root.render(null)); await render();
   expect(container.querySelector('button[role="tab"][aria-selected="true"]')?.textContent).toBe('最近');
   await click('分类');
   expect(row('Work').getAttribute('aria-expanded')).toBe('true');
+  expect(row('Outside recent page').querySelector('.organization-drag')).not.toBeNull();
   expect(row('Outside recent page')).toBeTruthy();
   expect(transport.open).not.toHaveBeenCalled(); expect(transport.create).not.toHaveBeenCalled();
 });

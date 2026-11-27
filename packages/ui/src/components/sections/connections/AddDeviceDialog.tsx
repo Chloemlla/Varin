@@ -11,11 +11,13 @@ import { subscribeVarinEvents } from '@/lib/varinEvents';
 import { listComputers, type ComputerCatalog } from '@/lib/computers';
 
 /** The consuming Host owns probing, credentials and SSH. No frontend-local reachability inference. */
-export function AddDeviceDialog({ onClose, onChanged }: { onClose(): void; onChanged(): void }) {
+export function AddDeviceDialog({ onClose, onChanged, connections }: { onClose(): void; onChanged(): void;
+  connections?: { staticHosts: boolean; ssh: boolean } }) {
   const { t } = useI18n(), { threads } = useRuntimeAPIs();
   const api = React.useMemo(createHostConnectionsHttpAPI, []);
   const [step, setStep] = React.useState<'method' | 'connection' | 'result'>('method');
-  const [method, setMethod] = React.useState<'url' | 'ssh'>('url');
+  const [method, setMethod] = React.useState<'url' | 'ssh'>(connections?.staticHosts === false ? 'ssh' : 'url');
+  const allowSsh = connections?.ssh !== false;
   const [name, setName] = React.useState('');
   const [address, setAddress] = React.useState('');
   const [token, setToken] = React.useState('');
@@ -27,7 +29,7 @@ export function AddDeviceDialog({ onClose, onChanged }: { onClose(): void; onCha
   const [status, setStatus] = React.useState<string>();
   const [imports, setImports] = React.useState<Awaited<ReturnType<typeof api.ssh.imports>>>([]);
   const [id] = React.useState(() => `device-${crypto.randomUUID()}`);
-  React.useEffect(() => { void api.ssh.imports().then(setImports, () => {}); }, [api]);
+  React.useEffect(() => { if (allowSsh) void api.ssh.imports().then(setImports, () => {}); }, [api, allowSsh]);
   const inspect = React.useCallback(async () => {
     const [files, desktops] = await Promise.allSettled([threads?.sources.list(null), listComputers()]);
     api.assertOwner();
@@ -83,7 +85,7 @@ export function AddDeviceDialog({ onClose, onChanged }: { onClose(): void; onCha
     <DialogHeader><DialogTitle>{t('bot.workspace.addDevice')}</DialogTitle><DialogDescription>{t('bot.workspace.deviceHint')}</DialogDescription></DialogHeader>
     <div className="device-connection-steps" aria-label={t('bot.workspace.addDevice')}>{(['method', 'connection', 'result'] as const).map((item, i) => <span key={item} aria-current={step === item ? 'step' : undefined}>{i + 1} · {t(`bot.workspace.connection.${item}`)}</span>)}</div>
     <div key={step} className="device-connection-step">
-      {step === 'method' ? <div className="grid gap-3">{(['url', 'ssh'] as const).map(item => <button key={item} type="button" aria-pressed={method === item} className="device-connection-method" onClick={() => { setMethod(item); setAddress(''); }}><Icon name={item === 'ssh' ? 'terminal-box' : 'global'} className="size-5" /><span><b>{t(`bot.workspace.connection.${item}`)}</b><small>{t(`bot.workspace.connection.${item}Hint`)}</small></span><Icon name={method === item ? 'checkbox-circle' : 'arrow-right-s'} className="size-4" /></button>)}</div>
+      {step === 'method' ? <div className="grid gap-3">{(['url', 'ssh'] as const).filter(item => item === 'ssh' ? allowSsh : connections?.staticHosts !== false).map(item => <button key={item} type="button" aria-pressed={method === item} className="device-connection-method" onClick={() => { setMethod(item); setAddress(''); }}><Icon name={item === 'ssh' ? 'terminal-box' : 'global'} className="size-5" /><span><b>{t(`bot.workspace.connection.${item}`)}</b><small>{t(`bot.workspace.connection.${item}Hint`)}</small></span><Icon name={method === item ? 'checkbox-circle' : 'arrow-right-s'} className="size-4" /></button>)}</div>
         : step === 'connection' ? <form id="add-device" onSubmit={event => { event.preventDefault(); void connect(); }} className="grid gap-4">
           <label className="grid gap-2 typography-meta">{t('bot.workspace.name')}<Input value={name} onChange={event => setName(event.target.value)} /></label>
           <label className="grid gap-2 typography-meta">{t(method === 'ssh' ? 'bot.workspace.connection.ssh' : 'bot.workspace.connection.url')}<Input value={address} placeholder={method === 'ssh' ? 'ssh user@host' : 'https://host:port'} onChange={event => setAddress(event.target.value)} autoFocus /></label>

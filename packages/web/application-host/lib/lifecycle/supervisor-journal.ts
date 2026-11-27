@@ -1,9 +1,12 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { constants } from 'node:fs';
+import { constants, watch } from 'node:fs';
 import { link, lstat, mkdir, open, readdir, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
-import type { FollowupEventReceiveParams, FollowupEventReceiveReceipt } from '@varin/protocol';
+import type { FollowupEventReceiveParams, FollowupEventReceiveReceipt, FollowupEventSourceIdentity } from '@varin/protocol';
+import type { DurableEventInbox } from './event-inbox.js';
+import type { WakePublication, WakePublisher } from './wake-publisher.js';
+import { validSupervisorLaunch } from './host-parking.js';
 
 const maxRecordBytes = 4 * 1024 * 1024;
 const version = 1;
@@ -16,11 +19,6 @@ const encode = (value: unknown) => JSON.stringify(value, (_key, item: unknown) =
   ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item);
 const cursor = (value: unknown) => value === null || typeof value === 'string' && value.length <= 16_384;
 
-export interface WakePublication {
-  /** Monotonic revision from the original owner, not wall time. */
-  revision: number;
-  nextWakeAtMs: number | null;
-}
 interface EventEnvelope {
   version: 1;
   owner: string;
@@ -32,6 +30,12 @@ interface Receipt {
   owner: string;
   digest: string;
 }
+interface EventAcknowledgement extends Receipt {
+  durable?: true;
+}
+const verifyEventDigest = (ack: EventAcknowledgement, digest: string): void => {
+  if (ack.digest !== digest) throw new Error('Supervisor journal key conflict');
+};
 export interface SupervisorJournalFaults {
   afterEventCommit?(): void;
   afterCatalogReceipt?(): void;
@@ -40,8 +44,8 @@ export interface SupervisorJournalFaults {
 
 const validPage = (page: unknown): page is FollowupEventReceiveParams => {
   if (!object(page) || !object(page.identity) || !object(page.identity.source) || !identifier(page.identity.principalId)
-    || !cursor(page.expectedCursor) || !cursor(page.nextCursor) || page.expectedCursor === page.nextCursor
-    || !Array.isArray(page.events) || page.events.length === 0
+    || !cursor(page.expectedCursor) || !cursor(page.nextCursor)
+    || !Array.isArray(page.events)
     || !(page.status === null || object(page.status))
     || !page.events.every(event => object(event) && identifier(event.eventId) && integer(event.occurredAtMs)
       && (event.objectId === null || identifier(event.objectId)) && (event.revision === null || identifier(event.revision))
@@ -55,7 +59,7 @@ const validPage = (page: unknown): page is FollowupEventReceiveParams => {
  * Single logical Host + its trusted local supervisor. A journal receipt does not
  * authorize stopping the Host or change who owns an event source or Calendar.
  */
-export class SupervisorJournal {
+export class SupervisorJournal implements WakePublisher, DurableEventInbox {
   private constructor(readonly directory: string, readonly owner: string, private readonly faults: SupervisorJournalFaults) {}
 
   static async open(directory: string, owner: string, faults: SupervisorJournalFaults = {}): Promise<SupervisorJournal> {
@@ -110,6 +114,22 @@ export class SupervisorJournal {
     } finally { await unlink(temporary).catch(() => undefined); }
   }
 
+  private async eventAcknowledgement(key: string): Promise<EventAcknowledgement | undefined> {
+    const file = await this.read(key + '.ack');
+    if (!file) return undefined;
+    const ack = file.value;
+    if (!object(ack) || ack.version !== version || ack.owner !== this.owner
+      || typeof ack.digest !== 'string' || !/^[0-9a-f]{64}$/.test(ack.digest)
+      || ack.durable !== undefined && ack.durable !== true) throw new Error('Supervisor journal key conflict');
+    return { version, owner: this.owner, digest: ack.digest, ...(ack.durable === true && { durable: true }) };
+  }
+
+  private async removeEventCopy(key: string, suffix: 'pending' | 'archived'): Promise<void> {
+    await unlink(path.join(this.directory, key + '.' + suffix)).catch(error => {
+      if (errorCode(error) !== 'ENOENT') throw error;
+    });
+  }
+
   async currentWake(): Promise<WakePublication | null> {
     const names = (await readdir(this.directory)).filter(name => /^wake-[0-9]{16}\.json$/.test(name)).sort();
     const latest = names.at(-1);
@@ -132,6 +152,23 @@ export class SupervisorJournal {
     return { revision: input.revision, digest };
   }
 
+  async recordPark(input: { launchId: string; pid: number; revision: number }): Promise<void> {
+    if (!validSupervisorLaunch(input.launchId) || !integer(input.pid) || input.pid === 0 ||
+      (await this.currentWake())?.revision !== input.revision) throw new Error('Invalid Host park receipt');
+    await this.put('park-' + input.launchId + '.json', { version, owner: this.owner, ...input });
+  }
+
+  async consumePark(input: { launchId: string; pid: number; revision: number }): Promise<boolean> {
+    if (!validSupervisorLaunch(input.launchId)) return false;
+    const name = 'park-' + input.launchId + '.json';
+    const marker = (await this.read(name))?.value;
+    if (!isDeepStrictEqual(marker, { version, owner: this.owner, ...input }) ||
+      (await this.currentWake())?.revision !== input.revision) return false;
+    await unlink(path.join(this.directory, name));
+    await this.syncDirectory();
+    return true;
+  }
+
   /** Reconcile (not fire business schedules): the caller owns a real process supervisor. */
   async reconcileDueWake(revision: number, now: number, ensureRunning: () => Promise<void>): Promise<'stale' | 'waiting' | 'ready'> {
     if (!integer(revision) || !integer(now)) throw new Error('Invalid wake reconciliation');
@@ -151,6 +188,12 @@ export class SupervisorJournal {
     if (!identifier(eventKey) || !validPage(page)) throw new Error('Invalid supervisor event page');
     const filename = hash(eventKey);
     const envelope: EventEnvelope = { version, owner: this.owner, eventKey, page };
+    const storedAck = await this.eventAcknowledgement(filename);
+    if (storedAck) {
+      const digest = hash(encode(envelope));
+      verifyEventDigest(storedAck, digest);
+      return { version, owner: this.owner, digest };
+    }
     const archived = path.join(this.directory, filename + '.archived');
     const pending = path.join(this.directory, filename + '.pending');
     // Older journals only archived an event after delivery. Fix its identity
@@ -159,56 +202,112 @@ export class SupervisorJournal {
       if (errorCode(error) !== 'ENOENT' && errorCode(error) !== 'EEXIST') throw error;
     });
     const digest = await this.put(filename + '.archived', envelope);
-    const acknowledged = (await this.read(filename + '.ack'))?.value;
+    const acknowledged = await this.eventAcknowledgement(filename);
     if (acknowledged) {
-      if (!object(acknowledged) || acknowledged.version !== version || acknowledged.owner !== this.owner
-        || acknowledged.digest !== digest) throw new Error('Supervisor journal key conflict');
+      if (acknowledged.durable) {
+        await this.removeEventCopy(filename, 'archived');
+        await this.syncDirectory();
+      }
+      verifyEventDigest(acknowledged, digest);
     } else {
-      await link(archived, pending).catch(error => { if (errorCode(error) !== 'EEXIST') throw error; });
+      await link(archived, pending).catch(async error => {
+        if (errorCode(error) === 'EEXIST') return;
+        if (errorCode(error) !== 'ENOENT') throw error;
+        const retired = await this.eventAcknowledgement(filename);
+        if (!retired) throw error;
+        verifyEventDigest(retired, digest);
+      });
       await this.syncDirectory();
     }
     this.faults.afterEventCommit?.();
     return { version, owner: this.owner, digest };
   }
 
+  onPending(wake: () => void, onError: () => void) {
+    const watcher = watch(this.directory, { persistent: false }, (_event, name) => {
+      if (!name || /^[a-f0-9]{64}\.pending$/.test(name)) wake();
+    });
+    watcher.on('error', onError);
+    return () => watcher.close();
+  }
+
   async hasPendingEvents(): Promise<boolean> {
     return (await readdir(this.directory)).some(name => /^[a-f0-9]{64}\.pending$/.test(name));
   }
 
-  async replay(receive: (page: FollowupEventReceiveParams, signal?: AbortSignal) => Promise<FollowupEventReceiveReceipt>, signal?: AbortSignal) {
+  async replay(receiveDurably: (page: FollowupEventReceiveParams, signal?: AbortSignal) => Promise<FollowupEventReceiveReceipt>, signal?: AbortSignal,
+    keepReceiverParked?: (identity: FollowupEventSourceIdentity) => void) {
     let delivered = 0;
-    let retained = 0;
-    for (const name of (await readdir(this.directory)).filter(value => /^[a-f0-9]{64}\.pending$/.test(value)).sort()) {
+    const load = async (name: string) => {
       signal?.throwIfAborted();
       const record = await this.read(name);
-      if (!record) continue;
+      if (!record) return null;
       const { value } = record;
       if (!object(value) || value.version !== version || value.owner !== this.owner || !identifier(value.eventKey)
         || hash(value.eventKey) + '.pending' !== name || !validPage(value.page)) throw new Error('Invalid supervisor inbox entry');
-      const ack = name.slice(0, -8) + '.ack';
+      return { raw: record.raw, page: value.page };
+    };
+    const names = (await readdir(this.directory)).filter(value => /^[a-f0-9]{64}\.pending$/.test(value)).sort();
+    // Event keys are content addresses. Their lexical order says nothing
+    // about the receiving Catalog cursor. Index only the edges, not the bodies.
+    const entries = new Map<string, { before: string; after: string }>();
+    const successors = new Map<string, string[]>();
+    const previous = new Set<string>();
+    for (const name of names) {
+      const record = await load(name);
+      if (!record) continue;
+      const { identity, expectedCursor, nextCursor } = record.page;
+      const before = encode([identity, expectedCursor]);
+      const after = encode([identity, nextCursor]);
+      entries.set(name, { before, after });
+      if (before !== after) previous.add(after);
+      const later = successors.get(before) ?? [];
+      later.push(name);
+      successors.set(before, later);
+    }
+    // Counterless push sources can keep their cursor. Apply those pages
+    // before an edge that advances the original checkpoint.
+    const orderedEdges = (names: string[]) => names.sort((left, right) => {
+      const a = entries.get(left)!, b = entries.get(right)!;
+      return Number(b.before === b.after) - Number(a.before === a.after);
+    });
+    const ready = orderedEdges([...entries].filter(([, edge]) => !previous.has(edge.before)).map(([name]) => name));
+    const ordered = new Set<string>();
+    for (const name of ready) {
+      if (ordered.has(name)) continue;
+      ordered.add(name);
+      for (const next of orderedEdges(successors.get(entries.get(name)!.after) ?? [])) ready.push(next);
+    }
+    // Catalog still decides admission if a receiver reuses a cursor value
+    // and the pending pages alone cannot establish its starting point.
+    for (const name of entries.keys()) ordered.add(name);
+    for (const name of ordered) {
+      const record = await load(name);
+      if (!record) continue;
+      const key = name.slice(0, -8);
       const fingerprint = hash(record.raw);
-      const saved = (await this.read(ack))?.value;
-      if (saved) {
-        const archived = await this.read(name.slice(0, -8) + '.archived');
-        if (!object(saved) || saved.version !== version || saved.owner !== this.owner
-          || saved.digest !== fingerprint || !archived || hash(archived.raw) !== fingerprint) throw new Error('Supervisor acknowledgement mismatch');
-      } else {
+      const saved = await this.eventAcknowledgement(key);
+      if (saved) verifyEventDigest(saved, fingerprint);
+      else {
         try {
-          const result = await receive(value.page, signal);
-          if (!isDeepStrictEqual(result.checkpoint.identity, value.page.identity) || result.checkpoint.cursor !== value.page.nextCursor
-            || result.accepted + result.duplicates !== value.page.events.length) throw new Error('Invalid Catalog acknowledgement');
-        } catch { if (signal?.aborted) throw signal.reason; retained++; continue; }
+          const result = await receiveDurably(record.page, signal);
+          if (!isDeepStrictEqual(result.checkpoint.identity, record.page.identity) || result.checkpoint.cursor !== record.page.nextCursor
+            || result.accepted + result.duplicates !== record.page.events.length) throw new Error('Invalid Catalog acknowledgement');
+        } catch {
+          if (signal?.aborted) throw signal.reason;
+          keepReceiverParked?.(record.page.identity);
+          continue;
+        }
         this.faults.afterCatalogReceipt?.();
-        // Catalog's normal SQLite WAL acknowledgement does not prove that
-        // the commit survived machine power loss. Keep the fsynced payload
-        // as a private recovery copy even after it leaves the runnable inbox.
-        await this.put(name.slice(0, -8) + '.archived', value);
-        await this.put(ack, { version, owner: this.owner, digest: fingerprint });
+        await this.put(key + '.ack', { version, owner: this.owner, digest: fingerprint, durable: true });
       }
-      await unlink(path.join(this.directory, name)).catch(error => { if (errorCode(error) !== 'ENOENT') throw error; });
+      // Keep old recovery copies whose ordinary Catalog receipt preceded
+      // the durable command. New acknowledgements leave only the fingerprint.
+      if (!saved || saved.durable) await this.removeEventCopy(key, 'archived');
+      await this.removeEventCopy(key, 'pending');
       await this.syncDirectory();
       delivered++;
     }
-    return { delivered, retained };
+    return { delivered, retained: entries.size - delivered };
   }
 }

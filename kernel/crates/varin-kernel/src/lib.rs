@@ -61,11 +61,15 @@ mod workspace_handoffs;
 mod workspace_adoption;
 mod native_metadata;
 mod native_security;
+mod upgrade_preflight;
 mod reparse_data;
 #[cfg(feature = "workspace-mount")]
 mod workspace_mount;
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--upgrade-preflight")) {
+        return upgrade_preflight::run();
+    }
     #[cfg(target_os = "linux")]
     if std::env::args().any(|arg| arg == "--watch-directories") {
         return directory_watch_linux::run();

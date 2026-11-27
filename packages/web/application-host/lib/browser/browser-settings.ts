@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import type { BrowserConnection, BrowserSettings, BrowserSettingsSnapshot } from '@varin/protocol';
 import { createCdpBrowserOwner } from './cdp-owner.js';
 import type { BrowserResources } from './browser-resources.js';
+import type { CdpEgress } from './cdp-transport.js';
 
 type Document = Record<string, unknown>;
 const object = (value: unknown): value is Document => !!value && typeof value === 'object' && !Array.isArray(value);
@@ -9,9 +10,10 @@ const text = (value: unknown): value is string => typeof value === 'string' && !
 export class BrowserSettingsError extends Error {
   constructor(message: string, readonly status = 400) { super(message); }
 }
-export async function probeBrowserConnection(value: unknown) {
+export async function probeBrowserConnection(value: unknown, egress?: CdpEgress) {
   const connection = parseBrowserSettings({ connections: [value], defaultBrowserId: null }).connections[0]!;
-  const owner = createCdpBrowserOwner({ browserId: connection.id, endpoint: connection.endpoint, ...(connection.headers ? { headers: connection.headers } : {}) });
+  const owner = createCdpBrowserOwner({ browserId: connection.id, endpoint: connection.endpoint,
+    ...(connection.headers && { headers: connection.headers }), ...(egress && { egress }) });
   try { await owner.connect(); return { resource: await owner.resource(), pages: (await owner.list()).length }; }
   finally { await owner.dispose(); }
 }
@@ -41,6 +43,7 @@ export function createBrowserSettings(options: {
   read(): Promise<Document>;
   update(change: (current: Document) => Document): Promise<unknown>;
   environment?: { endpoint?: string | undefined; scratchDirectory?: string | undefined };
+  egress?: CdpEgress;
 }) {
   const installed = new Map<string, BrowserConnection>();
   let flight = Promise.resolve();
@@ -67,7 +70,8 @@ export function createBrowserSettings(options: {
           options.resources.updateMetadata(connection.id, connection.label); installed.set(connection.id, connection); continue;
         }
         if (previous) await options.resources.unregister(connection.id);
-        options.resources.register(createCdpBrowserOwner({ browserId: connection.id, ...connection }), connection.label, 'This Host', { source: 'cdp' });
+        const owner = createCdpBrowserOwner({ browserId: connection.id, ...connection, ...(options.egress && { egress: options.egress }) });
+        options.resources.register(owner, connection.label, 'This Host', { source: 'cdp', retained: () => owner.retained() });
         installed.set(connection.id, connection);
       }
     });
@@ -99,6 +103,6 @@ export function createBrowserSettings(options: {
     });
     options.resources.clearBinding(threadId);
   };
-  return { read, save, refresh, preferred, selectTask };
+  return { read, save, refresh, preferred, selectTask, probe: (value: unknown) => probeBrowserConnection(value, options.egress) };
 }
 export type BrowserSettingsOwner = ReturnType<typeof createBrowserSettings>;

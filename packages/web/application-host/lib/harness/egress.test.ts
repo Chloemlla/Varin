@@ -66,6 +66,32 @@ afterEach(async () => {
 });
 
 describe("egress policy", () => {
+  it("restricts literal destinations and DNS answers used for dialing", async () => {
+    const rt = createEgressRuntime({
+      env: { HTTP_PROXY: 'http://unused-proxy.invalid:80' },
+      deployment: { userDestinations: 'public' },
+      resolveAll: async () => [{ address: '127.0.0.1', family: 4 }],
+    });
+    cleanups.push(rt.close);
+    await expect(rt.fetch('http://127.0.0.1:9123/')).rejects.toMatchObject({ kind: 'deployment-policy-denied' });
+    await expect(rt.fetch('http://target.test:9123/')).rejects.toMatchObject({ kind: 'deployment-policy-denied' });
+  });
+
+  it("uses only the required proxy for user destinations, including literal addresses", async () => {
+    const proxy = await stubConnectProxy('HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok');
+    cleanups.push(proxy.close);
+    const rt = createEgressRuntime({
+      env: { NO_PROXY: '*' },
+      deployment: { userDestinations: 'public', requiredProxy: proxy.url },
+      resolveAll: async () => { throw new Error('The configured proxy owns target DNS'); },
+    });
+    cleanups.push(rt.close);
+    const target = 'http://127.0.0.1:9123/';
+    expect(await (await rt.fetch(target, {}, { mode: 'direct' })).text()).toBe('ok');
+    expect(proxy.authorities).toEqual(['127.0.0.1:9123']);
+    expect(await rt.diagnose(target)).toMatchObject({ resolution: 'proxy-side' });
+  });
+
   it("resolves direct when no proxy env is set", () => {
     const p = resolveEgressPolicy(undefined, {});
     expect(p.mode).toBe("direct");

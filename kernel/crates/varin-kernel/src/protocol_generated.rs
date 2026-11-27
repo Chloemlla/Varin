@@ -115,6 +115,7 @@ pub(crate) const KERNEL_BODY_METHODS: &[&str] = &[
     "runtime.followup.arrangement.put",
     "runtime.followup.arrangements.list",
     "runtime.followup.events.receive",
+    "runtime.followup.events.receiveDurable",
     "runtime.followup.backlog",
     "runtime.calendar.sync",
     "runtime.calendar.admit",
@@ -225,6 +226,11 @@ pub(crate) const KERNEL_CONTROL_METHODS: &[&str] = &[
     "authority.grant.revoke",
     "authority.grant.retire",
     "runtime.status",
+    "runtime.park.reserve",
+    "runtime.park.release",
+    "runtime.inbox.reconcile",
+    "runtime.inbox.rejections",
+    "runtime.inbox.dismiss",
     "runtime.tools.select",
     "runtime.run.inspect",
     "runtime.run.failure",
@@ -2090,6 +2096,42 @@ pub(crate) struct ModelSelectParams {
     pub(crate) configuration: Value,
     pub(crate) credential_scope: Option<CredentialScope>,
     pub(crate) child_dispatch: Option<varin_runtime::catalog::dispatch::ChildDispatchCatalog>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RuntimeStatusParams {
+    pub(crate) include_wake_deadline: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct InboxReconcileParams {
+    pub(crate) inbox_id: String,
+    pub(crate) principal_id: String,
+    pub(crate) key: String,
+    pub(crate) thread_id: String,
+    pub(crate) branch_id: String,
+    pub(crate) method: String,
+    pub(crate) result: Option<Value>,
+    pub(crate) draft: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct InboxRejectionsParams {
+    pub(crate) principal_id: String,
+    pub(crate) thread_id: String,
+    pub(crate) branch_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct InboxDismissParams {
+    pub(crate) inbox_id: String,
+    pub(crate) principal_id: String,
+    pub(crate) thread_id: String,
+    pub(crate) branch_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -4948,6 +4990,11 @@ pub(crate) fn validate_generated_method_params(method: &str, params: &Value) -> 
                 .map(|_| ())
                 .map_err(|error| error.to_string())
         }
+        "runtime.followup.events.receiveDurable" => {
+            serde_json::from_value::<FollowupEventReceiveParams>(params.clone())
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }
         "runtime.followup.eventSources.list" => {
             serde_json::from_value::<KernelEmptyParams>(params.clone())
                 .map(|_| ())
@@ -5843,7 +5890,24 @@ pub(crate) fn validate_generated_method_params(method: &str, params: &Value) -> 
         "runtime.model.inspect" => serde_json::from_value::<RunParams>(params.clone())
             .map(|_| ())
             .map_err(|error| error.to_string()),
-        "runtime.status" => serde_json::from_value::<KernelEmptyParams>(params.clone())
+        "runtime.status" => serde_json::from_value::<RuntimeStatusParams>(params.clone())
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+        "runtime.park.reserve" => serde_json::from_value::<KernelEmptyParams>(params.clone())
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+        "runtime.park.release" => serde_json::from_value::<KernelEmptyParams>(params.clone())
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+        "runtime.inbox.reconcile" => serde_json::from_value::<InboxReconcileParams>(params.clone())
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+        "runtime.inbox.rejections" => {
+            serde_json::from_value::<InboxRejectionsParams>(params.clone())
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }
+        "runtime.inbox.dismiss" => serde_json::from_value::<InboxDismissParams>(params.clone())
             .map(|_| ())
             .map_err(|error| error.to_string()),
         "runtime.material.retention" => {
@@ -6887,6 +6951,9 @@ pub(crate) fn validate_generated_method_params(method: &str, params: &Value) -> 
                 .map(|_| ())
                 .map_err(|error| error.to_string())
         }
+        "source.retention" => serde_json::from_value::<KernelEmptyParams>(params.clone())
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
         "source.authority.handoff" => {
             serde_json::from_value::<SourceHandoffInspectParams>(params.clone())
                 .map(|_| ())

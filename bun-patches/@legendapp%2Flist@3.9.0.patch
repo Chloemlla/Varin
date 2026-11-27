@@ -1,28 +1,23 @@
 diff --git a/react.js b/react.js
-index 515545471e08426fc90856256db9491db0ca4b92..39e3be44ff2b11d9ca51c11639a900461cef7099 100644
+index ca0217afce6086dcd0bb6d50492abd7a624cd2ae..aadb321b00dad0380f61194ca86a5e33e25592c8 100644
 --- a/react.js
 +++ b/react.js
-@@ -5647,6 +5647,12 @@ function measureContainersInLayoutEffect(ctx, targetContainerIds = null) {
+@@ -5870,6 +5870,8 @@ function measureContainersInLayoutEffect(ctx, targetContainerIds = null) {
      if (itemKey !== void 0 && element && isContainerItemCurrent(ctx, containerId, itemKey)) {
        const generation = (_b = ctx.state.containerItemGenerations[containerId]) != null ? _b : 0;
-       const rect = element.getBoundingClientRect();
-+      // Varin: a mounted list under display:none has no measurable layout. Keep its last
-+      // sizes/baseline instead of collapsing rows and synchronously allocating more containers.
-+      // Match useOnLayoutSync: a real zero-height row with nonzero width must still be measured.
-+      if (rect.width === 0 && rect.height === 0) {
-+        continue;
-+      }
-       setContainerLayoutBaseline(element, rect);
+       const size = measureContainerLayoutSize(element);
++      // Hidden trees have no layout. Keep the previous baseline until visible again.
++      if (size.width === 0 && size.height === 0) continue;
+       setContainerLayoutBaseline(element, size);
        measurements.push({
          containerId,
-@@ -5815,12 +5821,15 @@ var ContainerLayoutCoordinator = typedMemo(function ContainerLayoutCoordinatorCo
+@@ -6045,12 +6047,14 @@ var ContainerLayoutCoordinator = typedMemo(function ContainerLayoutCoordinatorCo
      {
        sortContainerElements(ctx);
      }
 -    {
-+    // Varin: preserve synchronous DOM ordering above; only defer measurement.
-+    // Filling collapsed rows can allocate another batch recursively during
-+    // React's layout phase. Coalesce it after the commit and before paint.
++    // DOM order must match this commit. Batch measurement before paint so allocating
++    // more containers for collapsed rows doesn't recursively enter another layout effect.
 +    ctx.state.scheduledWork.microtask(() => {
        const targetContainerIds = getContainerLayoutEffectScope(ctx);
        if (targetContainerIds !== void 0) {
@@ -33,12 +28,10 @@ index 515545471e08426fc90856256db9491db0ca4b92..39e3be44ff2b11d9ca51c11639a90046
    }, [ctx, containerLayoutEpoch]);
    return children;
  });
-@@ -6257,6 +6266,12 @@ var pendingWebShrinkFrame;
+@@ -6487,6 +6491,10 @@ var pendingWebShrinkFrame;
  function cancelWebShrinkMeasurement(state) {
    pendingWebShrinkMeasurements.delete(state);
  }
-+// Varin: a list marked `data-legend-immediate-shrink` applies a shrinking item's size in the same
-+// frame, so the rows below follow a collapsing row instead of trailing it by a frame.
 +function shrinksImmediately(ref) {
 +  const element = ref.current;
 +  return !!(element && typeof element.closest === "function" && element.closest("[data-legend-immediate-shrink]"));
@@ -46,7 +39,7 @@ index 515545471e08426fc90856256db9491db0ca4b92..39e3be44ff2b11d9ca51c11639a90046
  function scheduleWebShrinkMeasurement(state, confirmMeasurement) {
    pendingWebShrinkMeasurements.set(state, confirmMeasurement);
    if (pendingWebShrinkFrame === void 0) {
-@@ -6290,7 +6305,7 @@ function processContainerLayout({ containerId, ctx, rectangle, ref, state }) {
+@@ -6520,7 +6528,7 @@ function processContainerLayout({ containerId, ctx, rectangle, ref, state }) {
        size: layout
      });
    };
@@ -54,32 +47,27 @@ index 515545471e08426fc90856256db9491db0ca4b92..39e3be44ff2b11d9ca51c11639a90046
 +  const shouldDeferWebShrinkLayoutUpdate = !isInMVCPActiveMode(listState) && previousSize !== void 0 && size + 1 < previousSize && !shrinksImmediately(ref);
    if (shouldDeferWebShrinkLayoutUpdate) {
      scheduleWebShrinkMeasurement(state, () => {
-       var _a4;
+       if (state.itemKey === currentItemKey) {
 diff --git a/react.mjs b/react.mjs
-index ce08abe7ee62e8940f9c6ff169829244bd6bb736..62d27cd1f09b6462d47545859431a0522aa609b5 100644
+index 801cd3d7ab65c0abe63f7ceedac69a524d283fe8..49243e180cb1a03e7e7597e65983e7c7b2ba3b30 100644
 --- a/react.mjs
 +++ b/react.mjs
-@@ -5626,6 +5626,12 @@ function measureContainersInLayoutEffect(ctx, targetContainerIds = null) {
+@@ -5849,6 +5849,8 @@ function measureContainersInLayoutEffect(ctx, targetContainerIds = null) {
      if (itemKey !== void 0 && element && isContainerItemCurrent(ctx, containerId, itemKey)) {
        const generation = (_b = ctx.state.containerItemGenerations[containerId]) != null ? _b : 0;
-       const rect = element.getBoundingClientRect();
-+      // Varin: a mounted list under display:none has no measurable layout. Keep its last
-+      // sizes/baseline instead of collapsing rows and synchronously allocating more containers.
-+      // Match useOnLayoutSync: a real zero-height row with nonzero width must still be measured.
-+      if (rect.width === 0 && rect.height === 0) {
-+        continue;
-+      }
-       setContainerLayoutBaseline(element, rect);
+       const size = measureContainerLayoutSize(element);
++      // Hidden trees have no layout. Keep the previous baseline until visible again.
++      if (size.width === 0 && size.height === 0) continue;
+       setContainerLayoutBaseline(element, size);
        measurements.push({
          containerId,
-@@ -5794,12 +5800,15 @@ var ContainerLayoutCoordinator = typedMemo(function ContainerLayoutCoordinatorCo
+@@ -6024,12 +6026,14 @@ var ContainerLayoutCoordinator = typedMemo(function ContainerLayoutCoordinatorCo
      {
        sortContainerElements(ctx);
      }
 -    {
-+    // Varin: preserve synchronous DOM ordering above; only defer measurement.
-+    // Filling collapsed rows can allocate another batch recursively during
-+    // React's layout phase. Coalesce it after the commit and before paint.
++    // DOM order must match this commit. Batch measurement before paint so allocating
++    // more containers for collapsed rows doesn't recursively enter another layout effect.
 +    ctx.state.scheduledWork.microtask(() => {
        const targetContainerIds = getContainerLayoutEffectScope(ctx);
        if (targetContainerIds !== void 0) {
@@ -90,12 +78,10 @@ index ce08abe7ee62e8940f9c6ff169829244bd6bb736..62d27cd1f09b6462d47545859431a052
    }, [ctx, containerLayoutEpoch]);
    return children;
  });
-@@ -6236,6 +6245,12 @@ var pendingWebShrinkFrame;
+@@ -6466,6 +6470,10 @@ var pendingWebShrinkFrame;
  function cancelWebShrinkMeasurement(state) {
    pendingWebShrinkMeasurements.delete(state);
  }
-+// Varin: a list marked `data-legend-immediate-shrink` applies a shrinking item's size in the same
-+// frame, so the rows below follow a collapsing row instead of trailing it by a frame.
 +function shrinksImmediately(ref) {
 +  const element = ref.current;
 +  return !!(element && typeof element.closest === "function" && element.closest("[data-legend-immediate-shrink]"));
@@ -103,7 +89,7 @@ index ce08abe7ee62e8940f9c6ff169829244bd6bb736..62d27cd1f09b6462d47545859431a052
  function scheduleWebShrinkMeasurement(state, confirmMeasurement) {
    pendingWebShrinkMeasurements.set(state, confirmMeasurement);
    if (pendingWebShrinkFrame === void 0) {
-@@ -6269,7 +6284,7 @@ function processContainerLayout({ containerId, ctx, rectangle, ref, state }) {
+@@ -6499,7 +6507,7 @@ function processContainerLayout({ containerId, ctx, rectangle, ref, state }) {
        size: layout
      });
    };
@@ -111,4 +97,4 @@ index ce08abe7ee62e8940f9c6ff169829244bd6bb736..62d27cd1f09b6462d47545859431a052
 +  const shouldDeferWebShrinkLayoutUpdate = !isInMVCPActiveMode(listState) && previousSize !== void 0 && size + 1 < previousSize && !shrinksImmediately(ref);
    if (shouldDeferWebShrinkLayoutUpdate) {
      scheduleWebShrinkMeasurement(state, () => {
-       var _a4;
+       if (state.itemKey === currentItemKey) {

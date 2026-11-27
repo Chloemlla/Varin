@@ -93,6 +93,12 @@ export async function startBrowserNode(options: BrowserNodeOptions) {
     // Peers can operate on provisioned browsers, never turn the role into an arbitrary CDP
     // connection broker or retrieve the deployment's upstream credentials / scratch paths.
     registerNodeRoleIdentity(app, { role: 'browser', hostId, capabilities: ['browser'], ...auth });
+    app.get('/api/harness/managed-execution/v1/retention', auth.requireAuth, (_req, res) => {
+      const activity = resources.activity();
+      res.setHeader('X-Varin-Managed-Host', hostId);
+      res.setHeader('Cache-Control', 'no-store');
+      res.json({ retireReady: !Object.values(activity).some(Boolean) });
+    });
     registerManagedBrowserRoutes(app, { hostId, resources, allowProbe: false,
       parseRequestBody: express.json({ limit: '64mb' }), ...auth });
     const fail: express.ErrorRequestHandler = (error, _req, res, _next) => {

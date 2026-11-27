@@ -1,6 +1,7 @@
 import { contextAgentDefinitionFixture } from './context-agent.test-helper.js';
 import { expect, it } from 'vitest';
 import { createChildProfilePreparer } from './child-profiles.js';
+import { providerResourceOwner } from '../deployment/resource-provider.js';
 import { createModelAuthority } from './model-authority.js';
 import type { ChildCapabilityDescriptor, ChildModelBinding } from './protocol.generated.js';
 
@@ -215,12 +216,15 @@ it('retains shipped-default provenance and explicit preset/custom arrays for exa
 it('discovers configuration identities independently of presets, partitions them by actual Host and does not probe sessions', async () => {
   const f = await fixture();
   const target = {kind:'managed_host' as const,hostId:'target',connectionId:'paired',endpointIdentity:'paired-endpoint'};
+  const dormant = providerResourceOwner('operator', { id: 'cold-workspace', hostId: 'cold-host' });
   const requested:unknown[]=[];
   const prepare=createChildProfilePreparer({models:f.models,settings:async()=>({}),capabilities:async()=>f.capabilities,
-    projects:async()=>[{id:'remote-project',name:'Remote',path:'/target/project',resource_owner:target}],
+    projects:async()=>[{id:'remote-project',name:'Remote',path:'/target/project',resource_owner:target},
+      {id:'on-demand-project',name:'On-demand',path:'/work/project',resource_owner:dormant}],
     externalAgents:async owner=>{requested.push(owner);return {revision:1,defaultAgent:'codex',agents:[{id:'codex',name:'Codex',harness:'codex',command:owner?'target-codex':'codex',args:[],enabled:!owner,availability:owner?'disabled':'auto'}]};}});
-  const catalog=await prepare({parent:f.parent});
-  expect(requested).toHaveLength(2);
+  const catalog=await prepare({parent:f.parent,resourceOwner:dormant});
+  expect(requested).toEqual([undefined, target]);
+  expect(catalog.projects?.find(project => project.id === 'on-demand-project')?.resource_owner).toEqual(dormant);
   expect(catalog.executors).toHaveLength(2);
   expect(catalog.executors?.[0]).toMatchObject({availability:'auto',binding:{configuration_id:'codex',resource_owner:{kind:'local'}}});
   expect(catalog.executors?.[1]).toMatchObject({availability:'disabled',binding:{resource_owner:target}});

@@ -91,6 +91,7 @@ export const createRelayService = ({
   const identityRuntime = createRelayIdentityRuntime({ crypto, readSettingsFromDisk, updateSettingsOnDisk });
 
   let hostClient: RelayHostClient | null = null;
+  let reconciliationRequests = 0;
   let status: RelayServiceStatus = { state: 'disabled', lastError: null, connectedClients: 0 };
   // Re-checks the claim while enabled: a standby instance takes over when the
   // claimant dies; a running host stands down when another process claims.
@@ -222,6 +223,7 @@ export const createRelayService = ({
   // session uses the relay, stop it when none remain. Called on startup and after
   // pairing/device changes, so the operator never toggles it manually.
   const reconcile = async (): Promise<void> => {
+    reconciliationRequests++;
     try {
       const demand = await hasRelayDemand();
       const config = await readConfig();
@@ -234,6 +236,8 @@ export const createRelayService = ({
       }
     } catch (error) {
       logger.warn(`[Relay] reconcile failed: ${errorMessage(error, 'unknown error')}`);
+    } finally {
+      reconciliationRequests--;
     }
   };
 
@@ -356,6 +360,7 @@ export const createRelayService = ({
 
   return {
     registerRoutes,
+    activity: () => ({ running: hostClient !== null, reconciling: reconciliationRequests > 0 }),
     startIfEnabled,
     reconcile,
     stop,

@@ -1,6 +1,7 @@
 /** A clean-process relay. The replacement cannot start before the original Host drains. */
 import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
+import { hostEnvironment } from '../security/host-environment.js';
 
 // The relay loads no application code. Keeping it alive while the Host stops avoids
 // depending on a closing extension, HTTP socket, worker or event loop for relaunch.
@@ -40,7 +41,7 @@ export function createProcessRestart(options: {
 }) {
   let pending: Promise<void> | undefined;
   return () => pending ??= (async () => {
-    const child = (options.spawn ?? spawn)(process.execPath, ['-e', relaySource], { stdio: ['inherit', 'inherit', 'inherit', 'ipc'], env: process.env });
+    const child = (options.spawn ?? spawn)(process.execPath, ['-e', relaySource], { stdio: ['inherit', 'inherit', 'inherit', 'ipc'], env: hostEnvironment.forHostRestart() });
     const observation = new AbortController();
     const ready = message(child, 'ready', observation.signal);
     const launched = message(child, 'launched', observation.signal);

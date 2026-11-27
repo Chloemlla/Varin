@@ -30,7 +30,7 @@ export interface ManagedRecoveryServiceOptions {
   documents: Pick<DocumentAuthority, 'admitWorkspaceRegistration'> & RecoveryEditors;
   storage: KernelStorageAdapter;
   store: Pick<KernelRecoveryStore, 'recordTurnStart' | 'recordTurnSettled' | 'getTurn'>;
-  recovery: RecoveryFileParticipantEngine;
+  recovery?: RecoveryFileParticipantEngine;
   validateLiveSource: LiveSourceResolver;
 }
 
@@ -99,6 +99,8 @@ export function createManagedRecoveryService(options: ManagedRecoveryServiceOpti
     }
     const request = structuredClone(input);
     const { binding, action, coordinatorHostId } = request;
+    const recovery = options.recovery;
+    if (!recovery && action.kind !== 'files' && action.kind !== 'settle') throw new SourceAdmissionError('source_unavailable');
     if (!coordinatorHostId || !binding.operationId || !binding.workspaceId || binding.conversation.kind !== 'thread'
       || !binding.conversation.threadId || !binding.conversation.branchId || !binding.turns.length
       || !binding.turns.some(value => value.turn.source?.workspace_id === binding.workspaceId)) {
@@ -195,18 +197,18 @@ export function createManagedRecoveryService(options: ManagedRecoveryServiceOpti
               retryable: false } } : {}) });
         }
         if (action.kind === 'settle') return { status: 'settled' };
-        return options.recovery.prepareFileRecovery({ ...access, workspaceId: binding.workspaceId,
+        return recovery!.prepareFileRecovery({ ...access, workspaceId: binding.workspaceId,
           conversation: binding.conversation, entryId: action.entryId, navigation: action.navigation,
           journalTurns: turns.map(({ selection: { turn, restore } }) => ({ workspaceId: turn.source!.workspace_id,
             executionId: turn.anchor.executionId, restore })), allowedFileTargets: targets.map(value => value.target) });
       }
       switch (action.kind) {
-        case 'prepare_undo': return options.recovery.prepareFileUndo({ ...access, undoOf: action.undoOf, navigation: action.navigation });
-        case 'apply': return options.recovery.applyFileRecovery({ ...action.input, ...access });
-        case 'read': return options.recovery.readFileRecovery(access);
-        case 'complete': return options.recovery.completeFileRecovery(access);
-        case 'compensate': return options.recovery.compensateFileRecovery(access);
-        case 'cancel': return options.recovery.cancelFileRecovery(access);
+        case 'prepare_undo': return recovery!.prepareFileUndo({ ...access, undoOf: action.undoOf, navigation: action.navigation });
+        case 'apply': return recovery!.applyFileRecovery({ ...action.input, ...access });
+        case 'read': return recovery!.readFileRecovery(access);
+        case 'complete': return recovery!.completeFileRecovery(access);
+        case 'compensate': return recovery!.compensateFileRecovery(access);
+        case 'cancel': return recovery!.cancelFileRecovery(access);
       }
     });
   };

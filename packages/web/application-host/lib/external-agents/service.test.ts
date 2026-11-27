@@ -16,7 +16,7 @@ vi.mock('./codex.js', () => ({ connectCodex: vi.fn() }));
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); vi.restoreAllMocks(); vi.clearAllMocks(); });
 
-async function fixture(options: { connect?: boolean; probeUnconfirmed?: boolean; directory?: string; environment?: ReturnType<typeof createPlatformEnvironmentRuntime> } = {}) {
+async function fixture(options: { connect?: boolean; probeUnconfirmed?: boolean; directory?: string; environment?: ReturnType<typeof createPlatformEnvironmentRuntime>; deployment?: ConstructorParameters<typeof ExternalAgentsService>[0]['deployment'] } = {}) {
   const config: ExternalAgentConfiguration = { id: 'fixture', name: 'Fixture', harness: 'codex', command: process.execPath, args: [], enabled: true };
   let snapshot = {
     conversation: { id: 'external:test', configurationId: config.id, harness: 'codex', cwd: '/tmp', title: 'Test', revision: 1, createdAt: 1, updatedAt: 1, archived: false, pinned: false, deleted: false, needsReview: true },
@@ -102,6 +102,7 @@ async function fixture(options: { connect?: boolean; probeUnconfirmed?: boolean;
   });
   const service = new ExternalAgentsService({ kernel: kernel as unknown as KernelClient, spawn: spawn as never,
     directory: options.directory ?? '/tmp/varin-service-portable', ...(options.environment ? { environment: options.environment } : {}),
+    ...(options.deployment && { deployment: options.deployment }),
     resolveWorkspace: async () => ({ workspaceId: 'workspace', root: '/tmp' }) });
   cleanups.push(async () => {
     const close = service.close();
@@ -116,6 +117,21 @@ async function fixture(options: { connect?: boolean; probeUnconfirmed?: boolean;
     durableEvent() { runtimeEvent?.({ stream: 'durable' }); },
   };
 }
+
+it('keeps existing external configurations visible while denying disallowed execution and installations', async () => {
+  const { service, settings, config, spawnProgram } = await fixture({ connect: false, deployment: { profiles: ['pi'], managedInstalls: false } });
+  const visible = await service.settings(undefined, undefined, true);
+  expect(visible.agents).toContainEqual(config);
+  expect(visible.detections).toContainEqual(expect.objectContaining({ id: config.id, code: 'deployment-policy-denied' }));
+  expect(visible.discoveredAgentIds).not.toContain(config.id);
+  for (const operation of [
+    () => service.connect('external:test'),
+    () => service.detect(config.id),
+    () => service.installations({ action: 'install', id: config.id }),
+  ]) await expect(operation()).rejects.toMatchObject({ code: 'deployment-policy-denied', status: 403 });
+  expect(spawnProgram).not.toHaveBeenCalled();
+  expect(settings.agents).toEqual([config]);
+});
 
 it('uses the service PATH to find npm when a login shell resets PATH', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'varin-agent-path-'));

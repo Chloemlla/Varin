@@ -205,15 +205,25 @@ pub struct OccurrenceView {
     pub revision: u64,
     pub reason: OccurrenceReason,
     pub observed_at_ms: u64,
+    pub target_kind: OccurrenceTargetKind,
     pub thread_id: String,
     pub branch_id: String,
     pub input_id: Option<String>,
+    pub history_item_id: Option<String>,
     pub run_id: Option<String>,
     pub execution_id: Option<String>,
     pub goal_id: Option<String>,
     pub state: OccurrenceState,
     pub hold_reason: Option<String>,
     pub failure_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_message: Option<String>,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OccurrenceTargetKind {
+    NewWork,
+    ExistingWork,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -662,6 +672,18 @@ pub(super) fn named_occurrence(db: &Connection, id: &str) -> Result<(String, Occ
     let d: Definition = record(db, "calendar_definitions", &o.definition_id)?;
     Ok((d.view.name.clone(), project_occurrence(db, &d, &o)?))
 }
+fn delivered_history_item(db: &Connection, input: &QueuedInputMetadata) -> Result<Option<String>> {
+    let Some(cursor) = input.delivered_cursor.filter(|_| input.state == InputState::Delivered) else {
+        return Ok(None);
+    };
+    // A new Run points to its accepted history item. An input joining an
+    // active Run carries the history item ID on its delivery event.
+    db.query_row(
+        "SELECT json_extract(data,'$.input_id') FROM events WHERE cursor=?1 AND kind IN ('run.accepted','input.delivered','message.delivered')",
+        [sql_number(cursor)?],
+        |row| row.get::<_, Option<String>>(0),
+    ).optional().map(Option::flatten).map_err(Into::into)
+}
 fn project_occurrence(db: &Connection, d: &Definition, o: &Occurrence) -> Result<OccurrenceView> {
     let mut v = OccurrenceView {
         id: o.id.clone(),
@@ -670,15 +692,21 @@ fn project_occurrence(db: &Connection, d: &Definition, o: &Occurrence) -> Result
         revision: o.revision,
         reason: o.reason.clone(),
         observed_at_ms: o.observed_at_ms,
+        target_kind: match o.target {
+            Target::NewWork { .. } => OccurrenceTargetKind::NewWork,
+            Target::ExistingWork { .. } => OccurrenceTargetKind::ExistingWork,
+        },
         thread_id: o.thread_id.clone(),
         branch_id: o.branch_id.clone(),
         input_id: o.input_id.clone(),
+        history_item_id: None,
         run_id: None,
         execution_id: None,
         goal_id: o.goal_id.clone(),
         state: OccurrenceState::Observed,
         hold_reason: None,
         failure_code: o.failure.clone(),
+        failure_message: None,
     };
     if o.arrangement_owned {
         if let Some((state, hold)) = followups::events::calendar_batch_projection(db, &o.id)? {
@@ -688,6 +716,7 @@ fn project_occurrence(db: &Connection, d: &Definition, o: &Occurrence) -> Result
                 let row: QueuedInputMetadata = record(db, "input_queue", input)?;
                 v.run_id = activation::fact(&row)?.run_id().map(str::to_owned);
                 v.execution_id = activation::fact(&row)?.execution_id().map(str::to_owned);
+                v.history_item_id = delivered_history_item(db, &row)?;
             }
             return Ok(v);
         }
@@ -708,6 +737,7 @@ fn project_occurrence(db: &Connection, d: &Definition, o: &Occurrence) -> Result
         v.run_id = activation::fact(&row)?.run_id().map(str::to_owned);
         v.execution_id = activation::fact(&row)?.execution_id().map(str::to_owned);
         if row.state == InputState::Delivered {
+            v.history_item_id = delivered_history_item(db, &row)?;
             v.state = OccurrenceState::Delivered;
             let goal = o
                 .goal_id
@@ -730,7 +760,13 @@ fn project_occurrence(db: &Connection, d: &Definition, o: &Occurrence) -> Result
                         Some(_) => OccurrenceState::Delivered,
                         None => match run.state {
                             RunState::Completed => OccurrenceState::Completed,
-                            RunState::Failed => OccurrenceState::Failed,
+                            RunState::Failed => {
+                                if let Some(failure) = super::execution_persistence::read_run_failure(db, &run)? {
+                                    v.failure_code = Some(failure.code);
+                                    v.failure_message = Some(failure.message);
+                                }
+                                OccurrenceState::Failed
+                            }
                             RunState::Cancelled => OccurrenceState::Cancelled,
                             _ => OccurrenceState::Delivered,
                         },
@@ -1480,6 +1516,17 @@ fn observe(
                 "thread.created",
                 json!({"branch_id":branch,"calendar_occurrence_id":id}),
             )?;
+            let title_at = match &reason {
+                OccurrenceReason::Scheduled { at_ms } => *at_ms,
+                OccurrenceReason::Manual { .. } => now,
+            };
+            let stamp: String = tx.query_row(
+                "SELECT strftime('%m-%d %H:%M', ?1, 'unixepoch')",
+                [sql_number(title_at / 1_000)?],
+                |row| row.get(0),
+            )?;
+            let title = format!("{} · {stamp} UTC", d.view.name);
+            super::threads::initialize_title(tx, &thread, Some(&title))?;
             (thread, branch)
         }
         Target::ExistingWork {

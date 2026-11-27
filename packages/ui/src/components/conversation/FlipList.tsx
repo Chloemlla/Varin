@@ -7,7 +7,7 @@ import { EASE_EXIT, EASE_OUT, springTiming, staggerDelay, TWEENS } from '@/lib/m
  * so rows keep their structure and their tests:
  *
  * - `FlipList` is the scroller. Items carry `data-flip-key`; it measures them
- *   before every commit and animates what changed.
+ *   when an existing list changes layout and animates what moved.
  * - `useSelectionGlide` (sidebarHighlights.ts) carries the selection from row to row.
  * - `useHoverPill` draws one hover highlight that follows the pointer.
  */
@@ -38,7 +38,7 @@ const ancestorsOf = (element: HTMLElement, root: HTMLElement): string[] => {
 };
 
 interface FlipListProps extends React.HTMLAttributes<HTMLDivElement> {
-  /** A change means the content was replaced (a search), not moved: that commit is not animated. */
+  /** Identifies a whole view or search result. Replacing it skips row measurements and animations. */
   instantKey?: string;
   /** Ordered visible identities and expansion/editing state. Status/text
    * updates with unchanged geometry leave running motions and measurements alone. */
@@ -62,7 +62,6 @@ export class FlipList extends React.Component<FlipListProps> {
   private node: HTMLDivElement | null = null;
   /** Every key seen since mount: an unknown one is new, a known one is returning. */
   private known = new Set<string>();
-  private lastInstantKey = this.props.instantKey;
   private moving = new Map<HTMLElement, Set<Animation>>();
   private ghosts = new Set<HTMLElement>();
 
@@ -74,29 +73,37 @@ export class FlipList extends React.Component<FlipListProps> {
   };
 
   componentDidMount(): void {
-    if (this.node) this.remember(this.measure(this.node));
+    if (this.node) this.rememberKeys(this.node);
   }
 
   componentWillUnmount(): void {
+    this.clearMotion();
+  }
+
+  private clearMotion(): void {
     for (const element of [...this.moving.keys()]) this.stopMoving(element);
     for (const ghost of this.ghosts) ghost.remove();
     this.ghosts.clear();
   }
 
   getSnapshotBeforeUpdate(previous: FlipListProps): Snapshot | null {
-    if (this.props.layoutKey !== undefined && previous.layoutKey === this.props.layoutKey && previous.instantKey === this.props.instantKey) return null;
+    if (previous.instantKey !== this.props.instantKey || this.props.layoutKey !== undefined && previous.layoutKey === this.props.layoutKey) return null;
     return this.node ? this.measure(this.node) : null;
   }
 
-  componentDidUpdate(_previous: FlipListProps, _state: unknown, before: Snapshot | null): void {
+  componentDidUpdate(previous: FlipListProps, _state: unknown, before: Snapshot | null): void {
     const root = this.node;
-    const instant = this.props.instantKey !== this.lastInstantKey;
-    this.lastInstantKey = this.props.instantKey;
-    if (!root || !before) return;
+    if (!root) return;
+    if (previous.instantKey !== this.props.instantKey) {
+      this.clearMotion();
+      this.rememberKeys(root);
+      return;
+    }
+    if (!before) return;
     const level = documentMotionLevel();
-    if (instant || level === 'off' || typeof root.animate !== 'function') {
-      for (const element of [...this.moving.keys()]) this.stopMoving(element);
-      this.remember(this.measure(root));
+    if (level === 'off' || typeof root.animate !== 'function') {
+      this.clearMotion();
+      this.rememberKeys(root);
       return;
     }
     // Keep existing translations while measuring the layout delta. Before and
@@ -221,6 +228,7 @@ export class FlipList extends React.Component<FlipListProps> {
     const items = new Map<string, Measured>();
     const collapsed = new Set<string>();
     for (const element of root.querySelectorAll<HTMLElement>(`[${KEY}]`)) {
+      if (element.closest('[inert]')) continue;
       const key = keyOf(element);
       if (element.hasAttribute('data-collapsed')) collapsed.add(key);
       const rect = element.getBoundingClientRect();
@@ -233,6 +241,10 @@ export class FlipList extends React.Component<FlipListProps> {
 
   private remember(snapshot: Snapshot): void {
     for (const key of snapshot.items.keys()) this.known.add(key);
+  }
+
+  private rememberKeys(root: HTMLElement): void {
+    for (const element of root.querySelectorAll(`[${KEY}]`)) this.known.add(keyOf(element));
   }
 
   render(): React.ReactNode {

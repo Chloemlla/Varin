@@ -21,6 +21,7 @@
  */
 
 import type { ComponentFetch } from '../components/file-transfer.js';
+import type { LocalInferencePolicy } from '../deployment/policy.js';
 import { WebSocketServer } from 'ws';
 
 import { DictationStreamManager } from './stream-manager.js';
@@ -86,6 +87,7 @@ export function createDictationRuntime({
   rejectWebSocketUpgrade,
   modelsDir,
   fetchModel,
+  localInference,
 }: {
   isDraining?: () => boolean;
   app: Express;
@@ -93,11 +95,12 @@ export function createDictationRuntime({
   isRequestOriginAllowed: (request: IncomingMessage) => boolean | Promise<boolean>;
   modelsDir: string;
   fetchModel?: ComponentFetch;
+  localInference?: LocalInferencePolicy;
   rejectWebSocketUpgrade: (socket: Duplex, statusCode: number, message: string) => void;
   server: Server;
   uiAuthController?: DictationUiAuthController;
 }) {
-  const service = createDictationService({ modelsDir, ...(fetchModel ? { fetchModel } : {}) });
+  const service = createDictationService({ modelsDir, ...(fetchModel ? { fetchModel } : {}), ...(localInference && { localInference }) });
 
   // Local text-to-speech (Kokoro in the dictation worker). Returns WAV bytes;
   // 503 with a reason code while the model is still downloading.
@@ -116,7 +119,7 @@ export function createDictationRuntime({
         ...(typeof body.speed === 'number' ? { speed: body.speed } : {}),
       });
       if ('error' in result) {
-        res.status(503).json({
+        res.status(result.reasonCode === 'deployment-policy-denied' ? 403 : 503).json({
           error: result.error,
           retryable: result.retryable !== false,
           ...(result.reasonCode ? { reasonCode: result.reasonCode } : {}),
@@ -148,7 +151,9 @@ export function createDictationRuntime({
     try {
       const result = await service.requestModelDownload(req.params.modelId);
       if (!result.ok) {
-        res.status(400).json({ error: result.error });
+        res.status(result.reasonCode === 'deployment-policy-denied' ? 403 : 400).json({
+          error: result.error, ...(result.reasonCode && { code: result.reasonCode }),
+        });
         return;
       }
       res.json(result);

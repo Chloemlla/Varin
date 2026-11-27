@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from 'child_process';
+import { hostEnvironment } from './security/host-environment.js';
 import {
   createExecutableSearchEnv,
   resolveExecutableLaunchTarget,
@@ -46,7 +47,7 @@ export async function checkNgrokAvailable(): Promise<NgrokAvailability> {
 export async function checkNgrokAuthtokenConfigured(
   ngrokPath: string | null = null,
 ): Promise<{ configured: boolean; detail: string }> {
-  if (typeof process.env.NGROK_AUTHTOKEN === 'string' && process.env.NGROK_AUTHTOKEN.trim().length > 0) {
+  if (hostEnvironment.read('NGROK_AUTHTOKEN')?.trim()) {
     return { configured: true, detail: 'NGROK_AUTHTOKEN is set.' };
   }
 
@@ -111,7 +112,7 @@ export async function checkNgrokApiReachability({
 const spawnNgrok = (args: string[], resolvedBinaryPath = 'ngrok') => spawn(resolvedBinaryPath, args, {
   stdio: ['ignore', 'pipe', 'pipe'],
   windowsHide: true,
-  env: createExecutableSearchEnv(),
+  env: { ...createExecutableSearchEnv(), NGROK_AUTHTOKEN: hostEnvironment.read('NGROK_AUTHTOKEN') },
   killSignal: 'SIGINT',
 });
 

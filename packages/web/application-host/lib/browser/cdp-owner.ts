@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { BrowserExecutionError } from '@varin/protocol';
 import type { BrowserAction, BrowserActionResult, BrowserDownload, BrowserElement, BrowserEvent, BrowserObservation, BrowserOwner, BrowserPage, BrowserReadRequest, BrowserConnectionState, BrowserResourceCapability } from '@varin/protocol';
-import { CdpDisconnectedError, CdpTransport, type CdpEvent, type CdpResult } from './cdp-transport.js';
+import { CdpDisconnectedError, CdpTransport, type CdpEgress, type CdpEvent, type CdpResult } from './cdp-transport.js';
 
 type Target = { targetId: string; type: string; title: string; url: string };
 type Frame = { id: string; parentId?: string; url: string; loaderId?: string };
@@ -22,6 +22,7 @@ export interface CdpBrowserOwnerOptions {
   scratchDirectory?: string;
   /** Owner-supplied authentication; never included in resource metadata. */
   headers?: Record<string, string>;
+  egress?: CdpEgress;
 }
 
 /** Browser process owner independent of Electron, desktop selection and workspace.
@@ -52,13 +53,17 @@ export class CdpBrowserOwner implements BrowserOwner {
     return { ...(this.instanceId ? { instanceId: this.instanceId } : {}), state: this.state, activation: 'connect' as const, capabilities, operations: ['list', 'open', 'read', 'activate', ...['navigate', 'back', 'forward', 'reload', 'close', 'click', 'double_click', 'hover', 'scroll', 'type', 'press', 'select', 'check', 'drag', 'dialog', 'evaluate', 'wait'].map(action => `act:${action}`), ...(this.fileTransfers ? ['upload', 'downloads', 'readDownload', 'releaseDownload'] : [])] };
   }
   prepareResource(): Promise<void> { return this.connect(); }
+  retained() {
+    if (!this.transport) return false;
+    return [...this.pages.values()].some(page => page.threads.size > 0) || this.downloadsById.size > 0;
+  }
   async connect(): Promise<void> {
     if (this.disposed) throw new Error('This browser owner has ended');
     if (this.connecting) return this.connecting;
     if (this.transport) return;
     this.connection('connecting');
     const connecting = (async () => {
-      const transport = await CdpTransport.connect(this.options.endpoint, this.options.headers);
+      const transport = await CdpTransport.connect(this.options.endpoint, this.options.headers, this.options.egress);
       if (this.disposed) { transport.close(); throw new Error('This browser owner has ended'); }
       const previousInstance = this.instanceId;
       this.transport = transport;

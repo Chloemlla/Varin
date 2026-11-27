@@ -33,6 +33,7 @@ interface Scope {
 export function createManagedMcpPreparer(options: {
   runtime(): AgentRuntimeClient;
   createLease: typeof createManagedMcpLease;
+  awaitInitialInventory?(owner: SourceResourceOwner): boolean;
   changed(runId: string): void;
   onError(): void;
 }) {
@@ -83,6 +84,9 @@ export function createManagedMcpPreparer(options: {
       if (scope && !isDeepStrictEqual(scope.owner, source.resourceOwner)) { release(input.runId); scope = undefined; }
       const selection = input.requiredBinding ? selectMcpServers(input.requiredBinding,
         owner => isDeepStrictEqual(owner, source.resourceOwner)) : undefined;
+      // An explicitly selected provider workspace already has an admitted source.
+      // Read its initial inventory before publishing server-specific tool routes.
+      const awaitInventory = options.awaitInitialInventory?.(source.resourceOwner) === true;
       const originals = Object.values(selection?.provenance.servers ?? {}).map(server => server.owner.source_authority);
       if (originals.some(original => !original || !isDeepStrictEqual(original, originals[0]))) throw new Error('mcp_original_source_authority_changed');
       if (!scope) {
@@ -98,14 +102,14 @@ export function createManagedMcpPreparer(options: {
             if (selected.controller.signal.aborted) return;
             selected.failure = error; selected.controller.abort(); options.onError();
           });
-          options.changed(input.runId);
+          if (!awaitInventory) options.changed(input.runId);
         }, selected.controller.signal, { purpose: 'mcp_owner', ...(originals[0] ? { original: originals[0] } : {}) }).catch(error => {
           selected.failure = error; if (!selected.controller.signal.aborted) options.onError();
         });
       }
-      // Only a saved original dependency waits here; a fresh Run publishes already-ready A tools.
-      if (selection && Object.keys(selection.provenance.servers).length) await scope.ready;
-      if (scope.failure) { if (selection && Object.keys(selection.provenance.servers).length) throw scope.failure; return undefined; }
+      const originalRequired = Boolean(selection && Object.keys(selection.provenance.servers).length);
+      if (originalRequired || awaitInventory) await scope.ready;
+      if (scope.failure) { if (originalRequired) throw scope.failure; return undefined; }
       if (scope.initial) {
         signal?.throwIfAborted(); const initial = scope.initial; delete scope.initial; return initial.lease;
       }

@@ -21,6 +21,7 @@ import type { LiveSourceResolver } from './live-source.js';
 import { assertNoScriptCellCycle, requireToolInvocation, runNestedToolCall, runToolDomainCall, withScriptCell, type ToolInvocationAuthority } from './tool-invocation.js';
 
 import { DORMANT_SCRIPT_IDENTITY, dormantScriptDeclaration, isDormantScriptDefault, isScriptService, VARIN_BUILTIN_SCRIPT_EXTENSION_ID } from './dormant-script-contract.js';
+import { isModelToolOrigin } from './model-tool-origin.js';
 
 export { SCRIPT_CAPABILITY };
 const declarations = new Map(SCRIPT_TOOL_DECLARATIONS.map(declaration => [declaration.id.slice('varin.script.'.length),
@@ -54,6 +55,7 @@ interface Environment {
 
 export function createScriptRuntime(options: {
   kernel: KernelClient; runtime: AgentRuntimeClient; resolveLiveSource: LiveSourceResolver;
+  withSourceUse?: import('../harness/managed-remote-client.js').ManagedRemoteTargetRegistry['withSourceUse'];
   onError(error: unknown): void;
   prepareDormantDefault?(authority: ToolInvocationAuthority, contextRevision: string | undefined, signal: AbortSignal): Promise<
     {kind:'source';source:LaunchSource} | {kind:'work_location_context_required';revision:string;instructions:string}>;
@@ -61,7 +63,13 @@ export function createScriptRuntime(options: {
   const { kernel, runtime } = options;
   const environments = new Map<string, Environment>();
   const openings = new Set<string>();
-  const unaccepted = new Set<string>();
+  const unaccepted = new Map<string, SourceAuthority>();
+  const releaseUnaccepted = async (operationId: string) => {
+    const original = unaccepted.get(operationId);
+    if (!original) return;
+    await original.release();
+    if (unaccepted.get(operationId) === original) unaccepted.delete(operationId);
+  };
   const rpc = <T, M extends Extract<KernelMethod, `runtime.${string}`>>(method: M, params: KernelMethodParams[M], signal?: AbortSignal) => kernel.agentRuntimeRequest<T, M>(method, params, signal);
   const send = (environment: Environment, frame: Omit<ScriptHostFrame, 'v' | 'environmentId'>): Promise<void> =>
     new Promise((resolve, reject) => environment.process.stdin.write(encodeScriptFrame({ ...frame, v: SCRIPT_PROTOCOL_VERSION, environmentId: environment.id } as ScriptHostFrame), error => error ? reject(error) : resolve()));
@@ -142,7 +150,10 @@ export function createScriptRuntime(options: {
     // Original terminal evidence outlives the released source grant and live heap.
     // A repeated close reads that fact; it must not try to spawn new authority to kill it again.
     if (retained?.effect === 'confirmed' && record(body) && record(body.process)
-      && body.process.writerActive === false && body.callbacksStopped === true) return result(body, 'confirmed', true, retained.outcome);
+      && body.process.writerActive === false && body.callbacksStopped === true) {
+      await releaseUnaccepted(operation.id).catch(options.onError);
+      return result(body, 'confirmed', true, retained.outcome);
+    }
     let source: SourceAuthority | undefined;
     try {
       await runtime.cancelOperation(operation.id);
@@ -150,8 +161,9 @@ export function createScriptRuntime(options: {
       const originalSource = operation.resource_source ?? launch?.selection.source;
       if (originalSource?.resource_owner.kind === 'managed_host') {
         const run = await runtime.run(operation.run_id);
-        await stopManagedScript(await runtime.managedSource(originalSource.resource_owner), { coordinatorHostId: runtime.coordinatorHostId,
+        const observed = await stopManagedScript(await runtime.managedSource(originalSource.resource_owner), { coordinatorHostId: runtime.coordinatorHostId,
           processId: operation.id, runId: operation.run_id, threadId: run.thread_id, source: originalSource });
+        if (observed.executorStopped) await releaseUnaccepted(operation.id).catch(options.onError);
       }
       if (originalSource?.resource_owner.kind !== 'managed_host') {
         source = await sourceFor(operation);
@@ -167,6 +179,7 @@ export function createScriptRuntime(options: {
       });
       const body = original.external_receipt ? original.external_receipt.result.data : original.result?.kind === 'output' ? original.result.output.data : undefined;
       const stopped = original.external_receipt?.executor_stopped === true;
+      if (stopped) await releaseUnaccepted(operation.id).catch(options.onError);
       return result(body, stopped ? 'confirmed' : 'unknown', stopped, stopped ? 'succeeded' : 'indeterminate');
     } catch (error) { return result({ environmentId: operation.id, error: errorText(error) }, 'unknown', false, 'indeterminate'); }
     finally { await source?.release().catch(options.onError); }
@@ -211,41 +224,47 @@ export function createScriptRuntime(options: {
     }
     const launch = await runtime.launch(authority.runId, signal);
     const dormant = authority.configurationIdentity === DORMANT_SCRIPT_IDENTITY;
-    let selected = launch?.selection.source;
-    if (!launch || !isDeepStrictEqual(selected, authority.source)) {
+    if (!launch || !isDeepStrictEqual(launch.selection.source, authority.source)) {
       return undispatchedToolReceipt('Script environment requires its original admitted physical source');
     }
+    const owner = launch.selection.source?.resource_owner ?? (dormant ? launch.selection.lazy_work_location?.resource_owner : undefined);
+    const work = () => bindEnvironment(authority, params, requestedCwd, launch.selection, dormant, signal);
+    return owner && options.withSourceUse ? options.withSourceUse(owner, work, signal) : work();
+  };
+  const bindEnvironment = async (authority: ToolInvocationAuthority, params: Record<string, JsonValue>, requestedCwd: string,
+    selection: import('./protocol.generated.js').LaunchIntent['selection'], dormant: boolean, signal: AbortSignal): Promise<ToolExecutionReceipt> => {
+    let selected = selection.source;
     if (dormant) {
-      if (selected || authority.origin.kind !== 'model_step' || !isDormantScriptDefault(launch.selection.lazy_work_location)
-        || !options.prepareDormantDefault) return undispatchedToolReceipt('Dormant script requires its original local default');
+      if (selected || !isDormantScriptDefault(selection.lazy_work_location)
+        || !options.prepareDormantDefault) return undispatchedToolReceipt('Dormant script requires its recorded work location');
       const prepared = await options.prepareDormantDefault(authority,
         typeof params.resource_context === 'string' ? params.resource_context : undefined, signal);
       if (prepared.kind === 'work_location_context_required') {
         return result({error:prepared.kind,resource_context:prepared.revision,instructions:prepared.instructions},
           'none',true,'failed');
       }
-      if (prepared.source.mode !== 'live_root' || prepared.source.resource_owner.kind !== 'local')
-        return undispatchedToolReceipt('Dormant script requires the prepared original local default');
+      if (prepared.source.mode !== 'live_root')
+        return undispatchedToolReceipt('Dormant script requires the prepared work location');
       selected = prepared.source;
     }
     if (!selected || selected.mode === 'fixed_branch')
       return undispatchedToolReceipt('Script environment requires its original admitted physical source');
     // Resolve the actual evaluator only after the successful context handshake.
-    const node = dormant ? await resolveScriptNodeBinding() : selected.resource_owner.kind === 'managed_host'
+    const node = selected.resource_owner.kind === 'managed_host'
       ? await (await runtime.managedSource(selected.resource_owner, signal)).scriptBinding({ coordinatorHostId: runtime.coordinatorHostId, source: selected }, signal)
-      : await restoreScriptNodeBinding(authority.configurationIdentity);
+      : dormant ? await resolveScriptNodeBinding() : await restoreScriptNodeBinding(authority.configurationIdentity);
     if (!dormant && node.configuration_identity !== authority.configurationIdentity) throw new Error('script_binding_changed');
     await rpc('runtime.managed_process.begin', { operationId: authority.operationId, executionOwner: authority.executorOwner,
       node, ...(dormant ? { preparedSource: selected } : {}) }, signal);
-    const selection = savedSourceLaunch(authority.runId, selected, sourceToolSchemas(launch.selection).map(tool => tool.name) as Parameters<typeof savedSourceLaunch>[2]);
-    const source = await admitRunSourceAuthority(kernel, runtime, selection, { signal, operationId: authority.operationId, retention: 'caller', purpose: 'script_environment', resolveLiveSource: options.resolveLiveSource });
+    const placement = savedSourceLaunch(authority.runId, selected, sourceToolSchemas(selection).map(tool => tool.name) as Parameters<typeof savedSourceLaunch>[2]);
+    const source = await admitRunSourceAuthority(kernel, runtime, placement, { signal, operationId: authority.operationId, retention: 'caller', purpose: 'script_environment', resolveLiveSource: options.resolveLiveSource });
     let environment: Environment | undefined;
     let enteredProcess = false;
     try {
       signal.throwIfAborted();
       const rootId = source.kind === 'local' ? source.rootId : source.binding.physicalRoot?.rootId;
-      if (dormant && (source.kind !== 'local' || selected.live_root?.rootId !== rootId
-        || source.canonicalRoot !== selected.live_root?.canonicalRoot || source.toolBinding.workspaceId !== selected.workspace_id
+      if (dormant && (selected.live_root?.rootId !== rootId
+        || (source.kind === 'local' ? source.canonicalRoot : source.binding.physicalRoot?.canonicalRoot) !== selected.live_root?.canonicalRoot || source.toolBinding.workspaceId !== selected.workspace_id
         || source.toolBinding.executionWorkspaceId !== selected.execution_workspace_id))
         throw new Error('Original dormant script physical Source changed before dispatch');
       if (!rootId) throw new Error('Original script physical source is unavailable');
@@ -255,13 +274,13 @@ export function createScriptRuntime(options: {
       const cwd = requestedCwd.split('/').filter(part => part && part !== '.').join('/');
       const initial = source.kind === 'local'
         ? await source.client.processSpawn({ ...scriptNodeSpawnInput(node), processId: authority.operationId,
-          workspaceId: selection.workspaceId, rootId, cwd })
+          workspaceId: placement.workspaceId, rootId, cwd })
         : await source.service.scriptSpawn({ ...address, node, cwd }, signal);
-      if (initial.processId !== authority.operationId || initial.workspaceId !== selection.workspaceId || initial.mode !== 'pipe')
+      if (initial.processId !== authority.operationId || initial.workspaceId !== placement.workspaceId || initial.mode !== 'pipe')
         throw new Error('Original script process identity changed');
       const client = source.kind === 'local' ? source.client : createManagedProcessClient(source.service, address,
-        { workspaceId: selection.workspaceId, rootId });
-      const projection = new KernelManagedProcess(client, { workspaceId: selection.workspaceId, rootId, processId: authority.operationId }, initial,
+        { workspaceId: placement.workspaceId, rootId });
+      const projection = new KernelManagedProcess(client, { workspaceId: placement.workspaceId, rootId, processId: authority.operationId }, initial,
         options.onError, () => {}, { retainOutput: true, ...(source.kind === 'managed' ? {
           terminate: async () => { await stopManagedScript(source.service, { coordinatorHostId: runtime.coordinatorHostId,
             processId: authority.operationId, runId: authority.runId, threadId: authority.threadId, source: selected }); },
@@ -304,7 +323,7 @@ export function createScriptRuntime(options: {
       if (enteredProcess) {
         // Lost acceptance can follow a real spawn. Retain the original caller grant and
         // typed process identity; the guardian and original operation reconcile it.
-        unaccepted.add(authority.operationId);
+        unaccepted.set(authority.operationId, source);
         void runtime.cancelOperation(authority.operationId).catch(options.onError);
         return result({ environmentId: authority.operationId, error: errorText(error) }, 'unknown', false, 'indeterminate');
       }
@@ -360,7 +379,8 @@ export function createScriptRuntime(options: {
     const input = parseVarinToolJson(value), params = input as Record<string, JsonValue>;
     return runToolDomainCall(context, { domain: SCRIPT_CAPABILITY, toolName: selected.declaration.tool!.name, operation: 'effect', arguments: input }, async authority => {
       try {
-        if (authority.configurationIdentity === DORMANT_SCRIPT_IDENTITY && authority.origin.kind !== 'model_step')
+        if (authority.configurationIdentity === DORMANT_SCRIPT_IDENTITY
+          && !await isModelToolOrigin(runtime, authority.runId, authority.origin, context.signal))
           return undispatchedToolReceipt('Dormant scripts require their original ordinary model request');
         if (method === 'open') {
           if (Object.hasOwn(params, 'resource_context') && (authority.configurationIdentity !== DORMANT_SCRIPT_IDENTITY
@@ -398,14 +418,13 @@ export function createScriptRuntime(options: {
         dirty = false;
         // Only current Host lost-open hints are revisited here. The durable event
         // after the original callback ends supplies evidence that no cells escaped.
-        for (const id of unaccepted) {
+        for (const id of unaccepted.keys()) {
           if (openings.has(id) || recoveryTasks.has(id)) continue;
           const operation = await runtime.operation(id);
           if (operation.execution_owner && kernel.toolCallbackEnded(operation.run_id, operation.execution_owner, id) === true) {
             const task = recoverEnvironment(operation);
             recoveryTasks.set(id, task);
-            void task.then(receipt => { if (receipt.executor_stopped) unaccepted.delete(id); })
-              .finally(() => { if (recoveryTasks.get(id) === task) recoveryTasks.delete(id); }).catch(options.onError);
+            void task.finally(() => { if (recoveryTasks.get(id) === task) recoveryTasks.delete(id); }).catch(options.onError);
           }
         }
         await Promise.all([...environments.values()].map(async environment => {
@@ -434,8 +453,9 @@ export function createScriptRuntime(options: {
         if (recoveryTasks.has(operation.id) || openings.has(operation.id)) continue;
         const environment = environments.get(operation.id);
         if (sourceOwner) {
-          const launch = await runtime.launch(operation.run_id);
-          if (!isDeepStrictEqual(launch?.selection.source?.resource_owner, sourceOwner) || environment?.accepting) continue;
+          if (environment?.accepting) continue;
+          const original = operation.resource_source ?? (await runtime.launch(operation.run_id))?.selection.source;
+          if (!isDeepStrictEqual(original?.resource_owner, sourceOwner)) continue;
         }
         const task = environment ? close(environment, new Error('Original process channel ended')) : recoverEnvironment(operation);
         recoveryTasks.set(operation.id, task);
@@ -459,7 +479,7 @@ export function createScriptRuntime(options: {
         isScriptService(binding.serviceId, binding.serviceVersion));
       if (!source && isDormantScriptDefault(lazy) && options.prepareDormantDefault) {
         const declaration: NonNullable<ExtensionToolOwnerOptions['configurationIdentity']>['declaration'] = (tool, identity) =>
-          identity === DORMANT_SCRIPT_IDENTITY ? dormantScriptDeclaration(tool) : fallback.declaration?.(tool, identity) ?? tool;
+          identity === DORMANT_SCRIPT_IDENTITY ? dormantScriptDeclaration(tool, lazy?.resource_owner.kind === 'managed_host') : fallback.declaration?.(tool, identity) ?? tool;
         return Object.assign((tool: Parameters<typeof fallback>[0], original?: string | null) => {
           if (!isScriptService(tool.id, tool.version)) return fallback(tool, original);
           if (original !== undefined && original !== DORMANT_SCRIPT_IDENTITY) throw new Error('Original script Node binding is unavailable');

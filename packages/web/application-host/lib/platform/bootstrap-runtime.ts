@@ -31,6 +31,9 @@ export type ServerBootstrapOptions =
     mobilePairingRuntime: MobileDependencies['pairingRuntime'];
     mobilePushRuntime: MobileDependencies['mobilePushRuntime'];
     uiPassword: UiAuthOptions['password'];
+    gatewayOnly?: boolean;
+    authenticateInboxReplay?: UiAuthOptions['authenticateInboxReplay'];
+    updatesEnabled?: boolean;
     verboseRequestLogs?: CommonRequestMiddlewareDependencies['verboseRequestLogs'];
   };
 
@@ -112,12 +115,27 @@ export const createServerBootstrapRuntime = (dependencies: ServerBootstrapDepend
 
     const uiAuthController = createUiAuth({
       password: uiPassword,
+      issuedClientsOnly: options.gatewayOnly === true,
+      ...(options.authenticateInboxReplay && { authenticateInboxReplay: options.authenticateInboxReplay }),
       readSettingsFromDisk,
       clientAuthController: remoteClientAuthRuntime,
       ...(getServerId ? { getServerId } : {}),
     });
     if (uiAuthController.enabled) {
       console.log('UI password protection enabled for browser sessions');
+    }
+
+    if (options.gatewayOnly) {
+      app.use(async (req, res, next) => {
+        if (req.method === 'GET' && (req.path === '/health' || req.path === '/live')) return next();
+        const context = await uiAuthController.resolveRequestAuth(req);
+        if (context?.type !== 'client' || !context.client || !context.clientId || !context.principalId) {
+          res.status(401).json({ code: 'gateway-credential-required' });
+          return;
+        }
+        req.varinAuth = { type: 'client', client: context.client, clientId: context.clientId, principalId: context.principalId };
+        return uiAuthController.requirePrincipalAccess(req, res, next);
+      });
     }
 
     registerServerStatusRoutes(app, {
@@ -140,7 +158,16 @@ export const createServerBootstrapRuntime = (dependencies: ServerBootstrapDepend
       ...(verboseRequestLogs !== undefined ? { verboseRequestLogs } : {}),
     });
 
-    registerAuthAndAccessRoutes(app, {
+    if (options.gatewayOnly) {
+      app.get('/auth/session', uiAuthController.handleSessionStatus);
+      app.post('/auth/url-token', uiAuthController.handleUrlAuthToken);
+      app.use([
+        '/auth', '/api/client-auth', '/api/mobile/pair', '/mobile-login', '/pair', '/connect',
+        '/api/passkeys', '/api/auth/reset', '/api/varin/tunnel', '/api/varin/relay', '/api/varin/external-access',
+      ], (_req, res) => {
+        res.status(403).json({ code: 'deployment-policy-denied', section: 'ingress' });
+      });
+    } else registerAuthAndAccessRoutes(app, {
       express,
       tunnelAuthController,
       uiAuthController,
@@ -157,7 +184,7 @@ export const createServerBootstrapRuntime = (dependencies: ServerBootstrapDepend
       ...(getServerLabel ? { getServerLabel } : {}),
     });
 
-    registerTtsRoutes(app, { sayTTSCapability });
+    registerTtsRoutes(app, { sayTTSCapability, allowLocalSpeech: options.allowLocalSpeech !== false });
 
     registerNotificationRoutes(app, {
       uiAuthController,
@@ -187,7 +214,10 @@ export const createServerBootstrapRuntime = (dependencies: ServerBootstrapDepend
       });
     }
 
-    registerVarinRoutes(app, {
+    if (options.updatesEnabled === false) app.use(['/api/varin/update-check', '/api/varin/update-install'], (_req, res) => {
+      res.status(403).json({ code: 'deployment-policy-denied', section: 'background' });
+    });
+    else registerVarinRoutes(app, {
       fs,
       path,
       process,

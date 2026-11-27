@@ -11,11 +11,11 @@ export type ProjectGitDispatcher = (command: ProjectGitCommand | ProjectGitHubCo
 
 /** One registration owns both HTTP and project dispatch. Project callers select
  * typed client operations, never a URL, handler name, or credential transport. */
-export function createProjectGitRoutes(app: Express, family: 'git' | 'github' = 'git') {
+export function createProjectGitRoutes(app: Express | undefined, family: 'git' | 'github' = 'git') {
   const handlers: Array<{ method: string; path: string; handler: GitRouteHandler }> = [];
   const register = (method: 'get' | 'post' | 'put' | 'delete', path: string, handler: GitRouteHandler) => {
     handlers.push({ method: method.toUpperCase(), path, handler });
-    app[method](path, async (request, response) => { await handler(request, response); });
+    app?.[method](path, async (request, response) => { await handler(request, response); });
   };
   const dispatch: ProjectGitDispatcher = async (command, signal) => {
     signal?.throwIfAborted();

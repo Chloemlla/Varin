@@ -1,3 +1,4 @@
+import { useDeploymentPolicy } from '@/hooks/useDeploymentPolicy';
 import React from 'react';
 import { getRuntimeApiBaseUrl, getRuntimeEndpointGeneration, subscribeRuntimeEndpointChanged, type RemoteClientRecord } from '@varin/application-client';
 import { AddDeviceDialog } from '@/components/sections/connections/AddDeviceDialog';
@@ -36,6 +37,9 @@ function DevicesOnService() {
   const [selected, setSelected] = React.useState('map');
   const [role, setRole] = React.useState<Role>('service');
   const [query, setQuery] = React.useState('');
+  const policy = useDeploymentPolicy();
+  const allowAdd = policy !== undefined && (policy?.connections?.staticHosts !== false || policy?.connections?.ssh !== false);
+  const allowPair = policy !== undefined && policy?.ingress?.mode !== 'gateway';
   const [addingDevice, setAddingDevice] = React.useState(false);
   const [switchingHost, setSwitchingHost] = React.useState<string>();
   const [revision, refresh] = React.useReducer(value => value + 1, 0);
@@ -162,8 +166,8 @@ function DevicesOnService() {
         name={host.label} meta={t('settings.devices.otherService')} onSelect={() => select(`service:${host.id}`)} />)}
     </>}
     foot={<>
-      <Btn kind="ghost" icon="add" onClick={() => setAddingDevice(true)}>{t('settings.devices.addResource')}</Btn>
-      <Btn kind="ghost" icon="qr-code" onClick={() => shell.openPage('remote-access', { item: 'remote-instances.client-auth' })}>{t('settings.devices.pair')}</Btn>
+      {allowAdd && <Btn kind="ghost" icon="add" onClick={() => setAddingDevice(true)}>{t('settings.devices.addResource')}</Btn>}
+      {allowPair && <Btn kind="ghost" icon="qr-code" onClick={() => shell.openPage('remote-access', { item: 'remote-instances.client-auth' })}>{t('settings.devices.pair')}</Btn>}
     </>}
     detailKey={otherHost ? selected : active ? selectedDevice : 'map'}
     detail={otherHost ? <>
@@ -232,7 +236,7 @@ function DevicesOnService() {
       </Section>}
     </>}
     dock={<>
-      {addingDevice ? <AddDeviceDialog onClose={() => setAddingDevice(false)} onChanged={refresh} /> : null}
+      {allowAdd && addingDevice ? <AddDeviceDialog connections={policy?.connections} onClose={() => setAddingDevice(false)} onChanged={refresh} /> : null}
       {switchingHost ? <DesktopHostSwitcherDialog open focusedHostId={switchingHost}
         onOpenChange={open => { if (!open) setSwitchingHost(undefined); }} /> : null}
     </>}

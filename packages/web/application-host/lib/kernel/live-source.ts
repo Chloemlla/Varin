@@ -11,12 +11,14 @@ interface Owners {
   documents: { getWorkspace(workspaceId: string, signal?: AbortSignal): Promise<{ root: string; hostId: string }>;
     resolveWorkspace?(input: { path: string }): Promise<{ workspaceId: string; hostId: string }> };
   kernel: KernelClient;
+  denyLocal?(): never;
 }
 
 /** Admission adapter only. Documents owns durable roots; Rust owns registrations and grants. */
-export function createLiveSourceOwner({ documents, kernel }: Owners) {
+export function createLiveSourceOwner({ documents, kernel, denyLocal }: Owners) {
   const validate: LiveSourceResolver = async (source, signal) => {
     signal?.throwIfAborted();
+    denyLocal?.();
     const original = documents.getWorkspace(source.workspaceId, signal);
     const [workspace, execution] = await Promise.all([original, source.executionWorkspaceId === source.workspaceId
       ? original : documents.getWorkspace(source.executionWorkspaceId, signal)]);

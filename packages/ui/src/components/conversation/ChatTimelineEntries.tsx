@@ -1282,6 +1282,10 @@ export const ChatTimelineEntryList: React.FC<Omit<
                 targetThreadId={typeof details.targetThreadId === 'string' ? details.targetThreadId : undefined}
                 id={typeof details.messageId === 'string' ? details.messageId : undefined} content={chatContentText(entry.content)} />;
             }
+            if (entry.customType === 'calendar-input') return <MetaEntry key={entry.id} icon="calendar-schedule">
+              <strong>{t('bot.schedule.triggered')}</strong>
+              <ChatUserContentView content={entry.content} messageId={entry.id} />
+            </MetaEntry>;
             return (
               <MetaEntry key={entry.id} icon="plug-2">
                 <strong>{entry.customType}</strong>

@@ -11,6 +11,7 @@ import { pairNodeRoleClient, revokeNodeRoleClient } from '../node-role-auth.js';
 import { createManagedRemoteTargetRegistry } from '../harness/managed-remote-client.js';
 import { ManagedBrowserPeers } from './browser-managed.js';
 import { BrowserResources } from './browser-resources.js';
+import type { ResourceProvider } from '../deployment/resource-provider.js';
 
 const kernelPath = process.env.VARIN_TEST_KERNEL_PATH ?? fileURLToPath(new URL(
   '../../../../../kernel/target/release/' + (process.platform === 'win32' ? 'varin-kernel.exe' : 'varin-kernel'), import.meta.url));
@@ -85,6 +86,42 @@ it('discovers a dormant browser through its paired role, then reacquires a fresh
       coordinatorHostId: 'coordinator', browserId: 'configured-cdp', instanceId: resource.instanceId, method: 'list', args: [],
     });
     expect(await (await listing(first)).json()).toMatchObject({ value: [{ pageId: 'tab' }] });
+
+    let generation = 'provider-original', acquired = 0;
+    const provider: ResourceProvider = {
+      id: 'provider', describe: async () => [{ id: 'logical-browser', hostId, role: 'browser',
+        browserId: 'configured-cdp', label: 'Managed browser', capabilities: ['browser', 'tabs', 'open', 'read'] }],
+      status: async resourceId => acquired ? { resourceId, state: 'ready', generation } : { resourceId, state: 'cold' },
+      acquire: async use => {
+        acquired++;
+        return { ...use, generation, endpoint: origin(), bearer: browser.token, expiresAt: Date.now() + 100_000 };
+      },
+      renew: async use => ({ ...use, endpoint: origin(), bearer: browser.token, expiresAt: Date.now() + 100_000 }),
+      release: async () => {},
+      retire: async () => { throw new Error('The native fixture owns its Node lifecycle'); },
+    };
+    const provided = new BrowserResources();
+    const placed = createManagedRemoteTargetRegistry({ coordinatorHostId: 'coordinator', kernel: {} as never,
+      resources: {} as never, readSettings: async () => ({}), provider });
+    const providerPeers = new ManagedBrowserPeers('coordinator', provided, placed);
+    await providerPeers.refresh();
+    expect(acquired).toBe(0);
+    const [described] = await provided.list();
+    expect(described?.state).toBe('disconnected');
+    const placedFirst = await provided.acquire(described!.browserId);
+    expect(placedFirst.instanceId).not.toBe(first.instanceId);
+    const binding = { browserId: placedFirst.browserId, instanceId: placedFirst.instanceId!, pageId: 'tab' };
+    const release = await provided.holdPage(binding, new AbortController().signal);
+    expect(await (await request('/retention', browser.token)).json()).toMatchObject({ retireReady: false });
+    await release();
+    expect(await (await request('/retention', browser.token)).json()).toMatchObject({ retireReady: true });
+    generation = 'provider-replacement';
+    await providerPeers.refresh();
+    expect((await provided.list())[0]?.state).toBe('disconnected');
+    const placedSecond = await provided.acquire(placedFirst.browserId);
+    expect(placedSecond.instanceId).not.toBe(placedFirst.instanceId);
+    await expect(provided.use(binding, {}, owner => owner.list())).rejects.toThrow('original browser instance ended');
+    await provided.dispose();
 
     await node.close();
     instance = 'restarted-browser';

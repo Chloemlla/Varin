@@ -22,7 +22,7 @@ Application Host owns extension installation and execution (embedded in Electron
 ## Identity, Artifacts & Trust Model
 
 - **Distinct facts**: `installed`, `selected version`, `candidate`, `desired enablement`, `reviewed grants`, and per-realm `actual generation` are separate states. Running code always loads from verified immutable artifacts (never live checkouts; no npm lifecycle scripts executed).
-- **Code trust vs capability grants**: Installing/enabling a brokered Host extension grants OS-account execution (not an OS sandbox). Varin capability grants gate Host APIs per manifest version + realm; upgrades never auto-inherit newly requested capabilities, and revocation immediately blocks new API calls on live/draining owners.
+- **Code trust and capability grants**. By default, a brokered Host extension runs under the Host's OS account. Operators can configure a separate [extension sandbox](ops/cloud-deployment.md#extension-sandboxes) for a user’s third-party extensions. Each extension has its own OS identity and broker channel. The provider can also isolate each extension in its own container. Varin capability grants gate Host APIs per manifest version and realm. Upgrades keep previously reviewed grants, and revocation blocks new API calls on live and draining owners.
 - **Execution realms**:
   - *Declarative*: Data-only contributions (no third-party code).
   - *Managed Surface*: Shared page realm with tracked mounts/subscriptions.

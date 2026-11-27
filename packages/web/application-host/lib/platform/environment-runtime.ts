@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { isHostPrivateVariable } from '../security/host-environment.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -143,7 +144,7 @@ export const createPlatformEnvironmentRuntime = (options: {
     const environment = { ...processLike.env };
     const snapshot = getLoginShellEnvSnapshot();
     for (const [key, value] of Object.entries(snapshot ?? {})) {
-      if (key.toLowerCase() === 'path' || ['PWD', 'OLDPWD', 'SHLVL', '_'].includes(key)) continue;
+      if (isHostPrivateVariable(key) || key.toLowerCase() === 'path' || ['PWD', 'OLDPWD', 'SHLVL', '_'].includes(key)) continue;
       if (typeof processLike.env[key] !== 'string' || processLike.env[key].length === 0) {
         environment[key] = value;
       }

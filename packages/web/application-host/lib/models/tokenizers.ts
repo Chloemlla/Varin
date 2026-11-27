@@ -7,6 +7,7 @@ import { gzip } from 'node:zlib';
 import type { ModelTokenizer } from '@varin/application-client';
 import type { TokenizerBinding } from '../kernel/protocol.generated.js';
 import type { EgressFetch } from '../harness/egress.js';
+import type { LocalInferencePolicy } from '../deployment/policy.js';
 import { validTokenizer, normalizeEncodingName } from './tokenizer-metadata.js';
 
 const digest = (value: string | Uint8Array) => createHash('sha256').update(value).digest('hex');
@@ -27,15 +28,19 @@ export class ModelTokenizers {
   #collection: Promise<void> | undefined;
   #requested = false;
   #obsolete = false;
-  constructor(directory: string, private readonly network: () => Network | undefined, private readonly changed: () => void) {
-    this.#root = join(directory, 'cache', 'tokenizers');
+  constructor(directory: string, private readonly network: () => Network | undefined, private readonly changed: () => void,
+    private readonly policy?: LocalInferencePolicy, cacheDirectory?: string) {
+    this.#root = cacheDirectory ?? join(directory, 'cache', 'tokenizers');
   }
   #key(source: ModelTokenizer) {
     return digest(JSON.stringify(source.kind === 'encoding' ? [source.kind, normalizeEncodingName(source.name)]
       : source.kind === 'huggingface' ? [source.kind, source.repository, source.revision ?? 'main']
         : source.kind === 'url' ? [source.kind, source.url] : [source.kind, source.path]));
   }
-  issue(source: ModelTokenizer) { return this.#issues.get(this.#key(source)); }
+  issue(source: ModelTokenizer) {
+    if (source.kind === 'file' && this.policy?.tokenizerFiles === false) return 'Deployment policy localInference disables Host tokenizer paths';
+    return this.#issues.get(this.#key(source));
+  }
   cached(source: ModelTokenizer) { return this.#exclusive(() => this.#cached(source)); }
   #exclusive<T>(action: () => Promise<T>): Promise<T> {
     const result = this.#gate.then(action);
@@ -46,6 +51,7 @@ export class ModelTokenizers {
     return { kind: 'file', path: join(this.#root, `${entry.sha256}.json.gz`), sha256: entry.sha256 };
   }
   async #cached(source: ModelTokenizer): Promise<TokenizerBinding | undefined> {
+    if (source.kind === 'file' && this.policy?.tokenizerFiles === false) return undefined;
     if (source.kind === 'encoding') return validTokenizer(source) ? { kind: 'encoding', name: normalizeEncodingName(source.name) } : undefined;
     const key = this.#key(source), ready = this.#ready.get(key);
     try {
@@ -75,13 +81,14 @@ export class ModelTokenizers {
   }
   async prepare(source: ModelTokenizer): Promise<TokenizerBinding | undefined> {
     if (!validTokenizer(source)) return undefined;
+    if (source.kind === 'file' && this.policy?.tokenizerFiles === false) return undefined;
     // Downloads/compression run outside the gate; publishing and collection share it.
     const selected = await this.#exclusive(async () => {
       const cached = await this.#cached(source);
       if (cached) return { cached };
       const key = this.#key(source), pending = this.#jobs.get(key);
       if (pending) return { job: pending };
-      const network = this.network();
+      const network = this.policy?.componentDownloads === false ? undefined : this.network();
       if (source.kind !== 'file' && !network) return {};
       const job = this.#load(source, network).then(({ entry, compressed }) => this.#exclusive(async () => {
         const binding = this.#binding(entry);
@@ -100,7 +107,8 @@ export class ModelTokenizers {
   /** Pin before returning a binding, including the interval before native admission. */
   acquire(source?: ModelTokenizer, inherited?: { tokenizer?: TokenizerBinding }): Promise<TokenizerLease> {
     return this.#exclusive(async () => {
-      const tokenizer = inherited ? inherited.tokenizer : source ? await this.#cached(source) : undefined;
+      const tokenizer = source?.kind === 'file' && this.policy?.tokenizerFiles === false
+        ? undefined : inherited ? inherited.tokenizer : source ? await this.#cached(source) : undefined;
       if (!inherited && source && !tokenizer) void this.prepare(source);
       const hash = tokenizer?.kind === 'file' ? tokenizer.sha256 : undefined;
       if (hash) this.#pins.set(hash, (this.#pins.get(hash) ?? 0) + 1);

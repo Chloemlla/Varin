@@ -1,7 +1,6 @@
 import React from 'react';
-import { getRuntimeEndpointGeneration, type BotMemoryItem, type BotPresence, type ScheduledTask, type ThreadIdentity, type ThreadFollowupsAPI } from '@varin/application-client';
-import type { VarinEventSourceDescriptor } from '@varin/extension-contract';
-import type { Followup, BotActivityPage } from '@varin/protocol';
+import { getRuntimeEndpointGeneration, type BotMemoryItem, type BotPresence, type ScheduledTask } from '@varin/application-client';
+import type { BotActivityPage } from '@varin/protocol';
 import { listBotMemory, listBotSchedules, readBotActivity, readBotPresence } from '@/lib/bots';
 import { subscribeVarinEvents } from '@/lib/varinEvents';
 import type { BotActivityView } from './botPresentation';
@@ -122,7 +121,7 @@ function useBotActivity(botId: string | null, revision: number) {
  * The panel's reads for one Bot: its activity across all conversations, current memory and the
  * Bot's Calendar tasks. They refresh on the matching Host events and when `revision` moves.
  */
-export function useBotFacts({ botId, revision, enabled, identity, followups }: { botId: string | null; revision: number; enabled: boolean; identity?: ThreadIdentity; followups?: ThreadFollowupsAPI }) {
+export function useBotFacts({ botId, revision, enabled }: { botId: string | null; revision: number; enabled: boolean }) {
   const [memoryRevision, refreshMemory] = React.useReducer((value: number) => value + 1, 0);
   const [scheduleRevision, refreshSchedules] = React.useReducer((value: number) => value + 1, 0);
   React.useEffect(() => enabled && botId ? subscribeVarinEvents(event => {
@@ -133,12 +132,7 @@ export function useBotFacts({ botId, revision, enabled, identity, followups }: {
   const { activity, retryActivity, loadEarlier, earlier } = useBotActivity(enabled ? botId : null, revision);
   const [memory, retryMemory] = useRead<BotMemoryItem[]>(enabled && botId ? botId : null, revision + memoryRevision, signal => listBotMemory(botId!, signal));
   const [tasks, retryTasks] = useRead<ScheduledTask[]>(enabled && botId ? botId : null, revision + scheduleRevision, signal => listBotSchedules(botId!, signal));
-  // Use a resolved session, never the profile's original (possibly deleted) entry.
-  const arrangementKey = enabled && botId && identity && followups ? JSON.stringify([botId, identity]) : null;
-  const [arrangements, retryArrangements] = useRead<Followup[]>(arrangementKey, revision + scheduleRevision, signal => followups!.arrangements(identity!, botId!, signal));
-  const [eventSources, retryEventSources] = useRead<VarinEventSourceDescriptor[]>(arrangementKey, revision + scheduleRevision, signal => followups!.eventSources(identity!, signal));
-  return { activity, memory, tasks, arrangements, eventSources, arrangementIdentity: arrangementKey ? identity : undefined,
-    retryArrangements, retryEventSources, retryActivity, loadEarlier, earlier, retryMemory, retryTasks, refreshMemory, refreshSchedules };
+  return { activity, memory, tasks, retryActivity, loadEarlier, earlier, retryMemory, retryTasks, refreshMemory, refreshSchedules };
 }
 
 /**

@@ -21,6 +21,8 @@ import { resourceThreadSource } from './thread-context.js';
 import { beginMaterialActivity, createMaterialLifecycle } from '../harness/material-lifecycle.js';
 import { threadMaterialScope } from './material-storage.js';
 import { HarnessServiceError } from '../harness/service-error.js';
+import { attachmentUploadIdentity, validateAttachmentFilename as filename, type AttachmentUpload } from './attachment-upload-identity.js';
+export { validateAttachmentFilename } from './attachment-upload-identity.js';
 
 export const ATTACHMENT_FILE = 'attachment.file';
 export const ATTACHMENT_DELIVERY = 'attachment.delivery';
@@ -30,15 +32,10 @@ const recordId = (ref: string) => {
   if (!/^attachment:[a-zA-Z0-9_-]+$/.test(ref)) throw new HarnessServiceError('invalid-params', 'Select an original attachment reference');
   return ref;
 };
-const filename = (value: string) => {
-  if (!value.trim() || value === '.' || value === '..' || /[\\/]/.test(value) || [...value].some(character => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127)) throw new HarnessServiceError('invalid-params', 'The attachment filename is invalid');
-  return value;
-};
-export { filename as validateAttachmentFilename };
 interface Scope { workspaceId: string; threadId: string }
 interface StoredAttachment { attachment: Attachment; contentHash: string; selection?: AttachmentSelection; operationId?: string; materials?: Array<{ snapshotId: string; contentHash: string; sourceHash?: string }> }
 type RecordValue = Awaited<ReturnType<KernelStorageContext['records']['get']>>;
-export interface AttachmentUpload { key: string; filename: string; mimeType: string; byteLength: number }
+export type { AttachmentUpload } from './attachment-upload-identity.js';
 export interface AttachmentRead { attachment: Attachment; stream: AsyncIterable<Uint8Array> }
 export interface EventAttachmentCapture {
   attachment: Attachment; contentHash: string; readPage(offset: number, length: number): Promise<KernelObjectSlice>;
@@ -152,10 +149,8 @@ export function createThreadAttachments(options: {
     transferPages(target, hash, byteLength, (offset, length, view = {}) => source.getBlob(view.rangeObject ?? hash, proof,
       { offset, length, ...(view.representation ? { representation: view.representation } : {}), ...(view.rangeObject ? { rangeRoot: hash } : {}), signal }), operationId, signal);
   const upload = async (scope: Scope, request: AttachmentUpload, source: AsyncIterable<Uint8Array>, signal?: AbortSignal): Promise<Attachment> => {
-    filename(request.filename);
-    if (!request.key || !Number.isSafeInteger(request.byteLength) || request.byteLength < 0) throw new HarnessServiceError('invalid-params', 'The attachment upload metadata is invalid');
-    const ref = `attachment:${digest([scope.threadId, 'upload', request.key])}`;
-    const attachment = { ref, filename: request.filename, mimeType: attachmentMimeType(request.filename, request.mimeType), byteLength: request.byteLength };
+    const attachment = attachmentUploadIdentity(scope.threadId, request);
+    const { ref } = attachment;
     return inScope(scope, 'attachment-write', async context => {
       const existing = await context.records.get(ref);
       if (existing) {

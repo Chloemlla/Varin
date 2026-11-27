@@ -83,6 +83,8 @@ pub struct WorkerStatus {
 }
 pub struct RunSupervisor {
     stopping: AtomicBool,
+    parking: AtomicBool,
+    continuations: Mutex<()>,
     catalog: Arc<Mutex<Catalog>>,
     workers: Mutex<HashMap<String, Worker>>,
     operation_workers: Mutex<HashMap<String, OperationWorker>>,
@@ -95,6 +97,8 @@ impl RunSupervisor {
     pub fn new(catalog: Catalog) -> Self {
         Self {
             stopping: AtomicBool::new(false),
+            parking: AtomicBool::new(false),
+            continuations: Mutex::new(()),
             catalog: Arc::new(Mutex::new(catalog)),
             workers: Mutex::new(HashMap::new()),
             operation_workers: Mutex::new(HashMap::new()),
@@ -105,8 +109,28 @@ impl RunSupervisor {
         }
     }
     pub fn is_stopping(&self) -> bool {
-        self.stopping.load(Ordering::Acquire)
+        self.stopping.load(Ordering::Acquire) || self.parking.load(Ordering::Acquire)
     }
+    pub fn continuation_pass(&self) -> Result<Option<std::sync::MutexGuard<'_, ()>>> {
+        let guard = self.continuations.lock().map_err(error)?;
+        Ok((!self.is_stopping()).then_some(guard))
+    }
+    pub fn reserve_park(&self) -> Result<bool> {
+        let Ok(_continuations) = self.continuations.try_lock() else { return Ok(false) };
+        if self.has_active_workers() || self.is_stopping() { return Ok(false); }
+        // All three admission paths check is_stopping under their worker lock.
+        // Once this is set, a reservation in progress is either visible below
+        // or will be declined before it creates a worker.
+        self.parking.store(true, Ordering::Release);
+        let workers_idle = self.workers.lock().map_err(error)?.is_empty();
+        let operations_idle = self.operation_workers.lock().map_err(error)?.is_empty();
+        if !workers_idle || !operations_idle {
+            self.release_park();
+            return Ok(false);
+        }
+        Ok(true)
+    }
+    pub fn release_park(&self) { self.parking.store(false, Ordering::Release); }
     pub fn catalog(&self) -> Arc<Mutex<Catalog>> {
         self.catalog.clone()
     }
@@ -148,7 +172,7 @@ impl RunSupervisor {
                 ));
             }
             let mut workers = self.workers.lock().map_err(error)?;
-            if self.stopping.load(Ordering::Acquire) {
+            if self.is_stopping() {
                 return Err(ExecutionError::new(
                     "supervisor_stopped",
                     "runtime supervisor is shutting down",
@@ -445,6 +469,7 @@ impl RunSupervisor {
     }
     /// Called on completion/input notifications and sparse maintenance while workers exist.
     pub fn advance_pending(&self) -> Result<()> {
+        if self.is_stopping() { return Ok(()); }
         self.reap()?;
         let pending: Vec<String> = self
             .workers
@@ -697,7 +722,7 @@ impl RunSupervisor {
                 return Ok(());
             }
             let mut workers = self.workers.lock().map_err(error)?;
-            if self.stopping.load(Ordering::Acquire) || workers.contains_key(run_id) {
+            if self.is_stopping() || workers.contains_key(run_id) {
                 return Ok(());
             }
             workers.insert(run_id.into(), Worker {
@@ -1200,7 +1225,7 @@ impl RunSupervisor {
         let operation_epoch = operation.epoch;
         let token = CancellationToken::default();
         let mut workers = self.operation_workers.lock().map_err(error)?;
-        if self.stopping.load(Ordering::Acquire) {
+        if self.is_stopping() {
             return Err(error("runtime is stopping"));
         }
         if workers.contains_key(operation_id) {

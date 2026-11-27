@@ -1,4 +1,4 @@
-import type { ThreadIdentity, ThreadModel } from '@varin/application-client';
+import type { ProjectEntry, ScheduledTask, ThreadIdentity, ThreadModel } from '@varin/application-client';
 import { DEFAULT_CHAT_CONTENT_WIDTH, isChatContentWidth } from '@varin/application-client';
 import { create } from 'zustand';
 import { devtools, persist } from 'zustand/middleware';
@@ -31,6 +31,12 @@ export type CalendarConversationContext = {
   identity?: ThreadIdentity;
   model?: ThreadModel;
   group?: { id: string; botId?: string; focus?: { kind: 'schedule' | 'followup'; id: string } };
+  botPage?: { kind: 'arrangements' } | {
+    kind: 'editor';
+    project: ProjectEntry;
+    task: ScheduledTask | null;
+    destinations: { identity: ThreadIdentity; label: string }[];
+  };
 };
 export type MainTab = 'chat' | 'plan' | 'git' | 'diff' | 'terminal' | 'files' | 'context' | 'diagram';
 export type PendingDiffScope = 'working' | 'staged';

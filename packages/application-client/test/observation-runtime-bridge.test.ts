@@ -46,7 +46,7 @@ it('mints realtime-proxy local auth at the actual local Host through the install
     globalThis.fetch = window.fetch;
     const pending = runtimeFetch('/api/threads/observe');
     await new Promise(resolve => setImmediate(resolve));
-    assert.deepEqual(requests, [{ url: 'https://local.test/auth/url-token', authorization: null }]);
+    assert.deepEqual(requests, [{ url: 'https://local.test/auth/url-token?observation=1', authorization: null }]);
     assert.equal(sockets.length, 0, 'do not race the proxy handshake against local token minting');
     release();
     const response = await pending;

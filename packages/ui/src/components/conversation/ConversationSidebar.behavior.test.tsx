@@ -1,7 +1,6 @@
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { parseHTML } from 'linkedom';
-import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { ThreadSummary } from '@varin/protocol';
 import { ConversationSidebar } from './ConversationSidebar';
 import { selectedComposerKey, threadHostKey, useThreadStore } from '@/stores/useThreadStore';
@@ -12,6 +11,19 @@ import { useSessionDisplayStore } from '@/stores/useSessionDisplayStore';
 import { useUIStore } from '@/stores/useUIStore';
 import { captureDialogOrigin, dialogOrigin } from '@/lib/motion/dialogOrigin';
 import { getRuntimeKey } from '@varin/application-client';
+
+// React detects native input events once, when the renderer is imported.
+const dom = await vi.hoisted(async () => {
+  const { parseHTML } = await import('linkedom');
+  const dom = parseHTML('<!doctype html><html><body></body></html>');
+  dom.document.oninput = null;
+  vi.stubGlobal('window', dom.window);
+  vi.stubGlobal('document', dom.document);
+  vi.stubGlobal('HTMLElement', dom.window.HTMLElement);
+  vi.stubGlobal('Element', dom.window.Element);
+  vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
+  return dom;
+});
 
 const mocks = vi.hoisted(() => ({
   update: vi.fn(),
@@ -36,10 +48,6 @@ vi.mock('@/components/ui/tooltip', () => {
 vi.mock('@/components/ui/dialog', () => ({
   Dialog: () => null, DialogContent: () => null, DialogDescription: () => null,
   DialogFooter: () => null, DialogHeader: () => null, DialogTitle: () => null,
-}));
-// Linkedom supplies DOM input events without the browser's React change-event normalization.
-vi.mock('@/components/ui/input', () => ({
-  Input: ({ onChange, ...props }: React.ComponentProps<'input'>) => <input {...props} onInput={onChange as React.FormEventHandler<HTMLInputElement>} />,
 }));
 
 // Preserve the menu contract relevant to editing: close completion starts the editor, then the
@@ -108,6 +116,15 @@ const summary = (id: string, title: string, parentId: string | null): ThreadSumm
   branches: [{ branch_id: `${id}-main`, head: null, active_run_id: null, latest_run: null }],
 });
 const titleButton = (title: string) => Array.from(container.querySelectorAll('button')).find(button => button.firstElementChild?.textContent === title)!;
+const typeText = async (input: HTMLInputElement, value: string) => {
+  // Linkedom returns null for an omitted input type; browsers default to text.
+  if (!input.type) input.type = 'text';
+  const setter = Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, 'value')!.set!;
+  await act(async () => {
+    setter.call(input, value);
+    input.dispatchEvent(new window.Event('input', { bubbles: true }));
+  });
+};
 const pressKey = async (input: HTMLInputElement, key: string) => {
   const event = new window.Event('keydown', { bubbles: true, cancelable: true });
   Object.defineProperty(event, 'key', { value: key });
@@ -137,10 +154,8 @@ const openRename = async (title: string, menu: 'context' | 'dropdown') => {
 };
 
 beforeEach(async () => {
-  const { document, window } = parseHTML('<!doctype html><html><body></body></html>');
-  for (const [name, value] of Object.entries({ document, window, HTMLElement: window.HTMLElement, Element: window.Element, IS_REACT_ACT_ENVIRONMENT: true })) vi.stubGlobal(name, value);
   let active: HTMLElement | null = null;
-  Object.defineProperty(document, 'activeElement', { get: () => active ?? document.body });
+  Object.defineProperty(document, 'activeElement', { configurable: true, get: () => active ?? document.body });
   const focusElement = (element: HTMLElement) => {
     if (active === element) return;
     const previous = active; active = element;
@@ -167,7 +182,8 @@ beforeEach(async () => {
   container = document.createElement('div'); document.body.append(container); root = createRoot(container);
   await act(async () => { root.render(<ConversationSidebar />); });
 });
-afterEach(async () => { await act(async () => root.unmount()); container.remove(); vi.unstubAllGlobals(); });
+afterEach(async () => { await act(async () => root.unmount()); container.remove(); });
+afterAll(() => vi.unstubAllGlobals());
 
 it('starts child task trees collapsed, remembers both choices after remount, and keeps newly added trees closed', async () => {
   await act(async () => useSessionDisplayStore.setState({ conversationTreeByHost: {} }));
@@ -204,9 +220,10 @@ it('restores a collapsed project group after remount and search reveals matches 
   expect(searchButton).not.toBeNull();
   await act(async () => searchButton!.click());
   const input = container.querySelector('input')!;
-  await act(async () => { input.value = 'Child task'; input.dispatchEvent(new window.Event('input', { bubbles: true })); });
+  expect(document.activeElement).toBe(input);
+  await typeText(input, 'Child task');
   expect(titleButton('Child task')).toBeDefined();
-  await act(async () => { input.value = ''; input.dispatchEvent(new window.Event('input', { bubbles: true })); });
+  await typeText(input, '');
   expect(group().getAttribute('aria-expanded')).toBe('false');
   expect(titleButton('Child task')).toBeUndefined();
 });
@@ -244,12 +261,12 @@ it.each(['completed', 'failed'] as const)('keeps unread %s child tasks quiet whi
 it.each(['context', 'dropdown'] as const)('keeps the %s rename editor focused, saves the child, and can rename again', async menu => {
   let input = await openRename('Child task', menu);
   expect(input.value).toBe('Child task');
-  await act(async () => { input.value = 'Renamed child'; input.dispatchEvent(new window.Event('input', { bubbles: true })); });
+  await typeText(input, 'Renamed child');
   await pressKey(input, 'Enter');
   expect(mocks.update).toHaveBeenCalledExactlyOnceWith('child', { title: 'Renamed child' });
   expect(titleButton('Renamed child')).toBeDefined();
   input = await openRename('Renamed child', menu);
-  await act(async () => { input.value = 'Discard this'; input.dispatchEvent(new window.Event('input', { bubbles: true })); });
+  await typeText(input, 'Discard this');
   await pressKey(input, 'Escape');
   expect(container.querySelector('input')).toBeNull();
   expect(mocks.update).toHaveBeenCalledTimes(1);
@@ -275,7 +292,7 @@ it('restores automatic titles from a manually named root conversation', async ()
 
 it('saves a parent title on blur without changing its child', async () => {
   const input = await openRename('Parent conversation', 'context');
-  await act(async () => { input.value = 'Renamed parent'; input.dispatchEvent(new window.Event('input', { bubbles: true })); });
+  await typeText(input, 'Renamed parent');
   await act(async () => { titleButton('Child task').focus(); });
   expect(mocks.update).toHaveBeenCalledExactlyOnceWith('parent', { title: 'Renamed parent' });
   expect(titleButton('Child task')).toBeDefined();

@@ -317,6 +317,26 @@ test('model OAuth admission covers direct, captured, draft, discovery and auxili
   expect((await models.getAuth(selected.id)).auth.apiKey).toBe('fixture-key');
 });
 
+test('deployment credentials reject saved and draft sources before contacting the provider', async () => {
+  const { directory, models } = await fixture();
+  const saved: ModelChannel = { ...channel(), authentication: { kind: 'environment', variable: 'MODEL_TEST_TOKEN' } };
+  await models.save(saved, (await models.read()).revision);
+  const before = await readFile(join(directory, 'models.json'), 'utf8');
+  const restricted = new ModelsService(directory, { projectTrusted: () => false, fetch: unexpectedFetch,
+    credentialPolicy: { sources: ['api-key'], oauthIssuers: [] } });
+  const snapshot = await restricted.read();
+  expect(snapshot.issues).toEqual([expect.objectContaining({ channelId: saved.id, code: 'deployment-policy-denied' })]);
+  expect(snapshot.types.find(type => type.id === saved.type)?.authentication).toEqual(['credential']);
+  expect(await restricted.listModels()).toEqual([]);
+  for (const resolve of [
+    () => restricted.getAuth(saved.id),
+    () => restricted.captureModel(saved.id, 'chat'),
+    () => restricted.discoverDraft({ channel: saved }, unexpectedFetch),
+  ]) await expect(resolve()).rejects.toMatchObject({ code: 'deployment-policy-denied' });
+  expect(() => restricted.signIn('openai-codex', 'account')).toThrow('Deployment policy modelCredentials');
+  expect(await readFile(join(directory, 'models.json'), 'utf8')).toBe(before);
+});
+
 test('matching OAuth issuer allows custom proxy endpoints and captured channels keep their original source policy', async () => {
   const { models } = await fixture();
   const reference = await models.credentials.linkOAuth({ kind: 'oauth', provider: 'opencode', accessToken: 'fixture-token' });

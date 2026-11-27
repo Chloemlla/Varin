@@ -83,6 +83,11 @@ export interface BrokeredHostEntrypointArtifact {
   packageRoot: string;
 }
 
+export interface BrokeredArtifactTransfer {
+  integrity: string;
+  open(signal?: AbortSignal): Promise<{ root: string; files: string[] }>;
+}
+
 export interface ExtensionArtifactStoreOptions {
   builtinRoots?: ReadonlyMap<string, string> | Record<string, string>;
   buildModule?: ExtensionModuleBuilder;
@@ -790,6 +795,23 @@ export class ExtensionArtifactStore {
       modulePath: path,
       packageRoot: join(root, "package"),
     };
+  }
+
+  /** Use the authenticated index as the transfer manifest, never the live package tree. */
+  async openBrokeredArtifact(integrity: string, signal?: AbortSignal) {
+    if (!INTEGRITY_PATTERN.test(integrity)) throw new ArtifactVerificationError('Invalid extension artifact integrity');
+    const { index, root } = await this.#readVerifiedIndex(join(this.directory, integrity.slice(7)), integrity, undefined, false, signal);
+    return { root, files: [INDEX_FILE, ...Object.keys(index.files)] };
+  }
+
+  async verifyBrokeredArtifact(integrity: string, extensionId: string, signal?: AbortSignal) {
+    if (!INTEGRITY_PATTERN.test(integrity)) throw new ArtifactVerificationError('Invalid extension artifact integrity');
+    const { index, root } = await this.#readVerifiedIndex(join(this.directory, integrity.slice(7)), integrity, undefined, true, signal);
+    if (index.manifest.id !== extensionId || index.manifest.entrypoints?.host?.mode !== 'brokered' || !index.host) {
+      throw new ArtifactVerificationError('Artifact does not belong to this extension sandbox');
+    }
+    assertVarinExtensionManifestCompatibility(index.manifest, this.varinVersion);
+    return { modulePath: join(root, index.host.module), packageRoot: join(root, 'package') };
   }
 
   async #readVerifiedIndex(

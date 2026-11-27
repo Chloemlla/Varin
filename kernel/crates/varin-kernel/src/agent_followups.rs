@@ -194,7 +194,7 @@ pub(super) fn execute(
                 .map_err(domain)?;
             Ok(serde_json::to_value(result)?)
         }
-        "runtime.followup.events.receive" => {
+        "runtime.followup.events.receive" | "runtime.followup.events.receiveDurable" => {
             let input = serde_json::from_value(params)?;
             let capture = runtime
                 .catalog()
@@ -206,12 +206,15 @@ pub(super) fn execute(
             if cancel.load(Ordering::Acquire) {
                 return Err(KernelError::Cancelled);
             }
-            let result = runtime
-                .catalog()
+            let catalog = runtime.catalog();
+            let mut catalog = catalog
                 .lock()
-                .map_err(|_| KernelError::Storage("Catalog owner unavailable".into()))?
-                .admit_event_receive(prepared)
-                .map_err(domain)?;
+                .map_err(|_| KernelError::Storage("Catalog owner unavailable".into()))?;
+            let result = if method == "runtime.followup.events.receiveDurable" {
+                catalog.admit_durable_event_receive(prepared)
+            } else {
+                catalog.admit_event_receive(prepared)
+            }.map_err(domain)?;
             Ok(serde_json::to_value(result)?)
         }
         "runtime.followup.eventSources.list" => {

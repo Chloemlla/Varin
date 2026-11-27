@@ -84,6 +84,38 @@ impl Storage {
         Ok(())
     }
 
+    fn read_catalog_format(conn: &Connection) -> Result<(Option<String>, bool), KernelError> {
+        let format = match conn.query_row(
+            "SELECT value FROM metadata WHERE key = 'format_version'", [], |row| row.get(0),
+        ).optional() {
+            Ok(format) => format,
+            Err(rusqlite::Error::SqliteFailure(_, Some(message))) if message.contains("no such table") => None,
+            Err(error) => return Err(error.into()),
+        };
+        let empty = conn.query_row("SELECT COUNT(*) = 0 FROM sqlite_master WHERE type = 'table'", [], |row| row.get(0))?;
+        Ok((format, empty))
+    }
+
+    pub(crate) fn format_preflight(root: &Path) -> Result<Value, KernelError> {
+        let file = root.join("catalog.sqlite");
+        let target = STORAGE_FORMAT_VERSION;
+        if !file.try_exists()? {
+            return Ok(json!({"status":"new", "target":target}));
+        }
+        let db = varin_runtime::catalog::open_checkpointed_database(&file)
+            .map_err(|error| KernelError::Storage(error.to_string()))?;
+        let (version, empty) = Self::read_catalog_format(&db)?;
+        let status = match version.as_deref() {
+            Some(value) if value == target => {
+                Self::validate_catalog_schema(&db)?;
+                "current"
+            }
+            None if empty => "new",
+            _ => "unsupported",
+        };
+        Ok(json!({"status":status, "current":version, "target":target}))
+    }
+
     pub(crate) fn open(root: &Path, host_id: &str) -> Result<Self, KernelError> {
         fs::create_dir_all(root)?;
         let lock_path = root.join("kernel.lock");
@@ -109,28 +141,7 @@ impl Storage {
         let (format, catalog_empty): (Option<String>, bool) = if catalog_existed {
             let probe =
                 Connection::open_with_flags(&catalog_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-            let format = match probe
-                .query_row(
-                    "SELECT value FROM metadata WHERE key = 'format_version'",
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()
-            {
-                Ok(format) => format,
-                Err(rusqlite::Error::SqliteFailure(_, Some(message)))
-                    if message.contains("no such table") =>
-                {
-                    None
-                }
-                Err(error) => return Err(error.into()),
-            };
-            let empty = probe.query_row(
-                "SELECT COUNT(*) = 0 FROM sqlite_master WHERE type = 'table'",
-                [],
-                |row| row.get(0),
-            )?;
-            (format, empty)
+            Self::read_catalog_format(&probe)?
         } else {
             (None, true)
         };

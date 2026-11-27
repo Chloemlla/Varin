@@ -1,4 +1,4 @@
-import { tryObservationFetch } from './observation-transport.js';
+import { enableParkingObservations, tryObservationFetch } from './observation-transport.js';
 import { getActiveRelayTunnel, type RelayTunnelFetchClient } from './relay-provider.js';
 import { buildRuntimeAuthHeaders } from './runtime-auth.js';
 import { getRuntimeUrlResolver, type RuntimeUrlQuery } from './runtime-url.js';
@@ -21,10 +21,19 @@ let nativeFetchDelegate: FetchDelegate | null = null;
 // Host-local APIs must not follow the selected remote Host resolver. The
 // runtime bridge retains the browser's original fetch here before patching
 // window.fetch, giving those APIs one explicit, testable transport boundary.
-export const fetchWithoutRuntimeRouting: FetchDelegate = (input, init) => (
-  tryObservationFetch(input, init)
-  ?? (nativeFetchDelegate ?? globalThis.fetch.bind(globalThis))(input, init)
-);
+export const fetchWithoutRuntimeRouting: FetchDelegate = async (input, init) => {
+  const observation = tryObservationFetch(input, init);
+  if (observation) return observation;
+  const generation = getRuntimeEndpointGeneration();
+  const response = await (nativeFetchDelegate ?? globalThis.fetch.bind(globalThis))(input, init);
+  if (typeof window !== 'undefined' && response.headers.get('x-varin-host-parking') === 'enabled') {
+    try {
+      const endpoint = new URL(input instanceof Request ? input.url : input.toString(), window.location.href);
+      if (isActiveRuntimeServiceUrl(endpoint)) enableParkingObservations(generation, () => runtimeFetch('/api/version').then(result => result.body?.cancel()));
+    } catch { /* Ignore unrelated service origins. */ }
+  }
+  return response;
+};
 
 const shouldResolveApiPath = (input: string): boolean => {
   return input.startsWith('/api/') || input === '/api' || input.startsWith('/auth/') || input === '/auth' || input === '/health';

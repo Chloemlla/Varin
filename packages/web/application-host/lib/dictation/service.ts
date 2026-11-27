@@ -10,6 +10,7 @@
  */
 
 import type { ComponentFetch } from '../components/file-transfer.js';
+import type { LocalInferencePolicy } from '../deployment/policy.js';
 import { rm } from 'fs/promises';
 
 import { DictationWorkerClient, WorkerBackedTranscriptionSession } from './local/worker-client.js';
@@ -46,7 +47,13 @@ interface LocalModelStatus {
 
 const errorMessage = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
-export function createDictationService({ modelsDir, fetchModel }: { modelsDir: string; fetchModel?: ComponentFetch }) {
+export function createDictationService({ modelsDir, fetchModel, localInference }: {
+  modelsDir: string; fetchModel?: ComponentFetch; localInference?: LocalInferencePolicy;
+}) {
+  const speechDenied = { error: 'Deployment policy localInference disables local speech',
+    reasonCode: 'deployment-policy-denied', retryable: false };
+  const downloadDenied = { error: 'Deployment policy localInference disables component downloads',
+    reasonCode: 'deployment-policy-denied', retryable: false };
   const workerClient = new DictationWorkerClient();
   /** modelId -> 'downloading' | 'error' */
   const downloadStates = new Map<string, 'downloading' | 'error'>();
@@ -130,6 +137,7 @@ export function createDictationService({ modelsDir, fetchModel }: { modelsDir: s
       return { session };
     }
 
+    if (localInference?.speech === false) return speechDenied;
     const modelId = resolveLocalModelId(options.localModel);
     let language: string;
     try { language = resolveLocalSttLanguage(modelId, options.language); }
@@ -137,6 +145,7 @@ export function createDictationService({ modelsDir, fetchModel }: { modelsDir: s
     const installed = await isLocalSttModelInstalled(modelsDir, modelId);
     signal?.throwIfAborted();
     if (!installed) {
+      if (localInference?.componentDownloads === false) return downloadDenied;
       const state = downloadStates.get(modelId);
       if (state === 'error') {
         const message = downloadErrors.get(modelId) || 'Model download failed';
@@ -196,6 +205,8 @@ export function createDictationService({ modelsDir, fetchModel }: { modelsDir: s
    */
   const getStatus = async (options: { localModel?: string; provider?: string } = {}) => {
     const provider = options.provider === 'openai-compatible' ? 'openai-compatible' : 'local';
+    if (localInference?.speech === false) return { provider, available: provider === 'openai-compatible',
+      ...(provider === 'local' && speechDenied), models: [], ttsModels: [] };
     const modelId = resolveLocalModelId(options.localModel);
 
     const describeModel = async (id: string, catalog: LocalSpeechModelCatalog): Promise<LocalModelStatus> => ({
@@ -268,9 +279,11 @@ export function createDictationService({ modelsDir, fetchModel }: { modelsDir: s
     | { error: string; reasonCode: string; retryable: boolean }
     | { audio: Buffer; format: string }
   > => {
+    if (localInference?.speech === false) return speechDenied;
     const modelId = isLocalTtsModelId(model) ? model : DEFAULT_LOCAL_TTS_MODEL;
     const installed = await isLocalSttModelInstalled(modelsDir, modelId);
     if (!installed) {
+      if (localInference?.componentDownloads === false) return downloadDenied;
       const state = downloadStates.get(modelId);
       if (state === 'error') {
         const message = downloadErrors.get(modelId) || 'Model download failed';
@@ -303,7 +316,11 @@ export function createDictationService({ modelsDir, fetchModel }: { modelsDir: s
    * Kick off a background download for a model (used by the status route's
    * download action so Settings can pre-download models).
    */
-  const requestModelDownload = async (modelId: string) => {
+  const requestModelDownload = async (modelId: string): Promise<
+    { ok: true; installed: boolean } | { ok: false; error: string; reasonCode?: string }
+  > => {
+    if (localInference?.speech === false) return { ok: false, ...speechDenied };
+    if (localInference?.componentDownloads === false) return { ok: false, ...downloadDenied };
     if (!isLocalModelId(modelId)) {
       return { ok: false, error: 'Unknown model id' };
     }

@@ -5,7 +5,7 @@ import type { SourceResourceOwner } from '@varin/protocol';
 /** Read the execution Host's configuration and optionally locate installed programs. */
 export function useSourceExternalAgents(owner: SourceResourceOwner | undefined, enabled: boolean, discover: boolean) {
   const host = React.useSyncExternalStore(subscribeRuntimeEndpointChanged, getRuntimeEndpointGeneration, getRuntimeEndpointGeneration);
-  const ownerKey = JSON.stringify(owner ?? { kind: 'local' });
+  const ownerKey = owner ? JSON.stringify(owner) : '';
   const scope = `${host}:${ownerKey}`;
   const [revision, retry] = React.useReducer(value => value + 1, 0);
   const [state, setState] = React.useState<{ scope: string; settings?: ExternalAgentSettings; error?: string; loading: boolean }>({ scope, loading: false });
@@ -13,7 +13,7 @@ export function useSourceExternalAgents(owner: SourceResourceOwner | undefined, 
     if (!enabled) return;
     const controller = new AbortController();
     setState(previous => ({ scope, settings: previous.scope === scope ? previous.settings : undefined, loading: true }));
-    void createExternalAgentsHttpAPI(host).settings(controller.signal, JSON.parse(ownerKey), discover).then(settings => {
+    void createExternalAgentsHttpAPI(host).settings(controller.signal, ownerKey ? JSON.parse(ownerKey) : undefined, discover).then(settings => {
       if (!controller.signal.aborted && host === getRuntimeEndpointGeneration()) setState({ scope, settings, loading: false });
     }).catch(error => {
       if (!controller.signal.aborted && host === getRuntimeEndpointGeneration())

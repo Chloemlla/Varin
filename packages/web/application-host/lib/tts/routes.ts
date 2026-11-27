@@ -6,7 +6,8 @@ import type { SayTtsCapability } from './capability-runtime.js';
 
 export function registerTtsRoutes(app: Express, {
   sayTTSCapability,
-}: { sayTTSCapability: SayTtsCapability | Promise<SayTtsCapability> | null }): void {
+  allowLocalSpeech = true,
+}: { sayTTSCapability: SayTtsCapability | Promise<SayTtsCapability> | null; allowLocalSpeech?: boolean }): void {
   let ttsModulePromise: Promise<typeof import('./index.js')> | null = null;
   const getTtsModule = async (): Promise<typeof import('./index.js')> => {
     if (!ttsModulePromise) {
@@ -158,6 +159,7 @@ export function registerTtsRoutes(app: Express, {
 
   // macOS 'say' command TTS speak endpoint
   app.post('/api/tts/say/speak', async (req, res) => {
+    if (!allowLocalSpeech) return res.status(403).json({ code: 'deployment-policy-denied', section: 'localInference' });
     try {
       const { text, voice = 'Samantha', rate = 200 } = req.body || {};
 

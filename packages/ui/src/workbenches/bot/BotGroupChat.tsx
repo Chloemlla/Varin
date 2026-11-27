@@ -1,7 +1,7 @@
 import React from 'react';
 import { createPortal } from 'react-dom';
 import { AnimatePresence, motion } from 'motion/react';
-import { botGroupRequest, downloadBotGroupFile, uploadBotGroupFile, createScheduledTasksHttpAPI, getRuntimeEndpointGeneration, getThreadObservationBus, type BotGroupMember, type BotGroupPage, type BotGroupPost, type BotGroupSummary, type BotSummary, type GroupChange, type GroupChatFile, type GroupDelivery, type ScheduledTask, type ThreadIdentity, type ThreadsAPI, type ThreadSnapshot } from '@varin/application-client';
+import { botGroupRequest, downloadBotGroupFile, uploadBotGroupFile, createScheduledTasksHttpAPI, getRuntimeEndpointGeneration, getThreadObservationBus, retainParkingObservations, type BotGroupMember, type BotGroupPage, type BotGroupPost, type BotGroupSummary, type BotSummary, type GroupChange, type GroupChatFile, type GroupDelivery, type ScheduledTask, type ThreadIdentity, type ThreadsAPI, type ThreadSnapshot } from '@varin/application-client';
 import { Button } from '@/components/ui/button';
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from '@/components/ui/context-menu';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
@@ -125,6 +125,9 @@ export function BotGroupChat({ group, bots, api, sequence, panelTarget, onOpenPa
 
   const posts = [...new Map([...older, ...(page?.posts ?? [])].map(post => [post.id, post])).values()];
   const active = posts.flatMap(post => post.delivery.filter(delivery => delivery.state === 'running' && delivery.identity && delivery.runId));
+  const hasActiveDelivery = active.length > 0;
+  const generation = getRuntimeEndpointGeneration();
+  React.useEffect(() => hasActiveDelivery ? retainParkingObservations(generation) : undefined, [generation, hasActiveDelivery]);
   const activeKey = JSON.stringify(active.map(value => [value.identity!.threadId, value.identity!.branchId, value.runId]));
   React.useEffect(() => {
     if (!api) return;

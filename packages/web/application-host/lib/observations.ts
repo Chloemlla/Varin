@@ -13,6 +13,7 @@ import {
 
 interface ObservationOptions {
   server: Server;
+  listener?: Server;
   authenticate(request: IncomingMessage): Promise<boolean>;
   isRequestOriginAllowed(request: IncomingMessage): boolean | Promise<boolean>;
   rejectWebSocketUpgrade(socket: Duplex, status: number, message: string): void;
@@ -209,7 +210,7 @@ export const attachObservations = (options: ObservationOptions) => {
     };
     const open = async (message: Extract<ObservationClientMessage, { type: 'open' }>, channel: Channel) => {
       try {
-        const response = await requestObservation(server, request, message, channel.abort.signal);
+        const response = await requestObservation(options.listener ?? server, request, message, channel.abort.signal);
         if (channels.get(message.id) !== channel) { await response.reader?.cancel(); return; }
         channel.reader = response.reader;
         if (!await send({ type: 'headers', id: message.id, status: response.status, statusText: response.statusText, headers: response.headers, ...(channel.binary ? { binary: true } : {}) })) return;

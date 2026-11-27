@@ -17,6 +17,7 @@ import { KernelWorkingStateRootStore, type KernelStorageAdapter } from './storag
 import { admitRunSourceAuthority, savedSourceLaunch, sourceToolSchemas } from './source-launch.js';
 import { requireToolInvocation, runToolDomainCall, type ToolInvocationAuthority } from './tool-invocation.js';
 import { captureExtensionSource, materializeExtensionSource, type ExtensionSourceCapture } from './extension-source.js';
+import { DeploymentPolicyDeniedError } from '../deployment/policy.js';
 
 export { VARIN_EXTENSION_PACKAGES_CAPABILITY };
 export interface ExtensionPackageOwnerOptions {
@@ -126,6 +127,7 @@ export function createExtensionPackageOwner(options: ExtensionPackageOwnerOption
       toolName: 'extension_package', arguments: parseVarinToolJson(params) }, async authority => {
       let enteredMutation = false;
       try {
+        if (request.action === 'stage') options.extensions.packages.admission?.source('source_view');
         const result = request.action === 'stage'
           ? await captureExtensionPackage(options, authority, request.packagePath, context.signal, async (directory, source) => {
               requireToolInvocation(context);
@@ -139,6 +141,10 @@ export function createExtensionPackageOwner(options: ExtensionPackageOwnerOption
         return { executor_stopped: true, completion: { kind: 'result', outcome: 'succeeded', effect: 'confirmed',
           content: { data: parseVarinToolJson(result), parts: [] } } };
       } catch (error) {
+        if (error instanceof DeploymentPolicyDeniedError) {
+          return { executor_stopped: true, completion: { kind: 'result', outcome: 'failed', effect: 'none',
+            content: { data: { error: error.message, code: error.code, section: error.section }, parts: [] } } };
+        }
         if (error instanceof ExtensionPackageCleanupError) {
           return { executor_stopped: true, completion: { kind: 'result', outcome: 'succeeded', effect: 'confirmed',
             content: { data: parseVarinToolJson({ ...error.result, cleanupError: error.message }), parts: [] } } };

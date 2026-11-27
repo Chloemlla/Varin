@@ -64,6 +64,7 @@ export interface PlatformRouteDependencies {
   extensionPackages: ExtensionRouteDependencies['extensionPackages'];
   extensionRuntime: ExtensionRouteDependencies['extensionRuntime'];
   pluginFetch?: import('@varin/extension-host').ExtensionReleaseFetch;
+  pluginCatalogSnapshot?: unknown;
   restartApplicationHost?: () => Promise<void>;
   formatSettingsResponse: SettingsHelpers['formatSettingsResponse'];
   fsPromises: typeof fsPromisesModule;
@@ -175,6 +176,7 @@ export const createPlatformRoutesRuntime = ({
 
     const pluginHostId = (await extensionCatalog.snapshot()).hostId;
     const pluginDiscovery = new PluginDiscoveryService({ dataDir: varinDataDir, hostId: pluginHostId, hostLabel: os.hostname(), catalog: extensionCatalog,
+      deploymentSnapshot: dependencies.pluginCatalogSnapshot,
       ...(dependencies.pluginFetch ? { fetch: dependencies.pluginFetch } : {}) });
     const pluginReleases = new ExtensionReleaseManager({
       packages: extensionPackages,

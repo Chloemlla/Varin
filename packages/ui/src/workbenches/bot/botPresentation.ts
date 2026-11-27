@@ -1,5 +1,5 @@
 import type { BotActivity, BotMemoryItem, BotPresence, BotSession, BotSummary, BotWorkItem, ThreadIdentity } from '@varin/application-client';
-import type { BotActivityEvent, BotActivityInput, CalendarOccurrenceState, MessageParticipant, Outcome, Run, RunState, ThreadSummary } from '@varin/protocol';
+import type { BotActivityEvent, BotActivityInput, CalendarOccurrence, CalendarOccurrenceState, MessageParticipant, Outcome, Run, RunState, ThreadSummary } from '@varin/protocol';
 import type { IconName } from '@/components/icon/icons';
 import type { I18nKey } from '@/lib/i18n';
 
@@ -453,6 +453,7 @@ export function dayLabel(day: number, now: number, locale: string): { key: 'bot.
   if (day === yesterday.getTime()) return { key: 'bot.activity.yesterday' };
   return { text: new Intl.DateTimeFormat(locale, { month: 'short', day: 'numeric', weekday: 'short' }).format(day) };
 }
+export const occurrenceTime = (record: CalendarOccurrence) => record.reason.kind === 'scheduled' ? record.reason.at_ms : record.observed_at_ms;
 export const clockTime = (ms: number, locale: string): string => new Intl.DateTimeFormat(locale, { hour: '2-digit', minute: '2-digit', hour12: false }).format(ms);
 /** Today shows the time; later days add the date. */
 export function scheduleWhen(atMs: number, locale: string, now = Date.now()): string {

@@ -37,6 +37,7 @@ export class ComponentInstallConflict extends Error {
 
 export interface LocalSemanticComponentManager {
   status(): LocalSemanticStatus;
+  installing(): boolean;
   install(url?: string): Promise<void>;
   importArchive(file: string): Promise<void>;
   cancel(): LocalSemanticStatus;
@@ -379,6 +380,7 @@ export function createLocalSemanticComponentManager(
 
   return {
     status: () => ({ ...currentStatus }),
+    installing: () => running !== null,
     install: (url = componentUrl(options.version, platform, arch)) => begin({ url }),
     importArchive: (file) => begin({ file }),
     cancel: () => {

@@ -59,7 +59,7 @@ export const useExternalAgentStore = create<{
     const api = createExternalAgentsHttpAPI(generation);
     try {
       const [settings, conversations, children] = await Promise.all([
-        api.settings(),
+        api.settings(undefined, { kind: 'local' }),
         api.list(),
         api.children(),
       ]);

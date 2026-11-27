@@ -31,6 +31,7 @@ Aggregated under **Schedules & Watches** (`follow_up` tool: `sources`, `arrange`
 - **State snapshots & routing**: Plugins may mark events replaceable by state group (collapsing unread updates into latest body + state transition summary while keeping raw occurrences readable). Source objects can map explicitly to an existing native/external task, or opt into creating a new Bot session on first contact.
 - **Trust boundary**: External events enter as environment input by default. Only an explicit authenticated user mapping for `(sourceObject, exactSender)` promotes messages to user-input semantics — plugin text/names never self-grant user identity.
 - **Bot Calendar**: Assets live in the Bot's home dir under namespace `bot:<id>`, executed by the shared native Calendar (no Bot-specific timer).
+- The Bot Schedules panel lists each definition once and groups its execution records underneath. **Schedules & Watches** and **New Schedule** open directly in the conversation area. An independent execution opens its own final reply from the original Run, with Markdown and output attachments. In the workbench, its conversation title includes the schedule name and the UTC time of the scheduled slot or manual trigger. A delivered continuation opens the original conversation at the calendar input and offers a return to that execution record. Independent Calendar work is outside the Bot's regular conversation list.
 - See [runtime.md](runtime.md#long-lived-event-watches) and [extensions.md](extensions.md).
 
 ## Task Inactivity Watchdog

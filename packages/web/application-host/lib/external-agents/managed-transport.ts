@@ -2,7 +2,7 @@ import {resourceThreadSource} from '../kernel/thread-context.js';
 import { createHash } from 'node:crypto';
 import type { ExternalCapturedFile, ExternalAttachmentOwner } from './attachments.js';
 import { isDeepStrictEqual } from 'node:util';
-import type { ExternalConversation } from '@varin/application-client';
+import type { ExternalAgentConfiguration, ExternalConversation } from '@varin/application-client';
 import type { ManagedSourceClient } from '../harness/managed-remote-client.js';
 import type { ManagedExternalControlReceipt } from '../harness/managed-remote-types.js';
 import { createManagedProcessClient } from '../kernel/managed-process-client.js';
@@ -17,14 +17,26 @@ export interface ExternalTransportReceipt {
 export interface ManagedExternalOwner {
   coordinatorHostId: string;
   source(owner: Extract<LaunchSource['resource_owner'],{kind:'managed_host'}>, signal?: AbortSignal): Promise<ManagedSourceClient>;
+  withSourceUse?<T>(owner: Extract<LaunchSource['resource_owner'], { kind: 'managed_host' }>, work: () => Promise<T>, signal?: AbortSignal): Promise<T>;
 }
 /** The product record remains in the coordinator Catalog. Only its exact target
  * process may execute; an uncertain old dispatch must be reconciled before resume. */
 export async function openManagedExternalTransport(owner: ManagedExternalOwner, conversation: ExternalConversation,
-  command: <T>(input: Record<string,unknown>)=>Promise<T>, reportError:(error:Error)=>void, signal:AbortSignal, expectedLaunch?:{command:string;args:string[];configurationIdentity?:string}) {
+  command: <T>(input: Record<string,unknown>)=>Promise<T>, reportError:(error:Error)=>void, signal:AbortSignal,
+  expectedLaunch?: { command: string; args: string[]; configurationIdentity?: string },
+  admitConfiguration?: (configuration: ExternalAgentConfiguration) => void) {
   const source = conversation.executionSource;
   if (!source || source.resource_owner.kind !== 'managed_host') throw new Error('External source owner is not managed');
-  const client = await owner.source(source.resource_owner,signal);
+  const resourceOwner = source.resource_owner;
+  const start = async () => openManagedProcess(owner.coordinatorHostId, await owner.source(resourceOwner, signal),
+    conversation, source, command, reportError, signal, expectedLaunch, admitConfiguration);
+  return owner.withSourceUse ? owner.withSourceUse(resourceOwner, start, signal) : start();
+}
+
+async function openManagedProcess(coordinatorHostId: string, client: ManagedSourceClient, conversation: ExternalConversation, source: LaunchSource,
+  command: <T>(input: Record<string, unknown>) => Promise<T>, reportError: (error: Error) => void, signal: AbortSignal,
+  expectedLaunch?: { command: string; args: string[]; configurationIdentity?: string },
+  admitConfiguration?: (configuration: ExternalAgentConfiguration) => void) {
   let receipt = await command<ExternalTransportReceipt>({action:'transport_prepare',id:conversation.id});
   const check = () => {
     if (receipt.conversationId !== conversation.id || receipt.configurationId !== conversation.configurationId || receipt.harness !== conversation.harness
@@ -32,7 +44,7 @@ export async function openManagedExternalTransport(owner: ManagedExternalOwner, 
   };
   check();
   const control = async (stop:boolean,release=false):Promise<ManagedExternalControlReceipt> => {
-    const result = await client.externalControl({coordinatorHostId:owner.coordinatorHostId,conversationId:conversation.id,
+    const result = await client.externalControl({coordinatorHostId,conversationId:conversation.id,
       transportId:receipt.id,processId:receipt.processId,source,stop,...(release?{release}: {})});
     if (result.conversationId !== conversation.id || result.transportId !== receipt.id || result.processId !== receipt.processId || !isDeepStrictEqual(result.source,source)
       || result.process && (result.process.processId !== receipt.processId || result.process.workspaceId !== source.workspace_id || result.process.mode !== 'pipe')
@@ -57,15 +69,16 @@ export async function openManagedExternalTransport(owner: ManagedExternalOwner, 
     await stop();
     receipt = await command<ExternalTransportReceipt>({action:'transport_prepare',id:conversation.id}); check();
   }
-  const launch = await client.externalBinding({coordinatorHostId:owner.coordinatorHostId,source,
+  const launch = await client.externalBinding({coordinatorHostId,source,
     configurationId:conversation.configurationId,harness:conversation.harness,...(conversation.sessionId?{sessionId:conversation.sessionId}:{})},signal);
+  admitConfiguration?.(launch.configuration);
   if(expectedLaunch && (!isDeepStrictEqual({command:launch.configuration.command,args:launch.configuration.args},{command:expectedLaunch.command,args:expectedLaunch.args}) || expectedLaunch.configurationIdentity !== undefined && expectedLaunch.configurationIdentity !== launch.configurationIdentity))throw new Error('Original target external Harness launch changed after input admission');
-  const binding = await client.bind({coordinatorHostId:owner.coordinatorHostId,scope:{kind:'external',conversationId:conversation.id,transportId:receipt.id},
+  const binding = await client.bind({coordinatorHostId,scope:{kind:'external',conversationId:conversation.id,transportId:receipt.id},
     purpose:'external_harness',operationId:receipt.processId,retention:'caller',source:resourceThreadSource(source)!},signal);
   if (!binding.physicalRoot) throw new Error('External target physical source is unavailable');
   await command({action:'transport_bind',id:conversation.id,transportId:receipt.id,authorityId:binding.authorityId,
     resourceEpoch:binding.resourceEpoch,configurationIdentity:launch.configurationIdentity});
-  const address = {coordinatorHostId:owner.coordinatorHostId,authorityId:binding.authorityId,resourceEpoch:binding.resourceEpoch,processId:receipt.processId};
+  const address = {coordinatorHostId,authorityId:binding.authorityId,resourceEpoch:binding.resourceEpoch,processId:receipt.processId};
   // No abort after dispatch: preserve unknown response and its original receipt.
   const initial = await client.externalSpawn({...address,launch,...(conversation.sessionId?{sessionId:conversation.sessionId}:{})});
   if (initial.processId !== receipt.processId || initial.workspaceId !== source.workspace_id || initial.mode !== 'pipe') throw new Error('External target process identity changed');

@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import { hostEnvironment } from '../security/host-environment.js';
 import fs from 'fs';
 import path from 'path';
 import { browserClientCookie, browserClientCookieName } from '../client-auth/browser-pairing.js';
@@ -77,6 +78,8 @@ interface UiAuthOptions {
   password?: unknown;
   readSettingsFromDisk?: () => Promise<Record<string, unknown>>;
   requireClientAuth?: boolean;
+  issuedClientsOnly?: boolean;
+  authenticateInboxReplay?: (req: UiAuthRequest) => Promise<ClientAuthResult | null>;
   sessionTtlMs?: number;
   principals?: PrincipalStore;
 }
@@ -475,7 +478,7 @@ const isTrustedDeviceRequest = (value: unknown): boolean => value === true;
 
 function getOrCreateJwtSecret(dataDir: string): Uint8Array {
   const secretFile = path.join(dataDir, 'jwt-secret');
-  const envSecret = process.env.VARIN_JWT_SECRET;
+  const envSecret = hostEnvironment.read('VARIN_JWT_SECRET');
   if (envSecret) {
     return new TextEncoder().encode(envSecret);
   }
@@ -502,7 +505,7 @@ function getOrCreateJwtSecret(dataDir: string): Uint8Array {
 
 function persistJwtSecret(secret: string, dataDir: string): Uint8Array {
   const secretFile = path.join(dataDir, 'jwt-secret');
-  if (process.env.VARIN_JWT_SECRET) {
+  if (hostEnvironment.read('VARIN_JWT_SECRET')) {
     const error = Object.assign(new Error('Global sign-out is unavailable while VARIN_JWT_SECRET is set'), { statusCode: 400 });
     throw error;
   }
@@ -520,6 +523,8 @@ export const createUiAuth = ({
   readSettingsFromDisk,
   clientAuthController = null,
   requireClientAuth = false,
+  issuedClientsOnly = false,
+  authenticateInboxReplay,
   principals = hostPrincipals(),
   getServerId = async () => null,
 }: UiAuthOptions = {}) => {
@@ -533,7 +538,7 @@ export const createUiAuth = ({
     const name = await getBrowserCookieName();
     return name ? parseCookies(req.headers.cookie)[name] ?? null : null;
   };
-  const requiresClient = (req: UiAuthRequest) => requireClientAuth || Boolean(getExternalIngress(req));
+  const requiresClient = (req: UiAuthRequest) => issuedClientsOnly || requireClientAuth || Boolean(getExternalIngress(req));
   const clientCredential = async (req: UiAuthRequest) => await browserToken(req) ?? getBearerTokenFromRequest(req);
   const issueBrowserClientCookie = async (req: UiAuthRequest, res: UiAuthHeaderResponse, credential: { token: string; expiresAt: string | null }) => {
     const ingress = getExternalIngress(req);
@@ -621,6 +626,7 @@ export const createUiAuth = ({
       result = (async () => {
         try {
           const value = await clientAuthController?.authenticateBearerToken?.(token, req);
+          if (issuedClientsOnly && value?.client?.authMethod !== 'offline') return null;
           if (value?.ok && value.clientId) markExternalIngressClient(req, value.clientId, typeof value.client?.expiresAt === 'string' ? value.client.expiresAt : null);
           return value?.ok ? value : null;
         }
@@ -655,6 +661,8 @@ export const createUiAuth = ({
     req: UiAuthRequest,
     { allowUrlToken = true }: { allowUrlToken?: boolean } = {},
   ): Promise<ClientAuthResult | null> => {
+    const replay = await authenticateInboxReplay?.(req);
+    if (replay) return replay;
     // A presented browser cookie selects this device, even if empty, expired or
     // revoked. Neither a native bearer nor an older URL grant may replace it.
     const deviceToken = await browserToken(req);

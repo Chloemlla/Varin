@@ -114,7 +114,8 @@ export type SourceServiceOperation =
   | { kind: 'attachment_cleanup' }
   | { kind: 'attachment_discard'; operationId: string; ref: string; path: string }
   | { kind: 'binary_write'; invocation: import('../kernel/tool-invocation.js').ToolInvocationAuthority; journal: RecoveryAnchor;
-      path: string; expectedRevision: string | null; bytesBase64: string; byteLength: number }
+      path: string; expectedRevision: string | null; byteLength: number } & (
+        { bytes: Uint8Array; bytesBase64?: never } | { bytes?: never; bytesBase64: string })
   | {kind:'code_capture';invocation:import('../kernel/tool-invocation.js').ToolInvocationAuthority;baselineBranchId:string;baselineRevision:number;files?:import('../kernel/code-exchange.js').CodeSelection[];sourceThreadId:string;targetThreadId:string;mapping?:import('../kernel/source-path-map.js').SourcePathMap;baselineMapping?:import('../kernel/source-path-map.js').SourcePathMap}
   | {kind:'external_code_apply';invocation:import('../kernel/tool-invocation.js').ToolInvocationAuthority;self:import('../kernel/code-exchange.js').CodeParticipant;child:import('../kernel/protocol.generated.js').ExternalChild;direction:'receive'|'send';externalSource:LaunchSource;result:import('./working-state/types.js').WorkingResult}
   | {kind:'code_apply';invocation:import('../kernel/tool-invocation.js').ToolInvocationAuthority;branchId:string;source:import('../kernel/code-exchange.js').CodeParticipant;target:import('../kernel/code-exchange.js').CodeParticipant;result:import('./working-state/types.js').WorkingResult}
@@ -207,7 +208,8 @@ export interface ManagedSourceService {
   externalConfigure(principal: ManagedSourcePrincipal, input: { coordinatorHostId: string; value: Pick<import('@varin/application-client').ExternalAgentSettings, 'agents' | 'defaultAgent'>; expectedRevision: number; key: string }, signal?: AbortSignal): Promise<import('@varin/application-client').ExternalAgentSettings>;
   externalInstallations(principal: ManagedSourcePrincipal, input: { coordinatorHostId: string; input: import('@varin/application-client').ExternalAgentInstallationRequest }, signal?: AbortSignal): Promise<import('@varin/application-client').ExternalAgentInstallations>;
   externalInstallationLog(principal: ManagedSourcePrincipal, input: { coordinatorHostId: string; id: string }, signal?: AbortSignal): Promise<string>;
-  externalPrepare(principal: ManagedSourcePrincipal, input: {coordinatorHostId:string;conversationId:string;resourceOwner:ManagedHostSourceOwner;path:string;expectedWorkspaceId?:string}, signal?:AbortSignal): Promise<LaunchSource>;
+  externalPrepare(principal: ManagedSourcePrincipal, input: {coordinatorHostId:string;conversationId:string;resourceOwner:ManagedHostSourceOwner;path:string;expectedWorkspaceId?:string;privateDirectory?:true}, signal?:AbortSignal): Promise<LaunchSource>;
+  externalRemovePrivateSource(principal: ManagedSourcePrincipal, input: {coordinatorHostId:string;conversationId:string;source:LaunchSource}, signal?:AbortSignal): Promise<{removed:true}>;
   externalBinding(principal: ManagedSourcePrincipal, input: ManagedExternalLaunchRequest, signal?: AbortSignal): Promise<ManagedExternalLaunchBinding>;
   externalSpawn(principal: ManagedSourcePrincipal, input: ManagedExternalSpawnRequest, signal?: AbortSignal): Promise<import('../kernel/protocol.generated.js').KernelProcessSnapshot>;
   externalControl(principal: ManagedSourcePrincipal, input: ManagedExternalControlRequest, signal?: AbortSignal): Promise<ManagedExternalControlReceipt>;
@@ -298,7 +300,7 @@ export interface ManagedRemoteIdentity {
   protocolVersion: typeof MANAGED_REMOTE_PROTOCOL_VERSION;
   requestHostIdentity?: boolean;
   /** Dedicated service peers are not experiment/process placement targets. */
-  role?: 'browser' | 'computer';
+  role?: 'resources' | 'browser' | 'computer';
   hostId: string;
   capabilities: string[];
   machine: ResourceMachineView;

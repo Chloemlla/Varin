@@ -547,6 +547,7 @@ export function createMcpResourceRuntime(options: McpResourceRuntimeOptions) {
     wake();
   };
   return {
+    activeOperations: () => entries.size + admitting.size,
     start() {
       if (started || disposed) {
         return;

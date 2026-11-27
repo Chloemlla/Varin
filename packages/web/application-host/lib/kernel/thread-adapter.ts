@@ -380,6 +380,8 @@ export class ThreadAdapter {
 
   private recoveryReader?: (identity: ThreadIdentity, signal?: AbortSignal) => Promise<NonNullable<ThreadSnapshot['recovery']>>;
   bindRecoveryReader(reader: (identity: ThreadIdentity, signal?: AbortSignal) => Promise<NonNullable<ThreadSnapshot['recovery']>>): void { this.recoveryReader = reader; }
+  private inboxRejections?: (identity: ThreadIdentity, principalId: string, signal?: AbortSignal) => Promise<NonNullable<ThreadSnapshot['inboxRejected']>>;
+  bindInboxRejections(reader: NonNullable<ThreadAdapter['inboxRejections']>): void { this.inboxRejections = reader; }
 
   private async skillInput(identity: ThreadIdentity, resources: ContextResources | undefined, text: string, signal?: AbortSignal): Promise<PreparedExplicitSkill | null> {
     if (!parseExplicitSkillCommand(text)) return null;
@@ -1644,11 +1646,14 @@ export class ThreadAdapter {
     }
     const shownRun = snapshot.activeRun ?? branch.latest_run;
     if (snapshot.policySelection && shownRun) snapshot.policySelection.preparation = this.runtime.policyPreparation(shownRun.id);
-    const [creationDefaults, recovery] = await Promise.all([
+    const principalId = currentRequestPrincipal();
+    const [creationDefaults, recovery, inboxRejected] = await Promise.all([
       this.creationDefaults?.(identity, signal), this.recoveryReader?.(identity, signal),
+      principalId ? this.inboxRejections?.(identity, principalId, signal) : undefined,
     ]);
     signal?.throwIfAborted();
-    return { ...snapshot, identity, ...(creationDefaults ? { creationDefaults } : {}), ...(recovery ? { recovery } : {}) };
+    return { ...snapshot, identity, ...(creationDefaults ? { creationDefaults } : {}), ...(recovery ? { recovery } : {}),
+      ...(inboxRejected?.length ? { inboxRejected } : {}) };
   }
 
   async inspectMany(threadIds: string[], signal?: AbortSignal) {

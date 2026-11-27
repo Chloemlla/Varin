@@ -1,25 +1,52 @@
-/** Standalone managed live-directory node. No Agent, UI backend, extension activation or outbound connections. */
+/** Standalone managed live-directory node. Its coordinator owns the Agent and UI. */
 import crypto from 'node:crypto';
+import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
 import http from 'node:http';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import express from 'express';
 import { ExtensionCatalogStore } from '@varin/extension-host';
+import { VARIN_BUILTIN_LANGUAGE_SERVERS_EXTENSION_ID, VARIN_BUILTIN_TYPESCRIPT_LANGUAGE_EXTENSION_ID } from '@varin/extension-builtins';
+import { bundledLanguageProviders, bundledTypescriptProvider, VARIN_BUILTIN_EXTENSION_PACKAGE_ROOTS } from '@varin/extension-builtins/host';
+import { readProjectTrust } from '@varin/settings-store';
 import { createRemoteClientAuthRuntime } from './lib/client-auth/remote-clients.js';
 import { assertDataRootMayStart } from './lib/data-restore-guard.js';
+import { hostEnvironment } from './lib/security/host-environment.js';
 import { createDocumentRootGuard } from './lib/documents/allowed-roots.js';
 import { createDocumentAuthority } from './lib/documents/authority.js';
 import { bindDocumentTextCodec } from './lib/documents/inspect.js';
 import { createManagedResourceTarget } from './lib/harness/managed-resource-target.js';
+import { createManagedMcpTarget } from './lib/harness/managed-mcp-target.js';
+import { isManagedMcpObservation } from './lib/harness/managed-remote-routes.js';
+import { McpAuthority, McpCompositions } from './lib/mcp/authority.js';
 import { createResourceFilesOwner } from './lib/workspace/resource-files.js';
 import { createHostResourceStorage, createHostResourceExecution } from './lib/kernel/host-resource-owners.js';
 import { createKernelClient } from './lib/kernel/kernel-client.js';
 import { createLiveSourceOwner } from './lib/kernel/live-source.js';
+import { createSourceQueryService } from './lib/kernel/source-query-service.js';
+import { createManagedRecoveryService } from './lib/kernel/managed-recovery-service.js';
+import { createKernelWorkspaceWorkingStateAccess } from './lib/kernel/storage-adapter.js';
 import { SourceAdmissionError } from './lib/kernel/source-admission-error.js';
 import { createPrincipalStore } from './lib/ui-auth/principals.js';
 import { createUiAuth } from './lib/ui-auth/ui-auth.js';
 import { canonicalizePathIdentity, isPathWithinRoot } from './lib/workspace/path-safety.js';
+import { createPlatformEnvironmentRuntime } from './lib/platform/environment-runtime.js';
+import { createTerminalRuntime } from './lib/terminal/runtime.js';
+import { createManagedTerminalOwner } from './lib/terminal/managed-owner.js';
+import { createPrivateProcessService } from './lib/kernel/private-process-service.js';
+import { createExternalPrograms } from './lib/external-agents/programs.js';
+import { createResourceExternalOwner } from './lib/external-agents/resource-owner.js';
+import { createOfficeRenderer } from './lib/office/renderer.js';
+import { registerGitRoutes } from './lib/git/routes.js';
+import { drainWorktreeBootstraps, hasActiveWorktreeBootstrap } from './lib/git/service.js';
+import { createManagedProjectManagementOwner } from './lib/projects/managed-project-management.js';
+import { createHostLanguage } from './lib/lsp/host-language.js';
+
+const liveProjectOperations = new Set([
+  'git-command', 'git-branches', 'git-root-context', 'worktrees', 'worktree-create', 'worktree-validate',
+  'worktree-remove', 'worktree-remote-branch-delete', 'worktree-bootstrap',
+]);
 
 interface NodeDirectories { dataDir: string; workspaceRoot: string; kernelPath?: string }
 interface NodeOptions extends NodeDirectories { host?: string; port?: number; releaseId?: string }
@@ -42,6 +69,7 @@ async function directories(options: NodeDirectories) {
   return { dataDir, workspaceRoot };
 }
 async function createNodeKernel(dataDir: string, kernelPath?: string) {
+  hostEnvironment.capture();
   // Both roles use the same durable identity. Native Storage owns its exclusive writer lock;
   // an offline admin command must not mutate a credential index cached by another live process.
   const { hostId } = await new ExtensionCatalogStore(dataDir).getHostIdentity();
@@ -142,11 +170,81 @@ export async function startResourceNode(options: NodeOptions) {
     documents.bindDurableMutationStorage(async (id, work) => work(await storage.kernelRecoveryStore.workspaceStorageContext(id)));
     const execution = createHostResourceExecution(kernel, documents, () => console.error('[ResourceNode] Native process observation unavailable'));
     cleanup.push(() => execution.kernelProcesses.dispose(), () => execution.kernelCompute.dispose());
+    const language = createHostLanguage({ kernel, hostId, dataDir, documents, isTrusted: guard, processes: execution.kernelProcesses });
+    cleanup.push(() => language.tools.dispose(), () => language.servers.dispose(), () => language.supervisor.dispose());
+    // Resource Nodes use the shipped language assets without starting a full extension Host.
+    const typescriptRoot = VARIN_BUILTIN_EXTENSION_PACKAGE_ROOTS.get(VARIN_BUILTIN_TYPESCRIPT_LANGUAGE_EXTENSION_ID)!;
+    const languageRoot = VARIN_BUILTIN_EXTENSION_PACKAGE_ROOTS.get(VARIN_BUILTIN_LANGUAGE_SERVERS_EXTENSION_ID)!;
+    for (const descriptor of [bundledTypescriptProvider(file => path.join(typescriptRoot, file)),
+      ...bundledLanguageProviders(file => path.join(languageRoot, file))]) {
+      language.supervisor.registerProvider({ ...descriptor, source: 'host' });
+    }
+    const documentReadingDirectory = path.join(dataDir, 'document-reading');
+    await fs.mkdir(documentReadingDirectory, { recursive: true });
+    const documentProcesses = createPrivateProcessService(kernel, `document-reading:${hostId}`, documentReadingDirectory);
+    cleanup.push(() => documentProcesses.dispose());
+    const office = createOfficeRenderer({ spawn: documentProcesses.spawn, temporaryRoot: documentReadingDirectory,
+      command: () => process.env.VARIN_LIBREOFFICE_COMMAND });
+    const environment = createPlatformEnvironmentRuntime();
+    const externalDirectory = path.join(dataDir, 'external-agents');
+    const externalProcesses = createPrivateProcessService(kernel, `external-agents:${hostId}`, externalDirectory);
+    const externalPrograms = createExternalPrograms({ directory: externalDirectory, environment, spawn: externalProcesses.spawn });
+    cleanup.push(() => externalProcesses.dispose(), externalPrograms.close);
+    const terminal = createTerminalRuntime({ fs: fsSync, path, documents,
+      buildAugmentedPath: environment.buildAugmentedPath, searchPathFor: environment.searchPathFor, isExecutable: environment.isExecutable,
+      loadPtyProvider: async () => execution.kernelProcesses.ptyProvider });
+    cleanup.push(() => terminal.shutdown());
     const liveSources = createLiveSourceOwner({ documents, kernel });
+    const projectTrusted = (cwd: string) => readProjectTrust(dataDir, cwd) === true;
+    const sourceQuery = createSourceQueryService({
+      kernel, documents, storage: storage.kernelStorageAdapter, validateLiveSource: liveSources.validate,
+      languageSupervisor: language.supervisor,
+      resourceOwners: {
+        dataDirectory: dataDir, projectOnly: true, homeDir: workspaceRoot, documents,
+        workingStates: createKernelWorkspaceWorkingStateAccess(storage.kernelStorageAdapter),
+        validateLiveSource: liveSources.validate, projectTrusted,
+        configuration: async () => ({ packages: [] }),
+        withSourceRead: storage.kernelStorageAdapter.withResourceRead.bind(storage.kernelStorageAdapter),
+      },
+    });
+    cleanup.push(() => sourceQuery.dispose());
+    const mcpAuthority = new McpAuthority({
+      deployment: { transports: ['stdio'], stdioPlacement: 'managed' },
+      adaptTransport: (scope, transport) => mcp.adaptTransport(scope, transport),
+      interactions: (input, scope) => mcp.receiveInteraction(scope, input),
+      sampling: (input, scope) => mcp.receiveSampling(scope, input),
+      interactionErrors: (input, scope) => mcp.receiveInteractionError(scope, input),
+    });
+    const mcp = createManagedMcpTarget({ kernel, documents, authority: mcpAuthority,
+      compositions: new McpCompositions(mcpAuthority, code => console.error('[ResourceNode MCP]', code)), agentDir: dataDir, hostId,
+      projectTrusted,
+      onError: () => console.error('[ResourceNode] Managed MCP process observation unavailable'),
+    });
+    cleanup.push(() => mcpAuthority.close(), () => mcp.close(), kernel.subscribeExit(() => { void mcp.close(); }));
     const target = createManagedResourceTarget({ kernel, liveSourceOnly: true, storageAvailable: false,
       onError: () => console.error('[ResourceNode] Managed resource observation unavailable') });
-    cleanup.push(() => target.dispose());
+    cleanup.push(drainWorktreeBootstraps, () => target.dispose());
+    const projects = createManagedProjectManagementOwner({ kernel, documents, gitDispatch: registerGitRoutes(undefined, { documents }) });
+    let activeProjectOperations = 0;
     target.attachSources({ documents, deviceFileAccess: false, validateLiveSource: liveSources.validate,
+      ...createResourceExternalOwner(dataDir, externalPrograms), prepareExternalLiveSource: liveSources.prepare,
+      async projectManagement(principal, request, signal) {
+        if (!liveProjectOperations.has(request.command?.action)) throw new SourceAdmissionError('source_unavailable');
+        activeProjectOperations++;
+        try { return await projects(principal, request, signal); }
+        finally { activeProjectOperations--; }
+      },
+      ...mcp.continuations,
+      serviceOperation: (scope, operation, signal) => operation.kind === 'mcp'
+        ? mcp.request(scope, operation.action, signal) : sourceQuery(scope, operation, signal),
+      async releaseSource(scope, retention) {
+        const [, receipt] = await Promise.all([sourceQuery.release(scope), mcp.release(scope, retention)]);
+        return { mcpExecutorStopped: receipt.executorStopped, mcpTaskControlsDrained: receipt.taskControlsDrained };
+      },
+      cleanupSource: sourceQuery.cleanup,
+      recovery: createManagedRecoveryService({ kernel, hostId, documents, deviceFileAccess: false,
+        storage: storage.kernelStorageAdapter, store: storage.kernelRecoveryStore, validateLiveSource: liveSources.validate }).handle,
+      terminal: createManagedTerminalOwner({ terminal: () => terminal, documents }),
       workspaceFiles: createResourceFilesOwner(documents, storage.kernelRecoveryFileResources, { restrictedRoot: workspaceRoot }),
       async prepareSource(input, signal) {
         if (input.mode !== 'live_root' || input.resourceOwner.kind !== 'local' || input.selection?.mode === 'native_workspace')
@@ -171,15 +269,30 @@ export async function startResourceNode(options: NodeOptions) {
       res.status(ready ? 200 : 503).json({ status: ready ? 'ok' : 'unavailable', role: 'resources',
         control: ready ? 'ready' : 'unavailable', releaseId: options.releaseId ?? version });
     });
-    app.use((req, res, next) => {
+    app.get('/api/harness/managed-execution/v1/retention', auth.requireAuth, async (_req, res) => {
+      res.setHeader('x-varin-managed-host', hostId);
+      res.setHeader('Cache-Control', 'no-store');
       if (draining) { res.status(503).json({ code: 'host-draining' }); return; }
-      if (req.path === '/api/harness/managed-execution/v1/sources/processSubscribe') {
-        observers.add(res); res.once('close', () => observers.delete(res));
+      const retention = await kernel.sourceRequest<Record<string, unknown>>('source.retention', {});
+      const writingProject = activeProjectOperations > 0 || hasActiveWorktreeBootstrap();
+      res.json(writingProject ? { ...retention, retireReady: false } : retention);
+    });
+    app.use((_req, res, next) => {
+      if (draining) {
+        res.setHeader('x-varin-managed-host', hostId);
+        res.status(503).json({ code: 'host-draining' });
+        return;
       }
       next();
     });
     app.use(express.json({ limit: '4mb' }));
-    target.mount(app, { documents, requireAuth: auth.requireAuth, resolveAuthContext: auth.resolveAuthContext, isDraining: () => draining });
+    app.use('/api/harness/managed-execution/v1/sources', (req, res, next) => {
+      if (['/processSubscribe', '/terminalStream'].includes(req.path) || req.path === '/service' && isManagedMcpObservation(req.body?.operation)) {
+        observers.add(res); res.once('close', () => observers.delete(res));
+      }
+      next();
+    });
+    target.mount(app, { documents, office, requireAuth: auth.requireAuth, resolveAuthContext: auth.resolveAuthContext, isDraining: () => draining });
     // Body parser and middleware failures must not echo request fragments, bearer data or stack traces.
     const fail: express.ErrorRequestHandler = (error, _req, res, _next) => {
       if (res.headersSent) { res.destroy(); return; }

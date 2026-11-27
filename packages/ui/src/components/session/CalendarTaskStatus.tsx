@@ -23,7 +23,7 @@ const preparationReasons: Record<string, I18nKey> = {
   'model-disabled': 'calendar.failure.reason.model_disabled',
   'model-operation-unavailable': 'calendar.failure.reason.model_operation_unavailable',
 };
-function CalendarFailure({ code }: { code: string }) {
+export function CalendarFailure({ code }: { code: string }) {
   const { t } = useI18n();
   const [prefix, stage, reason] = code.split(':');
   const knownStage = prefix === 'calendar_preparation' && stage && preparationStages.has(stage) ? stage : null;

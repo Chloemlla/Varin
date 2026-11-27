@@ -11,14 +11,18 @@ const root = createRequire(new URL('../package.json', import.meta.url));
 const web = createRequire(new URL('../packages/web/package.json', import.meta.url));
 const electron = createRequire(new URL('../packages/electron/package.json', import.meta.url));
 const mobile = createRequire(new URL('../packages/mobile/package.json', import.meta.url));
+const builtins = createRequire(new URL('../packages/extension-builtins/package.json', import.meta.url));
 const from = (parent, name) => createRequire(parent.resolve(name));
 const lock = fs.readFileSync(new URL('../bun.lock', import.meta.url), 'utf8');
 const lockedVersions = name => [...new Set([...lock.matchAll(new RegExp(`\\["${name}@([^"]+)"`, 'g'))].map(match => match[1]))].sort();
+const builder = from(from(electron, 'electron-builder'), 'app-builder-lib');
 const minimatchConsumers = [
   from(from(from(root, 'typescript-eslint'), '@typescript-eslint/parser'), '@typescript-eslint/typescript-estree'),
   from(root, 'nodemon'),
   from(from(root, 'eslint'), '@eslint/config-array'),
-  from(from(from(electron, 'electron-builder'), 'app-builder-lib'), '@electron/universal'),
+  builder,
+  from(builder, '@electron/universal'),
+  from(from(builtins, 'bash-language-server/package.json'), 'editorconfig'),
   from(from(from(web, 'exceljs'), 'archiver'), 'readdir-glob'),
   from(from(from(from(web, 'exceljs'), 'archiver'), 'archiver-utils'), 'glob'),
 ];
@@ -43,22 +47,29 @@ test('all installed minimatch lines preserve matches and avoid globparts amplifi
     const manifest = consumer('minimatch/package.json');
     if (tested.has(manifest.version)) continue;
     tested.add(manifest.version);
-    const modern = Number(manifest.version.split('.')[0]) >= 9;
+    const major = Number(manifest.version.split('.')[0]);
+    const modern = major >= 9;
     const modules = [consumer('minimatch')];
     if (modern) modules.push(await import(pathToFileURL(join(dirname(consumer.resolve('minimatch/package.json')), 'dist/esm/index.js')).href));
     for (const { Minimatch } of modules) {
-      const amplified = new Minimatch(Array(8).fill('**/../a/b').join('/'), { optimizationLevel: 2, braceExpandMax: 64 });
+      const preprocess = () => new Minimatch(Array(8).fill('**/../a/b').join('/'), { optimizationLevel: 2, braceExpandMax: 64 });
       if (modern) {
-        assert.ok(amplified.set.length <= 64, `minimatch ${manifest.version} must honor the upstream preprocessing bound`);
+        // v11 rejects the entire over-budget pattern. Our v9/v10 backports stop expanding it.
+        if (major >= 11) assert.throws(preprocess, { name: 'RangeError', message: /too many patterns/ });
+        else assert.ok(preprocess().set.length <= 64, `minimatch ${manifest.version} must honor the upstream preprocessing bound`);
         const large = new Minimatch('{x,*}/{0..999}', { optimizationLevel: 2 });
-        assert.equal(large.set.length, 2000, 'skip only quadratic deduplication, preserving every pattern');
+        if (major < 11) assert.equal(large.set.length, 2000, 'the backport preserves every expanded pattern');
+        // v11 compiles numeric ranges into a matcher rather than allocating a row per number.
+        assert.equal(large.match('x/0'), true);
         assert.equal(large.match('y/999'), true);
+        assert.equal(large.match('y/1000'), false);
         assert.equal(large.match('.y/5'), false);
         const ordinary = new Minimatch('**/../a/b/**/../c/d', { optimizationLevel: 2 });
         assert.equal(ordinary.match('../a/b/../c/d'), true);
       } else {
         // Versions 3 and 5 predate this optimization; the advisory's broad range
         // also lists them, but they never enter either affected preprocessing pass.
+        const amplified = preprocess();
         assert.equal(amplified.firstPhasePreProcess, undefined);
         assert.equal(amplified.secondPhasePreProcess, undefined);
         assert.equal(amplified.set.length, 1);

@@ -10,6 +10,7 @@ import { DesktopNetworkSettings } from '@/components/sections/varin/DesktopNetwo
 import { RemoteInstancesPage } from '@/components/sections/remote-instances/RemoteInstancesPage';
 import { isDesktopShell, isDesktopLocalOriginActive, isWebRuntime } from '@/lib/desktop';
 import { isCapacitorApp } from '@/lib/platform';
+import { useDeploymentPolicy } from '@/hooks/useDeploymentPolicy';
 import { useI18n } from '@/lib/i18n';
 export function HistorySettingsPage() {
   const { t } = useI18n();
@@ -23,6 +24,9 @@ export function NetworkSettingsPage() {
 }
 export function AccessSettingsIntro() {
   const { t } = useI18n();
+  const policy = useDeploymentPolicy();
+  if (policy === undefined) return null;
+  if (policy?.ingress?.mode === 'gateway') return <p className="typography-meta text-muted-foreground">{t('settings.connections.managedAccess')}</p>;
   return <>
     {isDesktopShell() && isDesktopLocalOriginActive() ? <DesktopNetworkSettings section="access" /> : null}
     {isWebRuntime() && !isDesktopShell() && !isCapacitorApp() ? <PasskeySettings /> : null}

@@ -4,7 +4,7 @@ import { parseHTML } from 'linkedom';
 import { expect, it, vi } from 'vitest';
 import { FlipList } from './FlipList';
 
-it('does not measure or restart slides for status-only commits; reorders add to the current glide', async () => {
+it('animates changes within a view and replaces views without measuring rows or leaving ghosts', async () => {
   const { window, document } = parseHTML('<html><body></body></html>');
   vi.stubGlobal('window', window); vi.stubGlobal('document', document);
   vi.stubGlobal('HTMLElement', window.HTMLElement); vi.stubGlobal('Element', window.Element);
@@ -23,8 +23,16 @@ it('does not measure or restart slides for status-only commits; reorders add to 
   };
   const host = document.createElement('div'); document.body.append(host);
   const root = createRoot(host);
-  const list = (order: string[], status: string) => <FlipList layoutKey={order.join(',')}>
+  const list = (order: string[], status: string, view = 'classified') => <FlipList layoutKey={order.join(',')} instantKey={view}>
     {order.map((key, index) => <div key={key} data-flip-key={key} data-top={index * 30}>{key} {status}</div>)}
+  </FlipList>;
+  const groups = (open: boolean, target: 'left' | 'right') => <FlipList layoutKey={`${open}:${target}`} instantKey="classified">
+    <div data-flip-key="left" data-top={0} data-collapsed={open ? undefined : ''}>
+      <div inert={!open}>{target === 'left' && <div data-flip-key="child" data-top={30} />}</div>
+    </div>
+    <div data-flip-key="right" data-top={60}>
+      {target === 'right' && <div data-flip-key="child" data-top={90} />}
+    </div>
   </FlipList>;
   try {
     await act(async () => root.render(list(['a', 'b'], 'running')));
@@ -38,5 +46,27 @@ it('does not measure or restart slides for status-only commits; reorders add to 
     await act(async () => root.render(list(['a', 'b'], 'completed')));
     expect(animations).toHaveLength(4);
     expect(animations.every(value => value.options.composite === 'add' && !value.cancel.mock.calls.length)).toBe(true);
+
+    await act(async () => root.render(list(['a'], 'completed')));
+    expect(host.querySelector('[data-flip-ghost]')).not.toBeNull();
+    const previousAnimations = animations.length;
+    reads = 0;
+    await act(async () => root.render(list([], 'completed', 'recent-loading')));
+    await act(async () => root.render(list(['b', 'c'], 'completed', 'recent-ready')));
+    expect(reads).toBe(0);
+    expect(host.querySelector('[data-flip-ghost]')).toBeNull();
+    expect(animations).toHaveLength(previousAnimations);
+    expect(animations.slice(0, 4).every(value => value.cancel.mock.calls.length === 1)).toBe(true);
+
+    await act(async () => root.render(list(['c', 'b'], 'completed', 'recent-ready')));
+    expect(animations.slice(previousAnimations).map(value => value.options.composite)).toEqual(['add', 'add']);
+
+    await act(async () => root.render(groups(false, 'left')));
+    const beforeOpening = animations.length;
+    await act(async () => root.render(groups(true, 'left')));
+    expect(animations.slice(beforeOpening).map(value => value.options.fill)).toEqual(['backwards']);
+    const beforeMoving = animations.length;
+    await act(async () => root.render(groups(true, 'right')));
+    expect(animations.slice(beforeMoving).map(value => value.options.composite)).toEqual(['add']);
   } finally { await act(async () => root.unmount()); vi.unstubAllGlobals(); }
 });

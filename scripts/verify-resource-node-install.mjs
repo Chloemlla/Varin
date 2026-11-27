@@ -64,7 +64,7 @@ export function verifyInstall(root = process.cwd()) {
   inspect(path.join(root, 'node_modules'));
   for (const dir of workspace) inspect(path.join(dir, 'node_modules'));
   for (const dir of observed) assert(visited.has(dir), `Installed package is outside the resource dependency closure: ${dir}`);
-  const entries = { resources: 'resource-node', browser: 'browser-node', computer: 'computer-node' };
+  const entries = { resources: 'resource-node', browser: 'browser-node', computer: 'computer-node', extensions: 'extension-node' };
   assert(Object.hasOwn(entries, runtime.role), 'Unexpected dedicated node role');
   assert.equal(runtime.entrypoint, `packages/web/server/${entries[runtime.role]}.js`);
   assert.deepEqual(runtime.dependencies, read(path.join(root, 'packages/web/package.json')).dependencies);
@@ -95,8 +95,9 @@ if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === imp
   const root = path.resolve(process.argv[2] ?? process.cwd());
   console.log('Verified resource node installed dependency closure:', verifyInstall(root));
   // Resolve the real compiled module under TARGETPLATFORM, not a graph-only fixture.
-  await verifyKernelBundle(root);
   const manifest = read(path.join(root, 'resource-node.json'));
+  if (manifest.role !== 'extensions') await verifyKernelBundle(root);
+  else assert(!fs.existsSync(path.join(root, 'packages/web/kernel')), 'Unexpected kernel in the Extension Node');
   if (manifest.role === 'computer') {
     const platform = { linux: 'linux/driver-host.py', darwin: 'macos/Varin Computer.app/Contents/MacOS/VarinComputer',
       win32: 'windows/VarinComputer.exe' }[process.platform];

@@ -66,12 +66,13 @@ export function ThreadDraftConversation({ api, draftKey, handoff }: { api: Threa
   const snapshotPublisher = React.useRef({}).current;
   const draft = useThreadDraftStore(state => state.drafts[draftKey] ?? EMPTY_THREAD_DRAFT);
   const conversationBot = useConversationBot(draft.botId);
-  const sourceOwner = draft.sourceSelection?.resourceOwner;
+  const sourceOwner = draft.sourceSelection?.resourceOwner ?? (draft.workspacePath ? { kind: 'local' as const } : undefined);
   const sourceOwnerKey = JSON.stringify(sourceOwner ?? { kind: 'local' });
   const sourceRemote = Boolean(sourceOwner && sourceOwner.kind !== 'local');
   const [agentSelectorOpened, setAgentSelectorOpened] = React.useState(false);
-  const sourceAgents = useSourceExternalAgents(sourceOwner, agentSelectorOpened || (sourceRemote && Boolean(draft.harnessId)), agentSelectorOpened);
-  const externalSettings = sourceRemote ? sourceAgents.settings : localExternalSettings;
+  const sourceAgents = useSourceExternalAgents(sourceOwner,
+    agentSelectorOpened || Boolean(draft.harnessId) && (sourceRemote || sourceOwner === undefined), agentSelectorOpened);
+  const externalSettings = sourceAgents.settings ?? (sourceRemote ? null : localExternalSettings);
   const harnessSelector = { settings: externalSettings, sourceRemote, loading: sourceAgents.loading,
     discoveredAgentIds: sourceAgents.settings?.discoveredAgentIds,
     error: sourceAgents.error, onRetry: sourceAgents.retry,

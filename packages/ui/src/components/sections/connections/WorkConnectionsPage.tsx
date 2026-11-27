@@ -14,6 +14,7 @@ import { browserDeviceLabel, browserResourceLabel } from '@/lib/browser-presenta
 import { isDesktopShell, isDesktopLocalOriginActive } from '@/lib/desktop';
 import { getClientPlatform } from '@/lib/platform';
 import { redactSensitiveUrl } from '@/lib/desktopHosts';
+import { useDeploymentPolicy } from '@/hooks/useDeploymentPolicy';
 import { useRuntimeAPIs } from '@/hooks/useRuntimeAPIs';
 import { useSelectedThreadSnapshot } from '@/hooks/useSelectedThreadSnapshot';
 import { listComputers, type ComputerCatalog } from '@/lib/computers';
@@ -30,6 +31,9 @@ export function WorkConnectionsPage() {
 function WorkConnectionsContent() {
   const { t } = useI18n();
   const { threads } = useRuntimeAPIs();
+  const policy = useDeploymentPolicy();
+  const allowAdd = policy !== undefined && (policy?.connections?.staticHosts !== false || policy?.connections?.ssh !== false);
+  const managedAccess = policy?.ingress?.mode === 'gateway';
   const { identity, snapshot, error: threadError } = useSelectedThreadSnapshot();
   const [manageResources, setManageResources] = React.useState(false);
   const [addingDevice, setAddingDevice] = React.useState(false);
@@ -89,10 +93,10 @@ function WorkConnectionsContent() {
       <SettingsPageLink page="remote-instances" description={t('settings.connections.manageHint')}>{t('settings.page.remoteInstances.title')}</SettingsPageLink>
     </SettingsSection>{isDesktopShell() ? <DesktopLocalHostSettings key={epoch} /> : null}</> : tab === 'access' ? <SettingsSection title={t('bot.workspace.pair')} description={t('bot.workspace.pairHint')} divider={false}>
       <SettingsPageLink page="access">{t('settings.page.access.title')}</SettingsPageLink>
-      <SettingsPageLink page="tunnel">{t('settings.page.tunnel.title')}</SettingsPageLink>
+      {policy !== undefined && !managedAccess && <SettingsPageLink page="tunnel">{t('settings.page.tunnel.title')}</SettingsPageLink>}
     </SettingsSection> : <>
       <SettingsSection title={t('settings.connections.files')} description={t('settings.connections.resourceOrigin')} divider={false}>
-        <div className="mb-4 flex flex-wrap gap-2"><Button size="sm" onClick={() => setAddingDevice(true)}><Icon name="add" className="size-4" />{t('bot.workspace.addDevice')}</Button><Button size="sm" variant="ghost" onClick={() => setManageResources(true)}>{t('settings.connections.resourceManage')}</Button></div>
+        {allowAdd && <div className="mb-4 flex flex-wrap gap-2"><Button size="sm" onClick={() => setAddingDevice(true)}><Icon name="add" className="size-4" />{t('bot.workspace.addDevice')}</Button><Button size="sm" variant="ghost" onClick={() => setManageResources(true)}>{t('settings.connections.resourceManage')}</Button></div>}
         {sourceError ? <p role="alert" className="typography-meta text-destructive">{sourceError}</p> : !sources ? <p role="status" className="typography-meta text-muted-foreground">{t('common.loading')}</p> : <div className="divide-y divide-border/60">
           {sources.targets.map(target => <div key={target.resourceOwner.kind === 'local' ? 'local' : target.resourceOwner.connectionId} className="flex flex-wrap items-center justify-between gap-3 py-3"><div><p className="typography-ui-label">{target.resourceOwner.kind === 'local' ? t('settings.connections.agentLocal') : target.label}</p><p className="mt-1 typography-meta text-muted-foreground">{target.capabilities.join(' · ')}</p></div><span className="typography-meta">{t('settings.connections.available')}</span></div>)}
           {sources.unavailable.map(target => <div key={target.connectionId} className="py-3"><p className="typography-ui-label">{target.label}</p><p role="status" className="mt-1 typography-meta text-muted-foreground">{target.message}</p></div>)}
@@ -119,6 +123,6 @@ function WorkConnectionsContent() {
         <div className="min-h-0 flex-1"><RemoteInstancesPage view="resources" /></div>
       </DialogContent>
     </Dialog>
-    {addingDevice && <AddDeviceDialog onClose={() => setAddingDevice(false)} onChanged={refresh} />}
+    {allowAdd && addingDevice && <AddDeviceDialog connections={policy?.connections} onClose={() => setAddingDevice(false)} onChanged={refresh} />}
   </SettingsPageLayout>;
 }

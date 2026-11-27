@@ -5,7 +5,8 @@ import type { BrowserResourceBinding } from '@varin/protocol';
 import { ConnectedBrowserOwner, connectorResourceId, type ConnectorExchange } from './browser-connector.js';
 import type { BrowserResources } from './browser-resources.js';
 import type { BrowserSettingsSnapshot, BrowserSettingsDevice } from '@varin/protocol';
-import { BrowserSettingsError, probeBrowserConnection, type BrowserSettingsOwner } from './browser-settings.js';
+import { BrowserSettingsError, type BrowserSettingsOwner } from './browser-settings.js';
+import { EgressError } from '../harness/egress.js';
 import type { ManagedBrowserPeers } from './browser-managed.js';
 import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -41,7 +42,12 @@ export function registerBrowserResourceRoutes(app: Express, resources: BrowserRe
   app.use(prefix, requireAuth, noStore);
   const route = (action: (req: Request, res: Response) => Promise<void>): RequestHandler => (req, res) => {
     void action(req, res).catch(error => {
-      if (!res.headersSent && !res.destroyed) res.status(error instanceof BrowserSettingsError ? error.status : 409).json({ error: error instanceof Error ? error.message : 'Browser resource is unavailable' });
+      if (res.headersSent || res.destroyed) return;
+      const denied = error instanceof EgressError && error.kind === 'deployment-policy-denied';
+      res.status(denied ? 403 : error instanceof BrowserSettingsError ? error.status : 409).json({
+        error: error instanceof Error ? error.message : 'Browser resource is unavailable',
+        ...(denied && { code: error.kind, section: 'egress' }),
+      });
     });
   };
   const target = (request: Request): BrowserResourceBinding => ({
@@ -59,6 +65,7 @@ export function registerBrowserResourceRoutes(app: Express, resources: BrowserRe
     res.json({ resource: await resources.acquire(String(req.params.browserId), stopOnClose(res)) });
   }));
   if (management) {
+    const settingsBody = json({ limit: '50mb' });
     const device = (req: Request) => {
       if (req.query.device === undefined || req.query.device === 'local') return undefined;
       if (typeof req.query.device !== 'string' || !req.query.device.trim()) throw new BrowserSettingsError('Choose the Host that owns this browser configuration');
@@ -70,20 +77,21 @@ export function registerBrowserResourceRoutes(app: Express, resources: BrowserRe
       res.json(remote ? await management.peers.configuration(remote)
         : { settings: await management.settings.read(), resources: await resources.list() });
     }));
-    app.put(prefix + '/configuration', route(async (req, res) => {
+    app.put(prefix + '/configuration', settingsBody, route(async (req, res) => {
       if (typeof req.body?.revision !== 'string') throw new BrowserSettingsError('Browser settings revision is required');
       const remote = device(req);
       res.json(remote ? await management.peers.configuration(remote, req.body as BrowserSettingsSnapshot)
         : { settings: await management.settings.save(req.body.revision, req.body), resources: await resources.list() });
     }));
-    app.post(prefix + '/probe', route(async (req, res) => {
-      res.json(device(req) ? await management.peers.probe(device(req)!, req.body) : await probeBrowserConnection(req.body));
+    app.post(prefix + '/probe', settingsBody, route(async (req, res) => {
+      const remote = device(req);
+      res.json(remote ? await management.peers.probe(remote, req.body) : await management.settings.probe(req.body));
     }));
     app.get(prefix + '/tasks/:threadId', route(async (req, res) => {
       const id = String(req.params.threadId); await management.thread(id);
       res.json({ preferredBrowserId: (await management.settings.preferred(id)).task, binding: resources.binding(id) });
     }));
-    app.put(prefix + '/tasks/:threadId', route(async (req, res) => {
+    app.put(prefix + '/tasks/:threadId', settingsBody, route(async (req, res) => {
       const id = String(req.params.threadId); await management.thread(id);
       const browserId = req.body?.browserId;
       if (browserId !== null && (typeof browserId !== 'string' || !browserId.trim())) throw new BrowserSettingsError('Choose a browser resource');

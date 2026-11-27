@@ -52,3 +52,11 @@ it('preserves observation transport failures and releases an errored reader', as
     assert.equal(signal?.aborted, true);
   } finally { globalThis.fetch = original; }
 });
+
+it('a Host without a status route settles an old inbox observation as missing', async () => {
+  const previous = globalThis.fetch;
+  globalThis.fetch = async () => new Response('<!doctype html>', { status: 404 });
+  try {
+    await assert.rejects(createThreadsHttpAPI().observeInbox!('old-inbox'), { status: 404, code: 'inbox-input-not-found' });
+  } finally { globalThis.fetch = previous; }
+});

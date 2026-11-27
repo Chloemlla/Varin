@@ -9,6 +9,7 @@ import type { ChildCapabilityDescriptor, ChildCapabilityFailure, ChildExecutor, 
 import { waitWithSignal } from '../cancellation.js';
 import { waitForModelBinding } from './model-binding-lifetime.js';
 import { executorChoices } from '../external-agents/executor-discovery.js';
+import { isProviderResourceOwner } from '../deployment/resource-provider.js';
 
 export interface ChildProfileInput {
   parent: ChildModelBinding;
@@ -66,6 +67,9 @@ export function createChildProfilePreparer(owners: {
     const remoteOwners = new Map(projects.filter(project => project.resource_owner.kind === 'managed_host').map(project => [JSON.stringify(canonical(project.resource_owner)), project.resource_owner]));
     if (input.resourceOwner?.kind === 'managed_host') remoteOwners.set(JSON.stringify(canonical(input.resourceOwner)),input.resourceOwner);
     if (owners.externalAgents) for (const owner of remoteOwners.values()) {
+      // An executor listing or dispatch can acquire an on-demand Host. Assembling
+      // the catalog for an ordinary turn only freezes its logical project address.
+      if (isProviderResourceOwner(owner)) continue;
       try { hostSettings.push({owner,settings:await waitWithSignal(owners.externalAgents(owner),signal)}); }
       catch { signal?.throwIfAborted(); /* An unavailable connection cannot prevent local work. */ }
     }

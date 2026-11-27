@@ -18,6 +18,19 @@ vi.mock('./local/worker-client.js', () => ({
 afterEach(() => { vi.clearAllMocks(); state.configurations.length = 0; });
 
 describe('multilingual dictation', () => {
+  it('keeps local speech and its first-use download behind deployment policy', async () => {
+    const disabled = createDictationService({ modelsDir: '/models', localInference: { speech: false } });
+    expect(await disabled.getStatus()).toMatchObject({ available: false, models: [], ttsModels: [] });
+    expect(await disabled.createSttSession()).toMatchObject({ retryable: false, reasonCode: 'deployment-policy-denied' });
+    expect(await disabled.synthesizeSpeech({ text: 'fixture' })).toMatchObject({ reasonCode: 'deployment-policy-denied' });
+    expect(state.installed).not.toHaveBeenCalled();
+
+    state.installed.mockResolvedValue(false);
+    const offline = createDictationService({ modelsDir: '/models', localInference: { componentDownloads: false } });
+    expect(await offline.createSttSession()).toMatchObject({ retryable: false, reasonCode: 'deployment-policy-denied' });
+    expect(state.download).not.toHaveBeenCalled();
+  });
+
   it('passes the selected regional language through to the native session in the model protocol', async () => {
     state.installed.mockResolvedValue(true);
     state.connect.mockResolvedValue(undefined);

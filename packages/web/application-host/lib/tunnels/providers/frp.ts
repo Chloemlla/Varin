@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { hostEnvironment } from '../../security/host-environment.js';
 import { constants } from 'node:fs';
 import * as fsPromises from 'node:fs/promises';
 import { isIP } from 'node:net';
@@ -117,7 +118,7 @@ export async function startFrpTunnel(
   const shutdownGraceMs = dependencies.shutdownGraceMs ?? 3_000;
   if (![startupTimeoutMs, shutdownGraceMs].every(value => Number.isInteger(value) && value > 0 && value <= 2_147_483_647)) throw invalid();
   if (signal?.aborted) throw aborted();
-  const token = env[config.tokenEnv];
+  const token = dependencies.env ? env[config.tokenEnv] : hostEnvironment.read(config.tokenEnv);
   if (!token?.trim()) throw new FrpTunnelError('missing_credential', 'The configured Host FRP token environment variable is empty');
   try {
     if (!(await fs.stat(config.executablePath)).isFile()) throw new Error();

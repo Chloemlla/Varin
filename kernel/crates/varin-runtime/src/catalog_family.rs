@@ -315,6 +315,10 @@ pub struct HistoryEntry {
     pub run_id: String,
     pub source: HistorySource,
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_response: Option<String>,
     pub body: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
@@ -1215,7 +1219,7 @@ impl FamilyRead {
         &self,
         item: &HistoryItem,
         cancelled: &dyn Fn() -> bool,
-    ) -> Result<(Value, String)> {
+    ) -> Result<(Value, String, Option<String>)> {
         let (mut body, _) = self
             .content
             .load_stored_history_payload(&item.content, cancelled)?;
@@ -1225,9 +1229,16 @@ impl FamilyRead {
             let state = super::memory_exclusion::load_state(&db, &self.content, &run.branch_id)?;
             super::memory_exclusion::history_body(state.as_ref(), &item.id, &mut body)?;
         }
+        let mut phase = None;
         let kind = if let Ok(mut conversation) =
             serde_json::from_value::<ConversationItem<crate::output::StoredMedia>>(body.clone())
         {
+            if item.source == HistorySource::Assistant {
+                phase = conversation.opaque.as_ref()
+                    .and_then(|opaque| opaque.value["phase"].as_str())
+                    .filter(|phase| matches!(*phase, "commentary" | "final_answer"))
+                    .map(str::to_owned);
+            }
             conversation.opaque = None;
             let kind = serde_json::to_value(&conversation.content)?["kind"]
                 .as_str()
@@ -1238,7 +1249,7 @@ impl FamilyRead {
         } else {
             "input".into()
         };
-        Ok((body, kind))
+        Ok((body, kind, phase))
     }
     fn association(
         &self,
@@ -1393,7 +1404,14 @@ impl FamilyRead {
             check(cancel)?;
             scanned += 1;
             let (sequence, item) = &ancestry[*index];
-            let (body, kind) = self.semantic(item, cancel)?;
+            let (body, kind, assistant_phase) = self.semantic(item, cancel)?;
+            let assistant_response = if item.source == HistorySource::Assistant {
+                body["id"].as_str()
+                    .and_then(|id| id.strip_prefix("model-item:"))
+                    .and_then(|id| id.split_once(':'))
+                    .and_then(|(length, id)| id.get(..length.parse::<usize>().ok()?))
+                    .map(str::to_owned)
+            } else { None };
             let serialized = serde_json::to_string(&body)?;
             if search
                 .as_ref()
@@ -1413,6 +1431,8 @@ impl FamilyRead {
                 run_id: item.run_id.clone(),
                 source: item.source,
                 kind,
+                assistant_phase,
+                assistant_response,
                 body: (!body_truncated).then_some(body),
                 preview: body_truncated.then(|| serialized[..end].into()),
                 body_bytes: serialized.len(),
@@ -1562,7 +1582,7 @@ impl FamilyRead {
     }
     pub fn item(self, request: ItemRequest, cancel: &dyn Fn() -> bool) -> Result<ItemPage> {
         let (anchor, item) = self.original_item(request.run_id.as_deref(), request.anchor.as_deref(), &request.item_id, cancel)?;
-        let (body, _) = self.semantic(&item, cancel)?;
+        let (body, _, _) = self.semantic(&item, cancel)?;
         let attachments = super::attachments::history_attachments_with_report(&self.open(cancel)?, &item, &body)?;
         check(cancel)?;
         let text = serde_json::to_string(&body)?;
@@ -1586,7 +1606,7 @@ impl FamilyRead {
     }
     pub fn output(self, request: OutputRequest, cancel: &dyn Fn() -> bool) -> Result<Value> {
         let (anchor, item) = self.original_item(request.run_id.as_deref(), request.anchor.as_deref(), &request.item_id, cancel)?;
-        let (body, _) = self.semantic(&item, cancel)?;
+        let (body, _, _) = self.semantic(&item, cancel)?;
         // These paths belong to the runtime's history envelope. Borrow the original body;
         // selecting one field must not deserialize and reserialize the entire output again.
         let content = &body["content"];

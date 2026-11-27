@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, unlinkSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it } from 'vitest';
-import { openKnowledgeDatabase } from './database.js';
+import { openKnowledgeDatabase, probeKnowledgeFormat } from './database.js';
 import { knowledgeDatabaseExists } from './database-files.js';
 import { createSemanticStoreEngine } from './semantic/store-engine.js';
 import { createHashEmbedder } from './semantic/embedder.js';
@@ -22,6 +22,9 @@ it.each(['0.8.10', '0.9.0', '0.9.1'])('recovers a %s checkpoint and its acknowle
   const root = mkdtempSync(join(tmpdir(), 'varin-tdb-checkpoint-')); roots.push(root);
   const files = installFileGroup(`trivium-${version}-checkpoint-wal`, root);
   const file = join(root, 'knowledge.tdb');
+  expect(probeKnowledgeFormat(file)).toMatchObject({ status: 'upgrade', current: expect.any(Number), target: expect.any(Number) });
+  expect(readdirSync(root).sort()).toEqual(Object.keys(files).sort());
+  for (const [name, data] of Object.entries(files)) expect(readFileSync(join(root, name))).toEqual(Buffer.from(data, 'base64'));
   const db = openKnowledgeDatabase(file, options);
   try {
     expect(db.getPayload(1)).toEqual({ type: 'knowledge', content: 'checkpoint' });
@@ -35,6 +38,7 @@ it.each(['0.8.10', '0.9.0', '0.9.1'])('recovers a %s checkpoint and its acknowle
     unlinkSync(join(root, name));
   }
   expect(await knowledgeDatabaseExists(file)).toBe(true);
+  expect(probeKnowledgeFormat(file)).toEqual({ status: 'current' });
   const reader = openKnowledgeDatabase(file, { ...options, accessMode: 'readOnly' });
   try {
     expect(reader.getPayload(2)).toEqual({ type: 'knowledge', content: 'after upgrade' });
@@ -61,6 +65,7 @@ it('directs WAL-only stores to Varin 0.9.53 without changing the file group', ()
   const root = mkdtempSync(join(tmpdir(), 'varin-tdb-wal-')); roots.push(root);
   const file = join(root, 'knowledge.tdb');
   const files = installFileGroup('trivium-0.8.10-wal-only', root);
+  expect(probeKnowledgeFormat(file)).toMatchObject({ status: 'blocked', code: 'VARIN_KNOWLEDGE_CHECKPOINT_REQUIRED' });
   for (const accessMode of ['readWrite', 'readOnly', 'immutable'] as const) {
     expect(() => openKnowledgeDatabase(file, { ...options, accessMode })).toThrow(expect.objectContaining({
       code: 'VARIN_KNOWLEDGE_CHECKPOINT_REQUIRED',

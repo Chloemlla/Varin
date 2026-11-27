@@ -105,6 +105,26 @@ export const classifyIp = (ip: string): EgressAddressClass => {
   return "public";
 };
 
+/** Public destinations for a restricted deployment. Keep this in step with the native HTTP transport. */
+export const isPublicDestination = (ip: string): boolean => {
+  const normalized = normalizeIpLiteral(ip);
+  const kind = isIP(normalized);
+  if (!kind || classifyIp(normalized) !== 'public') return false;
+  if (kind === 4) {
+    const [a, b, c] = normalized.split('.').map(Number);
+    return !(a === 192 && (b === 0 && c === 0 || b === 88 && c === 99));
+  }
+  const b = ipv6Bytes(normalized);
+  if (b.slice(0, 10).every(n => n === 0) && b[10] === 255 && b[11] === 255) {
+    return isPublicDestination(b.slice(12).join('.'));
+  }
+  // Permit only global unicast. Transition/translation addresses may route
+  // somewhere other than the IPv6 address we see.
+  return (b[0]! & 0xe0) === 0x20 && !(b[0] === 0x20 && (
+    b[1] === 2 || b[1] === 1 && b[2]! < 2
+  ));
+};
+
 /** Network requests support HTTP(S); file/data URLs have separate resource owners. */
 export const checkHttpUrl = (url: string): HttpUrlCheck => {
   try {

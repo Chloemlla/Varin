@@ -12,6 +12,7 @@ import { admitRunSourceAuthority, savedSourceLaunch, sourceToolSchemas } from '.
 import { resourceThreadSource } from './thread-context.js';
 import type { ToolInvocationAuthority } from './tool-invocation.js';
 import type { ManagedSourceLocalScope } from '../harness/managed-remote-types.js';
+import { sourceFailureCode } from './source-admission-error.js';
 
 export interface BinaryFileWrite {
   path: string;
@@ -128,9 +129,9 @@ export function createBinaryFileOwner(options: { kernel: KernelClient; runtime: 
           signal.throwIfAborted(); sent = true;
           return client.service({ coordinatorHostId: options.runtime.coordinatorHostId, authorityId: binding.authorityId, resourceEpoch: binding.resourceEpoch,
             requestId: `binary-write:${randomUUID()}`, operation: { kind: 'binary_write', invocation: authority, journal,
-              path: input.path, expectedRevision: input.expectedRevision, bytesBase64: Buffer.from(input.bytes).toString('base64'), byteLength: input.bytes.byteLength } }, signal);
+              path: input.path, expectedRevision: input.expectedRevision, bytes: input.bytes, byteLength: input.bytes.byteLength } }, signal);
         }, signal); } catch (error) {
-          if (!sent) throw error;
+          if (!sent || sourceFailureCode(error)) throw error;
           return { status: 'unknown', path: input.path, operationId: authority.operationId, executorStopped: false, fileJournal: true };
         }
       }
@@ -161,8 +162,9 @@ export async function writeManagedBinary(kernel: KernelClient, scope: ManagedSou
     || !['office_write', 'office_export', 'browser_files'].includes(invocation.toolName)
     || !object(resolvedArguments) || resolvedArguments.path !== request.path
     || !scope.principal.capabilities.includes('filesystem:write')) throw new Error('The file write differs from its original admitted operation');
-  const bytes = Buffer.from(request.bytesBase64, 'base64');
-  if (bytes.byteLength !== request.byteLength) throw new Error('The transferred file content is incomplete');
+  const bytes = request.bytes instanceof Uint8Array ? request.bytes
+    : typeof request.bytesBase64 === 'string' ? Buffer.from(request.bytesBase64, 'base64') : null;
+  if (!bytes || bytes.byteLength !== request.byteLength) throw new Error('The transferred file content is incomplete');
   return writeSourceBinary({ client: kernel.scoped(scope.grant), source: scope.source, rootId: scope.physicalRoot.rootId,
     operationId: invocation.operationId, tool: invocation.toolName, journal, path: request.path,
     expectedRevision: request.expectedRevision, bytes, ...(signal ? { signal } : {}) });

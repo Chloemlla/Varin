@@ -50,13 +50,14 @@ export function parseSourceResourceOwner(value: unknown): SourceResourceOwner {
 export function createThreadSourceDirectory(options: {
   documents: Pick<DocumentAuthority, 'resolveWorkspace' | 'admitWorkspaceRegistration'>;
   localLabel?: string;
+  denyLocal?(): never;
   workspace?(): Promise<SourceTargets['workspace']>;
   remote?: Pick<ThreadSourceRemoteOwner, 'list' | 'describe' | 'resolve' | 'draftSkills'>;
 }): SourceDirectory {
   async function listing(signal: AbortSignal | undefined, refresh: boolean) {
     signal?.throwIfAborted();
     const [remote, workspace] = await Promise.all([refresh ? options.remote?.list(signal) : options.remote?.describe?.(signal), options.workspace?.()]);
-    return { ...(workspace ? { workspace } : {}), targets: [{ resourceOwner: { kind: 'local' as const }, label: options.localLabel ?? 'This Host', capabilities: [] }, ...(remote?.targets ?? [])],
+    return { ...(workspace ? { workspace } : {}), targets: [...(options.denyLocal ? [] : [{ resourceOwner: { kind: 'local' as const }, label: options.localLabel ?? 'This Host', capabilities: [] }]), ...(remote?.targets ?? [])],
       unavailable: remote?.unavailable ?? [] };
   }
   return {
@@ -73,6 +74,7 @@ export function createThreadSourceDirectory(options: {
         if (!options.remote) throw new SourceAdmissionError('source_unavailable');
         return options.remote.resolve({ ...request, resourceOwner }, signal);
       }
+      options.denyLocal?.();
       const workspace = await options.documents.resolveWorkspace({ path: request.path });
       const registration = await options.documents.admitWorkspaceRegistration(workspace.workspaceId, signal);
       return { resourceOwner, workspaceId: workspace.workspaceId, path: registration.canonicalPath };
@@ -81,6 +83,7 @@ export function createThreadSourceDirectory(options: {
 }
 
 interface SourcePreparationOwners {
+  denyLocal?(): never;
   documents: SourceCaptureDocuments & Pick<DocumentAuthority, 'admitWorkspaceRegistration' | 'cloneInputSnapshot'>;
   prepareResources?: StableSourcePreparationOwners['prepareResources'];
   inspectInventory: StableSourcePreparationOwners['inspectInventory'];
@@ -161,7 +164,7 @@ export function normalizeThreadSourcePreparation(input: ThreadPrepareSource): Th
 }
 
 /** Documents supplies original drafts; WorkingState's branch-create receipt owns the fixed source. */
-export function createThreadSourcePreparer({ documents, workingStates, liveSources, nativeWorkspaces, prepareResources, inspectInventory, sourceTools, remote }: SourcePreparationOwners) {
+export function createThreadSourcePreparer({ documents, workingStates, liveSources, nativeWorkspaces, prepareResources, inspectInventory, sourceTools, remote, denyLocal }: SourcePreparationOwners) {
   const preparing = new Map<string, SourcePreparationFlight>();
   const prepare = async (input: ThreadPrepareSource, key: string, captureIdentity: string, signal: AbortSignal): Promise<ThreadPreparedSource> => {
     signal.throwIfAborted();
@@ -169,6 +172,7 @@ export function createThreadSourcePreparer({ documents, workingStates, liveSourc
       if (!remote) throw new SourceAdmissionError('source_unavailable');
       return remote.prepare(input, signal);
     }
+    denyLocal?.();
     // A saved registration is a namespace, not authority to read a physical directory.
     // Look up the durable receipt before reopening a now-moved directory or expired draft.
     const workspaceId = input.workspaceId;
@@ -314,17 +318,19 @@ export function createThreadSourcePreparer({ documents, workingStates, liveSourc
 }
 
 /** Submission and every continuation re-admit the same Host source authority. */
-export function createThreadSourceAdmission({ documents, withSourceRead, liveSources, nativeWorkspaces, runtime, remote }: {
+export function createThreadSourceAdmission({ documents, withSourceRead, liveSources, nativeWorkspaces, runtime, remote, denyLocal }: {
   documents: Pick<DocumentAuthority, 'admitWorkspaceRegistration'>;
   withSourceRead: ThreadResourceScopeOwners['withSourceRead'];
   liveSources?: LiveSourceOwner;
   nativeWorkspaces?: import('./native-workspaces.js').NativeWorkspaceOwner;
   runtime: AgentRuntimeClient;
   remote?: Pick<ThreadSourceRemoteOwner, 'admit'>;
+  denyLocal?(): never;
 }) {
   return async (source: ThreadSource, identity: ThreadIdentity, runId?: string, signal?: AbortSignal): Promise<void> => {
     signal?.throwIfAborted();
     const resourceOwner = parseSourceResourceOwner(source.resourceOwner);
+    if (resourceOwner.kind === 'local' && source.mode !== 'fixed_branch') denyLocal?.();
     const relation = source.mode === 'live_root' ? null : await runtime.childForThread(identity.threadId, signal);
     const child = relation && runId ? await runtime.childExecutionForRun(runId, signal) : null;
     if (relation && (!runId || !child || child.child_thread_id !== identity.threadId || child.child_branch_id !== identity.branchId

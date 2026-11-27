@@ -12,11 +12,14 @@ import { sourceFailureCode } from '../kernel/source-admission-error.js';
 import { KernelClientError } from '../kernel/kernel-error.js';
 import { registerDocumentRoutes } from '../documents/routes.js';
 import { assertResourcePathAllowed } from '../workspace/resource-access.js';
+import type { OfficeRenderer } from '../office/renderer.js';
+import { readManagedBinaryWrite } from './managed-binary-wire.js';
 
 export interface ManagedRemoteRoutesOptions {
   isDraining?: () => boolean;
   trackRequest?(work: Promise<void>): void;
   documents?: import('../documents/authority.js').DocumentAuthority;
+  office?: OfficeRenderer;
   service: ManagedRemoteExecutionService;
   requireAuth?: RequestHandler;
   resolveAuthContext?: (
@@ -32,6 +35,10 @@ export interface ManagedRemoteRoutesOptions {
 
 const noAuth: RequestHandler = (_request, _response, next) => next();
 const value = (input: unknown): Record<string, unknown> => input && typeof input === "object" && !Array.isArray(input) ? input as Record<string, unknown> : {};
+export function isManagedMcpObservation(input: unknown): boolean {
+  const operation = value(input);
+  return operation.kind === 'mcp' && ['changed', 'resource_watch', 'interaction_watch'].includes(String(value(operation.action).kind));
+}
 const isManagedMcpCleanup = (operation: Record<string, unknown>): boolean => operation.kind === 'mcp'
   && ['release', 'derivation_inspect', 'derivation_release', 'child_inspect', 'child_release', 'task_inspect', 'task_cancel', 'task_release', 'resource_inspect', 'resource_release', 'interaction_inspect', 'interaction_ack', 'interaction_release', 'interaction_close'].includes(String(value(operation.action).kind));
 const asString = (input: unknown, label: string): string => {
@@ -82,7 +89,7 @@ const managedRoute = (handler: (request: Request, response: Response) => Promise
 
 export function registerManagedRemoteRoutes(
   app: Express,
-  { service, requireAuth = noAuth, resolveAuthContext, documents, trackRequest, isDraining = () => false }: ManagedRemoteRoutesOptions,
+  { service, requireAuth = noAuth, resolveAuthContext, documents, office, trackRequest, isDraining = () => false }: ManagedRemoteRoutesOptions,
 ): void {
   const route = (handler: Parameters<typeof managedRoute>[0]) => managedRoute((req, res) => {
     const work = handler(req, res);
@@ -115,12 +122,6 @@ export function registerManagedRemoteRoutes(
   // capability declaration checks each later operation's actual requirements.
   const requireSourceAuth = clientAuth(['filesystem:read']);
   const requireReceiptAuth = clientAuth([]);
-  const authorize = (request: Request, coordinatorHostId: unknown): { coordinatorHostId: string; principalId: string } => {
-    const coordinator = asString(coordinatorHostId, "Coordinator identity");
-    const principal = principals.get(request);
-    if (!principal) throw new Error("Managed execution has no authenticated principal");
-    return { coordinatorHostId: coordinator, principalId: principal.principalId };
-  };
   app.use(base, (request, response, next) => {
     response.setHeader("X-Varin-Managed-Host", service.hostId);
     const expectedHost = request.headers['x-varin-managed-target'];
@@ -130,7 +131,47 @@ export function registerManagedRemoteRoutes(
     }
     next();
   });
-
+  if (office) {
+    const requireConversion = clientAuth(['terminal:use', 'process:control']);
+    app.get(`${base}/office/environment`, requireAuth, requireConversion, route(async (_request, response) => {
+      if (isDraining()) { response.status(503).json({ error: 'The target is shutting down' }); return; }
+      response.json(await office.environment());
+    }));
+    app.post(`${base}/office/convert`, requireAuth, requireConversion, route(async (request, response) => {
+      if (isDraining()) { response.status(503).json({ error: 'The target is shutting down' }); return; }
+      const source = request.get('x-varin-office-source'), format = request.get('x-varin-office-format');
+      if ((source !== 'docx' && source !== 'xlsx' && source !== 'pptx') ||
+          (format !== 'docx' && format !== 'xlsx' && format !== 'pptx' && format !== 'pdf' && format !== 'csv') ||
+          request.get('content-type') !== 'application/octet-stream') {
+        response.status(400).json({ error: 'Office conversion requires original Office bytes and supported formats' });
+        return;
+      }
+      try {
+        const converted = await whileResponseOpen(response, async signal => {
+          const chunks: Uint8Array[] = [];
+          for await (const bytes of requestBodyChunks(request)) {
+            signal.throwIfAborted();
+            chunks.push(bytes);
+          }
+          signal.throwIfAborted();
+          if (isDraining()) throw new Error('The target is shutting down');
+          return office.convert(Buffer.concat(chunks), source, format, signal);
+        });
+        response.setHeader('x-varin-office-format', converted.format);
+        response.setHeader('x-varin-office-version', Buffer.from(converted.engine.version).toString('base64url'));
+        response.type('application/octet-stream').send(converted.bytes);
+      } catch (error) {
+        if (response.destroyed) return;
+        response.status(422).json({ error: error instanceof Error ? error.message : 'Office conversion failed' });
+      }
+    }));
+  }
+  const authorize = (request: Request, coordinatorHostId: unknown): { coordinatorHostId: string; principalId: string } => {
+    const coordinator = asString(coordinatorHostId, "Coordinator identity");
+    const principal = principals.get(request);
+    if (!principal) throw new Error("Managed execution has no authenticated principal");
+    return { coordinatorHostId: coordinator, principalId: principal.principalId };
+  };
   app.get(`${base}/identity`, requireAuth, requireReceiptAuth, route(async (_request, response) => {
     response.setHeader("Cache-Control", "no-store");
     response.json(await service.identity());
@@ -165,7 +206,7 @@ export function registerManagedRemoteRoutes(
     registerDocumentRoutes(app, { documents, base: `${base}/documents` });
   }
 
-  const sourceMethods = ['terminal', 'projectManagement', 'externalChildSource', 'externalProjectSource', 'externalCapture','externalDetect','externalInspect','externalSettings','externalFile','externalConfigure','externalInstallations','externalInstallationLog','externalPrepare', 'externalBinding', 'externalSpawn', 'externalControl', 'workspace', 'attachmentBegin', 'attachmentPath', 'recovery', 'scriptBinding', 'scriptSpawn', 'scriptControl', 'processAccess', 'processControl', 'processWrite', 'processResize', 'capabilities', 'handoff', 'integrationReceipt', 'fileReceipt', 'codeExchange', 'resolve', 'skills', 'files', 'prepare', 'bind', 'authorize', 'execute', 'service', 'cancelService', 'observe', 'releaseReceipt', 'cancel', 'release', 'inspectScope', 'releaseScope','inspectReadScope','closeReadScope','fileObservation'] as const;
+  const sourceMethods = ['terminal', 'projectManagement', 'externalChildSource', 'externalProjectSource', 'externalCapture','externalDetect','externalInspect','externalSettings','externalFile','externalConfigure','externalInstallations','externalInstallationLog','externalPrepare', 'externalBinding', 'externalSpawn', 'externalControl', 'externalRemovePrivateSource', 'workspace', 'attachmentBegin', 'attachmentPath', 'recovery', 'scriptBinding', 'scriptSpawn', 'scriptControl', 'processAccess', 'processControl', 'processWrite', 'processResize', 'capabilities', 'handoff', 'integrationReceipt', 'fileReceipt', 'codeExchange', 'resolve', 'skills', 'files', 'prepare', 'bind', 'authorize', 'execute', 'service', 'cancelService', 'observe', 'releaseReceipt', 'cancel', 'release', 'inspectScope', 'releaseScope','inspectReadScope','closeReadScope','fileObservation'] as const;
   const receiptMethods: ReadonlySet<string> = new Set(['externalControl', 'scriptControl', 'processControl', 'handoff', 'integrationReceipt', 'fileReceipt', 'cancelService', 'observe', 'releaseReceipt', 'cancel', 'release', 'inspectScope', 'releaseScope','inspectReadScope','closeReadScope','fileObservation']);
   for (const method of sourceMethods) {
     const methodAuth: RequestHandler = (request, response, next) => {
@@ -178,7 +219,9 @@ export function registerManagedRemoteRoutes(
       return (receiptMethods.has(method) || cleanup ? requireReceiptAuth : requireSourceAuth)(request, response, next);
     };
     app.post(`${base}/sources/${method}`, requireAuth, methodAuth, route(async (request, response) => {
-      const body = value(request.body);
+      const body = value(method === 'service' && request.is('application/octet-stream')
+        ? await whileResponseOpen(response, signal => readManagedBinaryWrite(request, signal))
+        : request.body);
       if (method === 'service' && isDraining()) {
         const operation = value(body.operation);
         if (!isManagedMcpCleanup(operation)) { response.status(503).json({ code: 'host-draining', admission: 'not_started' }); return; }
@@ -194,8 +237,8 @@ export function registerManagedRemoteRoutes(
       // A disconnected observer is not a cancelled or drained accepted effect.
       // Cancellation and retirement have their own original-owner receipts.
       const sourceOperation = value(body.operation);
-      const mcpObserver = method === 'service' && sourceOperation.kind === 'mcp' && ['changed', 'resource_watch', 'interaction_watch'].includes(String(value(sourceOperation.action).kind));
-      const result = !mcpObserver && (method === 'workspace' && !['open', 'locations', 'list', 'bytes', 'readlink', 'filename-search', 'content-search'].includes(String(value(body.command).kind)) || method === 'recovery' || method === 'terminal' || method === 'externalCapture' || method === 'externalChildSource' || method === 'externalProjectSource' || method === 'projectManagement' || method === 'externalControl' || method === 'externalSpawn' || method === 'scriptSpawn' || method === 'scriptControl' || method === 'processWrite' || method === 'processResize' || method === 'processControl' || method === 'execute' || method === 'service' || method === 'cancelService' || method === 'cancel' || method === 'releaseReceipt' || method === 'release' || method === 'releaseScope')
+      const mcpObserver = method === 'service' && isManagedMcpObservation(sourceOperation);
+      const result = !mcpObserver && (method === 'workspace' && !['open', 'locations', 'list', 'bytes', 'readlink', 'filename-search', 'content-search'].includes(String(value(body.command).kind)) || method === 'recovery' || method === 'terminal' || method === 'externalCapture' || method === 'externalChildSource' || method === 'externalProjectSource' || method === 'projectManagement' || method === 'externalControl' || method === 'externalRemovePrivateSource' || method === 'externalSpawn' || method === 'scriptSpawn' || method === 'scriptControl' || method === 'processWrite' || method === 'processResize' || method === 'processControl' || method === 'execute' || method === 'service' || method === 'cancelService' || method === 'cancel' || method === 'releaseReceipt' || method === 'release' || method === 'releaseScope')
         ? await invoke() : await whileResponseOpen(response, invoke);
       if (!response.destroyed) {
         response.setHeader('Cache-Control', 'no-store');

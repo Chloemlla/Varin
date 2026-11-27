@@ -1,5 +1,5 @@
 import React from 'react';
-import type { ThreadIdentity, ThreadSnapshot, ThreadsAPI } from '@varin/application-client';
+import { retainParkingObservations, type ThreadIdentity, type ThreadSnapshot, type ThreadsAPI } from '@varin/application-client';
 import { ThreadProjection } from '@/lib/agent-runtime/thread-projection';
 import { ThreadStreamingStore } from '@/lib/agent-runtime/thread-streaming-store';
 import { threadHistoryWindow } from '@/lib/agent-runtime/thread-history';
@@ -10,6 +10,7 @@ import { runFailureMessage } from '@/lib/agent-runtime/runFailure';
 import { Button } from '@/components/ui/button';
 import { ThreadQuestions } from './ThreadQuestions';
 import { ThreadPermission } from './ThreadPermission';
+import { hasPendingThreadInteraction } from './threadOperations';
 import { threadComposerKey, threadHostKey } from '@/stores/useThreadStore';
 
 /** The selected member uses the same history and progress renderer as the main conversation. */
@@ -57,6 +58,8 @@ export function CollaborationConversation({
   }, [api, identity, historyWindow, retry, streaming]);
   const branch = snapshot?.thread.branches.find((branch) => branch.branch_id === identity.branchId);
   const run = snapshot?.activeRun ?? branch?.latest_run;
+  const keepLive = Boolean(branch?.active_run_id) || hasPendingThreadInteraction(snapshot?.operations, { run, launch: snapshot?.launch });
+  React.useEffect(() => keepLive ? retainParkingObservations(host) : undefined, [host, keepLive]);
   const source = snapshot?.launch?.selection.source;
   const reference = React.useMemo(() => ({ identity }), [identity]);
   return (

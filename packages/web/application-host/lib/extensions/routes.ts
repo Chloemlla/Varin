@@ -30,6 +30,7 @@ import {
   parseVarinExtensionRemoveRequest,
 } from '@varin/extension-contract';
 import { renderExtensionRecoveryPage } from './recovery-page.js';
+import { DeploymentPolicyDeniedError } from '../deployment/policy.js';
 
 interface ExtensionRouteDependencies {
   isDraining?: () => boolean;
@@ -99,6 +100,9 @@ const withRequestSignal = async <Result>(
 };
 
 const sendMutationError = (res: Response, error: unknown) => {
+  if (error instanceof DeploymentPolicyDeniedError) {
+    return res.status(403).json({ error: { code: error.code, section: error.section, message: error.message, retryable: false } });
+  }
   if (error instanceof ExtensionUpdateReadinessError) {
     return res.status(409).json({ error: { code: error.code, message: error.message, retryable: true } });
   }
@@ -302,6 +306,7 @@ export const registerExtensionRoutes = (app: Express, {
       try {
         return res.json(await extensionPackages.readAsset(req.body));
       } catch (error) {
+        if (error instanceof DeploymentPolicyDeniedError) return sendMutationError(res, error);
         const message = error instanceof Error ? error.message : String(error);
         const status = message.includes('not installed') || message.includes('does not contain') ? 404 : 400;
         return res.status(status).json({ error: { code: 'asset_unavailable', message, retryable: false } });
@@ -316,6 +321,7 @@ export const registerExtensionRoutes = (app: Express, {
       try {
         return res.json(await extensionPackages.readManagedEntrypoint(req.body));
       } catch (error) {
+        if (error instanceof DeploymentPolicyDeniedError) return sendMutationError(res, error);
         const message = error instanceof Error ? error.message : String(error);
         const status = message.includes('not installed') || message.includes('not present') ? 404 : 400;
         return res.status(status).json({ error: { code: 'entrypoint_unavailable', message, retryable: false } });

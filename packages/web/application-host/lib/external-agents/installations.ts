@@ -76,6 +76,10 @@ export class ExternalAgentInstaller {
   private revision = 0;
   private closing = false;
   constructor(private readonly deps: Dependencies) {}
+
+  activeOperations(): number {
+    return [...this.jobs.values()].filter(job => job.state.status === 'running' || job.state.status === 'cancelling').length;
+  }
   private root(id: string) {
     return path.join(
       this.deps.directory,

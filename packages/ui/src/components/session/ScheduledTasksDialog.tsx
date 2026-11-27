@@ -1,6 +1,8 @@
 import { retainCalendarRunKey } from './calendar-run-key';
 import { CalendarTaskStatus } from './CalendarTaskStatus';
 import * as React from 'react';
+import { AnimatePresence } from 'motion/react';
+import { BotSchedulePage } from './BotSchedulePage';
 import { Button } from '@/components/ui/button';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Checkbox } from '@/components/ui/checkbox';
@@ -50,15 +52,24 @@ type GroupRequest = NonNullable<CalendarConversationContext['group']>;
 
 export function ScheduledTasksDialog({ activeGroup }: { activeGroup?: BotGroupSummary } = {}) {
   const request = useUIStore(state => state.scheduledTasksConversation?.group);
+  const conversation = useUIStore(state => state.scheduledTasksConversation);
+  const open = useUIStore(state => state.isScheduledTasksDialogOpen);
+  const mobile = useUIStore(state => state.isMobile);
   const group = request && activeGroup?.id === request.id ? activeGroup : undefined;
   const setOpen = useUIStore(state => state.setScheduledTasksDialogOpen);
   const active = useWorkbenchShellActive();
   React.useEffect(() => { if (active && request && !group) setOpen(false); }, [active, request, group, setOpen]);
-  if (request && !group) return null;
-  return <ScheduledTasksContent key={group ? JSON.stringify(request) : 'general'} group={group} groupRequest={request} />;
+  const botPage = open && active ? conversation?.botPage : undefined;
+  return <>
+    {(!request || group) && !botPage && (!mobile || open) && <ScheduledTasksContent key={group ? JSON.stringify(request) : 'general'} group={group} groupRequest={request} />}
+    <AnimatePresence>{botPage && conversation && <BotSchedulePage key="bot-schedule" page={botPage}
+      conversation={conversation} onClose={() => setOpen(false)}>
+      {botPage.kind === 'arrangements' && <ScheduledTasksContent embedded={conversation} />}
+    </BotSchedulePage>}</AnimatePresence>
+  </>;
 }
 
-function ScheduledTasksContent({ group, groupRequest }: { group?: BotGroupSummary; groupRequest?: GroupRequest }) {
+function ScheduledTasksContent({ group, groupRequest, embedded }: { group?: BotGroupSummary; groupRequest?: GroupRequest; embedded?: CalendarConversationContext }) {
   const { t } = useI18n();
   const { threads } = useRuntimeAPIs();
   const [calendarEditorOpen, setCalendarEditorOpen] = React.useState(false);
@@ -72,14 +83,16 @@ function ScheduledTasksContent({ group, groupRequest }: { group?: BotGroupSummar
   const replacementRef = React.useRef<RunReplacement | null>(null);
   const runContextGeneration = React.useRef(0);
   const dismissRunReplacement = React.useCallback(() => { replacementRef.current = null; setRunReplacement(null); }, []);
-  const open = useUIStore((state) => state.isScheduledTasksDialogOpen);
+  const surfaceOpen = useUIStore((state) => state.isScheduledTasksDialogOpen);
+  const open = Boolean(embedded) || surfaceOpen;
   const setOpen = useUIStore((state) => state.setScheduledTasksDialogOpen);
   React.useEffect(() => subscribeRuntimeEndpointWillChange(() => {
     replacementRef.current = null; setRunReplacement(null); setCalendarWork(null); setCalendarEditorOpen(false); setCalendarEditorTask(null);
     if (groupRequest) setOpen(false);
     else useUIStore.setState({ scheduledTasksConversation: null });
   }), [groupRequest, setOpen]);
-  const conversation = useUIStore(state => state.scheduledTasksConversation);
+  const surfaceConversation = useUIStore(state => state.scheduledTasksConversation);
+  const conversation = embedded ?? surfaceConversation;
   const isMobile = useUIStore((state) => state.isMobile);
   const projectEntries = useProjectsStore((state) => state.projects);
   const [botEntries, setBotEntries] = React.useState<BotSummary[]>([]);
@@ -146,7 +159,7 @@ function ScheduledTasksContent({ group, groupRequest }: { group?: BotGroupSummar
   const selectedManually = React.useRef(false);
   React.useEffect(() => { if (!open) selectedManually.current = false; }, [open]);
   const arrangementFocus = useUIStore(state => state.scheduledTasksFocus);
-  const [view, setView] = React.useState<'scheduled' | 'followups'>(groupRequest?.focus?.kind === 'followup' ? 'followups' : 'scheduled');
+  const [view, setView] = React.useState<'scheduled' | 'followups'>(embedded || groupRequest?.focus?.kind === 'followup' ? 'followups' : 'scheduled');
   const [visitedFollowups, setVisitedFollowups] = React.useState(false);
   React.useEffect(() => { if (open && view === 'followups') setVisitedFollowups(true); }, [open, view]);
   React.useEffect(() => { if (open && arrangementFocus) setView('followups'); }, [open, arrangementFocus]);
@@ -450,10 +463,12 @@ function ScheduledTasksContent({ group, groupRequest }: { group?: BotGroupSummar
       && task.target.threadId === groupTarget?.threadId && task.target.branchId === groupTarget?.branchId);
     if (task) { openedSchedule.current = true; handleEditTask(task); }
   }, [open, loading, groupFocus, groupTarget, tasks, handleEditTask, groupMember?.botId, groupRequest?.botId]);
+  const directIdentity = embedded ? conversation?.identity : undefined;
   const followupFocus = React.useMemo(() => groupScoped
     ? groupTarget && groupFocus?.kind === 'followup' && groupRequest?.botId === groupMember?.botId
       ? { identity: groupTarget, followupId: groupFocus.id, token: 1 } : undefined
-    : arrangementFocus ?? undefined, [groupScoped, groupTarget, groupFocus, groupRequest?.botId, groupMember?.botId, arrangementFocus]);
+    : directIdentity ? { identity: directIdentity, token: 1 } : arrangementFocus ?? undefined,
+  [groupScoped, groupTarget, groupFocus, groupRequest?.botId, groupMember?.botId, arrangementFocus, directIdentity]);
   const visibleTasks = scopedTasks.filter((task) => {
     const state = completed(task) ? 'completed' : task.enabled ? 'enabled' : 'paused';
     return (filter === 'all' || filter === state)
@@ -585,7 +600,7 @@ function ScheduledTasksContent({ group, groupRequest }: { group?: BotGroupSummar
       <div className="min-w-0 space-y-2"><h1 className="text-2xl font-semibold tracking-tight text-foreground">{t(view === 'scheduled' ? 'tasksHub.scheduled' : botWorkbench ? 'arrangements.title' : 'tasksHub.followUps')}</h1><p className="typography-meta text-muted-foreground">{group?.name ?? t(view === 'scheduled' ? 'tasksHub.scheduledDescription' : botWorkbench ? 'arrangements.description' : 'tasksHub.followUpsDescription')}</p></div>
       <div className="flex shrink-0 items-center gap-2">
         {createButton}
-        {!isMobile && <Button variant="ghost" size="icon" aria-label={t('dialog.common.actions.close')} onClick={() => setOpen(false)}><Icon name="close" className="size-4" /></Button>}
+        {!isMobile && !embedded && <Button variant="ghost" size="icon" aria-label={t('dialog.common.actions.close')} onClick={() => setOpen(false)}><Icon name="close" className="size-4" /></Button>}
       </div>
     </div>
     {group ? <div className="flex flex-wrap items-center gap-2">{sectionTabs}{projectSelector}</div> : sectionTabs}
@@ -605,7 +620,7 @@ function ScheduledTasksContent({ group, groupRequest }: { group?: BotGroupSummar
 
   return (
     <>
-      {isMobile ? (
+      {embedded ? tasksContent : isMobile ? (
         <MobileOverlayPanel
           open={open}
           title={t(botWorkbench && !group ? 'arrangements.title' : 'tasksHub.title')}

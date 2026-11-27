@@ -189,6 +189,10 @@ export class KnowledgeStoreProcess {
       inFlight: summarize(this.#batch ?? []), queued: summarize(this.#queue) };
   }
 
+  activeRequests(): number {
+    return (this.#batch?.length ?? 0) + this.#queue.filter(item => !item.cancelled).length;
+  }
+
   #pump(): void {
     if (!this.#ready || !this.#predecessorReady || this.#batch || this.#scheduled || this.#failure || this.#ending) return;
     this.#scheduled = setImmediate(() => {
@@ -260,6 +264,7 @@ export class KnowledgeStoreProcess {
 const shared = new Map<"knowledge" | "semantic", KnowledgeStoreProcess>();
 /** Metadata only, captured when a Harness request times out or is cancelled. */
 export const knowledgeStorageActivity = () => [...shared].map(([domain, owner]) => ({ domain, ...owner.activity() }));
+export const activeKnowledgeStorageRequests = () => [...shared.values()].reduce((total, owner) => total + owner.activeRequests(), 0);
 export function knowledgeStoreProcess(domain: "knowledge" | "semantic" = "knowledge"): KnowledgeStoreProcess {
   let owner = shared.get(domain);
   if (!owner || owner.failed) {

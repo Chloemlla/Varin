@@ -1,5 +1,5 @@
-import { getRuntimeExtraHeadersSync, refreshLocalRuntimeUrlAuthToken, refreshRuntimeUrlAuthToken } from './runtime-auth.js';
-import { getRuntimeEndpointGeneration } from './runtime-switch.js';
+import { configureBackgroundUrlAuthRefresh, getRuntimeExtraHeadersSync, refreshLocalRuntimeUrlAuthToken, refreshRuntimeUrlAuthToken } from './runtime-auth.js';
+import { getRuntimeEndpointGeneration, subscribeRuntimeEndpointChanged } from './runtime-switch.js';
 import { getRuntimeUrlResolver } from './runtime-url.js';
 import { decodeObservationData, isAllowedObservationRequest, OBSERVATION_WINDOW_BYTES, OBSERVATION_WEBSOCKET_PATH, type ObservationClientMessage, type ObservationServerMessage } from './observation-protocol.js';
 
@@ -36,8 +36,8 @@ const resolveTarget = (input: RequestInfo | URL, method: string, headers: Header
       async websocketUrl() {
         // The handshake cannot carry a bearer header. Mint with this captured
         // Host's normal auth path, and fence the async result before dispatch.
-        await refreshRuntimeUrlAuthToken(`${activeApi.origin}${mount}`);
-        if (needsRealtimeProxy && localOrigin) await refreshLocalRuntimeUrlAuthToken(localOrigin);
+        await refreshRuntimeUrlAuthToken(`${activeApi.origin}${mount}`, { observation: true });
+        if (needsRealtimeProxy && localOrigin) await refreshLocalRuntimeUrlAuthToken(localOrigin, { observation: true });
         if (generation !== getRuntimeEndpointGeneration() || resolver !== getRuntimeUrlResolver()) {
           throw new Error('Application Host changed before observation dispatch');
         }
@@ -61,7 +61,7 @@ const resolveTarget = (input: RequestInfo | URL, method: string, headers: Header
       const endpoint = new URL(OBSERVATION_WEBSOCKET_PATH, target.origin);
       const token = target.searchParams.get('varin_url_token')
         || headers.get('X-Varin-Application-Token')
-        || (target.origin !== window.location.origin ? await refreshLocalRuntimeUrlAuthToken(target.origin) : '');
+        || (target.origin !== window.location.origin ? await refreshLocalRuntimeUrlAuthToken(target.origin, { observation: true }) : '');
       if (token) endpoint.searchParams.set('varin_url_token', token);
       return websocketUrl(endpoint);
     },
@@ -82,6 +82,120 @@ interface Observation {
 
 const connections = new Map<string, ObservationConnection>();
 const abortError = (): DOMException => new DOMException('The observation was aborted', 'AbortError');
+
+const activeConnectionKey = () => {
+  const base = new URL(getRuntimeUrlResolver().api('/api'), window.location.href);
+  return 'host:' + base.origin + base.pathname.slice(0, -'/api'.length);
+};
+const OBSERVATION_IDLE_MS = 60_000;
+const activityEvents = ['pointerdown', 'keydown', 'wheel', 'touchstart'] as const;
+let parkAware: { generation: number; key: string; signal: AbortSignal; suspended: boolean;
+  resume?: Promise<void>; changes: EventTarget; retentionChanged(): void; dispose(): void } | undefined;
+const retainedByView = new Map<number, number>();
+
+/** A visible work surface holds the active Host's observation while it needs live updates. */
+export function retainParkingObservations(generation: number): () => void {
+  if (generation !== getRuntimeEndpointGeneration()) return () => {};
+  const notify = () => {
+    if (parkAware?.generation === generation) parkAware.retentionChanged();
+  };
+  const count = retainedByView.get(generation) ?? 0;
+  retainedByView.set(generation, count + 1);
+  if (count === 0) notify();
+  let held = true;
+  return () => {
+    if (!held) return;
+    held = false;
+    const remaining = (retainedByView.get(generation) ?? 1) - 1;
+    if (remaining) retainedByView.set(generation, remaining);
+    else {
+      retainedByView.delete(generation);
+      notify();
+    }
+  };
+}
+
+export function enableParkingObservations(generation: number, wake: () => Promise<unknown>) {
+  if (typeof document === 'undefined' || generation !== getRuntimeEndpointGeneration() || parkAware?.generation === generation) return;
+  parkAware?.dispose();
+  const page = document;
+  const ended = new AbortController();
+  let lastActivity = performance.now();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const retained = () => retainedByView.has(generation);
+  const unsubscribe = subscribeRuntimeEndpointChanged(() => state.dispose());
+  const state: NonNullable<typeof parkAware> = {
+    generation, key: activeConnectionKey(), signal: ended.signal, suspended: false, changes: new EventTarget(),
+    retentionChanged() {
+      lastActivity = performance.now();
+      plan();
+      if (retained()) resume();
+    },
+    dispose() {
+      clearTimeout(timer);
+      page.removeEventListener('visibilitychange', visibility);
+      for (const event of activityEvents) page.removeEventListener(event, activity, true);
+      ended.abort();
+      unsubscribe();
+      if (parkAware === state) {
+        parkAware = undefined;
+        configureBackgroundUrlAuthRefresh(() => false);
+      }
+    },
+  };
+  const plan = () => {
+    clearTimeout(timer);
+    if (retained()) return;
+    timer = setTimeout(() => {
+      if (ended.signal.aborted || retained()) return;
+      state.suspended = true;
+      connections.get(state.key)?.suspend();
+    }, Math.max(0, lastActivity + OBSERVATION_IDLE_MS - performance.now()));
+  };
+  const resume = () => {
+    if (!state.suspended) return;
+    state.suspended = false;
+    // A foreground read is wake demand. Background observation retries never supply it.
+    const pending = wake().then(() => undefined, () => undefined);
+    state.resume = pending;
+    void pending.then(() => {
+      if (state.resume === pending) delete state.resume;
+      state.changes.dispatchEvent(new Event('resume'));
+    });
+  };
+  const activity = () => {
+    if (ended.signal.aborted || page.visibilityState === 'hidden') return;
+    lastActivity = performance.now();
+    plan();
+    resume();
+  };
+  const visibility = () => { if (page.visibilityState !== 'hidden') activity(); };
+  parkAware = state;
+  configureBackgroundUrlAuthRefresh(() => !ended.signal.aborted && (state.suspended || Boolean(state.resume) || page.visibilityState === 'hidden' && !retained()));
+  page.addEventListener('visibilitychange', visibility);
+  for (const event of activityEvents) page.addEventListener(event, activity, { capture: true, passive: true });
+  plan();
+}
+
+async function waitForParkingVisibility(target: ObservationTarget, signal?: AbortSignal | null) {
+  const state = parkAware;
+  if (!state || state.generation !== getRuntimeEndpointGeneration() || state.key !== target.key) return;
+  const until = signal ? AbortSignal.any([signal, state.signal]) : state.signal;
+  for (;;) {
+    until.throwIfAborted();
+    if (!state.suspended && !state.resume) return;
+    await new Promise<void>((resolve, reject) => {
+      const cleanup = () => {
+        state.changes.removeEventListener('resume', finish);
+        until.removeEventListener('abort', abort);
+      };
+      const finish = () => { cleanup(); resolve(); };
+      const abort = () => { cleanup(); reject(until.reason); };
+      until.addEventListener('abort', abort, { once: true });
+      state.changes.addEventListener('resume', finish, { once: true });
+    });
+  }
+}
 
 class ObservationConnection {
   private socket: WebSocket | null = null;
@@ -163,6 +277,8 @@ class ObservationConnection {
     for (const observation of this.observations.values()) this.rejectObservation(observation, error);
     this.socket?.close();
   }
+
+  suspend(): void { this.fail(new Error('Application Host observation suspended while this page is idle')); }
 
   private receive(raw: unknown): void {
     try {
@@ -274,6 +390,7 @@ export const tryObservationFetch = (input: RequestInfo | URL, init?: RequestInit
   const signal = init?.signal ?? request?.signal;
   return (async () => {
     signal?.throwIfAborted();
+    await waitForParkingVisibility(target, signal);
     let body: string | undefined;
     if (init?.body != null) {
       if (typeof init.body === 'string') body = init.body;

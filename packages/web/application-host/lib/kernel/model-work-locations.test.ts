@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ThreadLocationDirectory } from '@varin/application-client';
 import { createModelWorkLocations } from './model-work-locations.js';
 import { resourceSource } from './thread-context.js';
-import type { SourceToolBinding } from './protocol.generated.js';
+import { toolOperationId, type SourceToolBinding, type ToolOrigin } from './protocol.generated.js';
 
 const owner = {kind:'managed_host' as const, hostId:'original-host', connectionId:'original-peer', endpointIdentity:'private-endpoint-fingerprint'};
 const local = {kind:'local' as const};
@@ -212,21 +212,26 @@ describe('model location admission',()=>{
   });
 });
 
-it('prepares only the dormant script Operation’s recorded local default; returns changed instructions before any grant', async () => {
+it.each([
+  { owner: local, origin: { kind: 'model_step', request_id: 'req' } },
+  { owner, origin: { kind: 'nested_call', parent_operation_id: 'req:tool:gateway' } },
+] satisfies { owner: typeof local | typeof owner; origin: ToolOrigin }[])(
+  'prepares the recorded $owner.kind script location from $origin.kind', async ({ owner, origin }) => {
   let instructions = 'Use the original project source';
   const ref = {domainId:'project',viewId:'snapshot',path:'AGENTS.md',canonicalId:'/logs/AGENTS.md',version:'v1'};
   const capture = vi.fn(async () => ({system:null,appendSystem:null,instructions:[{origin:'project',kind:'project-instruction',appliesTo:'src',reference:ref}],capturedFiles:[{reference:ref,content:instructions}]}));
   const f = fixture(capture as unknown as Parameters<typeof createModelWorkLocations>[0]['captureLocationContext']);
-  Object.assign(f.launch.selection, {source:null,lazy_work_location:{resource_owner:local,path:'/logs',workspace_id:'logs'},
+  Object.assign(f.launch.selection, {source:null,lazy_work_location:{resource_owner:owner,path:'/logs',workspace_id:'logs'},
     extension_bindings:[{extensionId:'varin.builtin.scripts',serviceId:'varin.script.open',configurationIdentity:'deferred-local-script-v1',tool:{name:'script_open'}}]});
-  f.directory.resolve.mockResolvedValue({resourceOwner:local as never,workspaceId:'logs',path:'/logs'});
-  const live = {...source,resourceOwner:local,liveRoot:{...root,hostId:'local-owner'},tools:['file_read','process_spawn']};
+  f.directory.resolve.mockResolvedValue({resourceOwner:owner as never,workspaceId:'logs',path:'/logs'});
+  const live = {...source,resourceOwner:owner,liveRoot:{...root,hostId:owner.kind === 'local' ? 'local-owner' : owner.hostId},tools:['file_read','process_spawn']};
   f.prepare.mockResolvedValue({source:live as never,path:'/logs'});
   const executorOwner = {kind:'external' as const,identity:'script',epoch:'epoch'};
-  const op = {id:'req:tool:script',run_id:'run',phase:'running',executor:'script_open',execution_owner:executorOwner};
-  f.runtime.operation.mockResolvedValue(op);
+  const op = {id:toolOperationId(origin,'script'),run_id:'run',phase:'running',executor:'script_open',execution_owner:executorOwner};
+  const gateway = {run_id:'run',phase:'running',executor:'tool_invoke',intent:{origin:{kind:'model_step',request_id:'req'}}};
+  f.runtime.operation.mockImplementation(async id => id === op.id ? op : gateway);
   const authority = {runId:'run',threadId:'thread',operationId:op.id,invocationId:'invocation',callId:'script',
-    origin:{kind:'model_step' as const,request_id:'req'},source:null,executorOwner,
+    origin,source:null,executorOwner,
     operation:'effect' as const,completion:'job' as const,toolName:'script_open',configurationIdentity:'deferred-local-script-v1',arguments:{cwd:'src'}};
   const first = await f.work.prepareScriptDefault(authority,undefined,signal);
   expect(first).toMatchObject({kind:'work_location_context_required'});
@@ -241,10 +246,11 @@ it('prepares only the dormant script Operation’s recorded local default; retur
   expect(await f.work.prepareScriptDefault(authority,next.revision,signal)).toEqual({kind:'source',source:resourceSource(live)});
   expect(f.kernel.issueGrant).not.toHaveBeenCalled();
   expect(f.client.bind).not.toHaveBeenCalled();
-  f.directory.resolve.mockResolvedValueOnce({resourceOwner:local as never,workspaceId:'logs',path:'/symlink-target'});
+  f.directory.resolve.mockResolvedValueOnce({resourceOwner:owner as never,workspaceId:'logs',path:'/symlink-target'});
   await expect(f.work.prepareScriptDefault(authority,next.revision,signal)).rejects.toMatchObject({code:'source_changed'});
-  f.runtime.operation.mockResolvedValue({...op,execution_owner:{...executorOwner,epoch:'stale'}});
+  f.runtime.operation.mockImplementation(async id => id === op.id ? {...op,execution_owner:{...executorOwner,epoch:'stale'}} : gateway);
   const probes = f.directory.resolve.mock.calls.length;
   await expect(f.work.prepareScriptDefault(authority,next.revision,signal)).rejects.toMatchObject({code:'source_authority_denied'});
   expect(f.directory.resolve.mock.calls.length).toBe(probes);
-});
+  },
+);

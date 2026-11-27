@@ -259,7 +259,9 @@ const getRuntimeAuthCredential = async (): Promise<RuntimeAuthCredential> => {
 // Performs the actual network mint and swaps the new token in atomically (the
 // previous token stays valid until `setRuntimeUrlAuthToken` replaces it — no
 // empty-token window). Concurrent callers share one in-flight request.
-const mintRuntimeUrlAuthToken = (apiBaseUrl?: string | null): Promise<string> => {
+const urlTokenRoute = (observation: boolean) => observation ? '/auth/url-token?observation=1' : '/auth/url-token';
+
+const mintRuntimeUrlAuthToken = (apiBaseUrl?: string | null, observation = false): Promise<string> => {
   if (runtimeUrlAuthRefreshPromise) return runtimeUrlAuthRefreshPromise;
   const generation = runtimeAuthGeneration;
 
@@ -278,8 +280,8 @@ const mintRuntimeUrlAuthToken = (apiBaseUrl?: string | null): Promise<string> =>
     // reachable network base URL. Same auth headers, same route, tunneled.
     const relay = getActiveRelayTunnel();
     const response = relay
-      ? await relay.fetch('/auth/url-token', { method: 'POST', headers, signal })
-      : await fetch(buildAuthUrl(apiBaseUrl, '/auth/url-token'), {
+      ? await relay.fetch(urlTokenRoute(observation), { method: 'POST', headers, signal })
+      : await fetch(buildAuthUrl(apiBaseUrl, urlTokenRoute(observation)), {
           method: 'POST',
           headers,
           credentials: 'include',
@@ -315,7 +317,7 @@ const mintRuntimeUrlAuthToken = (apiBaseUrl?: string | null): Promise<string> =>
   return runtimeUrlAuthRefreshPromise;
 };
 
-const mintLocalRuntimeUrlAuthToken = (localOrigin: string): Promise<string> => {
+const mintLocalRuntimeUrlAuthToken = (localOrigin: string, observation = false): Promise<string> => {
   const origin = normalizeOrigin(localOrigin);
   if (!origin) return Promise.reject(new Error('Local runtime URL auth origin was invalid'));
   if (localRuntimeUrlAuthRefreshPromise && localRuntimeUrlAuthRefreshOrigin === origin) {
@@ -326,7 +328,7 @@ const mintLocalRuntimeUrlAuthToken = (localOrigin: string): Promise<string> => {
     const headers = await buildLocalRuntimeAuthHeaders(origin);
     signal.throwIfAborted();
     if (generation !== localRuntimeUrlAuthGeneration) throw new Error('Local runtime URL auth request is stale');
-    const response = await fetchWithoutRuntimeRouting(buildAuthUrl(origin, '/auth/url-token'), {
+    const response = await fetchWithoutRuntimeRouting(buildAuthUrl(origin, urlTokenRoute(observation)), {
       method: 'POST',
       credentials: 'include',
       headers,
@@ -369,13 +371,13 @@ const mintLocalRuntimeUrlAuthToken = (localOrigin: string): Promise<string> => {
 
 // Returns a valid token without a network call, minting only when the current
 // token is missing or already inside the skew window.
-export const refreshRuntimeUrlAuthToken = async (apiBaseUrl?: string | null): Promise<string> => {
+export const refreshRuntimeUrlAuthToken = async (apiBaseUrl?: string | null, options?: { observation?: boolean }): Promise<string> => {
   const existing = readValidRuntimeUrlAuthTokenSync();
   if (existing) return existing;
-  return mintRuntimeUrlAuthToken(apiBaseUrl);
+  return mintRuntimeUrlAuthToken(apiBaseUrl, options?.observation);
 };
 
-export const refreshLocalRuntimeUrlAuthToken = async (localOrigin: string): Promise<string> => {
+export const refreshLocalRuntimeUrlAuthToken = async (localOrigin: string, options?: { observation?: boolean }): Promise<string> => {
   const origin = normalizeOrigin(localOrigin);
   if (!origin) throw new Error('Local runtime URL auth origin was invalid');
   const existing = readValidLocalRuntimeUrlAuthTokenSync(origin);
@@ -386,7 +388,7 @@ export const refreshLocalRuntimeUrlAuthToken = async (localOrigin: string): Prom
   ) {
     clearLocalRuntimeUrlAuthToken();
   }
-  return mintLocalRuntimeUrlAuthToken(origin);
+  return mintLocalRuntimeUrlAuthToken(origin, options?.observation);
 };
 
 // ── Proactive URL auth token refresh ──────────────────────────────────────
@@ -400,6 +402,12 @@ let urlAuthRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 let urlAuthApiBaseUrl: string | null = null;
 const urlAuthListeners = new Set<() => void>();
 const URL_AUTH_PROACTIVE_BUFFER_MS = 5_000;
+let backgroundRefreshPaused = () => false;
+
+export function configureBackgroundUrlAuthRefresh(paused: () => boolean): void {
+  backgroundRefreshPaused = paused;
+  scheduleUrlAuthRefresh();
+}
 
 const notifyRuntimeUrlAuthListeners = (): void => {
   for (const listener of urlAuthListeners) {
@@ -420,7 +428,7 @@ const clearUrlAuthRefreshTimer = (): void => {
 
 const scheduleUrlAuthRefresh = (): void => {
   clearUrlAuthRefreshTimer();
-  if (urlAuthConsumerCount <= 0 || typeof window === 'undefined') return;
+  if (urlAuthConsumerCount <= 0 || typeof window === 'undefined' || backgroundRefreshPaused()) return;
 
   // Refresh before the skew window so the old token is still valid when the new
   // one swaps in. With no token yet (expiry 0), refresh immediately.
@@ -429,7 +437,7 @@ const scheduleUrlAuthRefresh = (): void => {
 
   urlAuthRefreshTimer = setTimeout(() => {
     urlAuthRefreshTimer = null;
-    if (urlAuthConsumerCount <= 0) return;
+    if (urlAuthConsumerCount <= 0 || backgroundRefreshPaused()) return;
     void mintRuntimeUrlAuthToken(urlAuthApiBaseUrl)
       .catch(() => {
         // Transient — the reschedule below retries (token is cleared on

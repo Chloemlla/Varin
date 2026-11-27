@@ -4,6 +4,7 @@ import { Note, Row, Section, Seg } from '../shared/kit';
 import { SettingsSection, SettingsFieldRow } from '@/components/sections/shared/SettingsSection';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { useConfigurationModels } from './ConfigurationModels';
+import { useDeploymentPolicy } from '@/hooks/useDeploymentPolicy';
 import { useI18n } from '@/lib/i18n';
 import { AutoSaveInput } from './AutoSaveInput';
 import { HarnessModelField } from './HarnessModelField';
@@ -19,6 +20,8 @@ export function InferenceSettings({ harness, update, kind, embedded = false, chi
 }>) {
   const { t } = useI18n();
   const { providers, modelsFor } = useConfigurationModels();
+  const policy = useDeploymentPolicy();
+  const localAvailable = policy?.localInference?.embedding !== false;
   const binding = harness[kind];
   const [source, setSource] = React.useState<InferenceSource>(binding?.protocol === 'local' ? 'local' : binding ? 'remote' : 'off');
   const sourceRef = React.useRef(source);
@@ -47,7 +50,7 @@ export function InferenceSettings({ harness, update, kind, embedded = false, chi
   const title = t(`settings.page.harness.section.${kind}`);
   const description = t(`settings.page.harness.section.${kind}.description`);
   const sourceLabel = t('settings.roles.inferenceSource');
-  const sources: { value: InferenceSource; label: string }[] = kind === 'embedding'
+  const sources: { value: InferenceSource; label: string }[] = kind === 'embedding' && localAvailable
     ? [{ value: 'local', label: t('settings.page.harness.localSemantic.source') }] : [];
   sources.push({ value: 'remote', label: t('settings.harness.retrieval.remote') }, { value: 'off', label: t('settings.roles.off') });
   const providerLabel = t(`settings.page.harness.${kind}.provider`);
@@ -57,7 +60,9 @@ export function InferenceSettings({ harness, update, kind, embedded = false, chi
     <Row item={embedded ? `harness.${kind}` : undefined} label={sourceLabel} description={embedded ? description : undefined}>
       <Seg label={title} value={source} options={sources} onChange={selectSource} />
     </Row>
-    {source === 'local' ? <LocalSemanticSettings /> : null}
+    {source === 'local' ? localAvailable
+      ? <LocalSemanticSettings allowDownload={policy?.localInference?.componentDownloads !== false} />
+      : <Note inPanel>{t('settings.connections.managedEmbedding')}</Note> : null}
     {source === 'remote' ? <>
       <Row label={providerLabel}>
         <Select value={fields.providerId || '__none'} onValueChange={(providerId) => {

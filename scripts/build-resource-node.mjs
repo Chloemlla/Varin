@@ -8,7 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
 const root = path.resolve(import.meta.dirname, '..');
-const roleEntry = { resources: 'resource-node', browser: 'browser-node', computer: 'computer-node' };
+const roleEntry = { resources: 'resource-node', browser: 'browser-node', computer: 'computer-node', extensions: 'extension-node' };
 function selectRole(role) {
   if (!Object.hasOwn(roleEntry, role)) throw new Error('Unknown dedicated node role');
   const basename = roleEntry[role];
@@ -114,6 +114,7 @@ export function collectResourceClosure(serverDir, ts, basename = 'resource-node'
             else if (basename === 'computer-node' && filename === 'lib/computer/driver-host.js' &&
               (target === 'computer-driver' || target === '../../computer-driver')) { /* target driver staged separately */ }
             else if (target.startsWith('..') || !fs.existsSync(asset)) throw new Error(`Unshippable node asset: ${filename} -> ${relative}`);
+            else if (/\.[cm]?js$/.test(target)) visit(target);
             else assetFiles.add(target);
           }
         }
@@ -261,7 +262,7 @@ export async function stageResourceNode({ source, output, update = false, role =
     const relative = `packages/web/server/${filename}`;
     copy(path.join(source, relative), relative);
   }
-  copy(path.join(source, 'packages/web/kernel'), 'packages/web/kernel');
+  if (role !== 'extensions') copy(path.join(source, 'packages/web/kernel'), 'packages/web/kernel');
   if (role === 'computer') copy(path.join(source, 'packages/web/server/computer-driver'), 'packages/web/server/computer-driver');
   copy(original('scripts/verify-resource-node-install.mjs'), 'verify-resource-node-install.mjs');
   writeJson(path.join(output, 'resource-node.json'), {
@@ -295,7 +296,7 @@ if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === imp
     checkResourceNodeLock({ update: source === '--update-lock-only', role });
   } else {
     if (!source || !output || extra || (flag && flag !== '--update-lock')) {
-      throw new Error('Usage: build-resource-node.mjs <built cloud runtime> <new output> [--update-lock], --check-lock, or --update-lock-only [--role browser|computer]');
+      throw new Error('Usage: build-resource-node.mjs <built cloud runtime> <new output> [--update-lock], --check-lock, or --update-lock-only [--role browser|computer|extensions]');
     }
     await stageResourceNode({ source: path.resolve(source), output: path.resolve(output), update: flag === '--update-lock', role });
   }

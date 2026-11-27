@@ -214,6 +214,7 @@ export type FetchResult =
 export type FetchErrorClass =
   | "dns"
   | "scheme-denied"
+  | "deployment-policy-denied"
   | "proxy-unavailable"
   | "proxy-auth"
   | "proxy-config-invalid"

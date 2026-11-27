@@ -50,6 +50,7 @@ export function mountComputerNodeRole(options: {
   const { app, server, computers, hostId, authenticate, isDraining } = options;
   const admitted = new WeakMap<Request, ComputerNodeCredential>();
   const observers = new Set<Response>();
+  const processing = new Set<Response>();
   const bootLeaseKey = randomBytes(32);
   const namespace = (request: Request) => {
     const principal = admitted.get(request);
@@ -125,6 +126,8 @@ export function mountComputerNodeRole(options: {
       };
     }
     if (op === 'stream') { observers.add(res); res.once('close', () => observers.delete(res)); }
+    processing.add(res);
+    res.once('close', () => processing.delete(res));
     proceed();
   };
   app.use('/api/computers', (req, res, next) => { void requirePeer(req, res, next).catch(next); });
@@ -147,5 +150,8 @@ export function mountComputerNodeRole(options: {
     originAllowed: req => !req.headers.origin,
   });
   let closed = false;
-  return { closeObservers() { if (closed) return; closed = true; for (const res of observers) res.destroy(); observers.clear(); media.stop(); } };
+  return {
+    async canRetire() { return !processing.size && !media.busy() && await computers.canRetire() && !processing.size && !media.busy(); },
+    closeObservers() { if (closed) return; closed = true; for (const res of observers) res.destroy(); observers.clear(); media.stop(); },
+  };
 }

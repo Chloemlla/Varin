@@ -231,6 +231,10 @@ impl Storage {
         grant: &Grant,
         cancellation: Arc<AtomicBool>,
     ) -> Result<Task, KernelError> {
+        if std::env::var_os("VARIN_KERNEL_LOCAL_EXECUTION").is_some_and(|mode| mode == "none") {
+            return Err(KernelError::Execution(varin_runtime::execution::ExecutionError::new(
+                "deployment-policy-denied", "This Host requires a managed execution target for processes")));
+        }
         let params = file_params_value(params);
         if let Some(transport) = &grant.external_transport_id {
             let original = self.source_authority_for_grant(&grant.grant_id)?

@@ -6,7 +6,9 @@ import { mergeHarnessSettings } from '@varin/protocol';
 
 const fixture = vi.hoisted(() => ({ read: vi.fn(), save: vi.fn(), fetch: vi.fn(), t: (key: string) => key }));
 vi.mock('@varin/application-client', async importOriginal => ({
-  ...await importOriginal<object>(), createEmbeddingRequestsHttpAPI: () => fixture, runtimeFetch: fixture.fetch,
+  ...await importOriginal<object>(), createEmbeddingRequestsHttpAPI: () => fixture,
+  runtimeFetch: (route: string, init?: RequestInit) => route === '/api/system/deployment-policy'
+    ? Promise.resolve(Response.json(null)) : init === undefined ? fixture.fetch(route) : fixture.fetch(route, init),
 }));
 vi.mock('@/lib/i18n', () => ({ useI18n: () => ({ t: fixture.t }) }));
 vi.mock('./ConfigurationModels', () => ({ useConfigurationModels: () => ({ providers: [], modelsFor: () => [] }) }));

@@ -18,6 +18,19 @@ async function fixture() {
   return { directory, file, scope };
 }
 
+test('a deployment can keep configured MCP stdio available only on managed resources', async () => {
+  const { file, scope } = await fixture();
+  await writeFile(file, JSON.stringify({ mcpServers: { server: { command: 'fixture-command' } } }));
+  const createTransport = vi.fn(() => { throw new Error('Unexpected MCP transport'); });
+  const authority = new McpAuthority({ deployment: { transports: ['http', 'stdio'], stdioPlacement: 'managed' }, createTransport });
+  cleanup.push(() => authority.close());
+  expect((await authority.inspect(scope)).servers).toMatchObject([{ name: 'server', status: 'disabled' }]);
+  await expect(authority.acquire(scope, { servers: ['server'] })).rejects.toMatchObject({
+    code: 'deployment-policy-denied', section: 'mcp',
+  });
+  expect(createTransport).not.toHaveBeenCalled();
+});
+
 test('shared preparation survives a cancelled first consumer and does not wait for resources', async () => {
   const { scope } = await fixture();
   const toolsStarted = deferred(), releaseTools = deferred();

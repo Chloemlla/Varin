@@ -520,6 +520,7 @@ export function createComputerAutomation(options: {
             admission.assert();
             return actorKey(admission.actor) === actorKey(controller.actor);
         },
+        hasActiveWork: () => leases.size > 0 || controllers.size > 0 || releasing.size > 0 || failedReleases.size > 0,
         acceptedExecutions(): ComputerExecutionRef[] {
             const actors = [...cleanupLeases(), ...controllers.values(), ...(options.pendingReleases?.() ?? [])].map(entry => entry.actor);
             return [...new Map(actors.filter(actor => !originFor(actor)).map(actor => [computerExecutionKey(actor.execution), actor.execution])).values()];

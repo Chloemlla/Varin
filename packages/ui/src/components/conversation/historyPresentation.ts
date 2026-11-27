@@ -1,7 +1,7 @@
 import type { JsonValue, Operation, OutputBody } from '@varin/protocol';
 import type { ThreadSnapshot, ThreadHistoryItem as HistoryItem, ThreadRunUsage } from '@varin/application-client';
 import type { ChatAssistantMessage, ChatSessionEntry, ChatToolExecutionState, ChatUserContent } from './types';
-import { inputParts } from '@/lib/agent-runtime/thread-content';
+import { inputParts, inputText } from '@/lib/agent-runtime/thread-content';
 import { presentInvocation, invocationData, invocationGateway, operationStatus } from './toolInvocation';
 
 const object = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
@@ -148,6 +148,8 @@ export class HistoryPresentation {
               fileAttachments: inputParts(item.content).flatMap(part => part.kind === 'attachment' ? [part.attachment] : []),
               imageParts: inputParts(item.content).flatMap(part => part.kind === 'media' ? [{ media: part.media, partIndex: part.partIndex, reference: part.imageReference }] : []),
             } };
+        } else if (item.source === 'environment' && envelope.kind === 'calendar_input') {
+          entry = { ...base, type: 'custom_message', customType: 'calendar-input', display: true, content: inputText(envelope.input) };
         } else if (item.source !== 'assistant' && (content.kind === 'text' || content.kind === 'reasoning_summary')) {
           const sender = object(envelope.provenance).thread_id;
           entry = { ...base, type: 'custom_message', customType: item.source === 'agent' ? 'thread-message' : item.source, display: true, content: String(content.text ?? ''),

@@ -122,19 +122,19 @@ interface TerminalConnection {
 }
 
 interface TerminalRuntimeDependencies {
-  app: Express;
+  app?: Express;
   buildAugmentedPath: () => string;
   documents?: Pick<DocumentAuthority, 'registerWriterForScope'>;
   fs: typeof fsModule;
   isExecutable(path: string): boolean;
-  isRequestOriginAllowed(req: IncomingMessage): Promise<boolean>;
+  isRequestOriginAllowed?(req: IncomingMessage): Promise<boolean>;
   inspectNativeProcesses?: (cwd: string) => Promise<import("../kernel/protocol.generated.js").KernelProcessSnapshot[]>;
   loadPtyProvider?: () => Promise<PtyProvider>;
   path: typeof pathModule;
-  rejectWebSocketUpgrade(socket: Duplex, statusCode: number, message: string): void;
+  rejectWebSocketUpgrade?(socket: Duplex, statusCode: number, message: string): void;
   searchPathFor(name: string, searchPath: string): string | null;
-  server: Server;
-  TERMINAL_INPUT_WS_HEARTBEAT_INTERVAL_MS: number;
+  server?: Server;
+  TERMINAL_INPUT_WS_HEARTBEAT_INTERVAL_MS?: number;
   terminalIdleSweepMs?: number;
   terminalIdleTimeoutMs?: number;
   terminalTerminationGraceMs?: number;
@@ -243,7 +243,8 @@ const trimHistory = (history: string): string => {
 
 export function createTerminalRuntime({
   app, server, fs, path, uiAuthController, buildAugmentedPath, searchPathFor, isExecutable,
-  isRequestOriginAllowed, rejectWebSocketUpgrade, TERMINAL_INPUT_WS_HEARTBEAT_INTERVAL_MS,
+  isRequestOriginAllowed = async () => false, rejectWebSocketUpgrade = socket => { socket.destroy(); },
+  TERMINAL_INPUT_WS_HEARTBEAT_INTERVAL_MS = 30_000,
   loadPtyProvider, inspectNativeProcesses, terminalTerminationGraceMs = TERMINATION_GRACE_MS,
   terminalIdleTimeoutMs = IDLE_TIMEOUT_MS,
   terminalIdleSweepMs = 5 * 60 * 1000,
@@ -262,7 +263,7 @@ export function createTerminalRuntime({
   const runtime = 'Bun' in globalThis ? 'bun' : 'node';
   let ptyProviderPromise: Promise<PtyProvider> | null = null;
   let nextHarnessSessionId = 0;
-  let wsServer: WebSocketServer | null = new WebSocketServer({ noServer: true, maxPayload: TERMINAL_WS_MAX_PAYLOAD_BYTES });
+  let wsServer: WebSocketServer | null = server ? new WebSocketServer({ noServer: true, maxPayload: TERMINAL_WS_MAX_PAYLOAD_BYTES }) : null;
   const shellResolver = createTerminalShellResolver({ fs, path, searchPathFor, isExecutable, buildAugmentedPath });
 
   const acquireWriter = async (
@@ -758,7 +759,7 @@ export function createTerminalRuntime({
   };
 
   const activeWsServer = wsServer;
-  activeWsServer.on('connection', (socket) => {
+  activeWsServer?.on('connection', (socket) => {
     const connection: TerminalConnection = { socket, attachments: new Map() };
     connections.add(connection);
     send(socket, { t: 'hello', v: TERMINAL_PROTOCOL_VERSION });
@@ -813,12 +814,12 @@ export function createTerminalRuntime({
           if (!await uiAuthController.ensureSessionToken(req, null)) { rejectWebSocketUpgrade(socket, 401, 'UI authentication required'); return; }
           if (!await isRequestOriginAllowed(req)) { rejectWebSocketUpgrade(socket, 403, 'Invalid origin'); return; }
         }
-        if (!wsServer) { rejectWebSocketUpgrade(socket, 500, 'Terminal WebSocket unavailable'); return; }
+        if (!activeWsServer || !wsServer) { rejectWebSocketUpgrade(socket, 500, 'Terminal WebSocket unavailable'); return; }
         activeWsServer.handleUpgrade(req, socket, head, (ws) => activeWsServer.emit('connection', ws, req));
       } catch { rejectWebSocketUpgrade(socket, 500, 'Upgrade failed'); }
     })();
   };
-  server.on('upgrade', upgradeHandler);
+  server?.on('upgrade', upgradeHandler);
 
   const makeHandle = (session: TerminalSession): TerminalHandle => ({
     get id() { return session.id; },
@@ -998,7 +999,7 @@ export function createTerminalRuntime({
     };
   };
 
-  app.get('/api/terminal/processes', async (req, res) => {
+  app?.get('/api/terminal/processes', async (req, res) => {
     try {
       if (!inspectNativeProcesses) { res.status(503).json({ error: 'Native process authority is unavailable' }); return; }
       const cwd = typeof req.query.cwd === 'string' ? req.query.cwd : '';
@@ -1006,7 +1007,7 @@ export function createTerminalRuntime({
       res.json({ processes: await inspectNativeProcesses(cwd) });
     } catch (error) { res.status(400).json({ error: errorMessage(error, 'Native process inspection failed') }); }
   });
-  app.get('/api/terminal/shells', async (_req: Request, res: Response) => {
+  app?.get('/api/terminal/shells', async (_req: Request, res: Response) => {
     try {
       const shells = await shellResolver.list();
       res.json(shells);
@@ -1014,7 +1015,7 @@ export function createTerminalRuntime({
       res.status(500).json({ error: errorMessage(error, 'Failed to list terminal shells') });
     }
   });
-  app.post('/api/terminal/create', async (req, res) => {
+  app?.post('/api/terminal/create', async (req, res) => {
     try { const session = await createSession(req.body ?? {}, { creationSource: 'http' }); res.json({ sessionId: session.id, cols: session.cols, rows: session.rows, status: session.status }); }
     catch (error) {
       const record = errorRecord(error);
@@ -1024,7 +1025,7 @@ export function createTerminalRuntime({
       res.status(statusCode).json({ error: errorMessage(error, 'Failed to create terminal session') });
     }
   });
-  app.post('/api/terminal/:sessionId/resize', async (req, res) => {
+  app?.post('/api/terminal/:sessionId/resize', async (req, res) => {
     const session = sessions.get(req.params.sessionId);
     if (!session) return res.status(404).json({ error: 'Terminal session not found' });
     const { cols, rows } = req.body ?? {};
@@ -1032,18 +1033,18 @@ export function createTerminalRuntime({
     try { await makeHandle(session).resize(cols, rows); res.json({ success: true, cols, rows }); }
     catch (error) { res.status(500).json({ error: errorMessage(error, 'Failed to resize terminal') }); }
   });
-  app.post('/api/terminal/:sessionId/appearance', (req, res) => {
+  app?.post('/api/terminal/:sessionId/appearance', (req, res) => {
     const session = sessions.get(req.params.sessionId);
     if (!session) return res.status(404).json({ error: 'Terminal session not found' });
     applyAppearance(session, req.body ?? {});
     res.json({ success: true });
   });
-  app.get('/api/terminal/:sessionId', (req, res) => {
+  app?.get('/api/terminal/:sessionId', (req, res) => {
     const info = inspectSession(req.params.sessionId);
     if (!info) return res.status(404).json({ error: 'Terminal session not found' });
     res.json(info);
   });
-  app.post('/api/terminal/:sessionId/restart', async (req, res) => {
+  app?.post('/api/terminal/:sessionId/restart', async (req, res) => {
     const session = sessions.get(req.params.sessionId);
     if (!session) return res.status(404).json({ error: 'Terminal session not found' });
     if (session.retired) return res.status(409).json({ error: 'Closed terminal identity cannot be restarted' });
@@ -1085,7 +1086,7 @@ export function createTerminalRuntime({
     }
     finally { if (pendingSessionRestarts.get(session.id) === restart) pendingSessionRestarts.delete(session.id); }
   });
-  app.delete('/api/terminal/:sessionId', async (req, res) => {
+  app?.delete('/api/terminal/:sessionId', async (req, res) => {
     const session = sessions.get(req.params.sessionId);
     if (!session) return res.status(404).json({ error: 'Terminal session not found' });
     if (session.retainWhenDetached) {
@@ -1100,7 +1101,7 @@ export function createTerminalRuntime({
       res.status(500).json({ error: errorMessage(error, 'Terminal process did not exit during close') });
     }
   });
-  app.post('/api/terminal/force-kill', async (req, res) => {
+  app?.post('/api/terminal/force-kill', async (req, res) => {
     const { sessionId, cwd } = req.body ?? {}; let killedCount = 0;
     const resolvedCwd = cwd ? path.resolve(String(cwd)) : null;
     const killedSessionIds: string[] = [];
@@ -1158,7 +1159,7 @@ export function createTerminalRuntime({
 
   const shutdown = async (): Promise<void> => {
     shuttingDown = true;
-    server.off('upgrade', upgradeHandler); clearInterval(idleSweep);
+    server?.off('upgrade', upgradeHandler); clearInterval(idleSweep);
     await Promise.allSettled([...pendingSessionCreates.values()].map((pending) => pending.promise));
     await Promise.allSettled([...pendingSessionRestarts.values()]);
     const terminations = [...sessions.values()].map(async (session) => {
@@ -1223,5 +1224,10 @@ export function createTerminalRuntime({
     inspectSession,
     subscribeCommands,
   };
-  return { beginDraining: () => { shuttingDown = true; }, shutdown, ...api };
+  const activity = () => ({
+    sessions: [...sessions.values()].filter(session => session.process !== null && session.status !== 'exited').length,
+    preparing: pendingSessionCreates.size + pendingSessionRestarts.size,
+    stopping: pendingTerminations.size,
+  });
+  return { beginDraining: () => { shuttingDown = true; }, activity, shutdown, ...api };
 }

@@ -476,7 +476,20 @@ export interface ThreadGoalsAPI {
   control(input: ThreadIdentity & { goalId: string; expectedRevision: number; action: GoalControlAction }): Promise<GoalControlReceipt>;
   list(identity: ThreadIdentity): Promise<Goal[]>;
 }
+export interface ThreadInboxReceipt { kind: 'inbox_accepted'; inboxId: string; key: string }
+export interface ThreadInputObservation {
+  inboxId?: string;
+  onInboxAccepted?(receipt: ThreadInboxReceipt): void;
+}
+export interface ThreadInboxRejection {
+  inboxId: string;
+  key: string;
+  draft: Pick<ThreadSubmit, 'text' | 'materials' | 'attachments' | 'clientTime' | 'contentReferences' | 'contentReferenceOccurrences'> | null;
+  code?: string | null;
+  status: number;
+}
 export interface ThreadSnapshot {
+  inboxRejected?: ThreadInboxRejection[];
   /** Admission-time default project, unaffected by later classification moves. */
   creationDefaults?: import('./conversation-organization.js').ConversationCreationDefaults | null;
   recovery?: {
@@ -658,8 +671,10 @@ export interface ThreadsAPI {
   contextHistory(identity: ThreadIdentity, runId: string, cursor?: { headId: string; beforeId: string }): Promise<ThreadContextHistory>;
   cancelContext(identity: ThreadIdentity, runId: string): Promise<RunCancellationReceipt>;
   resumeContext(identity: ThreadIdentity, runId: string): Promise<void>;
-  submit(input: ThreadSubmit): Promise<InputSubmitReceipt>;
-  enqueue(input: ThreadIdentity & ContentReferenceInput & { key: string; text: string; images?: ImageAttachment[]; materials?: ThreadMaterialAttachment[]; attachments?: import('@varin/protocol').AttachmentSelection[]; attachmentImageReferences?: Record<string, number>; skills?: ThreadSkillSelection[]; references?: ThreadObjectReference[]; mode: InputMode; clientTime?: import('@varin/protocol').MessageTimeObservation }): Promise<InputReceipt>;
+  submit(input: ThreadSubmit, observation?: ThreadInputObservation): Promise<InputSubmitReceipt & { mode?: InputMode }>;
+  enqueue(input: ThreadIdentity & ContentReferenceInput & { key: string; text: string; images?: ImageAttachment[]; materials?: ThreadMaterialAttachment[]; attachments?: import('@varin/protocol').AttachmentSelection[]; attachmentImageReferences?: Record<string, number>; skills?: ThreadSkillSelection[]; references?: ThreadObjectReference[]; mode: InputMode; clientTime?: import('@varin/protocol').MessageTimeObservation }, observation?: ThreadInputObservation): Promise<InputReceipt>;
+  dismissInboxRejection?(identity: ThreadIdentity, inboxId: string): Promise<{ ok: boolean }>;
+  observeInbox?(inboxId: string, signal?: AbortSignal): Promise<InputSubmitReceipt | InputReceipt>;
   editInput(inputId: string, expectedRevision: number, text: string, images?: ImageAttachment[], skills?: ThreadSkillSelection[], quotes?: ContentReferenceInput): Promise<QueuedInput>;
   cancelInput(inputId: string, expectedRevision: number): Promise<QueuedInput>;
   sendInputNow(inputId: string, expectedRevision: number, expectedRunId: string): Promise<QueuedInput>;

@@ -19,6 +19,7 @@ const networkMessages: Record<EgressErrorKind, string> = {
   connect: 'The Application Host could not connect to the model endpoint.',
   timeout: 'The model connection timed out.',
   cancelled: 'The model request was cancelled.',
+  'deployment-policy-denied': 'Deployment policy egress disallows this model destination.',
   unknown: 'The model network request failed.',
 };
 
@@ -84,8 +85,11 @@ export function registerModelRoutes(app: Express, models: ModelsService, require
     } catch (error) {
       if (error instanceof ModelConfigurationError) response.status(error.status).json({ code: error.code, message: error.message });
       else if (error instanceof EgressError) {
-        const blocked = error.kind === 'scheme-denied';
-        response.status(blocked ? 403 : 503).json({ code: `model-egress-${error.kind}`, message: networkMessages[error.kind] });
+        const policyDenied = error.kind === 'deployment-policy-denied';
+        const blocked = policyDenied || error.kind === 'scheme-denied';
+        response.status(blocked ? 403 : 503).json({
+          code: policyDenied ? error.kind : `model-egress-${error.kind}`, message: networkMessages[error.kind],
+        });
       } else response.status(503).json({ code: 'model-settings-unavailable', message: 'The model settings request could not be completed.' });
     } finally { response.removeListener('close', close); }
   });

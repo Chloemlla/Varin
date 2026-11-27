@@ -6,16 +6,18 @@ import request from 'supertest';
 import { c as createTar } from 'tar';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ApplicationExtensionCatalog, ExtensionPackageManager, ExtensionReleaseManager } from '@varin/extension-host';
+import { createExtensionAdmission } from '../deployment/extension-admission.js';
 import { PluginDiscoveryService } from './discovery.js';
 import { registerPluginCenterRoutes } from './plugin-center-routes.js';
 
 const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
 
-async function fixture() {
+async function fixture(admission?: ReturnType<typeof createExtensionAdmission>) {
   const root = await mkdtemp(join(tmpdir(), 'varin-plugin-route-')); roots.push(root);
-  const catalog = new ApplicationExtensionCatalog({ dataDir: join(root, 'data') });
-  const packages = new ExtensionPackageManager({ catalog, dataDir: join(root, 'data'), varinVersion: '1.2.3' });
+  const dataDir = join(root, 'data');
+  const catalog = new ApplicationExtensionCatalog({ dataDir });
+  const packages = new ExtensionPackageManager({ catalog, dataDir, varinVersion: '1.2.3', ...(admission && { admission }) });
   const hostId = (await catalog.snapshot()).hostId;
   const releases = new ExtensionReleaseManager({ packages, hostId });
   const discovery = new PluginDiscoveryService({ dataDir: join(root, 'data'), hostId, catalog });
@@ -27,10 +29,24 @@ async function fixture() {
     entrypoints: { host: { mode: 'brokered', file: 'host.cjs' } } }));
   await writeFile(join(packageRoot, 'host.cjs'), 'throw new Error("must not evaluate during preview");');
   const archive = join(root, 'release.tgz'); await createTar({ cwd: root, file: archive, gzip: true }, ['package']);
-  return { app, catalog, packages, packageRoot, hostId, bytes: await readFile(archive) };
+  return { app, catalog, packages, packageRoot, hostId, dataDir, bytes: await readFile(archive) };
 }
 
 describe('Plugin center authenticated Host routes', () => {
+  it('admits packages under the operator policy at preview and when opening a previously installed artifact', async () => {
+    const { app, catalog, packages, packageRoot, dataDir, bytes } = await fixture(createExtensionAdmission({ sources: ['npm'], realms: ['brokered'] }));
+    const forbidden = await request(app).post('/api/varin/extensions/v1/releases/preview-archive').set('x-session', 'yes')
+      .set('Content-Type', 'application/octet-stream').set('X-Varin-Archive-Name', 'plugin.tgz').send(bytes).expect(403);
+    expect(forbidden.body.error).toMatchObject({ code: 'deployment-policy-denied', section: 'extensions' });
+    const artifact = await packages.artifacts.prepareRelease(packageRoot, { kind: 'npm', specifier: '@example/upload', display: 'Upload' });
+    await packages.installPrepared(artifact, 0, true);
+    const restricted = new ExtensionPackageManager({ catalog, dataDir, varinVersion: '1.2.3',
+      admission: createExtensionAdmission({ artifactIntegrities: [] }) });
+    await expect(restricted.resolveBrokeredHostEntrypoint(artifact.manifest.id, 'selected', artifact.integrity))
+      .rejects.toMatchObject({ code: 'deployment-policy-denied', section: 'extensions' });
+    expect((await catalog.snapshot()).extensions[0]?.integrity).toBe(artifact.integrity);
+  });
+
   it('uploads and previews actual archive bytes without executing code, then installs that fixed artifact disabled', async () => {
     const { app, catalog, hostId, bytes } = await fixture();
     await request(app).get('/api/varin/extensions/v1/discovery').expect(401);

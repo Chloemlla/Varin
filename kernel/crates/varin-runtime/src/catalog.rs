@@ -149,6 +149,44 @@ fn inspect_catalog_format(db: &Connection) -> Result<i64> {
     Ok(version)
 }
 
+/// Inspect the same format gate used at startup, without opening a writer.
+/// An immutable probe must never overlook SQLite recovery data.
+pub fn open_checkpointed_database(file: &Path) -> Result<Connection> {
+    for suffix in ["-wal", "-journal"] {
+        let mut sidecar = file.as_os_str().to_owned();
+        sidecar.push(suffix);
+        match std::fs::metadata(sidecar) {
+            Ok(meta) if meta.len() > 0 => {
+                return Err(RuntimeError::Invalid(format!("SQLite recovery is pending for {} ({suffix}); checkpoint with its current version or inspect a recovered copy", file.display())));
+            }
+            Ok(_) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let mut uri = reqwest::Url::from_file_path(file)
+        .map_err(|_| RuntimeError::Invalid("Preflight requires an absolute SQLite file path".into()))?;
+    uri.set_query(Some("immutable=1"));
+    Ok(Connection::open_with_flags(uri.as_str(), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+        | rusqlite::OpenFlags::SQLITE_OPEN_URI | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)?)
+}
+
+pub fn format_preflight(root: &Path) -> Result<Value> {
+    let file = root.join("conversation.sqlite");
+    let target = FORMAT;
+    if !file.try_exists()? {
+        return Ok(serde_json::json!({"status":"new", "target":target}));
+    }
+    let db = open_checkpointed_database(&file)?;
+    let version = match inspect_catalog_format(&db) {
+        Ok(version) => version,
+        Err(RuntimeError::Format(version)) => return Ok(serde_json::json!({"status":"unsupported", "current":version, "target":target})),
+        Err(error) => return Err(error),
+    };
+    Ok(serde_json::json!({"status": if version == 0 {"new"} else if version == target {"current"} else {"upgrade"},
+        "current":version, "target":target}))
+}
+
 fn check_catalog_schema(db: &Connection, version: i64) -> Result<()> {
     threads::check_format(db)?;
     if version >= 102 { db.prepare("SELECT thread_id,model FROM thread_model_preferences")?; }
@@ -225,6 +263,7 @@ fn initialize_metadata(
         tx.pragma_update(None, "user_version", FORMAT)?;
         context_jobs::initialize_new(&tx)?;
     }
+    inbox::initialize(&tx)?;
     tx.execute_batch("CREATE TABLE IF NOT EXISTS resource_occupancy (operation_id TEXT PRIMARY KEY REFERENCES operations(id), claims TEXT NOT NULL)")?;
     inputs::initialize(&tx)?;
     crate::content::initialize(&tx, content)?;
@@ -462,6 +501,7 @@ impl Catalog {
         }
         // A tombstone closes new user admission, never accepted ingress or child duty.
         if matches!(origin, submissions::SubmissionOrigin::User { .. }) {
+            inbox::require_unexpired(tx, &command.key, &command.thread_id, &command.branch_id)?;
             threads::require_available(tx, &command.thread_id)?;
             threads::initialize_title(tx, &command.thread_id, prepared.title.as_deref())?;
         }
@@ -1908,6 +1948,8 @@ pub mod external;
 #[path = "catalog_principals.rs"]
 pub mod principals;
 
+#[path = "catalog_inbox.rs"]
+pub mod inbox;
 #[path = "catalog_upgrade.rs"]
 mod upgrades;
 #[path = "catalog_external_children.rs"]

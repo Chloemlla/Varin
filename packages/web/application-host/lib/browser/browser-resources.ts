@@ -15,6 +15,7 @@ interface Provider {
   dispose: boolean;
   source?: BrowserResource['source'];
   device?: BrowserResource['device'];
+  retained?: () => boolean;
   preparing?: Promise<void>;
 }
 interface PageLane {
@@ -60,7 +61,7 @@ export class BrowserResources {
     if (provider) { provider.label = label; if (deviceName !== undefined) provider.deviceName = deviceName; }
   }
 
-  register(owner: BrowserOwner, label: string, deviceName: string, options: { remote?: boolean; dispose?: boolean; source?: BrowserResource['source']; device?: BrowserResource['device'] } = {}) {
+  register(owner: BrowserOwner, label: string, deviceName: string, options: { remote?: boolean; dispose?: boolean; source?: BrowserResource['source']; device?: BrowserResource['device']; retained?: () => boolean } = {}) {
     if (this.providers.has(owner.browserId)) throw new Error('Duplicate browser resource');
     const unsubscribe = owner.subscribe(event => {
       if (event.kind === 'closed') {
@@ -83,7 +84,8 @@ export class BrowserResources {
       }
     });
     this.providers.set(owner.browserId, { owner, label, deviceName, fallbackInstance: randomUUID(), unsubscribe,
-      remote: options.remote ?? false, dispose: options.dispose ?? true, source: options.source, device: options.device });
+      remote: options.remote ?? false, dispose: options.dispose ?? true, source: options.source, device: options.device,
+      ...(options.retained && { retained: options.retained }) });
   }
   hasProviders() { return this.providers.size > 0; }
   activity() {
@@ -93,6 +95,7 @@ export class BrowserResources {
       activePageWrites: lanes.filter(lane => lane.active).length,
       waitingPageWrites: lanes.reduce((n, lane) => n + lane.waiting.length, 0),
       outstandingStopConfirmations: lanes.filter(lane => lane.stopUnconfirmed).length,
+      retainedProviders: [...this.providers.values()].filter(provider => provider.retained?.()).length,
     };
   }
   private async describe(provider: Provider): Promise<BrowserResource> {

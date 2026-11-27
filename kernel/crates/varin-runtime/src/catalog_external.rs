@@ -972,7 +972,8 @@ impl Catalog {
                             || input.get("expectedWorkspaceId").is_some_and(|expected| expected!=&workspace) {
                             return Err(RuntimeError::Conflict("External creation source changed".into()));
                         }
-                    } else if selected_source.as_ref().is_some_and(|value| value["resource_owner"]["kind"]=="managed_host") {
+                    } else if receipt["privateWorkspace"] != true
+                        && selected_source.as_ref().is_some_and(|value| value["resource_owner"]["kind"]=="managed_host") {
                         return Err(RuntimeError::Conflict("External creation source was omitted".into()));
                     }
                     let requested_cwd=source.as_ref().and_then(|v|v["path"].as_str()).map(str::to_owned).or(cwd.clone());

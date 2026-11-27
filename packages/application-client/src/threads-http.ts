@@ -1,5 +1,5 @@
 import { observeMessageTime, parseComputerAutomationProjection, parseComputerAutomationState } from '@varin/protocol';
-import { threadSourceFailureMessage, type ThreadsAPI } from './threads.js';
+import { threadSourceFailureMessage, type ThreadInboxReceipt, type ThreadInputObservation, type ThreadsAPI } from './threads.js';
 import { runtimeFetch } from './transport/runtime-fetch.js';
 import { getRuntimeEndpointGeneration, subscribeRuntimeEndpointWillChange } from './transport/runtime-switch.js';
 
@@ -25,26 +25,50 @@ export function createThreadsHttpAPI(): ThreadsAPI {
   const withClientTime = <T extends { clientTime?: import('@varin/protocol').MessageTimeObservation; images?: readonly import('@varin/protocol').ImageAttachment[] }>(input: T) => ({
     ...input, ...(input.images === undefined ? {} : { images: imagePayload(input.images) }), clientTime: input.clientTime ?? observeMessageTime(),
   });
-  const post = async <T>(method: string, body: unknown, signal?: AbortSignal): Promise<T> => {
+  const decodeResult = <T>(status: number, body: unknown, inboxSettled = false): T => {
+    if (status < 400) return body as T;
+    const failure = body && typeof body === 'object' ? body as { code?: unknown; admission?: unknown; error?: unknown } : {};
+    throw new ThreadRequestError(status, typeof failure.code === 'string' ? failure.code
+      : status === 413 ? 'http-body-too-large' : 'thread-request-failed',
+    inboxSettled || failure.admission === 'not_started' ? 'not_started' : undefined, typeof failure.error === 'string' ? failure.error : undefined);
+  };
+  const awaitInbox = async <T>(inboxId: string, generation: number, signal?: AbortSignal): Promise<T> => {
+    const switched = new AbortController();
+    const listener = subscribeRuntimeEndpointWillChange(() => switched.abort(new Error('Application Host changed during inbox observation')));
+    const observation = signal ? AbortSignal.any([signal, switched.signal]) : switched.signal;
+    try {
+      for (;;) {
+        observation.throwIfAborted();
+        if (generation !== getRuntimeEndpointGeneration()) throw new Error('Application Host changed during inbox observation');
+        const response = await runtimeFetch('/api/threads/inbox/status?inboxId=' + encodeURIComponent(inboxId), { signal: observation });
+        const status = await response.json().catch(error => {
+          if (response.ok) throw error;
+          return undefined;
+        });
+        observation.throwIfAborted();
+        if (response.status === 404) throw new ThreadRequestError(404, 'inbox-input-not-found');
+        decodeResult(response.status, status);
+        if (status.result) return decodeResult<T>(status.result.status, status.result.body, true);
+      }
+    } finally { listener(); }
+  };
+  const post = async <T>(method: string, body: unknown, signal?: AbortSignal, observation?: ThreadInputObservation): Promise<T> => {
     signal?.throwIfAborted();
     const generation = getRuntimeEndpointGeneration();
+    if (observation?.inboxId) return awaitInbox<T>(observation.inboxId, generation, signal);
     const response = await runtimeFetch(`/api/threads/${method}`, { method: 'POST', ...(signal ? { signal } : {}),
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(body) });
     signal?.throwIfAborted();
     if (generation !== getRuntimeEndpointGeneration()) throw new Error('Application Host changed during thread request');
-    if (!response.ok) {
-      const body: unknown = await response.json().catch(() => undefined);
-      const failure = body && typeof body === 'object' ? body as { code?: unknown; admission?: unknown; error?: unknown } : {};
-      signal?.throwIfAborted();
-      if (generation !== getRuntimeEndpointGeneration()) throw new Error('Application Host changed during thread request');
-      throw new ThreadRequestError(response.status, typeof failure.code === 'string' ? failure.code
-        : response.status === 413 ? 'http-body-too-large' : 'thread-request-failed',
-      failure.admission === 'not_started' ? 'not_started' : undefined, typeof failure.error === 'string' ? failure.error : undefined);
-    }
-    const result = await response.json() as T;
+    const result = response.ok ? await response.json() : await response.json().catch(() => undefined);
     signal?.throwIfAborted();
     if (generation !== getRuntimeEndpointGeneration()) throw new Error('Application Host changed during thread request');
-    return result;
+    if (response.status === 202 && result?.kind === 'inbox_accepted') {
+      const receipt = result as ThreadInboxReceipt;
+      observation?.onInboxAccepted?.(receipt);
+      return awaitInbox<T>(receipt.inboxId, generation, signal);
+    }
+    return decodeResult<T>(response.status, result);
   };
   const attachmentRequest = async <T>(path: string, init: RequestInit, decode: (response: Response) => Promise<T>, signal?: AbortSignal): Promise<T> => {
     signal?.throwIfAborted();
@@ -197,7 +221,14 @@ export function createThreadsHttpAPI(): ThreadsAPI {
     deleteBranch: input => post('branch/delete', input),
     listModels: () => post('models', {}),
     selectModel: input => post('model/select',input),
-    create: (key, options) => post('create', { key, ...options }), fork: input => post('fork', input), submit: input => post('submit', withClientTime(input)), enqueue: input => post('enqueue', withClientTime(input)),
+    create: (key, options) => post('create', { key, ...options }), fork: input => post('fork', input),
+    submit: async (input, observation) => {
+      const receipt = await post<Awaited<ReturnType<ThreadsAPI['submit']>>>('submit', withClientTime(input), undefined, observation);
+      return receipt.mode ? { ...receipt, thread_id: input.threadId, branch_id: input.branchId } : receipt;
+    },
+    enqueue: (input, observation) => post('enqueue', withClientTime(input), undefined, observation),
+    dismissInboxRejection: (identity, inboxId) => post('inbox/dismiss', { ...identity, inboxId }),
+    observeInbox: (inboxId, signal) => awaitInbox(inboxId, getRuntimeEndpointGeneration(), signal),
     prepareNavigation: ({ withFiles, ...input }) => post(withFiles ? 'navigation/prepare-files' : 'navigation/prepare', input),
     recoverySource: input => post('recovery/source', input),
     navigate: input => post('navigate', input),

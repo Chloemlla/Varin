@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+export { bundledLanguageProviders, bundledTypescriptProvider } from './language-providers.js';
 import {
   VARIN_BUILTIN_CODE_EXCHANGE_EXTENSION_ID,
   VARIN_BUILTIN_LANGUAGE_SERVERS_EXTENSION_ID,

@@ -168,6 +168,10 @@ export class PluginEventTransport {
       if (!page.events.length) await wait(signal, 1_000);
     }
   }
+  activity() {
+    return { connections: this.#flights.size, reconciling: Boolean(this.#pumping), retries: this.#timers.size };
+  }
+
   async close(): Promise<void> {
     this.#stop.abort(); for (const remove of this.#removers.splice(0)) remove();
     for (const timer of this.#timers.values()) clearTimeout(timer); this.#timers.clear();

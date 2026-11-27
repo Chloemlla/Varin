@@ -5,10 +5,37 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    io::Read,
+    io::{self, Read},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, Weak},
 };
 use tiktoken_rs::tokenizer::Tokenizer as OpenAiTokenizer;
+
+fn read_tokenizer_file(path: &str, digest: &str, cache_root: Option<&Path>) -> io::Result<Vec<u8>> {
+    let stored = std::fs::read(path).or_else(|error| {
+        // Compression changes representation, not a captured binding's identity.
+        if error.kind() == io::ErrorKind::NotFound && path.ends_with(".json") {
+            std::fs::read(format!("{path}.gz"))
+        } else {
+            Err(error)
+        }
+    });
+    stored.or_else(|error| {
+        let Some(root) = cache_root else { return Err(error) };
+        if error.kind() != io::ErrorKind::NotFound || digest.len() != 64
+            || !digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(error);
+        }
+        // The original absolute path is durable in Catalog. This fallback uses
+        // the same verified content digest after the Host relocates its cache.
+        std::fs::read(root.join(format!("{digest}.json.gz"))).or_else(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                std::fs::read(root.join(format!("{digest}.json")))
+            } else { Err(error) }
+        })
+    })
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -204,15 +231,10 @@ impl TokenCounter {
         self.loaded
             .file
             .get_or_init(|| {
-                let mut bytes = std::fs::read(path)
-                    .or_else(|error| {
-                        // Cache compression changes representation, not a captured binding's identity.
-                        if error.kind() == std::io::ErrorKind::NotFound && path.ends_with(".json") {
-                            std::fs::read(format!("{path}.gz"))
-                        } else {
-                            Err(error)
-                        }
-                    })
+                static CACHE_ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
+                let root = CACHE_ROOT.get_or_init(|| std::env::var_os("VARIN_KERNEL_TOKENIZER_CACHE_DIR")
+                    .map(PathBuf::from).filter(|path| path.is_absolute()));
+                let mut bytes = read_tokenizer_file(path, sha256, root.as_deref())
                     .map_err(|_| "tokenizer file unavailable".to_string())?;
                 if bytes.starts_with(&[0x1f, 0x8b]) {
                     let mut decoded = Vec::new();

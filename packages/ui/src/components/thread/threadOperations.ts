@@ -15,6 +15,16 @@ export function canRespondToQuestion(operation: ThreadSnapshot['operations'][num
     && acceptance.effect === 'none' && acceptance.lifetime === 'thread';
 }
 
+export function hasPendingThreadInteraction(operations: ThreadSnapshot['operations'] | undefined, scope: QuestionScope): boolean {
+  return operations?.some(operation => {
+    if (canRespondToQuestion(operation, scope)) return true;
+    if (operation.phase !== 'waiting' || operation.cancel_requested || operation.result?.kind !== 'control') return false;
+    const value = operation.result.value;
+    const permission = value && typeof value === 'object' && 'permission' in value ? value.permission : null;
+    return permission !== null && typeof permission === 'object' && 'decision' in permission && permission.decision === null;
+  }) ?? false;
+}
+
 export function canCancelOperation(operation: ThreadSnapshot['operations'][number], waitingOn?: string | null, questionScope?: QuestionScope): boolean {
   if (operation.executor === 'ask_user' && questionScope) return canRespondToQuestion(operation, questionScope);
   const subscription = operation.mcp_resource_subscription;

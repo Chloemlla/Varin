@@ -6,6 +6,7 @@ import { McpAuthority, type McpAuthorityScope } from './authority.js';
 import { mcpOAuthUrl } from './connection.js';
 import { ConfigTextFileEditor } from './config-text-file-editor.js';
 import { HostError } from '../configuration-errors.js';
+import { DeploymentPolicyDeniedError } from '../deployment/policy.js';
 import { validateMcpServerConfig, validateMcpPolicy, validateMcpDocument } from './configuration.js';
 import { AuthorizationFlows } from '../authorization-flows.js';
 import { parse, type ParseError } from 'jsonc-parser';
@@ -186,7 +187,8 @@ export function createMcpSettings(options: {
           response.json(await invoke(name, request.body, controller.signal));
         }
         catch (error) {
-          if (error instanceof ModelConfigurationError) response.status(error.status).json({ code: error.code, message: error.message });
+          if (error instanceof DeploymentPolicyDeniedError) response.status(403).json({ code: error.code, message: error.message, section: error.section });
+          else if (error instanceof ModelConfigurationError) response.status(error.status).json({ code: error.code, message: error.message });
           else if (error instanceof HostError) response.status(error.code.includes('conflict') ? 409 : 400).json({ code: error.code, message: error.message });
           else response.status(503).json({ code: 'mcp-settings-unavailable', message: 'MCP settings are unavailable' });
         } finally { response.removeListener('close', cancel); }

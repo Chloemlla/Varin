@@ -36,7 +36,7 @@ export class ModelDirectory {
   #timer: ReturnType<typeof setTimeout> | undefined;
   #controller: AbortController | undefined;
   #refreshed: (() => void) | undefined;
-  constructor(directory: string, readonly types: ChannelTypes, readonly changed: () => void) {
+  constructor(directory: string, readonly types: ChannelTypes, readonly changed: () => void, private readonly deploymentSnapshot?: unknown) {
     this.#file = createSettingsFileStore({ filePath: join(directory, 'model-directory.json') });
     this.#defaults = new Map(types.entries().map(type => [type.id, structuredClone(type.catalog ?? [])]));
     this.#bundled();
@@ -52,9 +52,10 @@ export class ModelDirectory {
     try {
       // The directory owns the parsed sources for this Host's lifetime.
       const document = await this.#file.read({ cache: false });
-      if (!Object.keys(document).length) return;
-      if (document.version !== 1 || !object(document.sources)) throw new Error('Invalid directory cache');
-      for (const [url, source] of Object.entries(document.sources)) {
+      const selected = this.deploymentSnapshot === undefined ? document : this.deploymentSnapshot;
+      if (this.deploymentSnapshot === undefined && !Object.keys(document).length) return;
+      if (!object(selected) || selected.version !== 1 || !object(selected.sources)) throw new Error('Invalid model directory snapshot');
+      for (const [url, source] of Object.entries(selected.sources)) {
         if (!object(source) || typeof source.checkedAt !== 'number' || !Number.isFinite(source.checkedAt) || source.etag !== undefined && typeof source.etag !== 'string') throw new Error('Invalid directory cache');
         this.#sources.set(url, source as unknown as CachedSource);
       }
@@ -64,11 +65,17 @@ export class ModelDirectory {
       this.#commitMetadata(this.#prepareMetadata(metadata?.body ?? DIRECTORY_SNAPSHOT));
       this.#updatedAt = metadata?.checkedAt;
       if (object(document.connections)) for (const [id, entry] of Object.entries(document.connections)) {
-        if (!object(entry) || typeof entry.key !== 'string' || typeof entry.scope !== 'string' || !Array.isArray(entry.models) || typeof entry.checkedAt !== 'number') throw new Error('Invalid connection directory');
+        if (!object(entry) || typeof entry.key !== 'string' || typeof entry.scope !== 'string' || !Array.isArray(entry.models) || typeof entry.checkedAt !== 'number') {
+          if (this.deploymentSnapshot !== undefined) continue;
+          throw new Error('Invalid connection directory');
+        }
         this.#connections.set(id, entry as unknown as ConnectionDirectory);
       }
       this.#applyOfficial();
-    } catch { this.#sources.clear(); this.#connections.clear(); this.#updatedAt = undefined; this.#bundled(); this.#issue = 'cache-unavailable'; }
+    } catch (error) {
+      if (this.deploymentSnapshot !== undefined) throw new Error('Invalid background.modelDirectorySnapshot', { cause: error });
+      this.#sources.clear(); this.#connections.clear(); this.#updatedAt = undefined; this.#bundled(); this.#issue = 'cache-unavailable';
+    }
   }
   #prepareMetadata(body: unknown) {
     if (!object(body)) throw new Error('Invalid model directory');
@@ -116,7 +123,10 @@ export class ModelDirectory {
   async forget(id: string) { if (this.#connections.delete(id)) { this.#applyOfficial(); await this.#persist(); } }
   async #persist() {
     try {
-      await this.#file.replace({ version: 1, sources: Object.fromEntries(this.#sources), connections: Object.fromEntries(this.#connections) });
+      const connections = Object.fromEntries(this.#connections);
+      if (this.deploymentSnapshot !== undefined) {
+        await this.#file.update(previous => ({ version: 1, sources: {}, ...previous, connections }));
+      } else await this.#file.replace({ version: 1, sources: Object.fromEntries(this.#sources), connections });
       this.#issue = undefined;
     } catch { this.#issue = 'cache-write-failed'; }
   }

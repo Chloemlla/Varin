@@ -20,14 +20,14 @@ export function createManagedMcpProcesses(input: {
   const { kernel, scope } = input;
   const controller = new AbortController();
   let external = false, stopped = false;
-  const handles = new Set<KernelManagedProcess>();
+  const handles = new Map<KernelManagedProcess, () => Promise<void>>();
   // An error response finishes the original native invocation; a transport loss does not.
   const unobserved = new Map<string, 'unknown' | 'rejected'>();
   const launches = new Set<Promise<ManagedPipedProcessHandle>>();
   const unsubscribe = kernel.subscribeExit(error => {
-    controller.abort(); for (const handle of handles) handle.invalidate(error);
+    controller.abort(); for (const handle of handles.keys()) handle.invalidate(error);
   });
-  const launch = async (options: Readonly<StdioTransportOptions>, signal: AbortSignal): Promise<ManagedPipedProcessHandle> => {
+  const launch = async (options: Readonly<StdioTransportOptions>, signal: AbortSignal, closeTransport: () => Promise<void>): Promise<ManagedPipedProcessHandle> => {
     const selected = AbortSignal.any([signal, controller.signal]);
     selected.throwIfAborted(); await input.readmit(selected);
     const root = scope.physicalRoot;
@@ -58,7 +58,7 @@ export function createManagedMcpProcesses(input: {
       throw new Error('mcp_native_process_identity_changed');
     const child = new KernelManagedProcess(client, { workspaceId: scope.source.workspace_id, processId, rootId: root.rootId }, initial,
       input.onError, () => { handles.delete(child); });
-    handles.add(child); unobserved.delete(processId);
+    handles.set(child, closeTransport); unobserved.delete(processId);
     try { await child.start(); }
     catch (error) { throw new ManagedProcessLaunchError(child, error); }
     if (selected.aborted) {
@@ -67,8 +67,8 @@ export function createManagedMcpProcesses(input: {
     }
     return child;
   };
-  const spawn = (options: Readonly<StdioTransportOptions>, signal: AbortSignal) => {
-    const work = launch(options, signal); launches.add(work);
+  const spawn = (options: Readonly<StdioTransportOptions>, signal: AbortSignal, closeTransport: () => Promise<void>) => {
+    const work = launch(options, signal, closeTransport); launches.add(work);
     void work.finally(() => launches.delete(work)).catch(() => undefined); return work;
   };
   const stopOriginal = async (processId: string) => {
@@ -107,13 +107,17 @@ export function createManagedMcpProcesses(input: {
       if (!(transport instanceof StdioTransport)) throw new Error('mcp_source_transport_owner_unknown');
       controller.signal.throwIfAborted();
       const owner: ManagedProcessOwner<ManagedPipedProcessHandle> = { child: null };
-      return createMcpProcessTransport(transport.options, spawn, owner);
+      const native: McpTransport = createMcpProcessTransport(transport.options,
+        (configuration, signal) => spawn(configuration, signal, () => native.close()), owner);
+      return native;
     },
     async drain(): Promise<void> {
       controller.abort(); await Promise.allSettled([...launches]);
       const children = [...handles];
       const results = await Promise.allSettled([
-        ...children.map(child => terminateManagedProcess(child, true).catch(() => stopOriginal(child.address.processId))),
+        // The SDK and Source retirement close the same pipe. Starting a second
+        // termination here races the transport's graceful EOF with process.kill.
+        ...children.map(([child, closeTransport]) => closeTransport().catch(() => stopOriginal(child.address.processId))),
         ...[...unobserved.keys()].map(stopOriginal),
       ]);
       const failed = results.find(result => result.status === 'rejected');

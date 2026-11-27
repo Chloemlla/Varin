@@ -16,6 +16,7 @@ import {
 import { createSettingsFileStore } from '@varin/settings-store';
 import type { SettingsFileStore } from '@varin/settings-store';
 import type cryptoModule from 'node:crypto';
+import { hostEnvironment } from '../security/host-environment.js';
 import type { JsonWebKey } from 'node:crypto';
 import type fsPromisesModule from 'node:fs/promises';
 import type { OutgoingHttpHeaders } from 'node:http2';
@@ -112,7 +113,7 @@ interface Http2Like {
 }
 
 const trimmedEnv = (name: string): string | null => {
-  const value = process.env[name];
+  const value = hostEnvironment.read(name);
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
 };
 
@@ -336,7 +337,7 @@ export const createApnsRuntime = (deps: ApnsRuntimeDependencies) => {
     let teamId = trimmedEnv('VARIN_APNS_TEAM_ID');
     let bundleId = trimmedEnv('VARIN_APNS_BUNDLE_ID');
     let environment = (trimmedEnv('VARIN_APNS_ENVIRONMENT') || '').toLowerCase();
-    let p8 = normalizePem(process.env.VARIN_APNS_P8 || '');
+    let p8 = normalizePem(hostEnvironment.read('VARIN_APNS_P8') || '');
 
     const p8Path = trimmedEnv('VARIN_APNS_P8_PATH');
     if (!p8 && p8Path) {

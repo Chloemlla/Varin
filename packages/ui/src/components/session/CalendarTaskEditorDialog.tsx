@@ -1,6 +1,6 @@
 import React from 'react';
 import { createScheduledTasksHttpAPI, createModelConnectionsHttpAPI, defaultConversationModel, getRuntimeEndpointGeneration } from '@varin/application-client';
-import type { ProjectEntry, ScheduledTask, ThreadModelInfo, ThreadSourceTargets } from '@varin/application-client';
+import type { ProjectEntry, ScheduledTask, ThreadIdentity, ThreadModelInfo, ThreadSourceTargets } from '@varin/application-client';
 import type { CalendarSource, SourceResourceOwner } from '@varin/protocol';
 import { useRuntimeAPIs } from '@/hooks/useRuntimeAPIs';
 import { Dialog, DialogContent, DialogTitle, DialogDescription } from '@/components/ui/dialog';
@@ -15,11 +15,13 @@ const sourceOwnerKey = (owner: SourceResourceOwner) => owner.kind === 'local'
   ? 'local' : JSON.stringify([owner.connectionId, owner.endpointIdentity, owner.hostId]);
 
 /** Edits external definitions only. Preview/admission and every occurrence stay with the Host. */
-export function CalendarTaskEditorDialog({ open, projectId, project, task, initialTarget, conversation, fixedDestination, onOpenChange, onSave }: {
+export function CalendarTaskEditorDialog({ open, projectId, project, task, initialTarget, conversation, fixedDestination, destinations, page, onOpenChange, onSave }: {
   project?: ProjectEntry;
   conversation?: CalendarConversationContext;
-  initialTarget?: import('@varin/application-client').ThreadIdentity | undefined;
+  initialTarget?: ThreadIdentity;
   fixedDestination?: string;
+  destinations?: { identity: ThreadIdentity; label: string }[];
+  page?: boolean;
   open: boolean; projectId: string; task: ScheduledTask | null; onOpenChange(open: boolean): void; onSave(task: Partial<ScheduledTask>): Promise<void>;
 }) {
   const { threads } = useRuntimeAPIs();
@@ -167,10 +169,11 @@ export function CalendarTaskEditorDialog({ open, projectId, project, task, initi
     } catch (value) { if (isCurrent()) setError(value instanceof Error ? value.message : t('calendar.error.save')); }
     finally { if (isCurrent()) setSaving(false); }
   };
+  const close = () => { if (!saving) { retireResolution(); onOpenChange(false); } };
+  const destinationKey = (identity: { threadId: string; branchId: string }) => JSON.stringify([identity.threadId, identity.branchId]);
+  const destination = destinationKey({ threadId, branchId });
   const field = (label: string, value: string, change: (value: string) => void, type = 'text') => <label className="grid gap-1 text-sm">{label}<Input type={type} value={value} onChange={event => change(event.target.value)} /></label>;
-  return <Dialog open={open} onOpenChange={value => { if (!saving) { if (!value) retireResolution(); onOpenChange(value); } }}><DialogContent className="max-h-[90vh] max-w-xl overflow-y-auto">
-    <DialogTitle>{t(task ? 'calendar.edit' : 'calendar.create')}</DialogTitle>
-    <DialogDescription>{t('calendar.description')}</DialogDescription>
+  const fields = <>
     {field(t('calendar.name'), name, setName)}
     <label className="grid gap-1 text-sm">{t('calendar.instruction')}<Textarea value={instruction} onChange={event => setInstruction(event.target.value)} /></label>
     <label className="text-sm">{t('calendar.schedule')} <select aria-label={t('calendar.scheduleLabel')} value={kind} onChange={event => { const value = event.target.value as typeof kind; setKind(value); setMissed(value === 'once' ? 'coalesce_once' : 'skip'); }}>
@@ -183,7 +186,15 @@ export function CalendarTaskEditorDialog({ open, projectId, project, task, initi
     <label className="text-sm">{t('calendar.missed')} <select aria-label={t('calendar.missedLabel')} value={missed} onChange={event => setMissed(event.target.value as typeof missed)}><option value="skip">{t('calendar.missed.skip')}</option><option value="coalesce_once">{t('calendar.missed.once')}</option></select></label>
     {fixedDestination ? <p className="text-sm">{t('calendar.target')} · {fixedDestination}</p> : <>
       <label className="text-sm">{t('calendar.target')} <select aria-label={t('calendar.targetLabel')} value={target} onChange={event => { retireResolution(); setResolving(false); setSourceError(''); setTarget(event.target.value as typeof target); }}><option value="new_work">{t('calendar.target.new')}</option><option value="existing_work">{t('calendar.target.existing')}</option></select></label>
-    {target === 'existing_work' ? <>{field(t('calendar.threadId'), threadId, setThreadId)}{field(t('calendar.branchId'), branchId, setBranchId)}<p className="text-sm text-muted-foreground">{t('calendar.existingHint')}</p></> : <>
+    {target === 'existing_work' ? destinations ? <label className="grid gap-1 text-sm">{t('bot.schedule.destination')}
+      <select value={destination} onChange={event => {
+        const identity = destinations.find(value => destinationKey(value.identity) === event.target.value)?.identity;
+        if (identity) { setThreadId(identity.threadId); setBranchId(identity.branchId); }
+      }}>
+        {!destinations.some(value => destinationKey(value.identity) === destination) && <option value={destination} disabled>{t('bot.schedule.destinationUnavailable')}</option>}
+        {destinations.map(value => <option key={destinationKey(value.identity)} value={destinationKey(value.identity)}>{value.label}</option>)}
+      </select>
+    </label> : <>{field(t('calendar.threadId'), threadId, setThreadId)}{field(t('calendar.branchId'), branchId, setBranchId)}<p className="text-sm text-muted-foreground">{t('calendar.existingHint')}</p></> : <>
       <label className="text-sm">{t('calendar.model')} <select aria-label={t('calendar.modelLabel')} value={model} onChange={event => { modelEdited.current = true; setModel(event.target.value); }}><option value="">{t('calendar.selectModel')}</option>{model && !models.some(value => JSON.stringify([value.providerId, value.modelId]) === model) && <option value={model} disabled>{JSON.parse(model).join(' / ')} ({t('calendar.unavailable')})</option>}{models.map(value => <option key={JSON.stringify([value.providerId, value.modelId])} value={JSON.stringify([value.providerId, value.modelId])}>{value.providerId} / {value.name ?? value.modelId}</option>)}</select></label>
       {field(t('calendar.thinking'), thinking, value => { thinkingEdited.current = true; setThinking(value); })}
       <label className="text-sm">{t('calendar.source')} <select aria-label={t('calendar.sourceLabel')} disabled={saving} value={sourceKind} onChange={event => {
@@ -219,6 +230,16 @@ export function CalendarTaskEditorDialog({ open, projectId, project, task, initi
     </>}</>}
     <label className="text-sm"><input type="checkbox" checked={enabled} onChange={event => setEnabled(event.target.checked)} /> {t('calendar.enabled')}</label>
     {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
-    <Button disabled={saving || (target === 'new_work' && (!source || resolving))} onClick={() => void save()}>{t(saving ? 'calendar.saving' : 'calendar.save')}</Button>
+    <div className={page ? 'flex justify-end gap-2' : 'contents'}>
+      {page && <Button type="button" variant="ghost" disabled={saving} onClick={close}>{t('sessions.scheduledTasks.editor.actions.cancel')}</Button>}
+      <Button type={page ? 'submit' : 'button'} disabled={saving || (target === 'new_work' ? !source || resolving : !threadId || !branchId)}
+        onClick={page ? undefined : () => void save()}>{t(saving ? 'calendar.saving' : 'calendar.save')}</Button>
+    </div>
+  </>;
+  if (page) return <form className="bot-schedule-editor grid gap-4" onSubmit={event => { event.preventDefault(); void save(); }}>{fields}</form>;
+  return <Dialog open={open} onOpenChange={value => { if (!value) close(); }}><DialogContent className="max-h-[90vh] max-w-xl overflow-y-auto">
+    <DialogTitle>{t(task ? 'calendar.edit' : 'calendar.create')}</DialogTitle>
+    <DialogDescription>{t('calendar.description')}</DialogDescription>
+    {fields}
   </DialogContent></Dialog>;
 }

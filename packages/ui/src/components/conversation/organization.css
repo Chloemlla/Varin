@@ -51,6 +51,8 @@
 .organization-tabs button { position: relative; height: 100%; font-size: 12px; color: var(--muted-foreground); }
 .organization-tabs button[aria-selected=true] { color: var(--foreground); font-weight: 500; }
 .organization-tabs button[aria-selected=true]::after { content: ''; position: absolute; bottom: 1px; left: 0; right: 0; height: 2px; border-radius: 2px; background: var(--muted-foreground); }
+.organization-view[data-ready=true] { animation: organization-view-enter var(--motion-dur-fade) var(--motion-ease-out); }
+@keyframes organization-view-enter { from { opacity: .8; } to { opacity: 1; } }
 .organization-fold { display: grid; transition: grid-template-rows var(--motion-dur-glide) var(--motion-ease-glide), opacity var(--motion-dur-glide) var(--motion-ease-glide); }
 .organization-children { margin-left: 13px; }
 .organization-task-children { margin-left: 21px; padding-left: 5px; border-left: 1px solid color-mix(in srgb, var(--border) 60%, transparent); }

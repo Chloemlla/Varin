@@ -80,15 +80,23 @@ export async function startComputerNode(options: ComputerNodeOptions) {
       const auth = await clients.authenticateBearerToken(bearer, req);
       return auth ? { clientId: auth.clientId, capabilities: auth.client.capabilities } : undefined;
     };
-    registerNodeRoleIdentity(app, { role: 'computer', hostId, capabilities: ['computer'],
+    const identityAuth: Parameters<typeof registerNodeRoleIdentity>[1] = { role: 'computer', hostId, capabilities: ['computer'],
       requireAuth: (_req, res, next) => { if (draining) res.status(503).json({ code: 'host-draining' }); else next(); },
       clientId: async req => {
         const credential = await authenticate(req);
         return credential?.capabilities.includes(COMPUTER_NODE_OBSERVE) ? credential.clientId : undefined;
       },
-    });
+    };
+    registerNodeRoleIdentity(app, identityAuth);
     const role = mountComputerNodeRole({ app, server, computers, hostId, isDraining: () => draining, authenticate });
     cleanup.push(role.closeObservers);
+    app.get('/api/harness/managed-execution/v1/retention', identityAuth.requireAuth, async (req, res) => {
+      if (!await identityAuth.clientId(req)) { res.status(401).json({ code: 'computer-peer-required' }); return; }
+      const retireReady = await role.canRetire();
+      res.setHeader('X-Varin-Managed-Host', hostId);
+      res.setHeader('Cache-Control', 'no-store');
+      res.json({ retireReady: !draining && retireReady });
+    });
     const errorHandler: express.ErrorRequestHandler = (error, _req, res, _next) => {
       if (res.headersSent) { res.destroy(); return; }
       const code = typeof error?.status === 'number' && error.status >= 400 && error.status < 500 ? error.status : 500;

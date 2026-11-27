@@ -1,17 +1,19 @@
-import { access, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { expect, it as test } from 'vitest';
 import { runLocalSupervisor, type SupervisorRunnerOptions } from './supervisor-runner.js';
 import { SupervisorJournal } from './supervisor-journal.js';
+import { PARK_EXIT_CODE } from './host-parking.js';
 
 const owner = 'original-persistent-host';
 const fixtureProgram = `
 import { createServer } from 'node:http';
-import { existsSync, readFileSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, openSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 const root = process.env.TEST_SUPERVISOR_ROOT;
+const launchId = process.env.VARIN_LOCAL_SUPERVISOR_LAUNCH_ID;
 const command = join(root, String(process.pid));
 const server = createServer((req, res) => {
   const ready = !existsSync(join(root, 'hold-readiness'));
@@ -25,8 +27,15 @@ const watch = setInterval(() => {
   const config = JSON.parse(readFileSync(command, 'utf8'));
   clearInterval(watch);
   if (!config.park) return close(config.code);
+  if (config.marker) {
+    const dir = join(root, 'supervisor-wake');
+    const fd = openSync(join(dir, 'park-' + launchId + '.json'), 'wx', 0o600);
+    writeFileSync(fd, JSON.stringify({ version: 1, owner: config.owner, launchId, pid: process.pid, revision: config.revision }));
+    fsyncSync(fd); closeSync(fd);
+    const directory = openSync(dir, 'r'); fsyncSync(directory); closeSync(directory);
+  }
   process.send({ type: 'varin:supervisor-parked', owner: config.owner, pid: process.pid,
-    launchId: config.wrongLaunch ? 'different-process' : process.env.VARIN_LOCAL_SUPERVISOR_LAUNCH_ID,
+    launchId: config.wrongLaunch ? 'different-process' : launchId,
     wakeRevision: config.revision }, () => close(config.code));
 }, 30);
 process.on('SIGTERM', () => close(0));
@@ -50,7 +59,11 @@ async function fixture(run: (f: {
   const launch = () => runner ??= runLocalSupervisor({ journal, entry, signal: signal.signal, pollMs: 30,
     startupMs: 5000, stopMs: 2000, env: { ...process.env, TEST_SUPERVISOR_ROOT: folder },
     status: (...event) => events.push(event) });
-  const command = async (pid: number, value: object) => { await writeFile(path.join(folder, String(pid)), JSON.stringify(value)); };
+  const command = async (pid: number, value: object) => {
+    const target = path.join(folder, String(pid));
+    await writeFile(target + '.tmp', JSON.stringify(value));
+    await rename(target + '.tmp', target);
+  };
   try { await run({ folder, journal, events, signal, launch, command }); }
   finally {
     signal.abort();
@@ -95,13 +108,13 @@ it('can wait without an existing child only for a current authenticated receipt,
     void launch();
     await expect.poll(() => pids(events, 'ready').length, poll).toBe(1);
     const first = pids(events, 'ready')[0]!;
-    await command(first, { park: true, owner, revision: 1, code: 0, wrongLaunch: true });
+    await command(first, { park: true, owner, revision: 1, code: PARK_EXIT_CODE, marker: true, wrongLaunch: true });
     await expect.poll(() => pids(events, 'ready').length, poll).toBe(2);
     const second = pids(events, 'ready')[1]!;
-    await command(second, { park: true, owner, revision: 0, code: 0 });
+    await command(second, { park: true, owner, revision: 1, code: PARK_EXIT_CODE });
     await expect.poll(() => pids(events, 'ready').length, poll).toBe(3);
     const third = pids(events, 'ready')[2]!;
-    await command(third, { park: true, owner, revision: 1, code: 0 });
+    await command(third, { park: true, owner, revision: 1, code: PARK_EXIT_CODE, marker: true });
     await expect.poll(() => pids(events, 'parked'), poll).toEqual([third]);
     expect(alive(third)).toBe(false);
     await delay(150);
@@ -125,7 +138,7 @@ it('waits without a child through a future wake and verifies readiness for that 
     void launch();
     await expect.poll(() => pids(events, 'ready').length, poll).toBe(1);
     const first = pids(events, 'ready')[0]!;
-    await command(first, { park: true, owner, revision: 8, code: 0 });
+    await command(first, { park: true, owner, revision: 8, code: PARK_EXIT_CODE, marker: true });
     await expect.poll(() => pids(events, 'parked'), poll).toEqual([first]);
     expect(alive(first)).toBe(false);
     expect(await exists(readyFile(journal, 8))).toBe(false);

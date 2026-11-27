@@ -50,13 +50,7 @@ pub(crate) fn drive(
             let Ok(mut c) = catalog.lock() else { break };
             // Each owner reads its own deadlines. A malformed record in one domain must
             // not stop the shared waiter or disarm another owner's future deadline.
-            let deadlines = [
-                ("waits", c.nearest_wait_deadline()),
-                ("bot-inactivity", c.nearest_bot_inactivity_deadline()),
-                ("followups", c.nearest_followup_deadline()),
-                ("calendar", c.nearest_calendar_deadline()),
-            ];
-            deadlines
+            c.continuation_deadlines()
                 .into_iter()
                 .filter_map(|(source, result)| {
                     let deadline = record_outcome(
@@ -92,6 +86,15 @@ pub(crate) fn drive(
         }
         let Some(runtime) = owner.upgrade() else {
             break;
+        };
+        let _pass = loop {
+            match runtime.continuation_pass() {
+                Ok(Some(guard)) => break guard,
+                // Release explicitly notifies the original waiter. Run the
+                // pass with that notification, even without a timer deadline.
+                Ok(None) => if !matches!(wakes.wait(None), Ok(true)) { return; },
+                Err(_) => return,
+            }
         };
         // Resolve short Wait facts before any content/Goal/followup work. A committed trigger
         // is naturally excluded from the next deadline query, including when its consumer

@@ -2,80 +2,111 @@ import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { parseHTML } from 'linkedom';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import type { Followup } from '@varin/protocol';
-import type { ThreadFollowupsAPI } from '@varin/application-client';
-import { BotArrangements } from './BotSchedulePane';
+import type { ScheduledTask, ThreadFamilyAPI } from '@varin/application-client';
+import type { CalendarOccurrence, FamilyHistoryEntry } from '@varin/protocol';
+import { BotSchedulePane } from './BotSchedulePane';
 import { BotPanelContext, type BotPanelModel } from './botPanelModel';
-import { useBotFacts } from './useBotFacts';
+import { readCalendarReply } from './calendarReply';
 
-const state = vi.hoisted(() => ({ open: vi.fn() }));
-vi.mock('@/stores/useUIStore', () => ({ useUIStore: { getState: () => ({ openArrangements: state.open }) } }));
-vi.mock('@/lib/bots', () => ({ listBotMemory: async () => [], listBotSchedules: async () => [], readBotActivity: async () => ({ events: [], participants: [], before: null }) }));
-vi.mock('@/lib/varinEvents', () => ({ subscribeVarinEvents: () => () => {} }));
-vi.mock('@/lib/i18n', () => ({ useI18n: () => ({ t: (key: string, params?: object) => key + (params ? JSON.stringify(params) : '') }) }));
+const state = vi.hoisted(() => ({ page: vi.fn(), reveal: vi.fn() }));
+vi.mock('@/stores/useUIStore', () => ({
+  useUIStore: Object.assign(() => false, { getState: () => ({ setScheduledTasksDialogOpen: state.page }) }),
+}));
+vi.mock('@/lib/i18n', () => ({ useI18n: () => ({ t: (key: string) => key }), getCurrentIntlLocale: () => 'en-US' }));
 vi.mock('@/components/icon/Icon', () => ({ Icon: () => null }));
+vi.mock('./BotScheduleResult', () => ({
+  BotScheduleResult: ({ record, open }: { record: CalendarOccurrence; open: boolean }) =>
+    open ? <div role="dialog" data-result={record.id}>{record.failure_code}</div> : null,
+}));
+
 const entry = { runtime: 'agent' as const, threadId: 'bot-entry', branchId: 'main' };
-const item = { id: 'watch-replies', thread_id: entry.threadId, branch_id: entry.branchId, name: 'Watch customer replies', trigger: { kind: 'plugin_event', source: { extensionId: 'mail', sourceId: 'incoming', connectionId: 'work', accountId: 'account' } }, state: 'active', repeat: 'each', timing: { kind: 'passive' }, pending_events: 3, pending_occurrences: 0, next_delivery_at_ms: null, source_status: null } as Followup;
+const selected = { ...entry, branchId: 'sub-branch' };
+const record: CalendarOccurrence = {
+  id: 'occurrence', definition_id: 'schedule', generation: 1, revision: 1, reason: { kind: 'manual', key: 'click' },
+  observed_at_ms: 100, target_kind: 'existing_work', thread_id: entry.threadId, branch_id: 'other-branch',
+  input_id: 'calendar-input:occurrence', history_item_id: 'original-history-item', run_id: 'specific-run', execution_id: null, goal_id: null, state: 'completed',
+  hold_reason: null, failure_code: null,
+};
+const failure: CalendarOccurrence = {
+  ...record, id: 'failed-preparation', observed_at_ms: 90, target_kind: 'new_work', run_id: null,
+  input_id: null, state: 'held', failure_code: 'calendar_preparation:model:model-unavailable',
+};
+const independent: CalendarOccurrence = { ...record, id: 'independent', observed_at_ms: 80, target_kind: 'new_work' };
+const task = {
+  id: 'schedule', name: 'Deployment check', schedule: { kind: 'daily' }, enabled: true,
+  target: { kind: 'existing_work', threadId: entry.threadId, branchId: entry.branchId },
+  calendar: { definition: { next_at_ms: 180 }, occurrences: [independent, failure, record] },
+} as ScheduledTask;
+const model = {
+  bot: { id: 'bot', entry, name: 'Varin', homeDir: '/bot' }, scheduleIdentity: selected,
+  sessions: [{ identity: entry, branches: [selected] }], sessionTitle: () => 'Release preparation',
+  facts: { tasks: { status: 'ready', value: [task] } }, openScheduleTurn: state.reveal,
+} as unknown as BotPanelModel;
+
 let root: Root;
 let container: HTMLElement;
 beforeEach(() => {
   const { window } = parseHTML('<html><body></body></html>');
   vi.stubGlobal('window', window); vi.stubGlobal('document', window.document); vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
-  container = document.createElement('div'); document.body.append(container); root = createRoot(container); state.open.mockReset();
+  container = document.createElement('div'); document.body.append(container); root = createRoot(container);
+  state.page.mockReset(); state.reveal.mockReset();
 });
 afterEach(async () => { await act(async () => root.unmount()); vi.unstubAllGlobals(); });
-function Harness({ api, revision = 0 }: { api: ThreadFollowupsAPI; revision?: number }) {
-  const facts = useBotFacts({ botId: 'bot', identity: entry, followups: api, enabled: true, revision });
-  const model = { bot: { id: 'bot', entry: { ...entry, threadId: 'deleted-profile-entry', branchId: 'deleted-branch' } }, threads: { followups: api }, facts } as unknown as BotPanelModel;
-  return <BotPanelContext.Provider value={model}><BotArrangements /></BotPanelContext.Provider>;
-}
-it('reads and opens management through the resolved session instead of the deleted profile entry', async () => {
-  const arrangements = vi.fn().mockResolvedValue([item]);
-  const eventSources = vi.fn().mockResolvedValue([{ extensionId: 'mail', sourceId: 'incoming', displayName: 'Customer inbox', connections: [{ connectionId: 'work', accountId: 'account', displayName: 'Work mailbox' }] }]);
-  const api = { arrangements, eventSources } as unknown as ThreadFollowupsAPI;
-  await act(async () => root.render(<Harness api={api} />));
-  expect(arrangements).toHaveBeenCalledWith(entry, 'bot', expect.any(AbortSignal));
-  expect(container.textContent).toContain('Watch customer replies');
-  expect(container.textContent).toContain('Customer inbox · Work mailbox');
-  expect(container.textContent).toContain('arrangements.pending{"count":3}');
-  expect(container.textContent).toContain('arrangements.unknownHealth');
-  await act(async () => container.querySelector('button')!.click());
-  expect(state.open).toHaveBeenCalledWith(entry, item.id);
-  await act(async () => [...container.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === 'arrangements.manage')!.click());
-  expect(state.open).toHaveBeenLastCalledWith(entry, undefined);
-  arrangements.mockRejectedValueOnce(new Error('List unavailable'));
-  await act(async () => root.render(<Harness api={api} revision={1} />));
-  expect(container.textContent).toContain('List unavailable');
-  expect(container.textContent).toContain('Watch customer replies');
-  arrangements.mockResolvedValue([{ ...item, state: 'paused', pending_events: 0, source_status: { code: 'credentials_missing', message: 'Reconnect mailbox' } }]);
-  await act(async () => container.querySelector<HTMLButtonElement>('[role="alert"] button')!.click());
-  expect(container.textContent).toContain('followups.paused');
-  expect(container.textContent).toContain('Reconnect mailbox');
-  expect(container.textContent).not.toContain('List unavailable');
-  expect(container.textContent).not.toContain('arrangements.unknownHealth');
-});
-it('keeps arrangements usable when source discovery fails and retries source names independently', async () => {
-  const arrangements = vi.fn().mockResolvedValue([item]);
-  const eventSources = vi.fn().mockRejectedValueOnce(new Error('Sources offline')).mockResolvedValue([{ extensionId: 'mail', sourceId: 'incoming', displayName: 'Recovered inbox', connections: [] }]);
-  const api = { arrangements, eventSources } as unknown as ThreadFollowupsAPI;
-  await act(async () => root.render(<Harness api={api} />));
-  expect(container.textContent).toContain('Sources offline');
-  expect(container.textContent).toContain('Watch customer replies');
-  await act(async () => container.querySelector<HTMLButtonElement>('[role="alert"] button')!.click());
-  expect(container.textContent).toContain('Recovered inbox');
-  expect(container.textContent).not.toContain('Sources offline');
-  expect(arrangements).toHaveBeenCalledTimes(1);
+
+it('keeps one row per definition and uses each execution’s saved destination', async () => {
+  await act(async () => root.render(<BotPanelContext.Provider value={model}><BotSchedulePane /></BotPanelContext.Provider>));
+  expect(container.querySelectorAll('.bot-schedule-trigger')).toHaveLength(1);
+  await act(async () => container.querySelector<HTMLButtonElement>('.bot-schedule-trigger')!.click());
+  const [continueWork, failed, newWork] = [...container.querySelectorAll<HTMLButtonElement>('.bot-schedule-record')];
+  await act(async () => continueWork!.click());
+  expect(state.reveal).toHaveBeenCalledWith(task.id, record, expect.any(Function));
+  await act(async () => failed!.click());
+  expect(container.querySelector('[role=dialog]')?.textContent).toBe(failure.failure_code);
+  await act(async () => newWork!.click());
+  expect(container.querySelector('[role=dialog]')?.getAttribute('data-result')).toBe(independent.id);
+  expect(state.reveal).toHaveBeenCalledTimes(1);
 });
 
-it('resolves source labels only within the exact remote Host connection and endpoint', async () => {
-  const host = { hostId: 'remote', connectionId: 'connection', endpointIdentity: 'endpoint' };
-  const remoteItem = { ...item, trigger: { ...item.trigger, source: { ...(item.trigger.kind === 'plugin_event' ? item.trigger.source : {}), host } } };
-  const descriptor = { extensionId: 'mail', sourceId: 'incoming', connections: [] };
-  const api = { arrangements: vi.fn().mockResolvedValue([remoteItem]), eventSources: vi.fn().mockResolvedValue([
-    { ...descriptor, displayName: 'Local inbox' },
-    { ...descriptor, host: { ...host, endpointIdentity: 'stale' }, displayName: 'Stale endpoint inbox' },
-    { ...descriptor, host, displayName: 'Remote inbox' },
-  ]) } as unknown as ThreadFollowupsAPI;
-  await act(async () => root.render(<Harness api={api} />));
-  expect(container.textContent).toContain('Remote inbox'); expect(container.textContent).not.toContain('Local inbox'); expect(container.textContent).not.toContain('Stale endpoint inbox');
+it('opens the real management and editor pages with the resolved Bot branch', async () => {
+  await act(async () => root.render(<BotPanelContext.Provider value={model}><BotSchedulePane /></BotPanelContext.Provider>));
+  const [manage, create] = [...container.querySelectorAll<HTMLButtonElement>('footer button')];
+  await act(async () => manage!.click());
+  expect(state.page).toHaveBeenLastCalledWith(true, { identity: selected, botPage: { kind: 'arrangements' } });
+  await act(async () => create!.click());
+  expect(state.page).toHaveBeenLastCalledWith(true, expect.objectContaining({
+    identity: selected, botPage: expect.objectContaining({ kind: 'editor', task: null, project: expect.objectContaining({ id: 'bot:bot' }) }),
+  }));
+  await act(async () => container.querySelector<HTMLButtonElement>('.bot-schedule-trigger')!.click());
+  await act(async () => container.querySelector<HTMLButtonElement>('.bot-schedule-records header button')!.click());
+  expect(state.page).toHaveBeenLastCalledWith(true, expect.objectContaining({ botPage: expect.objectContaining({ task }) }));
+});
+
+const historyEntry = (id: string, text: string, patch: Partial<FamilyHistoryEntry> = {}): FamilyHistoryEntry => ({
+  id, parentId: null, sequence: 1, runId: 'specific-run', source: 'assistant', kind: 'text',
+  body: { content: { kind: 'text', text } }, bodyBytes: 0, bodyTruncated: false, tool: null, ...patch,
+});
+
+it('joins only the original final reply across pages and reads an unabridged long item', async () => {
+  const read = vi.fn().mockResolvedValueOnce({
+    anchor: 'fixed', nextCursor: 'earlier',
+    items: [
+      historyEntry('tail', '', { assistantPhase: 'final_answer', assistantResponse: 'answer', bodyTruncated: true, body: null }),
+      historyEntry('different-run', '# Later user conversation', { runId: 'later-run' }),
+    ],
+  }).mockResolvedValueOnce({
+    anchor: 'fixed', nextCursor: null,
+    items: [
+      historyEntry('working', 'I will check', { assistantResponse: 'work' }),
+      historyEntry('tool', '', { kind: 'tool_call', assistantResponse: 'work' }),
+      historyEntry('heading', '## Result', { assistantPhase: 'final_answer', assistantResponse: 'answer' }),
+      historyEntry('commentary', 'Progress update', { assistantPhase: 'commentary', assistantResponse: 'answer' }),
+    ],
+  });
+  const item = vi.fn().mockResolvedValueOnce({ text: '{"content":{"kind":"text","text":"- **Original', nextOffset: 45 })
+    .mockResolvedValueOnce({ text: ' Markdown**"}}', nextOffset: null });
+  const signal = new AbortController().signal;
+  const reply = await readCalendarReply({ read, item } as unknown as ThreadFamilyAPI, selected, 'specific-run', signal);
+  expect(reply.flatMap(value => value.parts)).toEqual([{ kind: 'text', text: '## Result' }, { kind: 'text', text: '- **Original Markdown**' }]);
+  expect(read).toHaveBeenCalledWith(selected, expect.objectContaining({ runId: 'specific-run', branchId: selected.branchId, cursor: 'earlier' }), signal);
+  expect(item).toHaveBeenLastCalledWith(selected, expect.objectContaining({ runId: 'specific-run', anchor: 'fixed', itemId: 'tail', offset: 45 }), signal);
 });

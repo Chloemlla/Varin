@@ -1549,11 +1549,6 @@ const spawnLocalServer = async () => {
     process.env.VARIN_KERNEL_PATH = path.join(process.resourcesPath, 'kernel', process.platform === 'win32' ? 'varin-kernel.exe' : 'varin-kernel');
   }
   process.env.VARIN_DESKTOP_NOTIFY = 'true';
-  if (desktopUiPassword) {
-    process.env.VARIN_UI_PASSWORD = desktopUiPassword;
-  } else {
-    delete process.env.VARIN_UI_PASSWORD;
-  }
   process.env.VARIN_SKIP_API_COMPRESSION = process.env.VARIN_SKIP_API_COMPRESSION || 'true';
   process.env.NO_PROXY = process.env.NO_PROXY || 'localhost,127.0.0.1';
   process.env.no_proxy = process.env.no_proxy || 'localhost,127.0.0.1';
@@ -1587,7 +1582,7 @@ const spawnLocalServer = async () => {
     port: chosenPort,
     host: bindHost,
     allowUnauthenticatedLan: lanAccessEnabled,
-    uiPassword: desktopUiPassword || null,
+    uiPassword: desktopUiPassword,
     attachSignals: false,
     exitOnShutdown: false,
     apiOnly: false,
@@ -3252,7 +3247,8 @@ const setupTrayAndListener = (bootOutcome: BootOutcome | null): void => {
 
   // Remote hosts carry their own client token; the local UI password belongs
   // only to this Host and must not be sent to another configured connection.
-  const settingsPassword = readSettingsRoot().uiPassword;
+  const notificationSettings = readSettingsRoot();
+  const settingsPassword = notificationSettings.uiPassword || notificationSettings.desktopUiPassword;
   const password = isLocalRuntimeUrl(serverUrl) ? (typeof settingsPassword === 'string' ? settingsPassword : '')
     || process.env.VARIN_UI_PASSWORD
     || '' : '';

@@ -43,6 +43,10 @@ const gpgconfCandidates = ['gpgconf', '/opt/homebrew/bin/gpgconf', '/usr/local/b
 let resolvedGitBinary: string | null = null;
 const worktreeBootstrapState = new Map<string, WorktreeBootstrapState>();
 const activeWorktreeBootstrapTasks = new Map<string, Promise<void>>();
+export const hasActiveWorktreeBootstrap = (): boolean => activeWorktreeBootstrapTasks.size > 0;
+export const drainWorktreeBootstraps = async (): Promise<void> => {
+  while (activeWorktreeBootstrapTasks.size) await Promise.allSettled([...activeWorktreeBootstrapTasks.values()]);
+};
 const remoteExistenceCache = new Map<string, { checkedAt: number; exists: boolean }>();
 const SIMPLE_GIT_SAFE_BINARY_PATTERN = /^([a-z]:)?([a-z0-9/.\\_~-]+)$/i;
 const SIMPLE_GIT_UNSAFE_BINARY_WARNING = 'Invalid value supplied for custom binary, restricted characters must be removed';

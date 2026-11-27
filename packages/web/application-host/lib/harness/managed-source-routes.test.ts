@@ -185,7 +185,7 @@ describe('managed Source authenticated transport without listeners', () => {
     });
     const client = await f.registry.source(f.owner); const controller = new AbortController();
     const work = client.service({ ...request, requestId: 'service-request', operation: { kind: 'validate' } }, controller.signal);
-    await running; controller.abort();
+    await Promise.race([running, work]); controller.abort();
     expect(await work).toEqual({ pathScopes: ['original'] });
     expect(f.sources.cancelService).toHaveBeenCalledTimes(1);
     expect(f.fetch.mock.calls.filter(([url]) => String(url).endsWith('/sources/service'))[0]![1]?.signal).toBeUndefined();

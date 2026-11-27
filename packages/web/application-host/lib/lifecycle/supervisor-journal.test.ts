@@ -61,7 +61,7 @@ it('reopens after acceptance and after Catalog commit without losing or duplicat
   expect([...original.accepted]).toEqual(['original-event']);
   expect(await survivor.hasPendingEvents()).toBe(false);
   expect((await readdir(folder)).filter(name => name.endsWith('.ack'))).toHaveLength(1);
-  expect((await readdir(folder)).filter(name => name.endsWith('.archived'))).toHaveLength(1);
+  expect((await readdir(folder)).filter(name => name.endsWith('.archived'))).toHaveLength(0);
   await survivor.accept('original-page', page);
   expect(await survivor.hasPendingEvents()).toBe(false);
   await expect(survivor.accept('original-page', { ...page, nextCursor: 'conflicting-cursor' })).rejects.toThrow('key conflict');
@@ -132,6 +132,22 @@ it('watches foreground inboxes and leaves unverifiable acknowledgements queued',
       events: [{ ...page.events[0]!, eventId: 'second-original-event' }] });
     await vi.waitFor(async () => expect(await journal.hasPendingEvents()).toBe(false));
     expect([...original.accepted]).toEqual(['original-event', 'second-original-event']);
+  } finally { await inbox.close(); }
+}));
+
+it('replays a pending cursor chain in one startup scan when hashed filenames are reversed', async () => inDirectory(async folder => {
+  const journal = await SupervisorJournal.open(folder, owner);
+  const original = catalog();
+  const second = { ...page, expectedCursor: page.nextCursor, nextCursor: 'second-original-cursor',
+    events: [{ ...page.events[0]!, eventId: 'second-event' }] };
+  // SHA-256("two") sorts before SHA-256("one").
+  await journal.accept('one', page);
+  await journal.accept('two', second);
+  const inbox = startSupervisorInbox(journal, original.receive, () => {});
+  try {
+    await inbox.initialReplay;
+    expect(await journal.hasPendingEvents()).toBe(false);
+    expect(original.receive.mock.calls.map(([input]) => input.nextCursor)).toEqual([page.nextCursor, second.nextCursor]);
   } finally { await inbox.close(); }
 }));
 

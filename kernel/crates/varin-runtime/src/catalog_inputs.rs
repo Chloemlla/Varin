@@ -311,6 +311,7 @@ impl Catalog {
                 accepted: false,
             });
         }
+        super::inbox::require_unexpired(&tx, &command.key, &command.thread_id, &command.branch_id)?;
         super::threads::require_available(&tx, &command.thread_id)?;
         super::threads::require_public(&tx, &command.thread_id)?;
         super::threads::initialize_title(&tx, &command.thread_id, title.as_deref())?;

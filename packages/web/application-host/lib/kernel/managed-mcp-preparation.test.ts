@@ -7,7 +7,7 @@ import type { McpBinding } from './protocol.generated.js';
 const owner = { kind: 'managed_host' as const, hostId: 'B', connectionId: 'connection', endpointIdentity: 'endpoint' };
 const input: McpPreparation = { runId: 'run', threadId: 'thread', source: { runId: 'run', resourceOwner: owner,
   workspaceId: 'workspace', executionWorkspaceId: 'workspace', mode: 'materialized', branchId: 'branch', revision: 3, tools: [] } };
-function fixture() {
+function fixture(awaitInitialInventory = false) {
   const changed: string[] = [];
   let releases = 0, calls = 0, errors = 0;
   let resolve!: (value: Awaited<ReturnType<typeof createManagedMcpLease>>) => void;
@@ -20,6 +20,7 @@ function fixture() {
   } };
   const runtime = { coordinatorHostId: 'A', withManagedSourceAuthority: async (_run: string, _source: unknown, consume: (value: typeof access) => Promise<unknown>) => consume(access) } as unknown as AgentRuntimeClient;
   const manager = createManagedMcpPreparer({ runtime: () => runtime, changed: run => changed.push(run), onError: () => { errors++; },
+    awaitInitialInventory: () => awaitInitialInventory,
     createLease: async () => { calls++; return ready; } });
   const value = { lease: { release: () => { releases++; } }, snapshot: { incarnation: 'original-b-view', revision: 0 } } as Awaited<ReturnType<typeof createManagedMcpLease>>;
   return { manager, changed, value, resolve: () => resolve(value), counts: () => ({ calls, releases, errors }) };
@@ -32,6 +33,15 @@ it('lets a fresh Run use ready global tools while B prepares, then publishes a r
   expect(await f.manager.prepare(input)).toBe(f.value.lease);
   f.manager.release('run'); expect(f.counts().releases).toBe(0);
   f.value.lease.release(); expect(f.counts().releases).toBe(1);
+});
+it('includes the selected provider workspace inventory in its first composition', async () => {
+  const f = fixture(true);
+  const first = f.manager.prepare(input);
+  f.resolve();
+  expect(await first).toBe(f.value.lease);
+  expect(f.changed).toEqual([]);
+  f.manager.close();
+  f.value.lease.release();
 });
 it('releases a late initial B view after its Run has been closed without publishing readiness', async () => {
   const f = fixture(); await f.manager.prepare(input); f.manager.release('run');

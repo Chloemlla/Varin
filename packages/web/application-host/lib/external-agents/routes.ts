@@ -129,30 +129,32 @@ export function registerExternalAgentRoutes(
             !hasHostConnectionAccess(auth, action === 'configure' ? 'configuration' : 'execution'))
           throw new ExternalAgentError('forbidden', 'External program management requires Host configuration access', 403);
         if (['read', 'connect', 'authenticate', 'continue', 'disconnect', 'send', 'stop', 'respond', 'update'].includes(action)) await authorize(string(body.id), owner, controller.signal);
+        const resourceOwner = () => body.resourceOwner === undefined
+          ? service.defaultResourceOwner(owner) : parseSourceResourceOwner(body.resourceOwner);
         let result: unknown;
         switch (action) {
           case 'settings':
             result = await service.settings(controller.signal,
-              body.resourceOwner === undefined ? undefined : parseSourceResourceOwner(body.resourceOwner), body.discover === true);
+              await resourceOwner(), body.discover === true);
             break;
           case 'configure':
             result = await service.configure(
               object(body.value) as unknown as Pick<ExternalAgentSettings, 'agents' | 'defaultAgent'>,
               number(body.expectedRevision),
               string(body.key),
-              body.resourceOwner === undefined ? undefined : parseSourceResourceOwner(body.resourceOwner),
+              await resourceOwner(),
             );
             break;
           case 'installations':
             result = await service.installations(object(body.input) as unknown as import('@varin/application-client').ExternalAgentInstallationRequest, controller.signal,
-              body.resourceOwner === undefined ? undefined : parseSourceResourceOwner(body.resourceOwner));
+              await resourceOwner());
             break;
           case 'installation-log':
             result = await service.installationLog(string(body.id), controller.signal,
-              body.resourceOwner === undefined ? undefined : parseSourceResourceOwner(body.resourceOwner));
+              await resourceOwner());
             break;
           case 'detect':
-            result = await service.detect(string(body.id), controller.signal, body.resourceOwner === undefined ? undefined : parseSourceResourceOwner(body.resourceOwner));
+            result = await service.detect(string(body.id), controller.signal, await resourceOwner());
             break;
           case 'list':
             result = (await service.list(controller.signal)).filter(conversation => (conversation.principalId ?? null) === owner);

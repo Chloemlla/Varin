@@ -613,6 +613,27 @@ impl Catalog {
         &mut self,
         prepared: PreparedEventReceive,
     ) -> Result<EventReceiveReceipt> {
+        self.admit_event_page(prepared, false)
+    }
+
+    /// A supervisor page was accepted under the source's original checkpoint.
+    /// Replaying an earlier page can consume a once-only arrangement before
+    /// the later page reaches Catalog. Archive the committed page under the
+    /// same identity without reviving the arrangement.
+    pub fn admit_durable_event_receive(
+        &mut self,
+        prepared: PreparedEventReceive,
+    ) -> Result<EventReceiveReceipt> {
+        let receipt = self.admit_event_page(prepared, true)?;
+        self.confirm_ingress_durable()?;
+        Ok(receipt)
+    }
+
+    fn admit_event_page(
+        &mut self,
+        prepared: PreparedEventReceive,
+        previously_accepted: bool,
+    ) -> Result<EventReceiveReceipt> {
         let PreparedEventReceive { capture, events } = prepared;
         let _publication = capture.publication;
         if capture.epoch != self.epoch {
@@ -660,7 +681,13 @@ impl Catalog {
                 && (d.repeat != FollowupRepeat::Once || d.wait.state == NextRunWaitState::Waiting)
                 && identity(&tx, d).ok().flatten().as_ref() == Some(&input.identity)
         });
-        if !active && !super::event_transport::has_active_consumer(&tx, &input.identity)? {
+        let previously_registered = previously_accepted
+            && optional_record::<EventSourceCheckpoint>(
+                &tx, "followup_event_sources", &source_key(&input.identity)?
+            )?.is_some();
+        if !active && !previously_registered
+            && !super::event_transport::has_active_consumer(&tx, &input.identity)?
+        {
             return Err(RuntimeError::Conflict(
                 "event source has no active arrangement".into(),
             ));
@@ -700,6 +727,20 @@ impl Catalog {
             duplicates,
             checkpoint: cp,
         })
+    }
+
+    /// The private supervisor may discard its source bytes after this ack.
+    /// Content objects have already been synced. A full WAL checkpoint also
+    /// covers a duplicate whose original commit used the normal async path.
+    pub fn confirm_ingress_durable(&self) -> Result<()> {
+        let (busy, frames, synced): (i64, i64, i64) =
+            self.db.query_row("PRAGMA wal_checkpoint(FULL)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+        if busy != 0 || frames != synced {
+            return Err(RuntimeError::Conflict("event inbox Catalog checkpoint is incomplete".into()));
+        }
+        Ok(())
     }
 }
 fn matches_filter(filter: &Value, attributes: &Value) -> bool {

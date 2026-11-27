@@ -94,6 +94,7 @@ export class ExtensionReleaseManager {
   }
 
   async #resolve(source: VarinExtensionPackageSource): Promise<ResolvedRelease> {
+    this.#packages.admission?.source(source.kind);
     if (source.kind === 'github-release') {
       const selection = parseGithubReleaseSource(source.specifier);
       const releases: GithubRelease[] = [];
@@ -166,6 +167,7 @@ export class ExtensionReleaseManager {
 
   async #preview(sourceValue: VarinExtensionPackageSource, extensionId?: string, signal?: AbortSignal, archivePath?: string): Promise<VarinExtensionReleasePreview> {
     const source = parseVarinExtensionPackageSource(sourceValue);
+    this.#packages.admission?.source(source.kind);
     signal?.throwIfAborted();
     let artifact: VarinExtensionPreparedArtifact;
     let warnings: string[] = [];
@@ -207,6 +209,7 @@ export class ExtensionReleaseManager {
       if (source.kind !== 'local' && source.kind !== 'git') throw new Error('This source is not installable through release preview');
       artifact = await this.#packages.artifacts.prepare(source, signal);
     }
+    this.#packages.admission?.artifact(artifact);
     if (extensionId && artifact.manifest.id !== extensionId) throw new Error('Package identity does not match the selected extension');
     const read = await this.#packages.catalog.store.read();
     if (!read.authoritative) throw new Error('Cannot preview installation against a stale catalog');

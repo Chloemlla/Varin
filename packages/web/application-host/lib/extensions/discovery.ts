@@ -4,6 +4,7 @@ import { createSettingsFileStore, type SettingsFileStore } from '@varin/settings
 import { extensionSourceIdentity, parseGithubReleaseSource, parseNpmReleaseSource, parseVarinExtensionDiscoveryDocument, type VarinExtensionDiscoveryDocument, type VarinExtensionPackageSource } from '@varin/extension-contract';
 import type { ApplicationExtensionCatalog, ExtensionReleaseFetch } from '@varin/extension-host';
 import type { PluginCatalogSource, PluginCatalogState, PluginDiscoveryEntry, PluginDiscoverySnapshot } from '@varin/application-client';
+import { DeploymentPolicyDeniedError } from '../deployment/policy.js';
 
 /** The repository endpoint works independently of a particular Pages domain. */
 export const OFFICIAL_PLUGIN_CATALOG = 'https://raw.githubusercontent.com/Astrmira/Varin-plugins/main/catalog/v1.json';
@@ -84,14 +85,19 @@ export class PluginDiscoveryService {
   readonly #fetch: ExtensionReleaseFetch;
   readonly #now: () => Date;
   readonly #catalog: ApplicationExtensionCatalog | undefined;
+  readonly #deploymentSnapshot: DiscoveryDocument | undefined;
   readonly #refreshes = new Map<string, Promise<void>>();
 
-  constructor(options: { dataDir: string; hostId: string; hostLabel?: string; catalog?: ApplicationExtensionCatalog; fetch?: ExtensionReleaseFetch; store?: SettingsFileStore; now?: () => Date }) {
+  constructor(options: { dataDir: string; hostId: string; hostLabel?: string; catalog?: ApplicationExtensionCatalog; fetch?: ExtensionReleaseFetch; store?: SettingsFileStore; now?: () => Date; deploymentSnapshot?: unknown }) {
     this.#hostId = options.hostId;
     this.#hostLabel = options.hostLabel;
     this.#fetch = options.fetch ?? fetch;
     this.#now = options.now ?? (() => new Date());
     this.#catalog = options.catalog;
+    if (options.deploymentSnapshot !== undefined) {
+      try { this.#deploymentSnapshot = parseDocument(options.deploymentSnapshot); }
+      catch (error) { throw new Error('Invalid background.pluginCatalogSnapshot', { cause: error }); }
+    }
     this.#store = options.store ?? createSettingsFileStore({
       filePath: join(options.dataDir, 'extensions', 'discovery.json'),
       defaultValue: {
@@ -103,7 +109,7 @@ export class PluginDiscoveryService {
   }
 
   async snapshot(): Promise<PluginDiscoverySnapshot> {
-    const document = parseDocument(await this.#store.read());
+    const document = this.#deploymentSnapshot ?? parseDocument(await this.#store.read());
     const installed = this.#catalog ? (await this.#catalog.store.read()).document.extensions : {};
     const sources: PluginCatalogState[] = [];
     const listings = new Map<string, PluginDiscoveryEntry>();
@@ -144,6 +150,7 @@ export class PluginDiscoveryService {
   }
 
   async setSources(value: unknown): Promise<PluginDiscoverySnapshot> {
+    if (this.#deploymentSnapshot) throw new DeploymentPolicyDeniedError('background', 'The plugin catalog is supplied by the deployment');
     const sources = parsePluginCatalogSources(value);
     await this.#store.update(raw => {
       const current = parseDocument(raw);
@@ -157,6 +164,7 @@ export class PluginDiscoveryService {
   }
 
   async refresh(): Promise<PluginDiscoverySnapshot> {
+    if (this.#deploymentSnapshot) return this.snapshot();
     const document = parseDocument(await this.#store.read());
     await Promise.all(document.sources.filter(source => source.enabled).map(source => this.#refresh(source.url)));
     return this.snapshot();

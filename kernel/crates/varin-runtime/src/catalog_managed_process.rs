@@ -89,7 +89,7 @@ impl Catalog {
     ) -> Result<Operation> {
         self.bind_managed_process_source(context, kind, None)
     }
-    /// Record the exact selected local view of one deferred builtin script
+    /// Record the exact selected view of one deferred builtin script
     /// environment before the Host dispatches its process. The Run stays dormant.
     pub fn bind_deferred_script_environment(
         &mut self,
@@ -105,6 +105,7 @@ impl Catalog {
         kind: ManagedProcessKind,
         prepared: Option<launches::SourceSelection>,
     ) -> Result<Operation> {
+        let from_model = prepared.is_some() && self.model_tool_origin(&context.run_id, &context.origin)?;
         let tx = self.db.transaction()?;
         let mut op: Operation = record(&tx, "operations", &context.operation_id)?;
         let run: Run = record(&tx, "runs", &op.run_id)?;
@@ -128,13 +129,13 @@ impl Catalog {
             let delegated: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM child_tasks WHERE child_thread_id=?1)",
                 [&run.thread_id], |row| row.get(0))?;
             if !matches!(kind, ManagedProcessKind::ScriptEnvironment { .. })
-                || !matches!(context.origin, crate::execution::ToolOrigin::ModelStep { .. })
+                || !from_model
                 || context.origin.operation_id(&intent.call().call_id) != op.id
                 || op.executor.as_deref() != Some("script_open") || intent.call().name != "script_open"
                 || !matches!(op.execution_owner, Some(ExecutorOwner::External { .. }))
                 || op.epoch != run.epoch || op.epoch != self.epoch || op.call_completion.is_some()
                 || !principals::thread_has_host_authority(&tx, &run.thread_id)? || delegated
-                || launch.selection.source.is_some() || !default.resource_owner.is_local()
+                || launch.selection.source.is_some()
                 || source.resource_owner != default.resource_owner || source.mode != SourceMode::LiveRoot
                 || source.live_root.as_ref().is_none_or(|root| root.canonical_root != default.path)
                 || source.execution_workspace_id != source.workspace_id

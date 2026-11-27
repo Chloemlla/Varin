@@ -320,6 +320,23 @@ it('normal source retirement uses the original grants while failed preparation s
   expect(revokeGrant).toHaveBeenCalledWith('unaccepted-grant');
 });
 
+it('retires a completed Run’s managed scope when the kernel releases its tools', async () => {
+  let notify!: (runId: string, terminal: boolean) => void;
+  const inspectRun = vi.fn(async () => ({ id: 'managed-run', thread_id: 'thread', state: 'completed' }));
+  const kernel = { subscribeExit() {}, onToolReleased(listener: typeof notify) { notify = listener; },
+    handshake: { hostId: 'coordinator' }, agentRuntimeRequest: inspectRun } as unknown as KernelClient;
+  const releaseScope = vi.fn(async () => ({ released: [], pendingAuthorities: [] }));
+  const runtime = new AgentRuntimeClient(kernel);
+  runtime.retainManagedSourceBinding('managed-run', {} as never, { releaseScope } as never);
+  notify('managed-run', false);
+  expect(inspectRun).not.toHaveBeenCalled();
+  expect(releaseScope).not.toHaveBeenCalled();
+  notify('managed-run', true);
+  await vi.waitFor(() => expect(releaseScope).toHaveBeenCalledExactlyOnceWith({
+    coordinatorHostId: 'coordinator', threadId: 'thread', runId: 'managed-run', mode: 'retire',
+  }));
+});
+
 
 it('User file follow-ups admit only original-source exact reads and retire fresh caller grants even after a lost reply', async () => {
   const f = fixture(); f.facts.source.state = 'completed';

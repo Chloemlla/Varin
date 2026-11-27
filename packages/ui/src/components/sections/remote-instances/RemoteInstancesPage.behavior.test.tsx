@@ -5,7 +5,7 @@ import { beforeEach, afterEach, expect, it, vi } from 'vitest';
 import type { DesktopHostsConfig } from '@varin/application-client';
 
 const fixture = vi.hoisted(() => ({
-  get: vi.fn(), set: vi.fn(), navigate: vi.fn(), t: (key: string) => key,
+  policy: vi.fn(() => null), get: vi.fn(), set: vi.fn(), navigate: vi.fn(), t: (key: string) => key,
   runtimeAPIs: vi.fn(), copy: vi.fn(),
 }));
 vi.mock('qrcode', () => ({ default: { toDataURL: async () => 'data:image/png;base64,qr' } }));
@@ -28,6 +28,7 @@ vi.mock('@/lib/desktopSsh', () => {
   };
 });
 vi.mock('@/lib/varinEvents', () => ({ subscribeVarinEvents: () => () => {} }));
+vi.mock('@/hooks/useDeploymentPolicy', () => ({ useDeploymentPolicy: fixture.policy }));
 vi.mock('@/hooks/useRuntimeAPIs', () => ({ useRuntimeAPIs: fixture.runtimeAPIs }));
 vi.mock('@/stores/useUIStore', () => ({ useUIStore: (selector: (state: object) => unknown) => selector({ timeFormatPreference: '24h', settingsRemoteInstancesSelectedId: null, setSettingsRemoteInstancesSelectedId: () => {} }) }));
 vi.mock('@/lib/i18n', () => ({ useI18n: () => ({ t: fixture.t }) }));

@@ -54,6 +54,126 @@ Verify readiness (checks `status: "ok"`, expected `varinVersion` / `releaseId`, 
 curl --fail http://127.0.0.1:3000/health
 ```
 
+### Operator policy and gateway credentials
+
+Set `VARIN_DEPLOYMENT_POLICY` to an absolute path on an operator-owned mount outside
+`VARIN_DATA_DIR`. The Host reads the policy at startup. Unknown policy fields prevent startup.
+Without a policy, the Host uses its personal-installation defaults.
+
+```json
+{
+  "version": 1,
+  "ingress": { "mode": "gateway" },
+  "modelCredentials": { "sources": ["api-key", "oauth"], "oauthIssuers": ["openai-codex"] },
+  "egress": { "userDestinations": "public" },
+  "connections": { "staticHosts": false, "ssh": false },
+  "mcp": { "transports": ["http", "stdio"], "stdioPlacement": "managed" },
+  "background": { "updateChecks": false }
+}
+```
+
+Issue a credential with the Application Host stopped. Use the same data root as the Host
+and a private output directory. The output file holds the client ID and token.
+
+```bash
+varin clients issue --profile full-control --output /private/gateway.json
+varin clients revoke CLIENT_ID
+```
+
+In the application image, use `node packages/web/bin/cli.js clients`. For offline
+provisioning, mount the state volume and private output directory and use the Node
+entrypoint directly. The policy file may be mounted separately when serving the Host.
+
+```sh
+docker run --rm --user 1000:1000 --entrypoint node \
+  -v "$PWD/data/varin:/home/varin/.config/varin" \
+  -v "$PWD/private:/private" \
+  ghcr.io/astrmira/varin:YOUR_VERSION \
+  packages/web/bin/cli.js clients issue --profile full-control --output /private/gateway.json
+```
+
+Connect the gateway on the private service network. It supplies the issued bearer for HTTP,
+SSE and WebSocket upgrades and forwards the public origin using the reverse proxy headers
+described in [Reverse Proxy](REVERSE_PROXY.md). Gateway mode disables password, passkey,
+pairing, tunnel and relay entry points. `/live` and `/health` remain available for service probes.
+Authenticated clients can read `/api/system/deployment-policy` for the active settings without
+the operator addresses or file paths.
+
+- `modelCredentials.sources` admits stored API keys (`api-key`), declared `oauth` issuers,
+  `environment`, `google-adc`, `aws-chain`, `anthropic-federation`, and anonymous credentials (`none`)
+  individually. The Host keeps existing channel settings and marks excluded credentials unavailable.
+- `egress.userDestinations` can be `all` or `public`. With `public`, the Host HTTP egress owner,
+  kernel model transport, Host health probes for remote connections and Host-configured CDP
+  connections check the addresses they connect to. A user-supplied URL stays subject to that
+  policy even when it uses an operator service's hostname. Provider-managed Nodes use the
+  endpoints and credentials issued by the trusted resource provider. Set `requiredProxy` to
+  delegate destination enforcement to an operator HTTP(S) proxy. Deployments can route model
+  gateway traffic through that proxy under its own policy. Commands, external programs and
+  browser networking need their execution environment's network policy.
+- `connections.staticHosts` and `connections.ssh` control saved direct Hosts and SSH connections.
+  Both default to disabled with restricted egress, gateway ingress, or managed-only execution.
+  Restricted egress uses provider-managed Nodes because saved-Host and SSH tunnels carry
+  arbitrary protocols. Saved connections remain on disk.
+- `mcp.transports` controls MCP HTTP and stdio. `stdioPlacement: "managed"` requires a managed
+  resource for stdio. `stdioPlacement: "any"` also allows local execution.
+- `extensions.sources` restricts third-party package sources, `realms` controls
+  `native`, `brokered`, and `surface` entrypoints, and `artifactIntegrities` admits
+  specific Varin artifacts. Set any list to `[]` to disallow all entries it controls.
+  The distribution's built-in packages stay available. `agentStaging: false` disables
+  Agent staging before workspace capture. `brokeredTransport: "sandbox"` runs
+  third-party Host extensions through the resource provider and admits only the
+  brokered Host realm for those extensions. For a first-party-only Host, set `sources: []`.
+- `externalAgents.profiles` admits external harness profile IDs. Existing settings and
+  conversations stay in the catalog. `managedInstalls: false` disables new managed
+  installations and update checks. `placement: "managed"` requires a managed resource
+  with a selected work location, including for preparation and reconnection. Apply profile
+  controls on the execution Host as well if that Host is reachable by other coordinators.
+- For a coordinator with a resource provider, set `execution.mode` to `none` and set
+  `execution.defaultWorkspace` to the node's `resourceId`, `hostId` and absolute `path`.
+  New threads use that workspace when they start a tool that needs it. Local workspace
+  execution, local process spawning and local MCP stdio are refused by the coordinator.
+  Source-backed language queries run on the selected Resource Node. Bot homes and
+  attachments still use the Host's own data storage.
+- Set the individual `localInference` switches to `false` to disable local embeddings
+  (`embedding`), local dictation and TTS (`speech`), inference model downloads
+  (`componentDownloads`), Host tokenizer paths (`tokenizerFiles`), or llama.cpp decision
+  requests (`llamaCpp`).
+- `background.modelDirectorySnapshot` and `background.pluginCatalogSnapshot` optionally point to
+  read-only JSON files outside `VARIN_DATA_DIR`. They use the existing model directory and plugin
+  discovery cache formats. The Host uses the supplied snapshots for catalog reads and leaves
+  the user's own caches available for personal mode.
+
+### Application Host parking (POSIX)
+
+Run the supervisor on the same machine and under the same OS account as the Application
+Host. Give it the policy above with gateway ingress. Use the `hostId` from the existing
+data directory's `extensions/identity.json`. The external gateway connects to the
+stable loopback port rather than to the Host's temporary port.
+
+```sh
+varin supervisor /absolute/varin-data/supervisor-wake HOST_ID run \
+  --park-after-ms 300000 --listen-port 3000
+```
+
+The idle period is operator-selected. The Host waits for active owners, publishes the earliest
+scheduled wake and closes its stores before the supervisor treats it as parked. Foreground
+traffic waits for the Host and is forwarded once readiness returns. `/live` probes the
+supervisor and `/health` reports the Host's readiness. Pending event pages submitted to
+the local supervisor journal also wake the Host. After Catalog confirms durable receipt,
+the journal discards new event bodies and keeps their retry identities. Sandboxed event
+receivers retain their original authenticated stream through parking. The supervisor
+commits pages before returning the cursor and requests a wake for new pages or a stopped
+receiver. A connection-specific credential lease is held in memory for up to 30 minutes
+or until the access token expires, whichever comes first. The Host resumes receivers using
+the reconciled Catalog cursor. Local receivers and active file watches retain the Host.
+
+The offline gateway credential can submit and enqueue new conversation inputs and stage
+uploads while the Host is parked. The supervisor returns an inbox receipt and replays
+the inputs in order before opening foreground traffic. The client follows the receipt
+to final admission, and rejected inputs can be reopened from the conversation. Upload
+bytes are staged by content hash in the private supervisor directory and removed after
+acknowledgement.
+
 ### Resource Node (`docker-compose.resource-node.yml`)
 
 Expose a dev/test machine's files and commands to an existing Agent Host without running a full app:
@@ -66,8 +186,138 @@ Expose a dev/test machine's files and commands to an existing Agent Host without
    ```
 3. Start the node (`docker compose -f docker-compose.resource-node.yml up -d`, bound to `127.0.0.1:3001` by default; reach cross-machine via SSH forward or controlled HTTPS) and register its address + token in your Agent Host's Connections settings. Revoke with `revoke <clientId>` while stopped.
 
+Command-enabled credentials also support JavaScript script sessions and project MCP over stdio. Both execute on the node under the selected live workspace. The node reads project instructions from that workspace. To enable its `.mcp.json`, record the node's canonical workspace path in `project-trust.json` in the node state directory, for example `{"/home/varin/workspaces": true}`.
+
+Project Git commands also run on the node when the project uses its live workspace. They use Git, configuration and credentials on that machine. Git writes require write-enabled pairing.
+
+Agent language queries use the node's bundled language servers or its local Go, Rust
+and C/C++ toolchains. They need command-enabled pairing and access to the whole project.
+
+External Agent conversations can use a Resource Node's live workspace. Install and authenticate the CLI on the node. Its built-in profiles are discovered from the node's environment. For a custom executable or arguments, edit `external-agents.json` in the node's state directory while the node is stopped. It contains `agents` (the existing external Agent configurations) and `defaultAgent` (a configured ID or `null`). For example, `{"agents":[{"id":"codex","name":"Codex","harness":"codex","command":"codex","args":[],"enabled":true}],"defaultAgent":null}`.
+
+With `execution.defaultWorkspace`, the Host owner can start an external conversation without a project. The node creates its private directory under `external-workspaces` in the configured workspace and keeps it for resume until the conversation is deleted. Use command- and write-enabled pairing for this flow. Each conversation's selected execution owner is saved in the coordinating Host.
+
+When a Host has an `execution.defaultWorkspace`, it sends Office rendering and spreadsheet recalculation to that workspace's Resource Node using its command-enabled pairing. Install LibreOffice in the node image or on the node machine. The renderer looks for `soffice` or uses the node's `VARIN_LIBREOFFICE_COMMAND` if set. Regular Office structure reads, attachments and exported files still use their existing storage owners.
+
 The node image stages only the JavaScript and assets reachable by its compiled Resource Node entrypoint, a role-specific frozen Bun lock, and the workspace packages reachable by that role. Its build follows the frozen installed dependency graph and rejects unrelated installed packages. Use `bun run update:resource-node-lock` for dependency/version metadata changes; for a changed import graph, build the Cloud Runtime first, then run `node scripts/build-resource-node.mjs artifacts/cloud-runtime artifacts/resource-node --update-lock` before rebuilding the image. The node health check probes its live resource kernel control channel without starting a kernel or acquiring a workspace.
 
+### On-demand Resource Node provider
+
+Run `varin resource-provider --config /private/provider.json` as a separate process on the
+engine machine. The provider owns Docker or Podman access. The Application Host uses
+only the authenticated control socket and leased HTTP endpoint. With the local provider,
+run the Host in the same network namespace as its loopback data listener.
+
+Prepare separate directories for the workspace and the Resource Node state. Use the
+matching Resource Node image to pair offline once with both directories mounted at
+`/home/varin/workspaces` and `/home/varin/.config/varin`. Keep the pairing output
+outside both trees. The state directory's `extensions/identity.json` records the
+durable `hostId`. The provider control credential is a separate private JSON file
+containing a randomly generated `token`.
+
+```json
+{
+  "version": 1,
+  "id": "local-engine",
+  "socketPath": "/private/provider.sock",
+  "credentialFile": "/private/provider-token.json",
+  "engine": "docker",
+  "leaseDurationMs": 120000,
+  "startupTimeoutMs": 60000,
+  "idleRetentionMs": 300000,
+  "resources": [
+    {
+      "id": "workspace",
+      "hostId": "RESOURCE_NODE_HOST_ID",
+      "label": "Managed workspace",
+      "image": "ghcr.io/astrmira/varin-node:YOUR_VERSION",
+      "workspace": "/srv/varin/workspaces/user-a",
+      "state": "/srv/varin/node-state/user-a",
+      "credentialFile": "/private/user-a-node-pair.json"
+    }
+  ]
+}
+```
+
+This policy fragment registers that provider and makes its workspace the fallback
+for new chats and Bots. The path is interpreted on the Resource Node.
+
+```json
+{
+  "resourceProvider": {
+    "id": "local-engine",
+    "socketPath": "/private/provider.sock",
+    "credentialFile": "/private/provider-token.json"
+  },
+  "execution": {
+    "defaultWorkspace": {
+      "resourceId": "workspace",
+      "hostId": "RESOURCE_NODE_HOST_ID",
+      "path": "/home/varin/workspaces"
+    }
+  }
+}
+```
+
+Listing locations reads the control socket without starting a container. A file or
+command request acquires the node. Bound Sources and response streams retain their
+leases. Idle retirement requires the native node to report that its authorities,
+writers and compute have drained. The engine stops the original container and
+confirms its removal before the provider reports volume detach. The next generation
+uses the same state and workspace, and the saved location keeps its identity.
+Leave `idleRetentionMs` absent to keep the node running after use. On Windows,
+use a private named pipe such as `\\\\.\\pipe\\varin-provider` for `socketPath`.
+
+The local provider serves the Resource Node's live file, terminal and process
+operations. The default workspace setting selects a location for new work.
+Explicitly selected locations still use their configured owner. The provider drops Linux
+capabilities and sets no-new-privileges on execution containers. Set their `network` to an
+engine network with the outbound rules appropriate for the workspace.
+
+For a Browser Node, set `role` to `browser`, use the Browser Node image and set
+`browserId` to its provisioned connection ID. The entry takes a persistent
+`state` directory and the credential issued by the Browser Node's offline
+`pair` command. The node's CDP connection is provisioned in that state directory
+before first use. Listing browsers reads provider inventory. Opening one starts
+the Browser Node and connects to its CDP endpoint. Page holds keep the node alive,
+and an old page binding stays tied to its original node generation. The CDP
+browser process follows its own deployment lifecycle. Computer Node connections
+use their existing device settings.
+
+### Extension sandboxes
+
+Build the `extension-node` Dockerfile target from the same revision as the Application Host.
+Set `extensions.brokeredTransport` to `sandbox` in the Host policy. The default
+`extensions.sandboxScope: "user"` shares one resource across the owner's third-party
+extensions. For each user's provider, define one `extensions` resource without an `extensionId`.
+
+```json
+{
+  "id": "extension-sandbox",
+  "hostId": "extension-sandbox-host",
+  "label": "Extension sandbox",
+  "role": "extensions",
+  "image": "varin-extension-node:local",
+  "credentialFile": "/private/extension-sandbox.json"
+}
+```
+
+Set `extensions.sandboxScope: "extension"` to use a dedicated container for each extension.
+In that mode give each provider resource a distinct ID, Host ID, credential file, and
+`extensionId`. The same options apply to self-hosted personal installations. Personal
+installations with no sandbox policy keep their local brokered processes. Bundled
+first-party extensions keep their usual transport in both modes.
+
+Give each sandbox credential JSON a random `token`. The provider mounts it beneath a
+root-only directory. Each extension has a separate unprivileged UID and group, private
+scratch and verified artifact directory, and its own scoped broker credential.
+The Node relay and provider hold the credentials. Workers have a private IPC channel.
+Workers create files with owner-only permissions by default. Extensions in one shared
+container use the same network namespace, including loopback and abstract sockets.
+Use dedicated containers when extensions need separate network namespaces.
+Set `network` to an engine network with the outbound rules the extensions need.
+Extension storage and capability decisions stay on the Application Host. Package paths
+point to the sandbox copy. Use Host capabilities for resources outside the sandbox.
 
 ### Runtime Environment
 
@@ -76,6 +326,7 @@ The node image stages only the JavaScript and assets reachable by its compiled R
 | `VARIN_UI_PASSWORD` | Required when reachable beyond loopback |
 | `VARIN_HOST` | Bind address (Compose default: `0.0.0.0`) |
 | `VARIN_DATA_DIR` | Persistent Varin data root |
+| `VARIN_CACHE_DIR` | Optional absolute root for rebuildable model and MCP metadata and tokenizer files. Each Host uses its own subdirectory. |
 | `VARIN_WORKSPACE_ROOT` | Default directory for mounted projects |
 | `VARIN_WORKSPACE_LOCKDOWN` | Defaults to `false` in application images. Live file tools follow the container user's filesystem permissions. Set `true` in the service environment to limit access to `VARIN_WORKSPACE_ROOT`. |
 | `VARIN_SHUTDOWN_TIMEOUT_MS` | Host shutdown budget in ms (default `10000`) |
@@ -170,6 +421,34 @@ focused run. Ordinary CI checks the shipped Linux Computer driver's PyGObject,
 AT-SPI and GDK imports inside its exact image. It does not provision a desktop, and
 the opt-in check exercises capture against the isolated runner display instead.
 
+### Upgrade preflight
+
+Stop the Host and disable automatic restart while inspecting its data volume.
+Run `varin preflight --writers-stopped` from the **new** build with the existing
+`VARIN_DATA_DIR`. The JSON report gives the Catalog and Storage format and any
+knowledge database that needs conversion, including active semantic stores.
+`upgrade` means the named format will be converted on start or first writable
+use. Snapshot the stopped data volume before allowing that build to start.
+`blocked` returns a nonzero exit status and gives the affected format or reason.
+The command never opens a writer. A SQLite journal that still needs recovery
+must be checkpointed by the current build or examined on a recovered copy.
+
+Mount `VARIN_CACHE_DIR` separately when the deployment snapshots only durable
+data. On first start, Varin moves existing model metadata and tokenizers into
+the configured root. Existing MCP discovery data follows on first use of its
+scope. Historical tokenizer references can still resolve by content digest.
+Keep the cache mount when rolling between hosts if offline tokenizer availability
+matters. An operator-supplied model-directory snapshot can be mounted read-only.
+
+### Host lifecycle diagnostics
+
+The owner-authenticated `GET /api/system/lifecycle` reports the next Catalog
+wake as `catalog.nextWakeAtMs`, a UTC timestamp in milliseconds or `null` when
+there is no scheduled wake. It comes from the same Catalog deadlines as the
+native continuation worker, including timed waits, follow-ups, Bot inactivity
+and Calendar. The `owners.provider` field counts allocations being prepared,
+used or released. The endpoint is a read-only activity report.
+
 ### Dedicated Computer control plane
 
 The Linux `computer-node` build target packages the existing platform driver alongside
@@ -188,6 +467,16 @@ system-level Computer operations. Keep generated credentials on a private mount
 separate from the durable role data. Use offline `revoke CLIENT_ID` to retire a grant.
 Computer assignment credentials are additionally tied to their paired client and
 to the serving process; reassume the actual desktop assignment after a restart.
+
+To allocate that role on first use through the local container provider, register a
+resource with `role: "computer"`, its node `hostId`, and the node's actual `desktopId`
+in addition to the `id`, `label`, `image`, `state` and `credentialFile` fields above.
+Use an operator-prepared image that starts the corresponding desktop session and
+the Computer Node. The stock control-plane image leaves desktop provisioning to
+the deployment. A provider-backed desktop is listed while its node is stopped.
+An assignment, frame stream or VNC connection keeps the exact instance leased
+until it closes. Retirement also checks the node for unresolved input authority
+before stopping and detaching its state mount.
 
 These two new image targets are built and qualified in the disposable container
 validation graph. This does not publish new tags or change ordinary release image

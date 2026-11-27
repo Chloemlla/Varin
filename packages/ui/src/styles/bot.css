@@ -331,6 +331,34 @@ button.bot-event-input:hover { background: var(--interactive-hover); color: var(
 .bot-schedule-detail { display: grid; grid-template-columns: 70px 1fr; gap: 6px 10px; padding: 0 12px 12px 80px; font-size: 12.5px; color: var(--muted-foreground); }
 .bot-schedule-detail dt { opacity: .8; }
 .bot-schedule-detail dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.bot-schedule-trigger { display: flex; width: 100%; align-items: center; gap: 10px; padding: 10px 12px; border-radius: inherit; text-align: start; }
+.bot-schedule-trigger small { color: var(--muted-foreground); font-size: 11.5px; line-height: 1.5; }
+.bot-schedule-chevron { color: var(--muted-foreground); transition: rotate var(--motion-dur-glide) var(--motion-ease-glide); }
+.bot-schedule-trigger[aria-expanded="true"] .bot-schedule-chevron { rotate: 90deg; }
+.bot-schedule-records { margin: 0 10px 9px; padding-top: 2px; border-top: 1px solid var(--border); }
+.bot-schedule-records header { display: flex; align-items: center; justify-content: space-between; padding-inline: 4px; color: var(--muted-foreground); font-size: 11.5px; }
+.bot-schedule-records header button { height: 26px; padding-inline: 6px; font-size: inherit; color: inherit; }
+.bot-schedule-record { display: grid; width: 100%; grid-template-columns: minmax(0, 1fr) auto 16px; align-items: center; gap: 8px; min-height: 33px; padding-inline: 5px; border-radius: 6px; text-align: start; font-size: 12px; }
+.bot-schedule-record:hover { background: var(--interactive-hover); }
+.bot-schedule-record:focus-visible, .bot-schedule-trigger:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
+.bot-schedule-record time { font-variant-numeric: tabular-nums; }
+.bot-schedule-record time span, .bot-schedule-record-state { color: var(--muted-foreground); }
+.bot-schedule-record-state { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; }
+.bot-schedule-record-state i { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+.bot-schedule-record-state[data-state="completed"] i { background: var(--status-success); }
+.bot-schedule-record-state[data-state="failed"] { color: var(--status-error); }
+.bot-schedule-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px; margin: 14px 3px 0; padding-top: 10px; border-top: 1px solid var(--border); }
+.bot-schedule-actions button { height: 30px; font-size: 12px; font-weight: 400; }
+.bot-schedule-return { display: flex; align-items: center; padding: 5px 12px; border-bottom: 1px solid var(--border); }
+.bot-schedule-return:empty { display: none; }
+.mobile-workspace-content > .bot-schedule-page { inset-block-start: var(--varin-safe-area-top, env(safe-area-inset-top, 0px)); }
+.bot-schedule-editor select { max-width: 100%; min-height: 30px; margin-inline-start: 4px; padding: 3px 6px; border: 1px solid var(--border); border-radius: 6px; background: var(--background); }
+.bot-schedule-editor .grid select { margin-inline-start: 0; }
+:root:is([data-motion="off"], [data-motion="reduced"]) .bot-schedule-chevron { transition: none; }
+@media (pointer: coarse) {
+  .bot-schedule-record { min-height: 42px; }
+  .bot-schedule-actions button { min-height: 36px; }
+}
 
 /* Narrow windows: the panel floats over the conversation as a card instead of pushing it (§8). */
 @media (min-width: 760px) and (max-width: 1023px) {

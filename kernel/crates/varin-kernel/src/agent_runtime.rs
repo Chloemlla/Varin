@@ -694,6 +694,46 @@ pub(crate) fn spawn(
                             KernelError::Storage("runtime initialization has not completed".into())
                         })?;
 
+                        if matches!(method, "runtime.inbox.reconcile" | "runtime.inbox.rejections" | "runtime.inbox.dismiss") {
+                            let catalog = runtime.catalog();
+                            let mut catalog = catalog.lock().map_err(|_| KernelError::Storage("Catalog unavailable".into()))?;
+                            return match method {
+                                "runtime.inbox.reconcile" => catalog.reconcile_inbox_input(serde_json::from_value(params)?),
+                                "runtime.inbox.dismiss" => catalog.dismiss_inbox_input(serde_json::from_value(params)?),
+                                _ => catalog.rejected_inbox_inputs(serde_json::from_value(params)?),
+                            }.map_err(domain);
+                        }
+                        if method == "runtime.park.release" {
+                            let _: KernelEmptyParams = serde_json::from_value(params)?;
+                            runtime.release_park();
+                            if let Some(wake) = continuation_stop.as_ref() { wake.0.notify(); }
+                            return Ok(json!({}));
+                        }
+                        if method == "runtime.park.reserve" {
+                            let _: KernelEmptyParams = serde_json::from_value(params)?;
+                            let busy = || json!({"reserved":false,"nextWakeAtMs":null,"eventCursor":null});
+                            if !runtime.reserve_park().map_err(|error| KernelError::Operation(error.to_string()))? { return Ok(busy()); }
+                            let result = (|| {
+                                let catalog = runtime.catalog();
+                                let catalog = catalog.lock().map_err(|_| KernelError::Storage("Catalog unavailable".into()))?;
+                                let admission = catalog.resource_admission().summary();
+                                if admission.local_compute_active != 0 || admission.queued != 0 || catalog.has_runnable_work_for_parking().map_err(domain)? {
+                                    return Ok(None);
+                                }
+                                let wake = next_wake(&catalog)?;
+                                let now = varin_runtime::catalog::observations::wall_time_ms().map_err(domain)?;
+                                Ok(wake.is_none_or(|at| at > now).then_some((wake, catalog.event_cursor().map_err(domain)?)))
+                            })();
+                            return match result {
+                                Ok(Some((wake, cursor))) => Ok(json!({"reserved":true,"nextWakeAtMs":wake,"eventCursor":cursor})),
+                                other => {
+                                    runtime.release_park();
+                                    if let Some(wake) = continuation_stop.as_ref() { wake.0.notify(); }
+                                    other.map(|_| busy())
+                                }
+                            };
+                        }
+
                         if method == "runtime.bot.scope.remove" {
                             let catalog = runtime.catalog();
                             let resources = resources.clone();
@@ -2468,6 +2508,16 @@ pub(crate) fn live_mcp_binding(
         binding: mcp_binding(live.binding)?,
     })
 }
+fn next_wake(catalog: &Catalog) -> Result<Option<u64>, KernelError> {
+    let mut earliest = None;
+    for (_, deadline) in catalog.continuation_deadlines() {
+        if let Some(deadline) = deadline.map_err(domain)? {
+            earliest = Some(earliest.map_or(deadline, |at: u64| at.min(deadline)));
+        }
+    }
+    Ok(earliest)
+}
+
 fn dispatch(catalog: &mut Catalog, method: &str, params: Value) -> Result<Value, KernelError> {
     if method == "runtime.bot.matters.list" {
         let p: BotScopeParams = serde_json::from_value(params)?;
@@ -2625,9 +2675,14 @@ fn dispatch(catalog: &mut Catalog, method: &str, params: Value) -> Result<Value,
                 .map_err(domain)?;
             Ok(json!({}))
         }
-        "runtime.status" => { let _: KernelEmptyParams = serde_json::from_value(params)?; Ok(
-            json!({"epoch":catalog.epoch(),"eventCursor":catalog.event_cursor().map_err(domain)?,"admission":catalog.resource_admission().summary()}),
-        ) },
+        "runtime.status" => {
+            let input: RuntimeStatusParams = serde_json::from_value(params)?;
+            let mut status = json!({"epoch":catalog.epoch(),"eventCursor":catalog.event_cursor().map_err(domain)?,"admission":catalog.resource_admission().summary()});
+            if input.include_wake_deadline.unwrap_or(false) {
+                status["nextWakeAtMs"] = json!(next_wake(catalog)?);
+            }
+            Ok(status)
+        },
         "runtime.admission.inspect" => {
             let p: AdmissionInspectParams = serde_json::from_value(params)?;
             let epoch = u64::try_from(p.owner_generation)

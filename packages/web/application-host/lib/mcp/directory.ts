@@ -2,6 +2,7 @@
 import { createSettingsFileStore } from '@varin/settings-store';
 import type { Tool, Resource, ResourceTemplate } from './client.js';
 import { object } from '../models/configuration.js';
+import { relocateCacheDocument } from '../deployment/derived-cache.js';
 
 export interface McpDirectorySnapshot {
   tools: Tool[];
@@ -11,13 +12,21 @@ export interface McpDirectorySnapshot {
   updatedAt: string;
 }
 export class McpDirectory {
-  readonly #store;
+  #store;
   readonly #entries = new Map<string, McpDirectorySnapshot>();
   readonly #pending = new Map<string, McpDirectorySnapshot>();
   #loading: Promise<void> | undefined;
   #writing: Promise<void> | undefined;
-  constructor(path: string, readonly report: (error: unknown) => void) { this.#store = createSettingsFileStore({ filePath: path }); }
+  readonly #migration: Promise<void> | undefined;
+  constructor(path: string, readonly report: (error: unknown) => void, legacy?: string) {
+    this.#store = createSettingsFileStore({ filePath: path });
+    this.#migration = legacy && legacy !== path ? relocateCacheDocument(legacy, path).catch(error => {
+      this.report(error);
+      this.#store = createSettingsFileStore({ filePath: legacy });
+    }) : undefined;
+  }
   async get(key: string) {
+    if (this.#migration) await this.#migration;
     this.#loading ??= this.#store.read().then(document => {
       if (!object(document.entries)) return;
       for (const [key, value] of Object.entries(document.entries)) {
@@ -38,6 +47,7 @@ export class McpDirectory {
   put(key: string, value: McpDirectorySnapshot) {
     const snapshot = structuredClone(value); this.#entries.set(key, snapshot); this.#pending.set(key, snapshot);
     this.#writing ??= Promise.resolve().then(async () => {
+      if (this.#migration) await this.#migration;
       await this.#loading;
       while (this.#pending.size) {
         const batch = [...this.#pending]; this.#pending.clear();
@@ -49,5 +59,8 @@ export class McpDirectory {
       }
     }).catch(this.report).finally(() => { this.#writing = undefined; if (this.#pending.size) { const entry = this.#pending.entries().next().value!; this.put(...entry); } });
   }
-  async close() { while (this.#writing) await this.#writing; }
+  async close() {
+    if (this.#migration) await this.#migration;
+    while (this.#writing) await this.#writing;
+  }
 }

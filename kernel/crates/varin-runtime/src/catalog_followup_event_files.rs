@@ -334,6 +334,12 @@ mod tests {
             .load()
             .unwrap();
         catalog.admit_event_receive(prepared).unwrap();
+        // An earlier normal commit can be recovered without duplicating the
+        // event, then confirmed before the supervisor deletes its payload.
+        let retry = catalog.prepare_event_receive(input.clone()).unwrap().load().unwrap();
+        let receipt = catalog.admit_event_receive(retry).unwrap();
+        assert_eq!((receipt.accepted, receipt.duplicates), (0, 1));
+        catalog.confirm_ingress_durable().unwrap();
         let raw: String = catalog
             .db
             .query_row("SELECT body FROM followup_events", [], |r| r.get(0))

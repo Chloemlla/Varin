@@ -45,12 +45,21 @@ export interface ExtensionPackageManagerOptions {
   catalog: ApplicationExtensionCatalog;
   dataDir: string;
   varinVersion: string;
+  admission?: ExtensionArtifactAdmission;
+}
+
+export interface ExtensionArtifactAdmission {
+  source(kind: VarinExtensionPackageSource['kind']): void;
+  artifact(input: Pick<VarinExtensionPreparedArtifact, 'manifest' | 'integrity'> & {
+    source: Pick<VarinExtensionPackageSource, 'kind'>;
+  }): void;
 }
 
 export class ExtensionPackageManager {
   readonly artifacts: ExtensionArtifactStore;
   readonly catalog: ApplicationExtensionCatalog;
   readonly varinVersion: string;
+  readonly admission: ExtensionArtifactAdmission | undefined;
   readonly #verifiedBuiltinArtifacts = new Set<string>();
   // Populated only after matching or materializing our own distribution, never by installation.
   readonly #distributionArtifacts = new Map<string, string>();
@@ -76,6 +85,7 @@ export class ExtensionPackageManager {
   constructor(options: ExtensionPackageManagerOptions) {
     this.catalog = options.catalog;
     this.varinVersion = options.varinVersion;
+    this.admission = options.admission;
     assertVarinApplicationVersion(this.varinVersion);
     this.artifacts = options.artifacts ?? new ExtensionArtifactStore({
       builtinRoots: VARIN_BUILTIN_EXTENSION_PACKAGE_ROOTS,
@@ -92,12 +102,14 @@ export class ExtensionPackageManager {
     expectedRevision: number,
     signal?: AbortSignal,
   ): Promise<VarinExtensionCatalogSnapshot> {
+    this.admission?.source(source.kind);
     const candidate = await this.artifacts.prepare(source, signal);
     return this.installPrepared(candidate, expectedRevision, false, signal);
   }
 
   async stageCaptured(directory: string, provenance: VarinExtensionSourceViewProvenance, expectedRevision: number,
     signal?: AbortSignal, onMutation?: () => void): Promise<VarinExtensionPackageResult> {
+    this.admission?.source('source_view');
     const artifact = await this.artifacts.prepareCaptured(directory, provenance, signal);
     const snapshot = await this.installPrepared(artifact, expectedRevision, true, signal, onMutation);
     const installed = snapshot.extensions.find(entry => entry.manifest.id === artifact.manifest.id)!;
@@ -109,6 +121,7 @@ export class ExtensionPackageManager {
   async installPrepared(candidate: VarinExtensionPreparedArtifact, expectedRevision: number,
     forceDisabled: boolean, signal?: AbortSignal, onMutation?: () => void): Promise<VarinExtensionCatalogSnapshot> {
     signal?.throwIfAborted();
+    this.admission?.artifact(candidate);
     assertVarinExtensionManifestCompatibility(candidate.manifest, this.varinVersion);
     const current = await this.catalog.store.read();
     if (current.document.revision !== expectedRevision) {
@@ -206,7 +219,9 @@ export class ExtensionPackageManager {
       throw new Error(`Varin extension is not installed from a local source: ${request.extensionId}`);
     }
 
+    this.admission?.source(record.source.kind);
     const candidate = await this.artifacts.prepare(structuredClone(record.source), signal);
+    this.admission?.artifact(candidate);
     assertVarinExtensionManifestCompatibility(candidate.manifest, this.varinVersion);
     if (candidate.manifest.id !== request.extensionId) {
       throw new Error(
@@ -230,9 +245,14 @@ export class ExtensionPackageManager {
     return { candidateIntegrity: candidate.integrity, outcome: "staged", snapshot };
   }
 
-  selectCandidate(requestValue: VarinExtensionCandidateSelectionRequest | unknown, validateBeforeCommit?: () => void, restartCommit?: VarinExtensionRestartCommit, storagePublicationId?: string): Promise<VarinExtensionCatalogSnapshot> {
+  async selectCandidate(requestValue: VarinExtensionCandidateSelectionRequest | unknown, validateBeforeCommit?: () => void, restartCommit?: VarinExtensionRestartCommit, storagePublicationId?: string): Promise<VarinExtensionCatalogSnapshot> {
     const request = parseVarinExtensionCandidateSelectionRequest(requestValue);
+    await this.checkCandidateAdmission(request.extensionId, request.candidateIntegrity);
     return this.catalog.selectCandidate(request.extensionId, request.candidateIntegrity, request.expectedRevision, validateBeforeCommit, restartCommit, storagePublicationId);
+  }
+
+  async checkCandidateAdmission(extensionId: string, integrity: string): Promise<void> {
+    if (this.admission) await this.#artifact(extensionId, "candidate", integrity);
   }
 
   async readAsset(requestValue: VarinExtensionAssetRequest | unknown): Promise<VarinExtensionAssetPayload> {
@@ -307,6 +327,7 @@ export class ExtensionPackageManager {
     if (!artifact.integrity) throw new ArtifactSelectionError('artifact_unmaterialized', `Varin extension has no immutable artifact: ${extensionId}`);
     if (artifact.integrity !== integrity) throw new ArtifactSelectionError('artifact_changed', `Varin extension ${slot} artifact is no longer current: ${extensionId}`);
     if (!artifact.resolvedPath) throw new ArtifactSelectionError('artifact_unmaterialized', `Varin extension has no immutable artifact: ${extensionId}`);
+    this.admission?.artifact({ source: artifact.source, manifest: artifact.manifest, integrity });
     return { manifest: artifact.manifest, resolvedPath: artifact.resolvedPath };
   }
 }

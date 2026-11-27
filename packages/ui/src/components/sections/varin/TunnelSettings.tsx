@@ -1,3 +1,4 @@
+import { useDeploymentPolicy } from '@/hooks/useDeploymentPolicy';
 import React from 'react';
 import QRCode from 'qrcode';
 import { toast } from '@/components/ui';
@@ -350,6 +351,10 @@ const createPresetId = (): string => {
 
 export const TunnelSettings: React.FC<{ only?: 'provider' | 'self-hosted' }> = ({ only }) => {
   const host = React.useSyncExternalStore(subscribeRuntimeEndpointChanged, getRuntimeEndpointGeneration, getRuntimeEndpointGeneration);
+  const { t } = useI18n();
+  const policy = useDeploymentPolicy();
+  if (policy === undefined) return null;
+  if (policy?.ingress?.mode === 'gateway') return <p className="typography-meta text-muted-foreground">{t('settings.connections.managedAccess')}</p>;
   if (only === 'provider') return <LegacyTunnelSettings key={host} />;
   if (only === 'self-hosted') return <ExternalAccessSettings key={host} />;
   return <TunnelSettingsPanel key={host} />;

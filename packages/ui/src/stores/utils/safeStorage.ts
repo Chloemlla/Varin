@@ -109,10 +109,9 @@ const createDeferredJSONStorage = <S>(
                 }
             };
             const value = storage.getItem(name);
-            if (value instanceof Promise) {
-                return value.then(parse);
-            }
-            return parse(value);
+            return value === null || typeof value === 'string'
+                ? parse(value)
+                : Promise.resolve(value).then(parse);
         },
         setItem: (name, value) => {
             pendingWrites.set(name, value);

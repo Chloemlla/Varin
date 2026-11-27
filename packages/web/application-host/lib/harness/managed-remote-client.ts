@@ -33,6 +33,9 @@ import {
 } from "./managed-remote-types.js";
 import { decodeManagedProjectManagementResponse, decodeManagedSourceCancellation, decodeManagedSourceReceiptRelease, decodeManagedSourceResponse } from './managed-source-response.js';
 import { consumeManagedProcessStream } from './managed-process-stream.js';
+import { encodeManagedBinaryWrite } from './managed-binary-wire.js';
+import { createProviderLeaseOwner, isProviderResourceOwner, providerResourceOwner, retainProviderResponse, type ProviderLease, type ProviderResource, type ResourceProvider } from '../deployment/resource-provider.js';
+import type { ComputerProviderHost } from '../computer/computer-service.js';
 
 const BASE_PATH = "/api/harness/managed-execution/v1";
 const TARGET_REFRESH_WORKSPACE = "__varin_managed_remote__";
@@ -52,8 +55,8 @@ const managedEndpointUrl = (connection: Pick<ConfiguredHost, "apiUrl">, relative
 /** Identity of the actual managed endpoint, including its configured mount.
  * Credentials stay in the configured Host owner.
  */
-export const managedEndpointIdentity = (connection: Pick<ConfiguredHost, "apiUrl">): string => (
-  `sha256-${digest(managedEndpointUrl(connection).href)}`
+export const managedEndpointIdentity = (connection: Pick<ConfiguredHost, "apiUrl" | "provider">): string => (
+  connection.provider?.owner.endpointIdentity ?? `sha256-${digest(managedEndpointUrl(connection).href)}`
 );
 const payloadOf = (record: KernelRecordResult): Record<string, unknown> => {
   try {
@@ -70,6 +73,7 @@ export interface ConfiguredHost {
   clientToken?: string;
   requestHeaders: Record<string, string>;
   source: "desktop-host" | "ssh-instance" | "configured-host";
+  provider?: { resourceId: string; generation: string; owner: ManagedHostSourceOwner; role: ProviderResource['role'] };
 }
 
 export interface ManagedTarget {
@@ -93,13 +97,18 @@ export type ManagedSourceClient = Omit<{ [Method in keyof ManagedSourceService]:
   documents(path: string, method: 'GET' | 'POST', body?: unknown, signal?: AbortSignal): Promise<Response>;
   service<Operation extends SourceServiceOperation>(input: Omit<ManagedSourceServiceRequest, 'operation'> & { operation: Operation }, signal?: AbortSignal): Promise<SourceServiceResponse<Operation>>;
 };
+type ManagedTransportInit = RequestInit & { dispatcher?: never };
+type ManagedTransportFetch = (input: string | URL, init?: ManagedTransportInit) => Promise<Response>;
+type ManagedStreamInit = Omit<ManagedTransportInit, "body"> & { body?: RequestInit["body"] | AsyncIterable<Uint8Array> };
 
 export interface ManagedRemoteTargetRegistryOptions {
   coordinatorHostId: string;
   kernel: KernelClient;
   resources: ResourceService;
   readSettings(): Promise<Record<string, unknown>>;
-  fetch?: typeof fetch;
+  fetch?: ManagedTransportFetch;
+  provider?: ResourceProvider;
+  providerLeases?: ReturnType<typeof createProviderLeaseOwner>;
   /**
    * A managed target that was unreachable (or never probed) answered an
    * identity probe again. Consumers re-attach — never resubmit — durable
@@ -119,29 +128,39 @@ export class ManagedResponseError extends Error {
 export class ManagedTargetClient {
   constructor(
     readonly target: ManagedTarget,
-    private readonly fetchImpl: typeof fetch,
+    private readonly fetchImpl: ManagedTransportFetch,
+    private readonly useConnection?: (signal?: AbortSignal) => Promise<{ connection: ConfiguredHost; release(): void }>,
   ) {}
 
-  private headers(extra: Record<string, string> = {}): Headers {
-    const headers = new Headers(this.target.connection.requestHeaders);
-    if (this.target.connection.clientToken) headers.set("Authorization", `Bearer ${this.target.connection.clientToken}`);
+  private headers(connection: ConfiguredHost, extra: Record<string, string> = {}): Headers {
+    const headers = new Headers(connection.requestHeaders);
+    if (connection.clientToken) headers.set("Authorization", `Bearer ${connection.clientToken}`);
     for (const [name, value] of Object.entries(extra)) headers.set(name, value);
     headers.set('X-Varin-Managed-Target', this.target.hostId);
     // This is a Host-owned request, not a forwarded browser request. Match the
     // configured HTTPS ingress without weakening its browser Origin checks.
-    const endpoint = new URL(this.target.connection.apiUrl);
+    const endpoint = new URL(connection.apiUrl);
     if (endpoint.protocol === "https:") headers.set("Origin", endpoint.origin);
     return headers;
   }
 
-  async response(relativePath: string, init: Omit<RequestInit, "body"> & { body?: RequestInit["body"] | AsyncIterable<Uint8Array> } = {}, preserveErrorResponse = false): Promise<Response> {
-    const url = managedEndpointUrl(this.target.connection, relativePath).toString();
+  async response(relativePath: string, init: ManagedStreamInit = {}, preserveErrorResponse = false): Promise<Response> {
+    if (!this.useConnection) return this.exchange(this.target.connection, relativePath, init, preserveErrorResponse);
+    const use = await this.useConnection(init.signal ?? undefined);
+    try {
+      const response = await this.exchange(use.connection, relativePath, init, preserveErrorResponse);
+      return retainProviderResponse(response, use.release);
+    } catch (error) { use.release(); throw error; }
+  }
+
+  private async exchange(connection: ConfiguredHost, relativePath: string, init: ManagedStreamInit, preserveErrorResponse: boolean): Promise<Response> {
+    const url = managedEndpointUrl(connection, relativePath).toString();
     const { body, ...rest } = init;
     const asyncBody = body !== undefined && typeof (body as AsyncIterable<Uint8Array>)[Symbol.asyncIterator] === "function";
     const response = await this.fetchImpl(url, {
       ...rest,
       redirect: 'error',
-      headers: this.headers(Object.fromEntries(new Headers(init.headers).entries())),
+      headers: this.headers(connection, Object.fromEntries(new Headers(init.headers).entries())),
       ...(body === undefined ? {} : { body: body as never }),
       ...(asyncBody ? { duplex: "half" as never } : {}),
     });
@@ -159,7 +178,7 @@ export class ManagedTargetClient {
     return response;
   }
 
-  async request<Result>(relativePath: string, init: Omit<RequestInit, "body"> & { body?: RequestInit["body"] | AsyncIterable<Uint8Array> } = {}): Promise<Result> {
+  async request<Result>(relativePath: string, init: ManagedStreamInit = {}): Promise<Result> {
     return (await this.response(relativePath, init)).json() as Promise<Result>;
   }
 
@@ -217,6 +236,35 @@ export function createManagedRemoteTargetRegistry(options: ManagedRemoteTargetRe
     try { options.onSourceReachable?.(owner); } catch (error) { report(error); }
   };
   const report = (error: unknown) => options.onError?.(error instanceof Error ? error : new Error(String(error)));
+  const provider = options.provider;
+  const providerLeases = provider ? options.providerLeases ?? createProviderLeaseOwner(provider, report) : undefined;
+  const providerBindings = new Map<string, () => void>();
+  const describeProvider = async (signal?: AbortSignal, role: ProviderResource['role'] = 'resources') => {
+    if (!provider) return [];
+    return (await provider.describe(signal)).filter(resource => resource.role === role &&
+      (role === 'resources' ? resource.capabilities.includes('sources') : role === 'browser' ? Boolean(resource.browserId)
+        : role === 'computer' && Boolean(resource.desktopId) && resource.capabilities.includes('computer')))
+      .map(resource => ({ resource, resourceOwner: providerResourceOwner(provider.id, resource), label: resource.label, capabilities: resource.capabilities }));
+  };
+  const providerEntryFor = async (owner: ManagedHostSourceOwner, role: 'resources' | 'browser', signal?: AbortSignal) => {
+    const entry = (await describeProvider(signal, role)).find(candidate => candidate.resourceOwner.connectionId === owner.connectionId);
+    if (!entry || entry.resourceOwner.hostId !== owner.hostId || entry.resourceOwner.endpointIdentity !== owner.endpointIdentity) {
+      throw new Error('The original provider resource is unavailable');
+    }
+    return entry;
+  };
+  /** Keep a multi-request preparation on the same generation until its durable binding takes over. */
+  const withSourceUse = async <T>(owner: import('@varin/protocol').SourceResourceOwner, work: () => Promise<T>, signal?: AbortSignal): Promise<T> => {
+    if (!providerLeases || owner.kind !== 'managed_host' || !isProviderResourceOwner(owner)) return work();
+    const entry = await providerEntryFor(owner, 'resources', signal);
+    const use = await providerLeases.acquire(entry.resource.id, signal);
+    try { return await work(); } finally { use.release(); }
+  };
+  const providerConnection = (resource: ProviderResource, lease: ProviderLease): ConfiguredHost => {
+    const owner = providerResourceOwner(provider!.id, resource);
+    return { id: owner.connectionId, label: resource.label, source: 'configured-host', apiUrl: lease.endpoint,
+      clientToken: lease.bearer, requestHeaders: {}, provider: { resourceId: resource.id, generation: lease.generation, owner, role: resource.role } };
+  };
 
   const probe = async (connection: ConfiguredHost, signal?: AbortSignal): Promise<ManagedTarget> => {
     peers.delete(connection.id);
@@ -225,7 +273,7 @@ export function createManagedRemoteTargetRegistry(options: ManagedRemoteTargetRe
     const endpoint = new URL(connection.apiUrl);
     if (endpoint.protocol === "https:") headers.set("Origin", endpoint.origin);
     if (connection.clientToken) headers.set("Authorization", `Bearer ${connection.clientToken}`);
-    const response = await fetchImpl(managedEndpointUrl(connection, '/identity'), {
+    const response = await (connection.provider ? fetch : fetchImpl)(managedEndpointUrl(connection, '/identity'), {
       headers,
       redirect: 'error',
       signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000),
@@ -236,6 +284,9 @@ export function createManagedRemoteTargetRegistry(options: ManagedRemoteTargetRe
     }
     if (identity.protocolVersion !== MANAGED_REMOTE_PROTOCOL_VERSION) throw new Error(`Unsupported managed target protocol ${String(identity.protocolVersion)}`);
     if (response.headers.get("x-varin-managed-host") !== identity.hostId) throw new Error("Managed target identity receipt is inconsistent");
+    if (connection.provider && (identity.hostId !== connection.provider.owner.hostId || identity.role !== connection.provider.role || !identity.requestHostIdentity)) {
+      throw new Error('Resource provider endpoint does not identify its declared Node');
+    }
     if (identity.hostId === options.coordinatorHostId) throw new Error("Configured target resolves to this coordinator Host");
     const target: ManagedTarget = {
       machineId: `managed:${identity.hostId}`,
@@ -245,6 +296,23 @@ export function createManagedRemoteTargetRegistry(options: ManagedRemoteTargetRe
     };
     peers.set(connection.id, target);
     return target;
+  };
+
+  const acquireConnection = async (target: ManagedTarget, signal?: AbortSignal) => {
+    const placement = target.connection.provider!;
+    const use = await providerLeases!.acquire(placement.resourceId, signal);
+    try {
+      const current = use.lease;
+      if (current.generation !== placement.generation || current.endpoint !== target.connection.apiUrl) {
+        throw new Error('The original provider instance ended');
+      }
+      return { connection: { ...target.connection, clientToken: current.bearer }, release: use.release };
+    } catch (error) { use.release(); throw error; }
+  };
+  const makeClient = (target: ManagedTarget, request: ManagedTransportFetch = fetchImpl) => {
+    const placement = target.connection.provider;
+    if (!placement) return new ManagedTargetClient(target, request);
+    return new ManagedTargetClient(target, fetch, signal => acquireConnection(target, signal));
   };
 
   const registrationFor = (target: ManagedTarget): ResourceMachineRegistration => ({
@@ -344,7 +412,8 @@ export function createManagedRemoteTargetRegistry(options: ManagedRemoteTargetRe
   const sourceTargets = async (signal?: AbortSignal) => {
     signal?.throwIfAborted();
     const connections = configuredHosts(await options.readSettings());
-    const results = await Promise.allSettled(connections.map(async connection => {
+    const provided = describeProvider(signal);
+    const [results, providerTargets] = await Promise.all([Promise.allSettled(connections.map(async connection => {
       const endpointIdentity = managedEndpointIdentity(connection);
       const target = await probe(connection, signal).catch(error => {
         if (!signal?.aborted) for (const [key, owner] of reachableSources) {
@@ -356,10 +425,10 @@ export function createManagedRemoteTargetRegistry(options: ManagedRemoteTargetRe
       const resourceOwner = { kind: 'managed_host' as const, hostId: target.hostId, connectionId: connection.id, endpointIdentity };
       sourceReached(resourceOwner);
       return { resourceOwner, label: connection.label, capabilities: [...target.identity.capabilities] };
-    }));
+    })), provided]);
     signal?.throwIfAborted();
     return {
-      targets: results.flatMap(result => result.status === 'fulfilled' ? [result.value] : []),
+      targets: [...providerTargets.map(({ resource: _resource, ...target }) => target), ...results.flatMap(result => result.status === 'fulfilled' ? [result.value] : [])],
       unavailable: results.flatMap((result, index) => result.status === 'rejected'
         ? [{ connectionId: connections[index]!.id, label: connections[index]!.label, message: 'The configured Host source is unavailable' }] : []),
     };
@@ -367,9 +436,9 @@ export function createManagedRemoteTargetRegistry(options: ManagedRemoteTargetRe
 
   const describeSourceTargets = async (signal?: AbortSignal) => {
     signal?.throwIfAborted();
-    const connections = configuredHosts(await options.readSettings());
+    const [connections, provided] = await Promise.all([options.readSettings().then(configuredHosts), describeProvider(signal)]);
     signal?.throwIfAborted();
-    const targets = [], unavailable = [];
+    const targets = provided.map(({ resource: _resource, ...target }) => target), unavailable = [];
     for (const connection of connections) {
       const observed = peers.get(connection.id);
       if (!observed || connectionKey(observed.connection) !== connectionKey(connection) || !observed.identity.capabilities.includes('sources')) {
@@ -398,8 +467,47 @@ export function createManagedRemoteTargetRegistry(options: ManagedRemoteTargetRe
         ? [{ connectionId: connections[index]!.id, label: connections[index]!.label }] : []) };
   };
 
-  const forwardTarget = async (owner: ManagedHostSourceOwner, signal?: AbortSignal): Promise<ManagedTarget> => {
+  /** Provider discovery consumes inventory only. Even a status request cannot acquire a browser. */
+  const providerBrowsers = async (signal?: AbortSignal) => {
+    const entries = await describeProvider(signal, 'browser');
+    const results = await Promise.allSettled(entries.map(entry => provider!.status(entry.resource.id, signal)));
     signal?.throwIfAborted();
+    return entries.map((entry, index) => {
+      const status = results[index]!;
+      return { ...entry, status: status.status === 'fulfilled' ? status.value : undefined };
+    });
+  };
+
+  const providerComputers = async (withStatus = false): Promise<ComputerProviderHost[]> => {
+    const entries = await describeProvider(undefined, 'computer');
+    return Promise.all(entries.map(async ({ resource, resourceOwner }) => {
+      const status = withStatus ? await provider!.status(resource.id).catch(() => undefined) : undefined;
+      return {
+        id: resourceOwner.connectionId, label: resource.label, expectedHostId: resourceOwner.hostId, desktopId: resource.desktopId!,
+        platform: resource.platform ?? 'linux',
+        ...(status ? { state: status.state } : {}),
+        async acquire(signal?: AbortSignal) {
+          const use = await providerLeases!.acquire(resource.id, signal);
+          const connection = providerConnection(resource, use.lease);
+          return { connection, endpoint: use.lease.endpoint, generation: use.lease.generation, release: use.release };
+        },
+      };
+    }));
+  };
+
+  const forwardTarget = async (owner: ManagedHostSourceOwner, signal?: AbortSignal, providerRole: 'resources' | 'browser' = 'resources'): Promise<ManagedTarget> => {
+    signal?.throwIfAborted();
+    if (provider && isProviderResourceOwner(owner)) {
+      const entry = await providerEntryFor(owner, providerRole, signal);
+      const use = await providerLeases!.acquire(entry.resource.id, signal);
+      try {
+        const connection = providerConnection(entry.resource, use.lease);
+        const prior = peers.get(owner.connectionId);
+        return prior?.connection.provider?.generation === use.lease.generation && prior.connection.provider.role === providerRole
+          && prior.connection.apiUrl === connection.apiUrl
+          ? { ...prior, connection } : await probe(connection, signal);
+      } finally { use.release(); }
+    }
     const connection = configuredHosts(await options.readSettings()).find(entry => entry.id === owner.connectionId);
     if (!connection || managedEndpointIdentity(connection) !== owner.endpointIdentity) {
       throw new Error('The original managed source connection is unavailable');
@@ -451,7 +559,7 @@ export function createManagedRemoteTargetRegistry(options: ManagedRemoteTargetRe
   const storage = async <Action extends keyof ManagedStorageActions>(owner: ManagedHostSourceOwner, action: Action, input: ManagedStorageActions[Action]['input'], signal?: AbortSignal): Promise<ManagedStorageActions[Action]['result']> => {
     const target = await forwardTarget(owner, signal);
     if (!target.identity.capabilities.includes('storage')) throw new ManagedResponseError('This Host does not provide storage management', 'storage-unsupported', 501);
-    const client = new ManagedTargetClient(target, fetchImpl);
+    const client = makeClient(target);
     return client.json<ManagedStorageActions[Action]['result']>(`/storage/${action}`, input, 'POST', action === 'cleanup' ? undefined : signal);
   };
 
@@ -473,7 +581,7 @@ export function createManagedRemoteTargetRegistry(options: ManagedRemoteTargetRe
   const source = async (owner: ManagedHostSourceOwner, signal?: AbortSignal): Promise<ManagedSourceClient> => {
     const selected = await sourceTarget(owner, signal);
     const target = { ...selected, connection: { ...selected.connection, requestHeaders: { ...selected.connection.requestHeaders } } };
-    const client = new ManagedTargetClient(target, async (url, init) => {
+    const client = makeClient(target, async (url, init) => {
       try { return await fetchImpl(url, { ...init, redirect: 'error' }); }
       catch (error) {
         if (!init?.signal?.aborted) { reachableSources.delete(sourceKey(owner)); peers.delete(owner.connectionId); }
@@ -482,7 +590,21 @@ export function createManagedRemoteTargetRegistry(options: ManagedRemoteTargetRe
     });
     const request = async <Method extends keyof ManagedSourceService>(method: Method, input: Parameters<ManagedSourceService[Method]>[1], signal?: AbortSignal): Promise<Awaited<ReturnType<ManagedSourceService[Method]>>> => {
       if (input.coordinatorHostId !== options.coordinatorHostId) throw new Error('Managed source request belongs to another coordinator');
-      let result = await client.json<Awaited<ReturnType<ManagedSourceService[Method]>>>(`/sources/${method}`, input, 'POST', signal).catch(error => {
+      type Result = Awaited<ReturnType<ManagedSourceService[Method]>>;
+      const route = `/sources/${method}`;
+      const serviceRequest = method === 'service' ? input as ManagedSourceServiceRequest : undefined;
+      const operation = serviceRequest?.operation;
+      let response: Promise<Result>;
+      if (operation?.kind === 'binary_write') {
+        if (target.identity.capabilities.includes('binary-write-stream')) {
+          response = client.request<Result>(route, { method: 'POST', ...encodeManagedBinaryWrite(serviceRequest!, operation), ...(signal ? { signal } : {}) });
+        } else {
+          const { bytes, ...legacy } = operation;
+          response = client.json<Result>(route, { ...serviceRequest, operation: bytes
+            ? { ...legacy, bytesBase64: Buffer.from(bytes).toString('base64') } : legacy }, 'POST', signal);
+        }
+      } else response = client.json<Result>(route, input, 'POST', signal);
+      let result = await response.catch(error => {
         if (error instanceof ManagedResponseError && typeof error.code === 'string' && threadSourceFailureMessage(error.code)) {
           throw new SourceAdmissionError(error.code as SourceFailureCode, { cause: error });
         }
@@ -494,6 +616,20 @@ export function createManagedRemoteTargetRegistry(options: ManagedRemoteTargetRe
       if (method === 'cancelService') decodeManagedSourceCancellation(input as Parameters<ManagedSourceService['cancelService']>[1], result);
       if (method === 'releaseReceipt') decodeManagedSourceReceiptRelease(input as Parameters<ManagedSourceService['releaseReceipt']>[1], result);
       return result;
+    };
+    const placement = target.connection.provider;
+    const bindingKey = (authorityId: string) => JSON.stringify([owner.connectionId, placement?.generation, authorityId]);
+    const retainBinding = (authorityId: string, release: () => void) => {
+      const key = bindingKey(authorityId);
+      if (providerBindings.has(key)) release();
+      else providerBindings.set(key, release);
+    };
+    const settleBinding = (result: unknown) => {
+      if (!placement || !result || typeof result !== 'object' || !('phase' in result) || !('authorityId' in result)
+        || typeof result.authorityId !== 'string' || result.phase !== 'retired' && result.phase !== 'revoked') return;
+      const key = bindingKey(result.authorityId);
+      providerBindings.get(key)?.();
+      providerBindings.delete(key);
     };
     return {
       ...(target.identity.capabilities.includes('attachment-stream') ? {
@@ -549,13 +685,21 @@ export function createManagedRemoteTargetRegistry(options: ManagedRemoteTargetRe
       externalDetect: (input, signal) => request('externalDetect', input, signal),
       externalInspect: (input, signal) => request('externalInspect', input, signal),
       externalPrepare: (input, signal) => request('externalPrepare', input, signal),
+      externalRemovePrivateSource: (input, signal) => request('externalRemovePrivateSource', input, signal),
       terminal:(input,signal)=>request('terminal',input,signal),
       terminalStream:async(input,emit,signal)=>{if(input.coordinatorHostId!==options.coordinatorHostId)throw new Error('Terminal coordinator changed');
         const response=await client.response('/sources/terminalStream',{method:'POST',body:JSON.stringify(input),headers:{'Content-Type':'application/json'},signal});
         return consumeManagedTerminalFrames(response,emit,signal);},
       externalBinding: (input, signal) => request('externalBinding', input, signal),
       externalSpawn: (input, signal) => request('externalSpawn', input, signal),
-      externalControl: (input, signal) => request('externalControl', input, signal),
+      async externalControl(input, signal) {
+        const receipt = await request('externalControl', input, signal);
+        if (placement && input.release && receipt.executorStopped && receipt.outputReleased
+          && receipt.transportId === input.transportId && receipt.processId === input.processId && receipt.conversationId === input.conversationId) {
+          receipt.authorities.forEach(settleBinding);
+        }
+        return receipt;
+      },
       scriptControl: (input, signal) => request('scriptControl', input, signal),
       scriptBinding: (input, signal) => request('scriptBinding', input, signal),
       scriptSpawn: (input, signal) => request('scriptSpawn', input, signal),
@@ -587,7 +731,16 @@ export function createManagedRemoteTargetRegistry(options: ManagedRemoteTargetRe
       },
       skills: (input, signal) => request('skills', input, signal),
       prepare: (input, signal) => request('prepare', input, signal),
-      bind: (input, signal) => request('bind', input, signal),
+      async bind(input, signal) {
+        if (!placement) return request('bind', input, signal);
+        const use = await acquireConnection(target, signal);
+        try {
+          const binding = await request('bind', input, signal);
+          if (!binding.authorityId) throw new Error('Provider source returned no authority identity');
+          retainBinding(binding.authorityId, use.release);
+          return binding;
+        } catch (error) { use.release(); throw error; }
+      },
       authorize: (input, signal) => request('authorize', input, signal),
       execute: (input, signal) => request('execute', input, signal),
       service: async (input, signal) => {
@@ -619,14 +772,26 @@ export function createManagedRemoteTargetRegistry(options: ManagedRemoteTargetRe
       },
       fileObservation: (input, signal) => request('fileObservation', input, signal),
       inspectReadScope: (input, signal) => request('inspectReadScope', input, signal),
-      closeReadScope: (input, signal) => request('closeReadScope', input, signal),
+      async closeReadScope(input, signal) {
+        const result = await request('closeReadScope', input, signal);
+        if (placement && result.closed) result.authorities.forEach(settleBinding);
+        return result;
+      },
       cancelService: (input, signal) => request('cancelService', input, signal),
       observe: (input, signal) => request('observe', input, signal),
       releaseReceipt: (input, signal) => request('releaseReceipt', input, signal),
       cancel: (input, signal) => request('cancel', input, signal),
-      release: (input, signal) => request('release', input, signal),
+      async release(input, signal) {
+        const result = await request('release', input, signal);
+        settleBinding(result);
+        return result;
+      },
       inspectScope: (input, signal) => request('inspectScope', input, signal),
-      releaseScope: (input, signal) => request('releaseScope', input, signal),
+      async releaseScope(input, signal) {
+        const result = await request('releaseScope', input, signal);
+        if (placement && result && typeof result === 'object' && 'released' in result && Array.isArray(result.released)) result.released.forEach(settleBinding);
+        return result;
+      },
     };
   };
   const routedShellId = (machineId: string, processId: string): string => (
@@ -978,7 +1143,9 @@ export function createManagedRemoteTargetRegistry(options: ManagedRemoteTargetRe
     };
   };
 
-  return { refresh, resolveBackend, externalAuthority, targetFor, sourceTargets, describeSourceTargets, browserTargets, sourceTarget, forwardTarget, selectForwardTarget, storageTargets, storage, source, shellExec, shellRead, shellWrite, shellKill, setScopeSleeping, releaseScope, ownersForMachine };
+  return { refresh, resolveBackend, externalAuthority, targetFor, sourceTargets, describeSourceTargets, browserTargets, providerBrowsers, providerComputers, withSourceUse,
+    providerActivity: () => providerLeases?.activity() ?? null,
+    clientFor: makeClient, sourceTarget, forwardTarget, selectForwardTarget, storageTargets, storage, source, shellExec, shellRead, shellWrite, shellKill, setScopeSleeping, releaseScope, ownersForMachine };
 }
 
 export type ManagedRemoteTargetRegistry = ReturnType<typeof createManagedRemoteTargetRegistry>;

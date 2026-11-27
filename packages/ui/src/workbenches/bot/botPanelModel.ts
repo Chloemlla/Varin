@@ -1,6 +1,6 @@
 import React from 'react';
 import type { BotSummary, BotWorkItem, ThreadIdentity, ThreadsAPI } from '@varin/application-client';
-import type { BotMatter } from '@varin/protocol';
+import type { BotMatter, CalendarOccurrence } from '@varin/protocol';
 import type { RecentPointer } from '@/lib/motion/pointer';
 import type { BotPanelTab } from './botLayout';
 import type { BotFigurePose, BotNeed, BotSessionView, BotStateLine, BotTimelineEvent, BotWorkView } from './botPresentation';
@@ -8,7 +8,7 @@ import type { BotStageFeed } from './botStageRenderer';
 import type { useBotFacts } from './useBotFacts';
 
 /** A row reached from somewhere else: its tab opens and the row flashes once (§5.3). */
-export interface BotPanelFocus { tab: BotPanelTab; id: string; token: number }
+export interface BotPanelFocus { tab: BotPanelTab; id: string; token: number; occurrenceId?: string }
 
 /** Everything the right panel shows for the selected Bot, and the actions it may take. */
 export interface BotPanelModel {
@@ -38,6 +38,8 @@ export interface BotPanelModel {
   openWork(identity: ThreadIdentity, origin?: { tab: BotPanelTab; id: string }): void;
   /** The Bot's own conversations stay here. */
   openSession(identity: ThreadIdentity): void;
+  scheduleIdentity?: ThreadIdentity;
+  openScheduleTurn?(taskId: string, occurrence: CalendarOccurrence, beforeNavigate: () => void): void;
   openNeed(need: BotNeed): void;
   changeState(action: 'sleep' | 'wake' | 'retry'): void;
   archiveMatter(matter: BotMatter): void;

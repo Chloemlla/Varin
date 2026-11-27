@@ -18,7 +18,7 @@ function formatBytes(value: number | undefined): string {
   return `${amount >= 10 ? amount.toFixed(0) : amount.toFixed(1)} ${unit}`;
 }
 
-export function LocalSemanticSettings() {
+export function LocalSemanticSettings({ allowDownload = true }: { allowDownload?: boolean } = {}) {
   const state = useLocalSemantic();
   const { t } = useI18n();
   const fileInput = React.useRef<HTMLInputElement | null>(null);
@@ -59,7 +59,7 @@ export function LocalSemanticSettings() {
       {installing ? <Btn sm kind="ghost" disabled={state.busy} onClick={() => state.run(cancelLocalSemantic)}>
         {t('settings.page.harness.localSemantic.cancel')}
       </Btn> : <>
-        {canInstall ? <Btn sm kind="primary" icon="download" disabled={state.busy} onClick={() => state.run(installLocalSemantic, true)}>
+        {canInstall && allowDownload ? <Btn sm kind="primary" icon="download" disabled={state.busy} onClick={() => state.run(installLocalSemantic, true)}>
           {status?.error ? t('settings.page.harness.localSemantic.retry') : t('settings.page.harness.localSemantic.install')}
         </Btn> : null}
         <Btn sm kind={canInstall ? 'ghost' : 'default'} disabled={state.busy} onClick={() => fileInput.current?.click()}>

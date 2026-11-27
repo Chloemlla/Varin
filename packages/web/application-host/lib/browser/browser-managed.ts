@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { BINARY_EVENT_CONTENT_TYPE, encodeBinaryEvent, decodeBinaryEvents } from '@varin/application-client';
-import type { Express, Request, RequestHandler, Response } from 'express';
+import { json, type Express, type Request, type RequestHandler, type Response } from 'express';
 import { BROWSER_TOOL_DECLARATIONS } from '@varin/extension-builtins';
 import {
   BrowserExecutionError, isBrowserExecutionError, type BrowserAction, type BrowserActionResult,
@@ -15,6 +15,7 @@ import type { BrowserResources } from './browser-resources.js';
 import type { BrowserManagementSnapshot, BrowserSettingsSnapshot } from '@varin/protocol';
 import type { BrowserSettingsOwner } from './browser-settings.js';
 import { probeBrowserConnection } from './browser-settings.js';
+import { EgressError } from '../harness/egress.js';
 
 const base = '/api/harness/managed-execution/v1/browser';
 const relative = '/browser';
@@ -131,8 +132,11 @@ export function registerManagedBrowserRoutes(app: Express, options: {
   const principals = new WeakMap<Request, string>();
   const route = (handler: (req: Request, res: Response) => Promise<void>): RequestHandler => (req, res) => {
     void handler(req, res).catch(error => {
-      if (!res.headersSent && !res.destroyed) res.status(409).json({
+      if (res.headersSent || res.destroyed) return;
+      const denied = error instanceof EgressError && error.kind === 'deployment-policy-denied';
+      res.status(denied ? 403 : 409).json({
         error: error instanceof Error ? error.message : 'Browser resource is unavailable',
+        ...(denied && { code: error.kind, section: 'egress' }),
         effect: isBrowserExecutionError(error) ? error.effect : 'none',
         executorStopped: isBrowserExecutionError(error) ? error.executorStopped : true,
       });
@@ -150,7 +154,7 @@ export function registerManagedBrowserRoutes(app: Express, options: {
       principals.set(req, clientId); next();
     }).catch(next);
   });
-  if (options.parseRequestBody) app.use(base, options.parseRequestBody);
+  app.use(base, options.parseRequestBody ?? json({ limit: '50mb' }));
   app.get(`${base}/resources`, route(async (_req, res) => {
     // Never publish imported peers: discovery and dispatch are strictly one hop.
     res.json({ resources: await options.resources.list({ localOnly: true }) });
@@ -171,7 +175,9 @@ export function registerManagedBrowserRoutes(app: Express, options: {
     const settings = await options.settings.save(req.body.revision, req.body);
     res.json({ settings, resources: await options.resources.list({ localOnly: true }) });
   }));
-  if (options.allowProbe !== false) app.post(`${base}/probe`, route(async (req, res) => { res.json(await probeBrowserConnection(req.body)); }));
+  if (options.allowProbe !== false) app.post(`${base}/probe`, route(async (req, res) => {
+    res.json(await (options.settings?.probe ?? probeBrowserConnection)(req.body));
+  }));
   app.post(`${base}/call`, route(async (req, res) => {
     const call = parseCall(req.body);
     const resource = (await options.resources.list({ localOnly: true })).find(item => item.browserId === call.browserId);
@@ -248,35 +254,51 @@ function catalog(value: unknown): BrowserResource[] {
   return value.resources as BrowserResource[];
 }
 
-type Peers = Pick<ManagedRemoteTargetRegistry, 'browserTargets' | 'forwardTarget'>;
+type Peers = Pick<ManagedRemoteTargetRegistry, 'browserTargets' | 'forwardTarget' | 'clientFor' | 'providerBrowsers'>;
 export class ManagedBrowserOwner implements BrowserOwner {
   readonly browserId: string;
   private status: BrowserResource;
   private readonly listeners = new Set<(event: BrowserEvent) => void>();
   private disposed = false;
+  private providerGeneration: string | undefined;
   constructor(private readonly coordinatorHostId: string, readonly peer: ManagedHostSourceOwner, resource: BrowserResource,
     private readonly targets: Peers, private readonly fetchImpl: typeof fetch = fetch) {
     this.browserId = managedBrowserResourceId(peer, resource.browserId);
     this.status = resource;
   }
-  update(resource: BrowserResource) {
+  update(resource: BrowserResource, providerGeneration = this.providerGeneration) {
     if (resource.browserId !== this.status.browserId) throw invalid('Managed browser identity changed');
-    const changed = resource.state !== this.status.state || resource.instanceId !== this.status.instanceId;
+    const changed = resource.state !== this.status.state || resource.instanceId !== this.status.instanceId || providerGeneration !== this.providerGeneration;
     this.status = resource;
+    this.providerGeneration = providerGeneration;
     if (changed) this.emitConnection();
   }
   interrupt() { if (this.status.state !== 'interrupted') { this.status = { ...this.status, state: 'interrupted' }; this.emitConnection(); } }
-  private emitConnection() {
-    for (const listener of this.listeners) listener({ kind: 'connection', browserId: this.browserId, state: this.status.state,
-      ...(this.status.instanceId ? { instanceId: this.status.instanceId } : {}) });
+  observeProvision(state: string | undefined, generation: string | undefined) {
+    if (this.providerGeneration && this.providerGeneration === generation && state === 'ready') return;
+    const next = state === 'unavailable' ? 'interrupted' : 'disconnected';
+    if (this.status.state !== next || this.status.instanceId) {
+      const { instanceId: _previousInstance, ...status } = this.status;
+      this.status = { ...status, state: next };
+      this.emitConnection();
+    }
   }
-  async resource() { const { state, instanceId, capabilities, operations, activation } = this.status; return { state,
+  private instance() {
+    const id = this.status.instanceId;
+    return id && this.providerGeneration ? `managed-browser-instance:${hash([this.providerGeneration, id])}` : id;
+  }
+  private emitConnection() {
+    const instanceId = this.instance();
+    for (const listener of this.listeners) listener({ kind: 'connection', browserId: this.browserId, state: this.status.state,
+      ...(instanceId ? { instanceId } : {}) });
+  }
+  async resource() { const { state, capabilities, operations, activation } = this.status; const instanceId = this.instance(); return { state,
     ...(instanceId ? { instanceId } : {}), capabilities: [...capabilities], ...(operations ? { operations: [...operations] } : {}),
     ...(activation ? { activation } : {}) }; }
   async prepareResource() {
     if (this.disposed) throw invalid('The original managed browser owner has ended');
-    const target = await this.targets.forwardTarget(this.peer);
-    const client = new ManagedTargetClient(target, this.fetchImpl);
+    const target = await this.targets.forwardTarget(this.peer, undefined, 'browser');
+    const client = this.targets.clientFor(target, this.fetchImpl);
     if (!this.status.activation) {
       // Older peers and push connectors do not advertise an acquire operation.
       const resources = catalog(await client.request(`${relative}/resources`));
@@ -287,21 +309,27 @@ export class ManagedBrowserOwner implements BrowserOwner {
     }
     const resources = catalog(await client.json(`${relative}/resources/${encodeURIComponent(this.status.browserId)}/acquire`, {}, 'POST'));
     if (resources.length !== 1 || resources[0]!.browserId !== this.status.browserId) throw invalid('Managed browser acquisition returned a different resource');
-    this.update(resources[0]!);
+    this.update(resources[0]!, target.connection.provider?.generation);
   }
   private async request<T>(instanceId: string, method: Method, args: unknown[], scope: BrowserUseScope = {}): Promise<T> {
     if (this.disposed || this.status.state !== 'online') throw invalid('The original managed browser is offline');
-    if (instanceId !== this.status.instanceId) throw invalid('The original managed browser instance ended');
+    const nativeInstance = this.status.instanceId;
+    const generation = this.providerGeneration;
+    if (!nativeInstance || instanceId !== this.instance()) throw invalid('The original managed browser instance ended');
     if (!supported(this.status, method, args)) throw invalid('The browser provider does not support this operation');
     const mutates = writes({ method, args });
     let dispatched = false;
     try {
       scope.signal?.throwIfAborted();
-      const target = await this.targets.forwardTarget(this.peer, scope.signal);
+      const target = await this.targets.forwardTarget(this.peer, scope.signal, 'browser');
       scope.signal?.throwIfAborted();
-      const client = new ManagedTargetClient(target, this.fetchImpl);
+      if (target.connection.provider?.generation !== generation || this.instance() !== instanceId) {
+        if (this.providerGeneration === generation) this.observeProvision('ready', target.connection.provider?.generation);
+        throw invalid('The original Browser Node instance ended. Open the current browser before choosing another page.');
+      }
+      const client = this.targets.clientFor(target, this.fetchImpl);
       const call: Call = { coordinatorHostId: this.coordinatorHostId, browserId: this.status.browserId,
-        instanceId, method, args, ...(scope.threadId ? { threadId: scope.threadId } : {}) };
+        instanceId: nativeInstance, method, args, ...(scope.threadId ? { threadId: scope.threadId } : {}) };
       // Mutation response lifetime is independent of the caller's cancellation.
       dispatched = true;
       const response = await client.response(`${relative}/call`, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: `${BINARY_EVENT_CONTENT_TYPE}, application/json` },
@@ -329,10 +357,11 @@ export class ManagedBrowserOwner implements BrowserOwner {
       throw new BrowserExecutionError(error, dispatched && mutates ? 'unknown' : 'none', !dispatched || !mutates);
     }
   }
-  private port(instanceId = this.status.instanceId ?? '', scope: BrowserUseScope = {}): BrowserOwner {
+  private port(instanceId = this.instance() ?? '', scope: BrowserUseScope = {}): BrowserOwner {
     const request = <T>(method: Method, args: unknown[], signal?: AbortSignal, threadId = scope.threadId) =>
       this.request<T>(instanceId, method, args, { ...scope, ...(signal ? { signal } : {}), ...(threadId ? { threadId } : {}) });
-    const page = (value: BrowserPage) => ({ ...value, browserId: this.browserId });
+    const page = (value: BrowserPage) => ({ ...value, browserId: this.browserId,
+      ...(this.providerGeneration && { instanceId }) });
     return {
       browserId: this.browserId,
       resource: () => this.resource(),
@@ -417,7 +446,22 @@ export class ManagedBrowserPeers {
   }
   private async discover() {
     const seen = new Set<string>();
-    const { targets } = await this.targets.browserTargets();
+    const [{ targets }, provided] = await Promise.all([this.targets.browserTargets(), this.targets.providerBrowsers().catch(() => [])]);
+    for (const { resource, resourceOwner, status } of provided) {
+      const browserId = resource.browserId!;
+      const id = managedBrowserResourceId(resourceOwner, browserId);
+      seen.add(id);
+      let owner = this.owners.get(id);
+      if (!owner) {
+        owner = new ManagedBrowserOwner(this.coordinatorHostId, resourceOwner, {
+          browserId, label: resource.label, deviceName: resource.label, state: 'disconnected', source: 'cdp',
+          capabilities: capabilities.filter(capability => resource.capabilities.includes(capability)), activation: 'connect',
+        }, this.targets, this.fetchImpl);
+        this.owners.set(id, owner);
+        this.resources.register(owner, resource.label, resource.label, { remote: true, source: 'cdp' });
+      } else this.resources.updateMetadata(id, resource.label, resource.label);
+      owner.observeProvision(status?.state, status?.generation);
+    }
     await Promise.all(targets.map(async target => {
       try {
         const client = new ManagedTargetClient(await this.targets.forwardTarget(target.resourceOwner), this.fetchImpl);

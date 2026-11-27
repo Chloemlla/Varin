@@ -87,6 +87,73 @@ it('client submits, inspects, cancels, replays events and preserves receipt on r
   } finally { await reopened.close(); }
 }, 30_000);
 
+it('recovers the original inbox admission from Catalog after losing the coordinator acknowledgement', async () => {
+  const f = await fixture();
+  const principalId = 'inbox-owner';
+  const command = { inboxId: 'supervisor-first', principalId, key: 'inbox-command', threadId: 'inbox-thread', branchId: 'inbox-branch', method: 'submit' };
+  await f.runtimeClient.createThread(command.threadId, command.branchId, undefined, principalId);
+  expect(await f.host.agentRuntimeRequest('runtime.inbox.reconcile', command)).toEqual({});
+  const receipt = await f.runtimeClient.submit({ key: command.key, threadId: command.threadId, branchId: command.branchId,
+    expectedHead: null, input: { text: 'original parked message' }, configuration: {} });
+  await f.crash();
+  const reopened = createKernelClient(f.options);
+  try {
+    const expiry = { status: 409, body: { code: 'inbox-replay-expired', admission: 'not_started' } };
+    expect(await reopened.agentRuntimeRequest('runtime.inbox.reconcile', { ...command, result: expiry }))
+      .toEqual({ result: { status: 200, body: receipt } });
+    const resume = new AgentRuntimeClient(reopened);
+    for (const method of ['submit', 'enqueue'] as const) {
+      const key = 'expired-' + method;
+      const late = { key, threadId: command.threadId, branchId: command.branchId, input: { text: key } };
+      const attempt = { ...command, method, key, inboxId: key };
+      await reopened.agentRuntimeRequest('runtime.inbox.reconcile', attempt);
+      const draft = { text: key };
+      expect(await reopened.agentRuntimeRequest('runtime.inbox.reconcile', { ...attempt, result: expiry, draft }))
+        .toEqual({ result: expiry });
+      const dispatch = method === 'submit' ? resume.submit({ ...late, expectedHead: receipt.input_id, configuration: {} })
+        : resume.enqueue({ ...late, mode: 'next_run' });
+      await expect(dispatch).rejects.toThrow(/supervisor inbox input expired/i);
+      expect(await reopened.agentRuntimeRequest('runtime.inbox.rejections', {
+        principalId, threadId: command.threadId, branchId: command.branchId,
+      })).toEqual([{ inboxId: key, key, status: 409, code: 'inbox-replay-expired', draft }]);
+      await reopened.agentRuntimeRequest('runtime.inbox.dismiss', { inboxId: key, principalId, threadId: command.threadId, branchId: command.branchId });
+    }
+    await expect(reopened.agentRuntimeRequest('runtime.inbox.reconcile', { ...command, principalId: 'other-owner' })).rejects.toThrow(/identity changed/i);
+    const rejected = { ...command, inboxId: 'supervisor-second', key: 'rejected-input' };
+    const draft = { text: 'draft to edit', attachments: [{ ref: 'retained-file' }] };
+    await reopened.agentRuntimeRequest('runtime.inbox.reconcile', { ...rejected, draft, result: { status: 409, body: { code: 'thread-conflict' } } });
+    expect(await reopened.agentRuntimeRequest('runtime.inbox.rejections', {
+      principalId, threadId: command.threadId, branchId: command.branchId,
+    })).toEqual([{ inboxId: rejected.inboxId, key: rejected.key, status: 409, code: 'thread-conflict', draft }]);
+    const scope = { inboxId: rejected.inboxId, principalId, threadId: command.threadId, branchId: command.branchId };
+    await reopened.agentRuntimeRequest('runtime.inbox.dismiss', { ...scope, principalId: 'other-owner' });
+    expect(await reopened.agentRuntimeRequest('runtime.inbox.rejections', {
+      principalId, threadId: command.threadId, branchId: command.branchId,
+    })).toHaveLength(1);
+    await reopened.agentRuntimeRequest('runtime.inbox.dismiss', scope);
+    expect(await reopened.agentRuntimeRequest('runtime.inbox.rejections', {
+      principalId, threadId: command.threadId, branchId: command.branchId,
+    })).toEqual([]);
+    expect(await reopened.agentRuntimeRequest('runtime.inbox.reconcile', rejected)).toEqual({
+      result: { status: 409, body: { code: 'thread-conflict' } },
+    });
+  } finally { await reopened.close(); }
+}, 30_000);
+
+it('archives a durably accepted receiver page under its original checkpoint after the arrangement ends', async () => {
+  const { runtimeClient } = await fixture();
+  const identity = { principalId: 'owner', source: { extensionId: 'fixture.mail', sourceId: 'messages', connectionId: 'mailbox', accountId: 'account' } };
+  const page = { identity, expectedCursor: null, nextCursor: 'next', status: null, events: [{
+    eventId: 'event', objectId: null, senderId: null, revision: null, occurredAtMs: Date.now(), attributes: {},
+    content: { data: null, parts: [] }, files: [], echoOf: null,
+  }] };
+  await expect(runtimeClient.receiveDurablePluginEvents(page)).rejects.toThrow(/no active arrangement/i);
+  await runtimeClient.updateEventSourceStatus({ identity, status: { code: 'connecting', message: null, coverage: null, lastConnectedAtMs: null } });
+  await expect(runtimeClient.receivePluginEvents(page)).rejects.toThrow(/no active arrangement/i);
+  await expect(runtimeClient.receiveDurablePluginEvents(page)).resolves.toMatchObject({ accepted: 1, checkpoint: { identity, cursor: 'next' } });
+  await expect(runtimeClient.receiveDurablePluginEvents(page)).resolves.toMatchObject({ accepted: 0, duplicates: 1, checkpoint: { cursor: 'next' } });
+}, 30_000);
+
 it('framed IPC rejects malformed parameters and stale or grant-scoped authority', async () => {
   const f = await fixture();
   for (const request of [

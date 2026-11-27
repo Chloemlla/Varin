@@ -5,12 +5,15 @@ import { TunnelSettings } from '@/components/sections/varin/TunnelSettings';
 import { Disclosure, Section } from '@/components/sections/shared/kit';
 import { isDesktopLocalOriginActive, isDesktopShell, isWebRuntime } from '@/lib/desktop';
 import { isCapacitorApp } from '@/lib/platform';
+import { useDeploymentPolicy } from '@/hooks/useDeploymentPolicy';
 import { useI18n } from '@/lib/i18n';
 
 export function RemoteAccessPage() {
   const { t } = useI18n();
   const localDesktop = isDesktopShell() && isDesktopLocalOriginActive();
-  return <RemoteInstancesPage view="access" intro={<>
+  const policy = useDeploymentPolicy();
+  return <RemoteInstancesPage view="access" intro={policy === undefined ? null : policy?.ingress?.mode === 'gateway'
+    ? <p className="typography-meta text-muted-foreground">{t('settings.connections.managedAccess')}</p> : <>
     <Section>
       {localDesktop ? <Disclosure label={t('settings.remoteAccess.lan')}>
         <div className="sk-pad"><DesktopNetworkSettings section="access" /></div>

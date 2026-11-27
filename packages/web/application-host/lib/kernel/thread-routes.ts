@@ -23,6 +23,7 @@ import type { ThreadIdentity, ThreadModel, ThreadSubmit, ThreadThinkingLevel, Th
 import { ComputerError } from '../computer/computer-error.js';
 import { HarnessServiceError } from '../harness/service-error.js';
 import { KernelClientError } from './kernel-client.js';
+import { DeploymentPolicyDeniedError } from '../deployment/policy.js';
 import { ThreadAdapter, ThreadPreAdmissionError } from './thread-adapter.js';
 import { WorkspaceBackendUnavailableError } from './native-workspaces.js';
 import { listThreadSourceRoutes, putThreadSourceRoute, removeThreadSourceRoute, putThreadArrangement, controlThreadBacklog, listThreadFollowupJobs, pendingThreadFollowupRegistrations, cancelThreadFollowupRegistration, updateThreadFollowup, controlThreadFollowup, getThreadFollowup, getThreadFollowupOccurrence, listThreadFollowupOccurrences, listThreadFollowups, registerThreadFollowup } from './thread-followups.js';
@@ -319,6 +320,11 @@ export function registerThreadRoutes(app: Express, adapter: ThreadAdapter, requi
       catch (error) {
         // Errors from credentials/model services can contain upstream bodies. Do not echo them.
         const reason = error instanceof ThreadPreAdmissionError ? error.reason : error;
+        if (reason instanceof DeploymentPolicyDeniedError || reason instanceof KernelClientError && reason.code === 'deployment-policy-denied') {
+          response.status(403).json({ code: 'deployment-policy-denied', error: reason.message,
+            ...(error instanceof ThreadPreAdmissionError && { admission: 'not_started' }) });
+          return;
+        }
         if (reason instanceof ResourceScopeError) {
           const status = reason.failure.status === 'denied' ? 403 : reason.failure.status === 'stale' ? 409
             : reason.failure.status === 'missing' ? 404 : reason.failure.status === 'unavailable' ? 503 : 400;

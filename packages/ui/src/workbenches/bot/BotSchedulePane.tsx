@@ -1,119 +1,155 @@
 import React from 'react';
 import type { ScheduledTask } from '@varin/application-client';
+import type { CalendarOccurrence } from '@varin/protocol';
 import { Icon } from '@/components/icon/Icon';
+import { Button } from '@/components/ui/button';
 import { formatSchedule } from '@/components/session/scheduleFormat';
 import { getCurrentIntlLocale, useI18n } from '@/lib/i18n';
-import { followupStatus, followupTrigger, pendingFollowup } from '@/lib/followupPresentation';
 import { useUIStore } from '@/stores/useUIStore';
+import { useMobilePages } from '@/contexts/mobile-pages';
 import { useBotPanel } from './botPanelModel';
-import { clockTime, dayLabel } from './botPresentation';
+import { clockTime, dayLabel, occurrenceTime } from './botPresentation';
 import { useFlash, useScrollIntoFocus } from './botFocus';
+import { BotScheduleResult } from './BotScheduleResult';
 
-const openScheduleEditor = () => useUIStore.getState().setScheduledTasksDialogOpen(true);
-
-function ScheduleRow({ task, open, onToggle, locale, rule }: { task: ScheduledTask; open: boolean; onToggle(): void; locale: string; rule: boolean }) {
+function ScheduleRow({ task, open, onToggle, locale, onEdit, onResult }: {
+  task: ScheduledTask;
+  open: boolean;
+  onToggle(): void;
+  locale: string;
+  onEdit(button: HTMLButtonElement): void;
+  onResult(record: CalendarOccurrence, button: HTMLButtonElement): void;
+}) {
   const { t } = useI18n();
   const model = useBotPanel();
+  const id = React.useId();
   const definition = task.calendar?.definition;
   const next = definition?.next_at_ms ?? null;
-  const focused = !rule && model.focus?.tab === 'schedule' && model.focus.id === task.id;
-  const flash = useFlash(focused, model.focus?.token);
+  const focused = model.focus?.tab === 'schedule' && model.focus.id === task.id;
+  const token = model.focus?.token;
+  const occurrenceFocus = focused ? model.focus?.occurrenceId : undefined;
+  const flash = useFlash(focused, token);
   const ref = React.useRef<HTMLDivElement>(null);
-  useScrollIntoFocus(ref, focused, model.focus?.token);
+  const recordFocus = React.useRef<HTMLButtonElement>(null);
+  useScrollIntoFocus(ref, focused && !occurrenceFocus, token);
+  React.useEffect(() => {
+    if (!open || !occurrenceFocus || !recordFocus.current) return;
+    recordFocus.current.scrollIntoView?.({ block: 'nearest' });
+    recordFocus.current.focus({ preventScroll: true });
+  }, [open, occurrenceFocus, token]);
+
   const target = definition?.target ?? task.target;
-  const targetLabel = target.kind === 'existing_work'
-    ? (model.sessions.some(session => session.identity.threadId === target.threadId) ? model.sessionTitle(target.threadId) : target.threadId)
-    : t('bot.schedule.newWork');
-  const whenLabel = next ? clockTime(next, locale) : '--:--';
-  const dateLabel = next === null ? null : dayLabel(new Date(next).setHours(0, 0, 0, 0), Date.now(), locale);
-  const dateText = dateLabel === null ? '' : 'key' in dateLabel ? t(dateLabel.key) : new Intl.DateTimeFormat(locale, { month: 'numeric', day: 'numeric' }).format(next!);
-  const nextNote = definition?.calculation_failure ? t('bot.schedule.calculationFailed')
-    : definition?.calculation_pending ? t('bot.schedule.calculating') : !next ? t('bot.schedule.noNext') : null;
+  const targetText = target.kind === 'new_work' ? t('bot.schedule.newWork') :
+    model.sessions.some(session => session.identity.threadId === target.threadId)
+      ? t('bot.schedule.continueIn', { title: model.sessionTitle(target.threadId) })
+      : t('calendar.target.existing');
+  const nextDay = next === null ? null : dayLabel(new Date(next).setHours(0, 0, 0, 0), Date.now(), locale);
+  const dateText = nextDay === null ? '' : 'key' in nextDay ? t(nextDay.key) : new Intl.DateTimeFormat(locale, { month: 'numeric', day: 'numeric' }).format(next!);
+  const nextNote = !task.enabled ? t('bot.schedule.paused') : definition?.calculation_failure ? t('bot.schedule.calculationFailed')
+    : definition?.calculation_pending ? t('bot.schedule.calculating') : t('bot.schedule.noNext');
+  const records = React.useMemo(() => [...(task.calendar?.occurrences ?? [])].sort((a, b) =>
+    occurrenceTime(b) - occurrenceTime(a) || b.observed_at_ms - a.observed_at_ms), [task.calendar?.occurrences]);
+  const dateFormat = React.useMemo(() => new Intl.DateTimeFormat(locale, { month: 'short', day: 'numeric' }), [locale]);
   return <div ref={ref} className={`bot-schedule ${flash ?? ''}`} data-open={open} data-paused={!task.enabled || undefined}>
-    <button type="button" className="flex w-full items-start gap-3 px-3 py-[11px] text-left" aria-expanded={open} onClick={onToggle}>
-      {rule ? <span className="bot-schedule-when items-center pt-0.5 text-muted-foreground"><Icon name="history" className="size-4" /></span>
-        : <span className="bot-schedule-when"><b>{whenLabel}</b><span className="text-[11.5px] text-muted-foreground">{dateText}</span></span>}
-      <span className="flex min-w-0 flex-col leading-normal">
-        <span className="flex min-w-0 items-center gap-1.5"><b className="bot-schedule-name truncate text-[13.5px] font-medium">{task.name}</b>{!task.enabled ? <span className="bot-tag shrink-0">{t('bot.schedule.paused')}</span> : null}</span>
-        <span className="truncate text-[12.5px] text-muted-foreground">{rule ? formatSchedule(task, t) : nextNote ?? targetLabel}</span>
+    <button type="button" className="bot-schedule-trigger" aria-expanded={open} aria-controls={id} onClick={onToggle}>
+      <span className="bot-schedule-when">{task.enabled && next !== null
+        ? <><b>{clockTime(next, locale)}</b><small>{dateText}</small></>
+        : <><Icon name="calendar-schedule" className="size-4" /><small>{nextNote}</small></>}</span>
+      <span className="grid min-w-0 flex-1">
+        <b className="bot-schedule-name truncate text-[13.5px] font-medium">{task.name}</b>
+        <small className="truncate" title={formatSchedule(task, t)}>{t(`calendar.schedule.${task.schedule.kind}`)} · {targetText}</small>
       </span>
+      <Icon name="arrow-right-s" className="bot-schedule-chevron size-4 shrink-0" />
     </button>
-    <div className="bot-fold" data-open={open}><div>
-      <dl className="bot-schedule-detail">
-        <dt>{t('bot.schedule.rule')}</dt><dd>{formatSchedule(task, t)}</dd>
-        <dt>{t('bot.schedule.target')}</dt><dd>{targetLabel}</dd>
-        <dt>{t('bot.schedule.missed')}</dt><dd>{(definition?.missed_policy ?? task.missedPolicy) === 'coalesce_once' ? t('bot.schedule.missedOnce') : t('bot.schedule.missedSkip')}</dd>
-        {task.loopError ? <dd className="col-span-2 text-destructive">{task.loopError}</dd> : null}
-        <dd className="col-span-2 flex gap-1.5 pt-1.5">
-          <button type="button" className="inline-flex h-7 items-center gap-1.5 rounded-lg px-2.5 text-[12.5px] text-foreground shadow-[inset_0_0_0_1px_var(--interactive-border)] hover:bg-[var(--interactive-hover)]" onClick={openScheduleEditor}>
-            <Icon name="edit" className="size-3.5" />{t('bot.schedule.edit')}
-          </button>
-        </dd>
-      </dl>
+    <div className="bot-fold" id={id} data-open={open} inert={!open}><div>
+      <div className="bot-schedule-records">
+        <header>
+          <span>{t('bot.schedule.records')}</span>
+          <Button type="button" size="sm" variant="ghost" onClick={event => onEdit(event.currentTarget)}>{t('bot.schedule.editTitle')}</Button>
+        </header>
+        {task.loopError && <p role="status" className="px-1 pb-2 typography-meta text-destructive">{task.loopError}</p>}
+        {!records.length ? <p className="px-1 pb-2 typography-meta text-muted-foreground">{t('bot.schedule.emptyRecords')}</p>
+          : records.map(record => {
+            const when = occurrenceTime(record);
+            return <button type="button" className="bot-schedule-record" key={record.id}
+              ref={occurrenceFocus === record.id ? recordFocus : undefined} onClick={event => onResult(record, event.currentTarget)}>
+              <time dateTime={new Date(when).toISOString()}>{dateFormat.format(when)} <span>{clockTime(when, locale)}</span></time>
+              <span className="bot-schedule-record-state" data-state={record.state}><i />{t(`bot.schedule.state.${record.state}`)}</span>
+              <Icon name="arrow-right-s" className="size-4 shrink-0 text-muted-foreground" />
+            </button>;
+          })}
+      </div>
     </div></div>
   </div>;
 }
 
-/** Compact projection only; management uses the same owner and original receiving location. */
-export function BotArrangements() {
-  const { t } = useI18n();
-  const model = useBotPanel();
-  const { arrangements: read, eventSources, arrangementIdentity, retryArrangements, retryEventSources } = model.facts;
-  if (!model.threads?.followups || !arrangementIdentity) return null;
-  const sources = eventSources.value ?? [];
-  const open = (id?: string, identity = arrangementIdentity) => useUIStore.getState().openArrangements(identity, id);
-  return <section aria-label={t('arrangements.title')}>
-    <p className="bot-section-label">{t('arrangements.title')}</p>
-    {read.status === 'loading' && !read.value && <p role="status" className="px-3 typography-meta">{t('common.loading')}</p>}
-    {read.status === 'failed' && <p role="alert" className="px-3 typography-meta text-destructive">{read.error} <button onClick={retryArrangements}>{t('settings.harness.retry')}</button></p>}
-    {eventSources.status === 'failed' && <p role="alert" className="px-3 typography-meta text-destructive">{eventSources.error} <button onClick={retryEventSources}>{t('settings.harness.retry')}</button></p>}
-    {(read.value ?? []).filter(pendingFollowup).map(item => {
-      const source = item.trigger.kind === 'plugin_event' ? item.trigger.source : null;
-      const descriptor = sources.find(candidate => candidate.extensionId === source?.extensionId && candidate.sourceId === source.sourceId
-        && candidate.host?.hostId === source.host?.hostId && candidate.host?.connectionId === source.host?.connectionId && candidate.host?.endpointIdentity === source.host?.endpointIdentity);
-      const connection = descriptor?.connections.find(candidate => candidate.connectionId === source?.connectionId && candidate.accountId === source.accountId);
-      return <button key={item.id} type="button" className="bot-schedule flex w-full flex-col gap-1 px-3 py-3 text-left" onClick={() => open(item.id, { runtime: 'agent', threadId: item.thread_id, branchId: item.branch_id })}>
-        <span className="text-[13.5px] font-medium">{item.name || descriptor?.displayName || followupTrigger(item, t)}</span>
-        <span className="text-xs text-muted-foreground">{[descriptor?.displayName ?? source?.sourceId, connection?.displayName ?? source?.connectionId, followupStatus(item, t)].filter(Boolean).join(' · ')}</span>
-        <span className="text-xs text-muted-foreground">{item.next_delivery_at_ms !== null ? t('arrangements.next', { time: new Date(item.next_delivery_at_ms).toLocaleString() }) : t(`arrangements.${item.timing.kind}`)}</span>
-        {item.pending_events > 0 && <span className="text-xs">{t('arrangements.pending', { count: item.pending_events })}</span>}
-        {source && !item.source_status && <span className="text-xs text-muted-foreground">{t('arrangements.unknownHealth')}</span>}
-        {item.source_status?.code && <span className="text-xs text-destructive">{t('arrangements.unavailable', { code: item.source_status.code })}{item.source_status.message ? ` · ${item.source_status.message}` : ''}</span>}
-      </button>;
-    })}
-    <button type="button" className="mx-3 my-3 text-[13px] hover:underline" onClick={() => open()}>{t('arrangements.manage')}</button>
-  </section>;
-}
-
-/** What comes next and what repeats. Editing stays in the Calendar dialog (§5.6). */
 export function BotSchedulePane() {
   const { t } = useI18n();
   const model = useBotPanel();
+  const mobile = useMobilePages();
   const locale = getCurrentIntlLocale();
-  const [openId, setOpenId] = React.useState<string | null>(null);
-  React.useEffect(() => { if (model.focus?.tab === 'schedule') setOpenId(model.focus.id); }, [model.focus]);
+  const focus = model.focus;
+  const [openId, setOpenId] = React.useState<string | null>(() => focus?.tab === 'schedule' ? focus.id : null);
+  const [result, setResult] = React.useState<{ taskId: string; recordId: string; open: boolean } | null>(null);
+  const pageOpen = useUIStore(state => state.isScheduledTasksDialogOpen && Boolean(state.scheduledTasksConversation?.botPage));
+  const pageOrigin = React.useRef<HTMLButtonElement | null>(null);
+  const resultOrigin = React.useRef<HTMLButtonElement | null>(null);
+  React.useEffect(() => { if (focus?.tab === 'schedule') setOpenId(focus.id); }, [focus]);
+  React.useLayoutEffect(() => {
+    if (pageOpen || !pageOrigin.current) return;
+    if (pageOrigin.current.isConnected && !pageOrigin.current.closest('[inert]')) pageOrigin.current.focus({ preventScroll: true });
+    pageOrigin.current = null;
+  }, [pageOpen]);
   const read = model.facts.tasks;
-  const tasks = read.value ?? [];
-  const upcoming = tasks.filter(task => task.enabled && task.calendar?.definition.next_at_ms)
-    .sort((a, b) => (a.calendar!.definition.next_at_ms ?? 0) - (b.calendar!.definition.next_at_ms ?? 0));
-  // Repeating rules, paused ones included; a once-only task that is no longer coming up stays visible here too.
-  const rules = tasks.filter(task => task.schedule.kind !== 'once' || !upcoming.includes(task));
-  const row = (task: ScheduledTask, rule: boolean) => {
-    const key = rule ? `rule:${task.id}` : task.id;
-    return <ScheduleRow key={key} task={task} locale={locale} rule={rule} open={openId === key} onToggle={() => setOpenId(current => current === key ? null : key)} />;
+  const identity = model.scheduleIdentity ?? model.session?.identity ?? model.bot.entry;
+  const tasks = [...(read.value ?? [])].sort((a, b) => (
+    (a.enabled ? a.calendar?.definition.next_at_ms ?? Infinity : Infinity) -
+    (b.enabled ? b.calendar?.definition.next_at_ms ?? Infinity : Infinity) || a.name.localeCompare(b.name, locale)
+  ));
+  const selectedTask = result && tasks.find(task => task.id === result.taskId);
+  const selectedRecord = selectedTask && result && selectedTask.calendar?.occurrences.find(record => record.id === result.recordId);
+  const openEditor = (task: ScheduledTask | null, button: HTMLButtonElement) => {
+    pageOrigin.current = button;
+    const destinations = model.sessions.flatMap(session => [session.identity, ...session.branches].map((identity, index) => ({
+      identity, label: index ? t('bot.schedule.destinationBranch', { title: model.sessionTitle(identity.threadId), index }) : model.sessionTitle(identity.threadId),
+    })));
+    useUIStore.getState().setScheduledTasksDialogOpen(true, {
+      identity, model: model.bot.model ?? undefined,
+      botPage: { kind: 'editor', project: { id: `bot:${model.bot.id}`, path: model.bot.homeDir, label: model.bot.name }, task, destinations },
+    });
   };
-  return <>
-    <BotArrangements />
+  const openRecord = (task: ScheduledTask, record: CalendarOccurrence, button: HTMLButtonElement) => {
+    const target = record.target_kind ?? (record.thread_id === `thread:${record.id}` ? 'new_work' : 'existing_work');
+    if (target === 'existing_work' && record.history_item_id && record.run_id && (record.state === 'delivered' || record.state === 'completed') && model.openScheduleTurn) {
+      model.openScheduleTurn(task.id, record, () => mobile?.showDetails(false));
+      return;
+    }
+    resultOrigin.current = button;
+    setResult({ taskId: task.id, recordId: record.id, open: true });
+  };
+  return <div inert={pageOpen || undefined}>
     {read.status === 'failed' ? <div role="alert" className="mx-2 my-2 flex gap-2 typography-meta text-destructive">
       <span className="min-w-0 flex-1 break-words">{read.error}</span>
-      <button type="button" className="shrink-0 text-foreground hover:underline" onClick={model.facts.retryTasks}>{t('settings.harness.retry')}</button>
+      <button type="button" className="shrink-0 text-foreground hover:underline" onClick={model.facts.retryTasks}>{t('common.retry')}</button>
     </div> : null}
     {read.status === 'loading' && !read.value ? <p role="status" className="px-4 py-6 text-center typography-meta text-muted-foreground">{t('common.loading')}</p> : null}
-    {upcoming.length ? <section aria-label={t('bot.schedule.upcoming')}><p className="bot-section-label">{t('bot.schedule.upcoming')}</p>{upcoming.map(task => row(task, false))}</section> : null}
-    {rules.length ? <section aria-label={t('bot.schedule.rules')}><p className="bot-section-label">{t('bot.schedule.rules')}</p>{rules.map(task => row(task, true))}</section> : null}
+    {tasks.length ? <section aria-label={t('bot.schedule.upcoming')}>
+      <p className="bot-section-label">{t('bot.schedule.upcoming')}</p>
+      {tasks.map(task => <ScheduleRow key={task.id} task={task} locale={locale} open={openId === task.id}
+        onToggle={() => setOpenId(current => current === task.id ? null : task.id)}
+        onEdit={button => openEditor(task, button)} onResult={(record, button) => openRecord(task, record, button)} />)}
+    </section> : null}
     {read.status === 'ready' && !tasks.length ? <p className="px-4 py-7 text-center text-[13px] leading-loose text-muted-foreground">{t('bot.schedule.empty')}</p> : null}
-    <button type="button" className="mx-1 mt-3 flex h-9 w-[calc(100%-8px)] items-center justify-center gap-2 rounded-[10px] text-[13px] text-muted-foreground shadow-[inset_0_0_0_1px_var(--interactive-border)] transition-colors hover:bg-[var(--interactive-hover)] hover:text-foreground" onClick={openScheduleEditor}>
-      <Icon name="add" className="size-3.5" />{t('bot.schedule.new')}
-    </button>
-  </>;
+    <footer className="bot-schedule-actions">
+      <Button type="button" size="sm" variant="ghost" className="gap-1 px-1 text-muted-foreground" onClick={event => {
+        pageOrigin.current = event.currentTarget;
+        useUIStore.getState().setScheduledTasksDialogOpen(true, { identity, botPage: { kind: 'arrangements' } });
+      }}>{t('arrangements.title')}<Icon name="arrow-right-s" className="size-3.5" /></Button>
+      <Button type="button" size="sm" variant="outline" className="gap-1.5" onClick={event => openEditor(null, event.currentTarget)}>
+        <Icon name="add" className="size-3.5" />{t('bot.schedule.new')}
+      </Button>
+    </footer>
+    {selectedTask && selectedRecord && result && <BotScheduleResult key={selectedRecord.id} name={selectedTask.name} record={selectedRecord} locale={locale}
+      open={result.open} onClose={() => setResult(current => current && ({ ...current, open: false }))} finalFocus={() => resultOrigin.current} />}
+  </div>;
 }

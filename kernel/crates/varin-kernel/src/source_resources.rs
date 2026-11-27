@@ -1065,6 +1065,7 @@ pub(crate) fn prepare_request(
         "source.authority.inspect_scope" => {
             storage.inspect_source_scope(serde_json::from_value(params)?)?
         }
+        "source.retention" => storage.source_retention(epoch)?,
         "source.authority.release" => {
             let p: SourceAuthorityReleaseParams = serde_json::from_value(params)?;
             storage.release_source_authority(

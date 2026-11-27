@@ -90,11 +90,12 @@ projected Calendar wake, Calendar asset watchers, HTTP observations and active
 external ingress. An unavailable owner is reported separately from a known
 zero. This is an observation, not an atomic handoff receipt or permission to stop.
 
-The Host stays online. Follow-up, timed waits, other owner retention and external
-wake acknowledgement are not covered by this projection; parking remains
-unsupported. Do not use the cancelling shutdown API to implement an idle park.
-The durable ingress and wake protocol must first prove that accepted input and
-scheduler responsibility survive a stopped Host.
+Automatic parking is available for a gateway-mode Host run by the POSIX local supervisor
+with `--park-after-ms` and `--listen-port`. Parking requires known retention owners and a
+native Catalog reservation. The Host publishes the earliest required wake, seals ingress,
+transfers eligible extension receivers, and closes its owned stores before issuing a park
+receipt. Ordinary shutdown remains a separate operation.
+See [operator setup](ops/cloud-deployment.md#application-host-parking-posix).
 
 ### Opt-in local supervisor handoff (POSIX)
 
@@ -137,18 +138,26 @@ Do not run another producer for the same cursor. Host replay passes the page
 through the original Catalog event-receive command (including its active-source
 and deduplication checks), and verifies the returned identity and checkpoint.
 Conflicts or invalid acknowledgements leave the accepted page pending. The
-journal keeps an acknowledged copy privately because ordinary Catalog WAL
-receipts do not promise power-loss durability. This increment has no automatic
-archive compaction or recovery from a storage rollback; budget disk space and
-keep this directory private. On a process crash before acknowledgement, the
-same pending page is delivered again under its original keys.
+journal releases event bodies after Catalog confirms durable receipt. On a process crash
+before acknowledgement, the same pending page is delivered under its original keys.
+The journal requires POSIX directory sync.
 
-This does **not** switch automatic parking on or transfer Calendar scheduling.
-There is no Park command and the production Host does not emit a quiescent
-exit receipt. The resident supervisor must not turn an ordinary exit or stop
-into Park. Incomplete owner coverage, external scheduler publication and
-lossless close are still blockers. On filesystems without supported directory
-sync or on Windows, do not enable the local supervisor journal.
+The local supervisor's durable user inbox accepts input and referenced uploads during
+wake-up. One branch's pending replay preserves its order. Unrelated branches and reads
+can proceed. Catalog keeps the original command receipt and exposes definitively rejected
+drafts until the owner dismisses them. Automatic replay has a two-minute window once an
+entry reaches its branch head. Catalog either recovers its original receipt or records a
+rejection and fences a late submission before replay continues. This storage is additive
+within Catalog format 103.
+
+Parking-aware clients close observations after one minute of idle time. A conversation
+that is running, awaiting approval or awaiting an answer keeps its observation open.
+Personal clients keep their existing observation behavior.
+
+`IngressInbox` and `WakePublisher` define durable acceptance and wake publication. The local
+implementations serve a single Host. An embedding deployment can provide its event inbox and scheduler through the gateway-mode Host startup options and call the controller’s park method. The local supervisor also accepts an alternative user-input inbox.
+Fleet coordination, gateway authentication and shared process placement belong to the
+deployment.
 
 ## Graceful Shutdown & Cold Backup
 

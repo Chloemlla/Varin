@@ -1410,6 +1410,7 @@ export const createPreviewProxyRuntime = ({
   let sweepTimer: ReturnType<typeof setInterval> | null = null;
   let draining = false;
   const sockets = new Set<Duplex>();
+  const responses = new Set<PreviewProxyResponse>();
   const rememberSocket = (socket: Duplex) => {
     if (draining) { socket.destroy(); return; }
     sockets.add(socket); socket.once('close', () => sockets.delete(socket));
@@ -1806,7 +1807,13 @@ export const createPreviewProxyRuntime = ({
       }
       next();
     };
-    app.use('/api/preview/proxy', requirePreviewTarget, proxy);
+    const observeRequest: RequestHandler = (_request, response, next) => {
+      responses.add(response);
+      response.once('close', () => responses.delete(response));
+      response.once('finish', () => responses.delete(response));
+      next();
+    };
+    app.use('/api/preview/proxy', requirePreviewTarget, observeRequest, proxy);
 
     server.on('upgrade', (req, socket, head) => {
       if ((draining || isDraining()) && req.url?.startsWith('/api/preview/proxy/')) {
@@ -1853,6 +1860,7 @@ export const createPreviewProxyRuntime = ({
   return {
     attach,
     beginDraining,
+    activity: () => ({ requests: responses.size, sockets: sockets.size }),
     stop: () => { beginDraining(); if (sweepTimer) clearInterval(sweepTimer); sweepTimer = null; targets.clear(); },
   };
 };

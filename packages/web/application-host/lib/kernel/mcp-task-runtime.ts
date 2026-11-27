@@ -332,6 +332,7 @@ export function createMcpTaskRuntime(options:{
   const wake=()=>{if(started&&!disposed)void reconcile().catch(report);};
   const sourceReached=()=>{if(disposed)return;sourceRevision++;for(const entry of entries.values())resetSource(entry,sourceRevision);wake();};
   return {
+    activeOperations: () => entries.size + admitting.size,
     start(){if(started||disposed)return;started=true;removers.push(options.runtime.onReady(sourceReached),options.runtime.onEvent(wake));wake();},
     reconcile,sourceReached,
     async submit(input:{call:HostToolCall;owner:ExecutorOwner;lease:McpTaskLease;tool:McpAuthorityTool;args:Record<string,unknown>;ttl?:number;signal:AbortSignal;beforeDispatch?:()=>void|Promise<void>}):Promise<ToolExecutionReceipt>{

@@ -56,12 +56,21 @@ function DropTarget({ id, drop, children, line = false, disabled = false }: { id
   const { setNodeRef, isOver } = useDroppable({ id, data: drop, disabled });
   return <div ref={setNodeRef} className={cn(line ? 'relative z-10 -my-0.5 h-1 rounded transition-colors' : 'rounded-md', isOver && (line ? 'bg-primary' : 'bg-interactive-selection ring-1 ring-primary/50'))}>{children}</div>;
 }
-function DragRow({ node, pending, expanded, children }: { node: OrganizationNode; pending: boolean; expanded: boolean; children: (handle: React.ReactNode) => React.ReactNode }) {
+type BranchProps = { node: OrganizationNode; pending: boolean; expanded: boolean };
+
+function OrganizationBranch({ node, pending, expanded, children, dragRef, dragging }: React.PropsWithChildren<BranchProps> & {
+  dragRef?: React.Ref<HTMLDivElement>; dragging?: boolean;
+}) {
+  return <div ref={dragRef} data-flip-key={node.key} data-flip-arrive="" data-collapsed={!expanded && (node.container || node.children.length || node.conversation?.hasChildren) ? '' : undefined}
+    className={cn('transition-opacity', (dragging || pending) && 'opacity-45')} aria-busy={pending || undefined}>{children}</div>;
+}
+
+function DraggableBranch({ children, ...branch }: BranchProps & { children: (handle: React.ReactNode) => React.ReactNode }) {
   const { t } = useI18n();
-  const { attributes, listeners, setNodeRef, isDragging } = useDraggable({ id: node.key, data: node, disabled: pending });
-  return <div ref={setNodeRef} data-flip-key={node.key} data-flip-arrive="" data-collapsed={!expanded && (node.container || node.children.length) ? '' : undefined} className={cn('transition-opacity', (isDragging || pending) && 'opacity-45')} aria-busy={pending || undefined}>
+  const { attributes, listeners, setNodeRef, isDragging } = useDraggable({ id: branch.node.key, data: branch.node, disabled: branch.pending });
+  return <OrganizationBranch {...branch} dragRef={setNodeRef} dragging={isDragging}>
     {children(<button type="button" {...attributes} {...listeners} className="organization-icon-button organization-drag" aria-label={t('organization.drag')}><Icon name="draggable" className="size-3" /></button>)}
-  </div>;
+  </OrganizationBranch>;
 }
 export interface OrganizationNavigationHandle { newConversation(botId?: string | null): void; newGroup(): void; addProject(): void }
 export interface ConversationOrganizationTreeProps {
@@ -77,6 +86,7 @@ export const ConversationOrganizationTree = React.forwardRef<OrganizationNavigat
   const botWorkspace = useBotWorkspaceNavigation();
   const apis = useRuntimeAPIs();
   const projects = useProjectsStore(s => s.projects);
+  const projectById = React.useMemo(() => new Map(projects.map(project => [project.id, project])), [projects]);
   const threads = useThreadStore(s => s.threads);
   const botEntry = useBotNavigation(s => s.entry);
   const selected = useThreadStore(s => s.selectedIdentity);
@@ -85,7 +95,6 @@ export const ConversationOrganizationTree = React.forwardRef<OrganizationNavigat
   const sidebar = useSidebarCatalog(viewKey === 'bot');
   const snapshot = state.host === getRuntimeEndpointGeneration() ? state.snapshot : null;
   const [preference, setPreference] = useOrganizationNavigation(viewKey);
-  const knownKeys = new Set([...(snapshot?.containers ?? []).map(c => organizationObjectKey({ kind: 'container', id: c.id })), ...(snapshot?.conversations ?? []).map(e => organizationObjectKey(e.conversation))]);
   const recent = preference.view === 'recent' && !preference.focus;
   const selectionTargets = React.useRef(new Map<string, OrganizationNode>());
   const [selection, setSelection] = React.useState<Set<string>>(new Set());
@@ -118,15 +127,21 @@ export const ConversationOrganizationTree = React.forwardRef<OrganizationNavigat
   React.useEffect(() => {
     if (previousBot.current !== botId) { previousBot.current = botId; setPreference({ focus: null }); setSelection(new Set()); }
   }, [botId, setPreference]);
-  const namedSnapshot = React.useMemo(() => snapshot ? { ...snapshot, containers: snapshot.containers.map(c => c.kind === 'project' ? { ...c, name: projects.find(p => p.id === c.projectId)?.label || projects.find(p => p.id === c.projectId)?.path.split(/[\\/]/).filter(Boolean).at(-1) || t('organization.projectUnavailable') } : c) } : null, [snapshot, projects, t]);
+  const namedSnapshot = React.useMemo(() => snapshot ? { ...snapshot, containers: snapshot.containers.map(container => {
+    if (container.kind !== 'project') return container;
+    const project = container.projectId ? projectById.get(container.projectId) : undefined;
+    return { ...container, name: project?.label || project?.path.split(/[\\/]/).filter(Boolean).at(-1) || t('organization.projectUnavailable') };
+  }) } : null, [snapshot, projectById, t]);
+  const namedContainers = React.useMemo(() => new Map(namedSnapshot?.containers.map(container => [container.id, container])), [namedSnapshot]);
   React.useEffect(() => { onFocusChange?.(namedSnapshot?.containers.find(container => container.id === preference.focus)?.name ?? null); }, [preference.focus, namedSnapshot, onFocusChange]);
   const scopeQuery = React.useMemo<ConversationOrganizationQuery>(() => ({ pageNodes: true, archived: archived ? 'only' : 'exclude', ...(excludeBotConversations ? { excludeBotConversations: true } : {}), ...(botId ? { botId } : {}), ...(recent ? { kind: 'conversations', sort: 'recent', recursive: true, conversationTree: {} } : {}), ...(query.trim() ? { query: query.trim(), recursive: true } : !recent ? { rootOnly: true } : {}) }), [archived, botId, query, recent, excludeBotConversations]);
   const conversationQuery = React.useCallback((parent: ConversationOrganizationRef): ConversationOrganizationQuery => ({ ...scopeQuery, conversationTree: { parent } }), [scopeQuery]);
   const containerQuery = React.useCallback((containerId: string): ConversationOrganizationQuery => ({ pageNodes: true, containerId, archived: archived ? 'only' : 'exclude', ...(excludeBotConversations ? { excludeBotConversations: true } : {}), ...(botId ? { botId } : {}) }), [archived, botId, excludeBotConversations]);
   const viewQuery = React.useMemo(() => preference.focus && !query.trim() ? containerQuery(preference.focus) : scopeQuery, [preference.focus, query, containerQuery, scopeQuery]);
+  const viewPageKey = organizationQueryKey(viewQuery);
   React.useEffect(() => { void loadOrganizationPage(viewQuery); }, [viewQuery, state.host]);
   const visibleSnapshot = React.useMemo(() => organizationViewSnapshot(state.pages, viewQuery, object => !!query.trim() || preference.expanded[organizationObjectKey(object)] === true), [state.pages, viewQuery, preference.expanded, query]);
-  const namedVisibleSnapshot = React.useMemo(() => visibleSnapshot ? { ...visibleSnapshot, containers: visibleSnapshot.containers.map(c => namedSnapshot?.containers.find(named => named.id === c.id) ?? c) } : null, [visibleSnapshot, namedSnapshot]);
+  const namedVisibleSnapshot = React.useMemo(() => visibleSnapshot ? { ...visibleSnapshot, containers: visibleSnapshot.containers.map(container => namedContainers.get(container.id) ?? container) } : null, [visibleSnapshot, namedContainers]);
   const roots = React.useMemo<OrganizationNode[]>(() => {
     if (!namedVisibleSnapshot) return [];
     if (recent) return projectRecentConversations(namedVisibleSnapshot, { archived, botId, excludeBotConversations });
@@ -147,7 +162,8 @@ export const ConversationOrganizationTree = React.forwardRef<OrganizationNavigat
   React.useEffect(() => {
     if (!snapshot || !expansion || expansion.revision === expandedRevision.current) return;
     expandedRevision.current = expansion.revision;
-    setPreference({ expanded: Object.fromEntries([...knownKeys].map(key => [key, expansion.expanded])) });
+    const knownKeys = [...snapshot.containers.map(c => organizationObjectKey({ kind: 'container', id: c.id })), ...snapshot.conversations.map(e => organizationObjectKey(e.conversation))];
+    setPreference({ expanded: Object.fromEntries(knownKeys.map(key => [key, expansion.expanded])) });
   // Only an explicit expand/collapse command changes the loaded nodes' choices.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [expansion?.revision, snapshot]);
@@ -155,7 +171,9 @@ export const ConversationOrganizationTree = React.forwardRef<OrganizationNavigat
   const walk = (items: OrganizationNode[]) => { for (const node of items) { nodes.set(node.key, node); walk(node.children); } }; walk(roots);
   const focused = preference.focus ? nodes.get(organizationObjectKey({ kind: 'container', id: preference.focus })) : null;
   const shown = focused && !query.trim() ? focused.children : roots;
-  const listLayoutKey = JSON.stringify([[...nodes.keys()], preference.expanded, preference.focus, recent, snapshot?.revision, query]);
+  // Loading a replacement view is one transition, even if its first page arrives later.
+  const listContentKey = JSON.stringify([state.host, viewPageKey, visibleSnapshot !== null]);
+  const listLayoutKey = JSON.stringify([listContentKey, [...nodes.values()].map(node => [node.key, node.children.length, !!preference.expanded[node.key]])]);
   useSelectionGlide(list, selectedObject ? organizationObjectKey(selectedObject) : null, listLayoutKey);
   useHoverPill(list);
   const openedContainers: string[] = [];
@@ -260,14 +278,23 @@ export const ConversationOrganizationTree = React.forwardRef<OrganizationNavigat
     const receipt = await command({ action: 'restore', items: undo, parents: parentIds.map((id, index) => parents([id], scopes[index])[0]) });
     if (receipt && host === getRuntimeEndpointGeneration()) setUndo(current => current === undo ? null : current);
   };
-  const allNodes = new Map<string, OrganizationNode>([...(snapshot?.containers ?? []).map(container => ({ key: organizationObjectKey({ kind: 'container', id: container.id }), object: { kind: 'container' as const, id: container.id }, parentId: container.parentId, order: container.order, container, children: [] })), ...(snapshot?.conversations ?? []).map(conversation => ({ key: organizationObjectKey(conversation.conversation), object: conversation.conversation, parentId: conversation.position.containerId, order: conversation.position.order, conversation, children: [] }))].map(node => [node.key, node]));
+  const allNodes = React.useMemo(() => new Map<string, OrganizationNode>([
+    ...(snapshot?.containers ?? []).map(container => ({ key: organizationObjectKey({ kind: 'container', id: container.id }), object: { kind: 'container' as const, id: container.id }, parentId: container.parentId, order: container.order, container, children: [] })),
+    ...(snapshot?.conversations ?? []).map(conversation => ({ key: organizationObjectKey(conversation.conversation), object: conversation.conversation, parentId: conversation.position.containerId, order: conversation.position.order, conversation, children: [] })),
+  ].map(node => [node.key, node])), [snapshot]);
   const selectedNodes = [...selection].flatMap(key => allNodes.get(key) ?? selectionTargets.current.get(key) ?? []);
   const draggedNodes = drag ? selection.has(drag.key) ? selectedNodes : [drag] : [];
-  const canDrop = (parentId: string | null, before: ConversationOrganizationObject | null = null) => !!snapshot && organizationDropAllowed(snapshot, draggedNodes, { parentId, before });
+  const canDrop = (parentId: string | null, before: ConversationOrganizationObject | null = null) => !!snapshot && (!draggedNodes.length || organizationDropAllowed(snapshot, draggedNodes, { parentId, before }));
+  const clearDrag = () => { setDrag(null); setDropLabel(''); };
+  const selectView = (view: 'recent' | 'classified') => {
+    if (view === preference.view) return;
+    clearDrag();
+    setPreference({ view });
+  };
   const onDragEnd = (event: DragEndEvent) => {
     const node = event.active.data.current as OrganizationNode | undefined;
     const drop = event.over?.data.current as Drop | undefined;
-    setDrag(null); setDropLabel('');
+    clearDrag();
     if (!event.delta.x && !event.delta.y) return;
     if (node && drop) act(() => moveNodes(selection.has(node.key) ? selectedNodes : [node], drop));
   };
@@ -275,7 +302,7 @@ export const ConversationOrganizationTree = React.forwardRef<OrganizationNavigat
   const create = (parentId: string | null) => setEditor({ id: crypto.randomUUID(), parentId, name: '', icon: 'stack', color: '' });
   const newConversation = (containerId: string | null, identity: string | null | undefined = defaultBotId ?? botId) => act(async () => {
     const projectId = nearestOrganizationProject(snapshot!, containerId);
-    const project = projects.find(p => p.id === projectId);
+    const project = projectId ? projectById.get(projectId) : undefined;
     await startThreadFromNavigation({ directory: project?.path, projectId: projectId ?? undefined, organization: { containerId }, ...(identity ? { botId: identity } : {}) });
     onNavigate?.();
   });
@@ -287,9 +314,9 @@ export const ConversationOrganizationTree = React.forwardRef<OrganizationNavigat
     await metadata(scope.conversations.map(conversation => ({ key: organizationObjectKey(conversation.conversation), object: conversation.conversation, parentId: conversation.position.containerId, order: conversation.position.order, conversation, children: [] })), { archived: !archived });
   };
   const name = (node: OrganizationNode) => node.container?.name ?? node.conversation?.title ?? t('organization.untitled');
-  const threadById = new Map(threads.map(thread => [thread.thread_id, thread]));
-  const externalById = new Map(external.map(conversation => [conversation.id, conversation]));
-  const summaryByKey = new Map(sidebar.summaries.map(summary => [organizationObjectKey({ kind: summary.harness ? 'external' : 'native', id: summary.id }), summary]));
+  const threadById = React.useMemo(() => new Map(threads.map(thread => [thread.thread_id, thread])), [threads]);
+  const externalById = React.useMemo(() => new Map(external.map(conversation => [conversation.id, conversation])), [external]);
+  const summaryByKey = React.useMemo(() => new Map(sidebar.summaries.map(summary => [organizationObjectKey({ kind: summary.harness ? 'external' : 'native', id: summary.id }), summary])), [sidebar.summaries]);
   const confirmDelete = useUIStore(store => store.showDeletionDialog);
   const [confirming, setConfirming] = React.useState<typeof confirmation>(null);
   const previousRename = React.useRef(rename); if (rename) previousRename.current = rename;
@@ -314,17 +341,19 @@ export const ConversationOrganizationTree = React.forwardRef<OrganizationNavigat
   // A receipt creates one notification; directory refreshes do not replace its action.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [undo]);
+  const searching = Boolean(query.trim());
+  const showRowPath = recent || flat || searching;
   const render = (node: OrganizationNode): React.ReactNode => {
     const entry = node.conversation, container = node.container;
-    const project = container?.kind === 'project' ? projects.find(project => project.id === container.projectId) : undefined;
-    const title = name(node), expanded = !!query.trim() || preference.expanded[node.key] === true;
+    const project = container?.kind === 'project' && container.projectId ? projectById.get(container.projectId) : undefined;
+    const title = name(node), expanded = searching || preference.expanded[node.key] === true;
     const thread = entry?.conversation.kind === 'native' ? threadById.get(node.object.id) : undefined;
     const ext = entry?.conversation.kind === 'external' ? externalById.get(node.object.id) : undefined;
     const active = !!entry && selectedObject?.kind === entry.conversation.kind && selectedObject.id === entry.conversation.id;
-    const pathLabel = entry && namedSnapshot ? organizationContainerPath(namedSnapshot, entry.position.containerId).map(container => container.name).join(' / ') || t('organization.uncategorized') : '';
+    const pathLabel = showRowPath && entry ? entry.path.map(id => namedContainers.get(id)?.name).filter(Boolean).join(' / ') || t('organization.uncategorized') : '';
     const inheritedFrom = entry?.position.inheritedFrom;
-    const originatingTitle = inheritedFrom ? snapshot?.conversations.find(candidate => organizationObjectKey(candidate.conversation) === organizationObjectKey(inheritedFrom))?.title ?? (inheritedFrom.kind === 'native' ? threadById.get(inheritedFrom.id)?.title : externalById.get(inheritedFrom.id)?.title) : null;
-    const toggle = () => { if (query.trim()) return; setPreference({ expanded: { [node.key]: !expanded } }); };
+    const originatingTitle = showRowPath && !recent && inheritedFrom ? allNodes.get(organizationObjectKey(inheritedFrom))?.conversation?.title ?? (inheritedFrom.kind === 'native' ? threadById.get(inheritedFrom.id)?.title : externalById.get(inheritedFrom.id)?.title) : null;
+    const toggle = () => { if (searching) return; setPreference({ expanded: { [node.key]: !expanded } }); };
     const open = () => {
       if (!entry) { if (query.trim() && container && onSearchReset) { setPreference({ focus: container.id }); onSearchReset(); } else toggle(); return; }
       act(async () => {
@@ -388,22 +417,34 @@ export const ConversationOrganizationTree = React.forwardRef<OrganizationNavigat
     const waiting = !!thread?.branches.some(branch => isWaitingStatus(runStatus(branch.latest_run)));
     const attention = thread?.unread && !active && !busy ? { kind: thread.branches.some(branch => branch.latest_run?.state === 'failed') ? 'error' as const : 'complete' as const, updatedAt: thread.updated_at_ms } : undefined;
     const updated = entry?.updatedAtMs ?? thread?.updated_at_ms ?? ext?.updatedAt;
-    // Reordering respects the visible container/conversation and pin segments. Moving into a
-    // different location remains available on its row, independently of display sorting.
-    const reorderable = !query.trim() && canDrop(node.parentId, node.object) && (!container || sortOrder === 'manual') && (!entry?.position.inheritedFrom || entry.position.explicit) && draggedNodes.every(candidate => !!candidate.container === !!container && (!entry || !!candidate.conversation?.pinned === !!entry.pinned));
-    return <React.Fragment key={node.key}>
-      {!recent && <DropTarget id={`before:${node.key}`} line disabled={!reorderable} drop={{ parentId: node.parentId, before: node.object, label: t('organization.moveBefore', { name: title }) }} />}
-      <DragRow node={node} pending={pendingObjects.has(node.key)} expanded={expanded}>{handle => <><DropTarget id={`inside:${node.key}`} disabled={!!query.trim() || !container || !canDrop(container.id)} drop={{ parentId: container?.id ?? node.parentId, before: null, label: t('organization.moveInside', { name: container ? title : t('organization.category') }) }}>
+    const row = (handle?: React.ReactNode) => (
         <ContextMenu><ContextMenuTrigger asChild><div className={cn(stickyHeaders && container && 'sticky top-0 z-10 bg-sidebar/95 backdrop-blur-sm')}>
           <OrganizationRow id={node.key} title={title} icon={rowIcon} origin={entry && <ConversationOrigin origin={entry.origin} />} active={active} container={!!container} recent={recent} expanded={expanded} expandable={!!(node.children.length || container || entry?.hasChildren)} selected={selection.has(node.key)} selecting={selection.size > 0 || selectionMode}
-            busy={busy} waiting={waiting} attention={attention} pinned={entry?.pinned} path={entry && (recent || flat || query.trim()) ? [pathLabel, !recent && originatingTitle].filter(Boolean).join(' · ') : undefined} time={updated === undefined ? undefined : formatSessionCompactDateLabel(updated)} summary={summaryByKey.get(node.key)} onOpen={open} onToggle={toggle} onSelect={() => selectNode(node)}
+            busy={busy} waiting={waiting} attention={attention} pinned={entry?.pinned} path={showRowPath && entry ? [pathLabel, originatingTitle].filter(Boolean).join(' · ') : undefined} time={recent && updated !== undefined ? formatSessionCompactDateLabel(updated) : undefined} summary={summaryByKey.get(node.key)} onOpen={open} onToggle={toggle} onSelect={() => selectNode(node)}
             onKeyDown={event => { if (event.target !== event.currentTarget) return; if (event.key === 'Enter') open(); if (event.key === 'ArrowRight' && !expanded || event.key === 'ArrowLeft' && expanded) { event.preventDefault(); toggle(); } if (event.key === ' ' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); selectNode(node); } if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); const rows = [...(list.current?.querySelectorAll<HTMLElement>('[role="treeitem"]') ?? [])].filter(row => !row.closest('[inert]')); rows[rows.indexOf(event.currentTarget) + (event.key === 'ArrowDown' ? 1 : -1)]?.focus(); } }}
             menu={menuItems(false)}
-            actions={<>{!recent && handle}{container && <button type="button" className="organization-icon-button organization-row-new" aria-label={t('organization.newIn', { name: title })} onClick={() => newConversation(container.id)}><Icon name="add" className="size-3.5" /></button>}{project && <ProjectActionsButton projectRef={{ id: project.id, path: project.path, resourceOwner: project.source?.resourceOwner, source: project.source, versionedWorkspace: project.versionedWorkspace }} directory={project.path} allowMobile menuTrigger={<button type="button" className="organization-icon-button" aria-label={t('sessions.sidebar.project.actions.projectMenu')}><Icon name="play" className="size-3.5" /></button>} />}</>} />
+            actions={!recent && <>{handle}{container && <button type="button" className="organization-icon-button organization-row-new" aria-label={t('organization.newIn', { name: title })} onClick={() => newConversation(container.id)}><Icon name="add" className="size-3.5" /></button>}{project && <ProjectActionsButton projectRef={{ id: project.id, path: project.path, resourceOwner: project.source?.resourceOwner, source: project.source, versionedWorkspace: project.versionedWorkspace }} directory={project.path} allowMobile menuTrigger={<button type="button" className="organization-icon-button" aria-label={t('sessions.sidebar.project.actions.projectMenu')}><Icon name="play" className="size-3.5" /></button>} />}</>} />
         </div></ContextMenuTrigger><ContextMenuContent className="min-w-48">{menuItems(true)}</ContextMenuContent></ContextMenu>
-      </DropTarget>
-      {(node.children.length > 0 || container || entry?.hasChildren) && <div className="organization-fold" style={{ gridTemplateRows: expanded ? '1fr' : '0fr', opacity: expanded ? 1 : 0 }} inert={!expanded}><div className="min-h-0 overflow-hidden"><div role="group" className={container ? 'organization-children' : 'organization-task-children'}>{node.children.map(render)}{recent && entry?.hasChildren && expanded && pageControls(conversationQuery(entry.conversation))}{container && expanded && !query.trim() && pageControls(containerQuery(container.id))}{container && <DropTarget id={`end:${node.key}`} line disabled={!canDrop(container.id)} drop={{ reorder: true, parentId: container.id, before: null, label: t('organization.moveEnd', { name: title }) }} />}</div></div></div>}
-      </>}</DragRow>
+    );
+    const inside = (handle?: React.ReactNode) => <>
+      {container && !recent ? <DropTarget id={`inside:${node.key}`} disabled={searching || !canDrop(container.id)} drop={{ parentId: container.id, before: null, label: t('organization.moveInside', { name: title }) }}>{row(handle)}</DropTarget> : row(handle)}
+      {(node.children.length > 0 || container || entry?.hasChildren) && <div className="organization-fold" style={{ gridTemplateRows: expanded ? '1fr' : '0fr', opacity: expanded ? 1 : 0 }} inert={!expanded}>
+        <div className="min-h-0 overflow-hidden"><div role="group" className={container ? 'organization-children' : 'organization-task-children'}>
+          {node.children.map(render)}
+          {recent && entry?.hasChildren && expanded && pageControls(conversationQuery(entry.conversation))}
+          {container && expanded && !searching && pageControls(containerQuery(container.id))}
+          {container && !recent && <DropTarget id={`end:${node.key}`} line disabled={!canDrop(container.id)} drop={{ reorder: true, parentId: container.id, before: null, label: t('organization.moveEnd', { name: title }) }} />}
+        </div></div>
+      </div>}
+    </>;
+    const branch = { node, pending: pendingObjects.has(node.key), expanded };
+    if (recent) return <OrganizationBranch key={node.key} {...branch}>{inside()}</OrganizationBranch>;
+    // Reordering respects the visible container/conversation and pin segments. Moving into a
+    // different location remains available on its row, independently of display sorting.
+    const reorderable = !searching && canDrop(node.parentId, node.object) && (!container || sortOrder === 'manual') && (!entry?.position.inheritedFrom || entry.position.explicit) && draggedNodes.every(candidate => !!candidate.container === !!container && (!entry || !!candidate.conversation?.pinned === !!entry.pinned));
+    return <React.Fragment key={node.key}>
+      <DropTarget id={`before:${node.key}`} line disabled={!reorderable} drop={{ parentId: node.parentId, before: node.object, label: t('organization.moveBefore', { name: title }) }} />
+      <DraggableBranch {...branch}>{inside}</DraggableBranch>
     </React.Fragment>;
   };
   const saveGroup = () => {
@@ -423,9 +464,21 @@ export const ConversationOrganizationTree = React.forwardRef<OrganizationNavigat
   };
   const firstRootConversation = shown.findIndex(node => node.conversation);
   const lastContainer = shown.reduce((last, node, index) => node.container ? index : last, -1);
+  const listEnd = <div className="min-h-8 px-2 py-2 typography-micro text-muted-foreground">
+    {shown.length || !visibleSnapshot ? '' : t(archived ? 'organization.emptyArchive' : 'organization.empty')}
+    {drag && t('organization.dropEnd')}
+  </div>;
+  const tree = <div role="tree" aria-label={t('organization.directory')} className="organization-view" data-ready={visibleSnapshot !== null}>
+    {shown.map((node, index) => <React.Fragment key={node.key}>
+      {!recent && !searching && !preference.focus && index === firstRootConversation && index > lastContainer && <p className="mb-1 mt-3 px-1.5 typography-micro text-muted-foreground">{t('organization.uncategorized')}</p>}
+      {render(node)}
+    </React.Fragment>)}
+    {pageControls(viewQuery)}
+    {recent ? listEnd : <DropTarget id="root:end" disabled={searching || !canDrop(preference.focus)} drop={{ reorder: true, parentId: preference.focus, before: null, label: t('organization.currentEnd') }}>{listEnd}</DropTarget>}
+  </div>;
   return <section className="flex min-h-0 flex-1 flex-col" aria-label={t('organization.shared')}>
     <div className="flex min-h-9 items-center justify-between gap-2 px-3 pb-1">
-      {preference.focus ? <button type="button" className="flex min-w-0 items-center gap-1 typography-micro text-muted-foreground hover:text-foreground" title={location(preference.focus)} onClick={() => setPreference({ focus: null })}><Icon name="arrow-left-s" className="size-3 shrink-0" /><span className="truncate">{location(preference.focus)}</span></button> : <div className="organization-tabs" role="tablist" aria-label={t('organization.directory')}><button type="button" role="tab" aria-selected={recent} onClick={() => setPreference({ view: 'recent' })}>{t('organization.recent')}</button><button type="button" role="tab" aria-selected={!recent} onClick={() => setPreference({ view: 'classified' })}>{t('organization.classified')}</button></div>}
+      {preference.focus ? <button type="button" className="flex min-w-0 items-center gap-1 typography-micro text-muted-foreground hover:text-foreground" title={location(preference.focus)} onClick={() => setPreference({ focus: null })}><Icon name="arrow-left-s" className="size-3 shrink-0" /><span className="truncate">{location(preference.focus)}</span></button> : <div className="organization-tabs" role="tablist" aria-label={t('organization.directory')}><button type="button" role="tab" aria-selected={recent} onClick={() => selectView('recent')}>{t('organization.recent')}</button><button type="button" role="tab" aria-selected={!recent} onClick={() => selectView('classified')}>{t('organization.classified')}</button></div>}
       <div className="flex shrink-0 items-center">{selectedEntry.entry && <button type="button" className="organization-icon-button" title={t('organization.locate')} aria-label={t('organization.locate')} onClick={() => { setPreference({ focus: selectedEntry.entry!.position.containerId, view: 'classified' }); onSearchReset?.(); }}><Icon name="target" className="size-3.5" /></button>}{!archived && <DropdownMenu><DropdownMenuTrigger asChild><button type="button" className="organization-icon-button" disabled={!snapshot} aria-label={t('organization.add')}><Icon name="add" className="size-3.5" /></button></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuItem onClick={() => create(preference.focus)}><Icon name="folder-add" className="size-4" />{t('organization.newGroupMenu')}</DropdownMenuItem><DropdownMenuItem onClick={() => setProjectCreate({ parentId: preference.focus })}><Icon name="code-box" className="size-4" />{t('organization.addProject')}</DropdownMenuItem></DropdownMenuContent></DropdownMenu>}</div>
     </div>
     {projectCreate && <ProjectCreateDialog open parentContainerId={projectCreate.parentId} onOpenChange={open => { if (!open) { setProjectCreate(null); void refreshConversationOrganization(); } }} />}
@@ -433,10 +486,12 @@ export const ConversationOrganizationTree = React.forwardRef<OrganizationNavigat
     <OrganizationOperationFeedback pendingKeys={new Set(Object.keys(state.pending))} failed={Object.values(state.failed)} intents={metadataIntents} onCheck={original => act(() => submitOrganization(original.operation, original))} onRetry={key => act(() => submitOrganizationMetadata([], key))} name={reference => snapshot?.conversations.find(entry => entry.conversation.kind === reference.kind && entry.conversation.id === reference.id)?.title || (reference.kind === 'native' ? threadById.get(reference.id)?.title : externalById.get(reference.id)?.title) || t('organization.untitled')} />
     {state.loading && !snapshot && <p role="status" className="px-3 typography-meta text-muted-foreground">{t('organization.loading')}</p>}
     {(selection.size > 0 || selectionMode) && <div className="mx-2 mb-1 flex flex-wrap items-center gap-1 rounded-lg bg-interactive-hover px-1 py-1 typography-meta"><span className="mr-auto pl-1 text-muted-foreground">{t('organization.selectedCount', { count: selection.size })}</span><Button size="sm" variant="ghost" disabled={!selectedNodes.length} onClick={() => chooseMove(selectedNodes)}>{t('organization.move')}</Button><DropdownMenu><DropdownMenuTrigger asChild><button type="button" className="organization-icon-button" aria-label={t('organization.actions', { name: t('organization.selectedCount', { count: selection.size }) })}><Icon name="more" className="size-3.5" /></button></DropdownMenuTrigger><DropdownMenuContent><DropdownMenuItem disabled={metadataBusy(selectedNodes) || !selectedNodes.some(node => node.conversation)} onClick={() => act(() => metadata(selectedNodes.filter(node => node.conversation), { archived: !archived }))}>{t(archived ? 'organization.restore' : 'organization.archive')}</DropdownMenuItem><DropdownMenuItem data-variant="destructive" disabled={metadataBusy(selectedNodes) || !selectedNodes.some(node => node.conversation)} onClick={() => requestDelete(selectedNodes.filter(node => node.conversation))}>{t('organization.deleteSelected')}</DropdownMenuItem></DropdownMenuContent></DropdownMenu><button type="button" className="organization-icon-button" aria-label={t('organization.endSelection')} onClick={() => { setSelection(new Set()); onExitSelection?.(); }}><Icon name="close" className="size-3.5" /></button></div>}
-    <DndContext sensors={sensors} collisionDetection={args => args.pointerCoordinates ? pointerWithin(args) : closestCenter(args)} onDragStart={event => setDrag(event.active.data.current as OrganizationNode)} onDragOver={onDragOver} onDragEnd={onDragEnd} onDragCancel={() => { setDrag(null); setDropLabel(''); }}>
-      <FlipList containerRef={list} layoutKey={listLayoutKey} instantKey={query} className="relative min-h-0 flex-1 overflow-auto px-2 pb-3"><div role="tree" aria-label={t('organization.directory')}>{shown.map((node, index) => <React.Fragment key={node.key}>{!recent && !query.trim() && !preference.focus && index === firstRootConversation && index > lastContainer && <p className="mb-1 mt-3 px-1.5 typography-micro text-muted-foreground">{t('organization.uncategorized')}</p>}{render(node)}</React.Fragment>)}{pageControls(viewQuery)}<DropTarget id="root:end" disabled={recent || !!query.trim() || !canDrop(preference.focus)} drop={{ reorder: true, parentId: preference.focus, before: null, label: t('organization.currentEnd') }}><div className="min-h-8 px-2 py-2 typography-micro text-muted-foreground">{shown.length || !state.pages[organizationQueryKey(viewQuery)]?.snapshot ? '' : t(archived ? 'organization.emptyArchive' : 'organization.empty')}{drag && t('organization.dropEnd')}</div></DropTarget></div></FlipList>
-      <DragOverlay>{drag ? <div className="rounded-lg border border-border bg-popover px-3 py-2 typography-ui-label shadow-md">{name(drag)}{dropLabel && <div className="typography-meta text-muted-foreground">{dropLabel}</div>}</div> : null}</DragOverlay>
-    </DndContext>
+    <FlipList containerRef={list} layoutKey={listLayoutKey} instantKey={listContentKey} className="relative min-h-0 flex-1 overflow-auto px-2 pb-3">
+      {recent ? tree : <DndContext sensors={sensors} collisionDetection={args => args.pointerCoordinates ? pointerWithin(args) : closestCenter(args)} onDragStart={event => setDrag(event.active.data.current as OrganizationNode)} onDragOver={onDragOver} onDragEnd={onDragEnd} onDragCancel={clearDrag}>
+        {tree}
+        <DragOverlay>{drag ? <div className="rounded-lg border border-border bg-popover px-3 py-2 typography-ui-label shadow-md">{name(drag)}{dropLabel && <div className="typography-meta text-muted-foreground">{dropLabel}</div>}</div> : null}</DragOverlay>
+      </DndContext>}
+    </FlipList>
     <span role="status" aria-live="polite" className="sr-only">{dropLabel}</span>
     <OrganizationGroupDialog value={editor} onChange={setEditor} location={t('organization.groupLocation', { path: location(editor?.parentId ?? null) })} pending={!!editor && Object.values(state.pending).some(command => 'id' in command.operation && command.operation.id === editor.id)} onSubmit={saveGroup} />
     {namedSnapshot && <Dialog open={!!move} onOpenChange={open => { if (!open) setMove(null); }}><DialogContent className="max-w-[420px] gap-5 p-5"><DialogHeader className="text-left"><DialogTitle className="text-[15px] font-medium">{t('organization.moveTo')}</DialogTitle><DialogDescription className="typography-meta">{moveContents?.length === 1 ? name(moveContents[0]) : t('organization.selectedCount', { count: moveContents?.length ?? 0 })}</DialogDescription></DialogHeader><form className="space-y-5" onSubmit={event => { event.preventDefault(); if (move) act(() => moveNodes(move, { parentId: moving || null, before: null, label: '' })); }}><OrganizationDestinationPicker value={moving} onChange={setMoving} snapshot={namedSnapshot} excluded={moveContents?.flatMap(node => node.container ? [node.container.id] : []) ?? []} disabled={movingBusy} /><DialogFooter className="flex-row"><Button type="button" variant="ghost" size="sm" onClick={() => setMove(null)}>{t('organization.cancel')}</Button><Button type="submit" size="sm" disabled={movingBusy}>{t(movingBusy ? 'organization.moving' : 'organization.moveHere')}</Button></DialogFooter></form></DialogContent></Dialog>}

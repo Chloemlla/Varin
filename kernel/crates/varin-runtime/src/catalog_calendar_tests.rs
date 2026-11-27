@@ -504,7 +504,10 @@ fn cold_occurrence_and_initial_goal_use_original_run_history_and_terminal_owners
     let input = definition(true);
     let d = sync(&mut f.db, &input);
     let o = due(&mut f.db, &d, 0);
+    assert_eq!(o.target_kind, OccurrenceTargetKind::NewWork);
     assert!(o.thread_id.starts_with("thread:"));
+    let title: String = f.db.db.query_row("SELECT title FROM threads WHERE id=?1", [&o.thread_id], |row| row.get(0)).unwrap();
+    assert_eq!(title, format!("{} · 01-01 00:00 UTC", input.name));
     assert!(latest_run(&f.db.db, &o.branch_id).unwrap().is_none());
     let p = prepare(&f.db, &o);
     let admitted = f.db.admit_calendar_submission(p).unwrap();
@@ -762,6 +765,7 @@ fn existing_active_work_uses_shared_ingress_and_cancelled_queued_occurrence_neve
     reconcile(&db).unwrap();
     let mut db = db.into_inner().unwrap();
     let queued = db.calendar_occurrence(&o.id).unwrap();
+    assert_eq!(queued.target_kind, OccurrenceTargetKind::ExistingWork);
     assert_eq!(queued.run_id.as_deref(), Some(run.as_str()));
     assert_eq!(queued.state, OccurrenceState::Held);
     assert_eq!(queued.hold_reason.as_deref(), Some("preparing"));
@@ -816,7 +820,12 @@ fn actual_engine_consumes_cold_calendar_context_and_accounts_initial_goal_usage(
                     content: Content::Text {
                         text: "Calendar result".into(),
                     },
-                    opaque: None,
+                    opaque: Some(OpaqueProviderItem {
+                        connection_identity: "fixture".into(),
+                        family: "fixture".into(),
+                        adapter_version: "1".into(),
+                        value: json!({"phase":"final_answer"}),
+                    }),
                 },
             })
             .unwrap();
@@ -875,6 +884,20 @@ fn actual_engine_consumes_cold_calendar_context_and_accounts_initial_goal_usage(
         .unwrap();
     assert_eq!(current.usage.actual.inferences, 1);
     assert_eq!(current.usage.actual.output_tokens.known, 3);
+    let history = db.lock().unwrap().capture_family_read(
+        &occurrence.thread_id, Some(&occurrence.thread_id), Some(&occurrence.branch_id),
+    ).unwrap();
+    let page = history.read(family::ReadRequest {
+        run_id: Some(run.clone()), anchor: None, cursor: None,
+        query: family::FamilyReadQuery::Recent { limit: None, max_item_bytes: None },
+    }, &|| false).unwrap();
+    let reply = page.items.last().unwrap();
+    assert_eq!(reply.assistant_phase.as_deref(), Some("final_answer"));
+    assert!(reply.assistant_response.is_some());
+    let body = reply.body.as_ref().unwrap();
+    assert_eq!(body["content"]["text"], "Calendar result");
+    assert!(body["opaque"].is_null());
+    assert!(page.items.iter().any(|item| Some(&item.id) == delivered.history_item_id.as_ref()));
     assert_eq!(
         db.lock()
             .unwrap()
@@ -1745,8 +1768,11 @@ fn existing_work_new_root_prepares_current_extension_without_rewriting_previous_
     reconcile(&db).unwrap();
     super::super::activation::reconcile(&db).unwrap();
     let db = db.into_inner().unwrap();
-    let current_run = db.calendar_occurrence(&occurrence.id).unwrap().run_id.unwrap();
+    let delivery = db.calendar_occurrence(&occurrence.id).unwrap();
+    let current_run = delivery.run_id.unwrap();
     assert_ne!(current_run, original_run);
+    assert!(db.history(&occurrence.branch_id).unwrap().iter().any(|item|
+        Some(&item.id) == delivery.history_item_id.as_ref() && item.run_id == current_run));
     let pending = db.launch_intent(&current_run).unwrap().unwrap();
     assert_eq!(pending.extension_admission.as_ref().unwrap().state, launches::ExtensionAdmissionState::Pending);
     let request: RequestBinding = serde_json::from_value(json!({"resource_activations":[],"resource_checkpoint_id":null,

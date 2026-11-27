@@ -9,6 +9,7 @@ import type { ExtensionReleaseManager } from '@varin/extension-host';
 import { parseVarinExtensionPackageSource } from '@varin/extension-contract';
 import type { VarinExtensionReleaseInstallRequest } from '@varin/extension-contract';
 import type { PluginDiscoveryService } from './discovery.js';
+import { DeploymentPolicyDeniedError } from '../deployment/policy.js';
 
 interface PluginCenterRouteDependencies {
   discovery: PluginDiscoveryService;
@@ -58,6 +59,9 @@ export function registerPluginCenterRoutes(app: Express, { discovery, releases, 
       if (!res.destroyed && !res.writableEnded) return res.json(result);
     } catch (error) {
       if (res.destroyed || res.writableEnded) return;
+      if (error instanceof DeploymentPolicyDeniedError) {
+        return res.status(403).json({ error: { code: error.code, message: error.message, section: error.section } });
+      }
       const conflict = error instanceof ExtensionCatalogRevisionConflictError;
       return res.status(conflict ? 409 : 400).json({ error: {
         code: conflict ? 'revision_conflict' : 'plugin_request_failed',

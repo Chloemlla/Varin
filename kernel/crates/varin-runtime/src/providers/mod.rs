@@ -9,6 +9,7 @@ mod builtins;
 pub mod chat;
 pub mod codex;
 pub mod connection_options;
+mod deployment_egress;
 pub mod google;
 pub mod extensions;
 pub(crate) mod groups;
@@ -237,7 +238,8 @@ impl ReqwestTransport {
         }
         // State is scoped to this trusted connection configuration, never a global tenant cache.
         // Separate callers block on their own futures; no request holds an executor-wide mutex.
-        let state = self
+        let transport = deployment_egress::transport(request.endpoint)?.unwrap_or(self);
+        let state = transport
             .state
             .get_or_init(|| {
                 let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -249,7 +251,7 @@ impl ReqwestTransport {
                     })?;
                 let client = {
                     let _entered = runtime.enter();
-                    (self.builder)()
+                    (transport.builder)()
                         .redirect(reqwest::redirect::Policy::none())
                         .retry(reqwest::retry::never())
                         .build()
@@ -289,9 +291,18 @@ impl ReqwestTransport {
             let mut response = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(failure("cancelled", "generation cancelled")),
-                response = send => response.map_err(|error| ModelFailure {
-                    transport_cause: Some(transport_diagnostic::cause(error)),
-                    ..failure("transport_error", "model connection failed")
+                response = send => response.map_err(|error| {
+                    let mut cause = std::error::Error::source(&error);
+                    while let Some(error) = cause {
+                        if error.is::<deployment_egress::DestinationDenied>() {
+                            return deployment_egress::denied();
+                        }
+                        cause = error.source();
+                    }
+                    ModelFailure {
+                        transport_cause: Some(transport_diagnostic::cause(error)),
+                        ..failure("transport_error", "model connection failed")
+                    }
                 })?,
             };
             let request_id = response.headers().get("x-request-id").or_else(|| response.headers().get("request-id")).or_else(|| response.headers().get("x-amzn-requestid"))

@@ -18,11 +18,11 @@ export async function dispatchProjectGit(options: { dispatch: ProjectGitDispatch
   principal: ManagedSourcePrincipal, workspaceId: string, registeredRoot: string, command: ProjectGitCommand, signal?: AbortSignal): Promise<unknown> {
   if (!command || !operations.has(command.operation) || !Array.isArray(command.args)) throw new Error('Invalid project Git command');
   const includes = (values: readonly string[]) => values.includes(command.operation);
-  const require = (...capabilities: string[]) => { for (const capability of capabilities) if (!principal.capabilities.includes(capability)) throw new Error(`Target Git requires ${capability}`); };
-  require('filesystem:read', 'terminal:use');
-  if (!includes(PROJECT_GIT_READ)) require('filesystem:write', 'process:control');
-  if (includes(PROJECT_GIT_CONFIGURATION_READ)) require('config:read');
-  if (includes(PROJECT_GIT_CONFIGURATION_WRITE)) require('config:write');
+  const requireCapabilities = (...capabilities: string[]) => { for (const capability of capabilities) if (!principal.capabilities.includes(capability)) throw new Error(`Target Git requires ${capability}`); };
+  requireCapabilities('filesystem:read', 'terminal:use');
+  if (!includes(PROJECT_GIT_READ)) requireCapabilities('filesystem:write', 'process:control');
+  if (includes(PROJECT_GIT_CONFIGURATION_READ)) requireCapabilities('config:read');
+  if (includes(PROJECT_GIT_CONFIGURATION_WRITE)) requireCapabilities('config:write');
   const selection = parseProjectSourceSelection(command.selection);
   await assertResourcePathAllowed(registeredRoot, principal.allowedDirectories);
   const logicalRoot = await canonical(selection.mode === 'native_workspace' && selection.nativeScope
@@ -102,11 +102,11 @@ export async function dispatchProjectGit(options: { dispatch: ProjectGitDispatch
 export async function dispatchProjectGitHub(options: { dispatch: ProjectGitDispatcher; nativeWorkspaces?: Pick<NativeWorkspaceOwner, 'prepareSelection'> },
   principal: ManagedSourcePrincipal, workspaceId: string, registeredRoot: string, command: import('@varin/application-client').ProjectGitHubCommand, signal?: AbortSignal): Promise<unknown> {
   if (!command || typeof command.operation !== 'string' || !Array.isArray(command.args)) throw new Error('Invalid project GitHub command');
-  const require = (...capabilities: string[]) => { for (const capability of capabilities) if (!principal.capabilities.includes(capability)) throw new Error(`Target GitHub requires ${capability}`); };
-  require('filesystem:read', 'terminal:use');
-  if (command.operation.startsWith('auth') || command.operation === 'me' || command.operation === 'repoBranches') require('config:read');
-  if (command.operation.startsWith('auth') && command.operation !== 'authStatus') require('config:write');
-  if (['prCreate','prUpdate','prMerge','prReady','authSyncTerminal','authConfigureGitAuthor'].includes(command.operation)) require('process:control');
+  const requireCapabilities = (...capabilities: string[]) => { for (const capability of capabilities) if (!principal.capabilities.includes(capability)) throw new Error(`Target GitHub requires ${capability}`); };
+  requireCapabilities('filesystem:read', 'terminal:use');
+  if (command.operation.startsWith('auth') || command.operation === 'me' || command.operation === 'repoBranches') requireCapabilities('config:read');
+  if (command.operation.startsWith('auth') && command.operation !== 'authStatus') requireCapabilities('config:write');
+  if (['prCreate','prUpdate','prMerge','prReady','authSyncTerminal','authConfigureGitAuthor'].includes(command.operation)) requireCapabilities('process:control');
   await assertResourcePathAllowed(registeredRoot, principal.allowedDirectories);
   const args: unknown[] = structuredClone(command.args);
   const directoryMethods = ['prStatus','repoUpstream','prsList','prContext','issuesList','issueGet','issueComments'];
